@@ -845,6 +845,29 @@ impl Model {
         Ok(())
     }
 
+    /// Debug: with BLAZE_DUMP=<dir>, write `rows` x `width` bf16 values at `ptr` to <dir>/<name>.bin (eager forwards
+    /// only; a capture skips it).
+    fn dump(&self, name: &str, ptr: *const u16, rows: usize, width: usize) -> Result<()> {
+        let Some(dir) = std::env::var_os("BLAZE_DUMP") else { return Ok(()) };
+        let mut cap: c_int = 0;
+        unsafe {
+            unsafe extern "C" {
+                fn cudaStreamIsCapturing(s: sys::cudaStream_t, status: *mut c_int) -> c_int;
+            }
+            cudaStreamIsCapturing(self.stream.0, &mut cap);
+        }
+        if cap != 0 {
+            return Ok(());
+        }
+        self.stream.sync()?;
+        let mut host = vec![0u16; rows * width];
+        check(unsafe { sys::cudaMemcpy(host.as_mut_ptr().cast(), ptr.cast(), rows * width * 2, sys::MEMCPY_D2H) }, "dump")?;
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(std::path::Path::new(&dir).join(format!("{name}.bin")), bytes)?;
+        Ok(())
+    }
+
     /// The streams' input to a block: per-stream norm, then the gated low-rank mix into `normed`.
     fn hc_enter(&self, hc: &HcBlock, rows: usize, streams: *const u16, hnorm: *mut u16, out: *mut u16) -> Result<()> {
         let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
@@ -977,8 +1000,10 @@ impl Model {
                     }
                     if let Some(ple) = &layer.ple {
                         self.ple_apply(ple, t, n, verify)?;
+                        self.dump(&format!("l{li}_ple"), streams.ptr(), t, cfg.hc.as_ref().unwrap().count * h)?;
                     }
                     self.hc_enter(attn, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?;
+                    self.dump(&format!("l{li}_attn_in"), w.normed.ptr(), t, h)?;
                 }
             }
             if let Some(ci) = self.opts.capture_layers.iter().position(|&c| c == li) {
@@ -999,6 +1024,7 @@ impl Model {
             match &layer.mix {
                 Mixing::Norm { post, .. } => self.reduce_norm(post, t)?,
                 Mixing::Hyper { attn, mlp } => {
+                    self.dump(&format!("l{li}_attn_out"), w.x.ptr(), t, h)?;
                     self.hc_exit(attn, t)?;
                     let streams = w.streams.as_ref().unwrap();
                     self.hc_enter(mlp, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?;
@@ -1006,7 +1032,10 @@ impl Model {
             }
             self.mlp(li, layer, t)?;
             if let Mixing::Hyper { mlp, .. } = &layer.mix {
+                self.dump(&format!("l{li}_mlp_out"), w.x.ptr(), t, h)?;
                 self.hc_exit(mlp, t)?;
+                let streams = w.streams.as_ref().unwrap();
+                self.dump(&format!("l{li}_streams"), streams.ptr(), t, cfg.hc.as_ref().unwrap().count * h)?;
             }
         }
         self.all_reduce(w.x.ptr(), t * h)?;
