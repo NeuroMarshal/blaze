@@ -48,10 +48,8 @@ struct StepMeta {
     /// sampled step: penalty lists per logit row
     sample: bool,
     pen_ids: Vec<i32>,
-    pen_counts: Vec<i32>,
+    pen_coef: Vec<f32>,
     pen_off: Vec<i32>,
-    pen_presence: Vec<f32>,
-    pen_frequency: Vec<f32>,
 }
 
 enum Cmd {
@@ -130,10 +128,8 @@ impl Runner {
                 bail!("{} penalty entries (max {})", meta.pen_ids.len(), m.max_pen);
             }
             self.put(m.pen_ids, &meta.pen_ids);
-            self.put(m.pen_counts, &meta.pen_counts);
+            self.put(m.pen_coef, &meta.pen_coef);
             self.put(m.pen_off, &meta.pen_off);
-            self.put(m.pen_presence, &meta.pen_presence);
-            self.put(m.pen_frequency, &meta.pen_frequency);
         }
         let s = self.model.stream.0;
         check(
@@ -249,13 +245,18 @@ impl Snapshot {
     }
 }
 
-/// Penalties of one sampled item (OpenAI presence / frequency over its generated tokens).
+/// Logit edits of one sampled item: per token, logit' = (logit > 0 ? logit * a : logit * b) + c (repetition penalty,
+/// presence / frequency penalties, logit bias, bans).
 #[derive(Clone, Default)]
 pub struct Penalty {
-    pub presence: f32,
-    pub frequency: f32,
-    /// (token, count) of the tokens generated so far
-    pub counts: Vec<(i32, i32)>,
+    pub edits: Vec<(i32, f32, f32, f32)>,
+}
+
+/// Sampling candidates of one row: (logit, token) sorted descending, and the log-sum-exp of the whole (edited) row.
+#[derive(Clone, Default)]
+pub struct Cands {
+    pub top: Vec<(f32, i32)>,
+    pub lse: f32,
 }
 
 pub struct Engine {
@@ -548,19 +549,10 @@ impl Engine {
 
     /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
     /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
-    pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Vec<(f32, i32)>>> {
+    pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Cands>> {
         let mut m = self.plan(seqs, tokens, false)?;
         m.sample = true;
-        m.pen_off.push(0);
-        for p in pens {
-            for &(id, c) in &p.counts {
-                m.pen_ids.push(id);
-                m.pen_counts.push(c);
-            }
-            m.pen_off.push(m.pen_ids.len() as i32);
-            m.pen_presence.push(p.presence);
-            m.pen_frequency.push(p.frequency);
-        }
+        fill_edits(&mut m, pens);
         let n = m.logit_rows.len();
         let meta = Arc::new(m);
         let pairs = match self.broadcast(|| Cmd::Step(meta.clone(), true, false))? {
@@ -611,21 +603,12 @@ impl Engine {
 
     /// Sampled speculative verify: like `verify`, but every row gets its sampling candidates (with row i's penalties
     /// `pens[i]`, which count the draft tokens before it).
-    pub fn verify_sampled(&mut self, seq: &mut Seq, tokens: &[i64], pens: &[Penalty]) -> Result<Vec<Vec<(f32, i32)>>> {
+    pub fn verify_sampled(&mut self, seq: &mut Seq, tokens: &[i64], pens: &[Penalty]) -> Result<Vec<Cands>> {
         self.broadcast(|| Cmd::PreVerify(seq.row))?;
         self.last_verify = Some((seq.len(), Arc::new(tokens.to_vec())));
         let mut m = self.plan(&mut [seq], &[tokens], true)?;
         m.sample = true;
-        m.pen_off.push(0);
-        for p in pens {
-            for &(id, c) in &p.counts {
-                m.pen_ids.push(id);
-                m.pen_counts.push(c);
-            }
-            m.pen_off.push(m.pen_ids.len() as i32);
-            m.pen_presence.push(p.presence);
-            m.pen_frequency.push(p.frequency);
-        }
+        fill_edits(&mut m, pens);
         let n = m.logit_rows.len();
         let meta = Arc::new(m);
         let pairs = match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
@@ -635,20 +618,32 @@ impl Engine {
         Ok(self.merge_candidates(&pairs, n))
     }
 
-    fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Vec<(f32, i32)>> {
+    fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Cands> {
         let (k, world) = (sys::BLZ_TOPK_MAX, self.workers.len());
         (0..n)
             .map(|r| {
-                let mut c: Vec<(f32, i32)> = (0..world)
-                    .flat_map(|w| {
-                        let base = (w * n + r) * k * 2;
-                        (0..k).map(move |j| (pairs[base + 2 * j], pairs[base + 2 * j + 1] as i32))
-                    })
-                    .filter(|&(_, id)| id >= 0)
-                    .collect();
-                c.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
-                c.truncate(k);
-                c
+                let mut top = Vec::with_capacity(world * k);
+                let mut lse_sum = 0.0f64;
+                let mut lse_max = f64::MIN;
+                let shard_lse: Vec<f32> = (0..world).map(|w| pairs[((w * n + r) * (k + 1) + k) * 2]).collect();
+                for &l in &shard_lse {
+                    lse_max = lse_max.max(l as f64);
+                }
+                for &l in &shard_lse {
+                    lse_sum += (l as f64 - lse_max).exp();
+                }
+                for w in 0..world {
+                    let base = (w * n + r) * (k + 1) * 2;
+                    for j in 0..k {
+                        let id = pairs[base + 2 * j + 1] as i32;
+                        if id >= 0 {
+                            top.push((pairs[base + 2 * j], id));
+                        }
+                    }
+                }
+                top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+                top.truncate(k);
+                Cands { top, lse: (lse_max + lse_sum.ln()) as f32 }
             })
             .collect()
     }
@@ -700,5 +695,16 @@ impl Drop for Engine {
                 let _ = h.join();
             }
         }
+    }
+}
+
+fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
+    m.pen_off.push(0);
+    for p in pens {
+        for &(id, a, b, c) in &p.edits {
+            m.pen_ids.push(id);
+            m.pen_coef.extend([a, b, c]);
+        }
+        m.pen_off.push(m.pen_ids.len() as i32);
     }
 }

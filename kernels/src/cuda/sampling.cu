@@ -151,10 +151,18 @@ __global__ void __launch_bounds__(kThreads) topk_radix_kernel(const uint16_t* __
   }
 }
 
-__global__ void pack_kernel(const float* __restrict__ vals, const int32_t* __restrict__ ids, int n,
-                            float* __restrict__ pairs) {
+__global__ void pack_kernel(const float* __restrict__ vals, const int32_t* __restrict__ ids,
+                            const float* __restrict__ lse, int rows, int k, float* __restrict__ pairs) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) pairs[2 * i] = vals[i], pairs[2 * i + 1] = float(ids[i]);
+  if (i >= rows * (k + 1)) return;
+  const int r = i / (k + 1), j = i % (k + 1);
+  if (j < k) {
+    pairs[2 * i] = vals[r * k + j];
+    pairs[2 * i + 1] = float(ids[r * k + j]);
+  } else {
+    pairs[2 * i] = lse ? lse[r] : 0.0f;
+    pairs[2 * i + 1] = -2.0f;
+  }
 }
 
 __global__ void penalties_kernel(uint16_t* __restrict__ logits, int64_t ld, int col0, int ncols,
@@ -172,11 +180,64 @@ __global__ void penalties_kernel(uint16_t* __restrict__ logits, int64_t ld, int 
   }
 }
 
+__global__ void edits_kernel(uint16_t* __restrict__ logits, int64_t ld, int col0, int ncols,
+                             const int32_t* __restrict__ ids, const float* __restrict__ coef,
+                             const int32_t* __restrict__ off) {
+  const int row = blockIdx.x;
+  for (int i = off[row] + threadIdx.x; i < off[row + 1]; i += blockDim.x) {
+    const int c = ids[i] - col0;
+    if (c < 0 || c >= ncols) continue;
+    uint16_t* p = logits + int64_t(row) * ld + c;
+    const float x = bf(*p);
+    *p = to_bf((x > 0.0f ? x * coef[3 * i] : x * coef[3 * i + 1]) + coef[3 * i + 2]);
+  }
+}
+
+__global__ void __launch_bounds__(1024) lse_kernel(const uint16_t* __restrict__ logits, int64_t ld, int ncols,
+                                                    float* __restrict__ lse) {
+  __shared__ float red[32];
+  const uint16_t* row = logits + int64_t(blockIdx.x) * ld;
+  float mx = -FLT_MAX;
+  for (int c = threadIdx.x; c < ncols; c += blockDim.x) mx = fmaxf(mx, bf(row[c]));
+  for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+  __syncthreads();
+  mx = -FLT_MAX;
+  for (int i = 0; i < int(blockDim.x >> 5); ++i) mx = fmaxf(mx, red[i]);
+  __syncthreads();
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < ncols; c += blockDim.x) sum += __expf(bf(row[c]) - mx);
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float t = 0.0f;
+    for (int i = 0; i < int(blockDim.x >> 5); ++i) t += red[i];
+    lse[blockIdx.x] = mx + logf(t);
+  }
+}
+
 }  // namespace
 
-extern "C" cudaError_t blz_topk_pack(const float* vals, const int32_t* ids, int n, float* pairs, cudaStream_t stream) {
+extern "C" cudaError_t blz_logit_edits(uint16_t* logits, int64_t ld, int rows, int col0, int ncols, const int32_t* ids,
+                                       const float* coef, const int32_t* off, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  edits_kernel<<<rows, 256, 0, stream>>>(logits, ld, col0, ncols, ids, coef, off);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_row_lse(const uint16_t* logits, int64_t ld, int rows, int ncols, float* lse,
+                                   cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  lse_kernel<<<rows, 1024, 0, stream>>>(logits, ld, ncols, lse);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_topk_pack(const float* vals, const int32_t* ids, const float* lse, int rows, int k,
+                                     float* pairs, cudaStream_t stream) {
+  const int n = rows * (k + 1);
   if (n == 0) return cudaSuccess;
-  pack_kernel<<<(n + 255) / 256, 256, 0, stream>>>(vals, ids, n, pairs);
+  pack_kernel<<<(n + 255) / 256, 256, 0, stream>>>(vals, ids, lse, rows, k, pairs);
   return cudaGetLastError();
 }
 

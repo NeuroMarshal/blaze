@@ -324,6 +324,7 @@ fn main() -> Result<()> {
                     presence_penalty,
                     frequency_penalty: 0.0,
                     seed: None,
+                    ..Default::default()
                 },
                 default_max_tokens: max_tokens,
                 tool_parser: (!tool_call_parser.is_empty() && tool_call_parser != "none").then_some(tool_call_parser),

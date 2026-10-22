@@ -3,7 +3,7 @@
 //! blaze-chat; generation runs on the scheduler.
 
 use crate::sampler::SamplingParams;
-use crate::sched::{Finish, GenEvent, GenRequest, Scheduler, ThinkBudget};
+use crate::sched::{Finish, GenEvent, GenRequest, Scheduler, ThinkBudget, TokenLogprob};
 use crate::text::Text;
 use anyhow::{Result, anyhow};
 use axum::extract::State;
@@ -95,9 +95,34 @@ async fn models(State(st): State<Arc<AppState>>) -> Json<Value> {
                                              "max_model_len": st.max_context}]}))
 }
 
-/// Sampling parameters of a request body: the OpenAI fields, SGLang's extras (top_k, min_p), server defaults.
-fn sampling_of(body: &Value, d: &SamplingParams) -> SamplingParams {
+/// Sampling parameters of a request body: the OpenAI fields, vLLM / SGLang extras (top_k, min_p, repetition_penalty,
+/// min_tokens, bad_words), server defaults.
+fn sampling_of(body: &Value, d: &SamplingParams, text: &Text) -> SamplingParams {
     let f = |k: &str| body.get(k).and_then(Value::as_f64).map(|x| x as f32);
+    let logit_bias = body
+        .get("logit_bias")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().filter_map(|(k, v)| Some((k.parse::<i32>().ok()?, v.as_f64()? as f32))).collect())
+        .unwrap_or_default();
+    let bad_words = body
+        .get("bad_words")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .flat_map(|w| [w.to_string(), format!(" {w}")])
+                .filter_map(|w| text.encode(&w).ok())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.into_iter().map(|x| x as i32).collect())
+                .collect()
+        })
+        .unwrap_or_default();
+    // chat: logprobs (bool) + top_logprobs; completions: logprobs (int)
+    let logprobs = match body.get("logprobs") {
+        Some(Value::Bool(true)) => Some(body.get("top_logprobs").and_then(Value::as_u64).unwrap_or(0) as usize),
+        Some(Value::Number(n)) => n.as_u64().map(|x| x as usize),
+        _ => None,
+    };
     SamplingParams {
         temperature: f("temperature").unwrap_or(d.temperature),
         top_p: f("top_p").unwrap_or(d.top_p),
@@ -106,7 +131,25 @@ fn sampling_of(body: &Value, d: &SamplingParams) -> SamplingParams {
         presence_penalty: f("presence_penalty").unwrap_or(d.presence_penalty),
         frequency_penalty: f("frequency_penalty").unwrap_or(d.frequency_penalty),
         seed: body.get("seed").and_then(Value::as_u64),
+        repetition_penalty: f("repetition_penalty").unwrap_or(d.repetition_penalty),
+        logit_bias,
+        min_tokens: body.get("min_tokens").and_then(Value::as_u64).unwrap_or(0) as usize,
+        bad_words,
+        logprobs,
     }
+}
+
+/// Stop tokens of a request: the model's EOS (unless ignore_eos) and stop_token_ids.
+fn stop_ids_of(body: &Value, text: &Text) -> Vec<i32> {
+    let mut ids: Vec<i32> = if body.get("ignore_eos").and_then(Value::as_bool).unwrap_or(false) {
+        Vec::new()
+    } else {
+        text.eos.iter().map(|&e| e as i32).collect()
+    };
+    if let Some(a) = body.get("stop_token_ids").and_then(Value::as_array) {
+        ids.extend(a.iter().filter_map(Value::as_i64).map(|x| x as i32));
+    }
+    ids
 }
 
 fn stop_strings(body: &Value) -> Vec<String> {
@@ -159,8 +202,10 @@ impl Detok {
     }
 }
 
-/// One generation's events as text deltas: (delta, finish, prompt tokens, cached tokens, completion tokens).
+/// One generation's events as text deltas: (delta, finish, prompt tokens, cached tokens, completion tokens), and the
+/// logprobs of its tokens when asked for.
 struct Gen {
+    logprobs: Vec<(u32, TokenLogprob)>,
     rx: tokio::sync::mpsc::UnboundedReceiver<GenEvent>,
     cancel: Arc<AtomicBool>,
     detok: Detok,
@@ -183,8 +228,11 @@ impl Gen {
                     self.prompt_tokens = prompt_tokens;
                     self.cached_tokens = cached_tokens;
                 }
-                GenEvent::Token(t) => {
+                GenEvent::Token(t, lp) => {
                     self.completion_tokens += 1;
+                    if let Some(lp) = lp {
+                        self.logprobs.push((t as u32, lp));
+                    }
                     let d = self.detok.push(t as u32);
                     if self.detok.stopped {
                         self.cancel.store(true, Ordering::Relaxed);
@@ -231,15 +279,15 @@ fn think_budget(st: &AppState, body: &Value, starts_inside: bool) -> Option<Thin
     Some(ThinkBudget { budget, start_id, end_id, starts_inside, force })
 }
 
-fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>) -> Result<Gen> {
-    submit_ex(st, tokens, params, max_tokens, stops, None)
+fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
+          stop_ids: Vec<i32>) -> Result<Gen> {
+    submit_ex(st, tokens, params, max_tokens, stops, stop_ids, None)
 }
 
 fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
-             think: Option<ThinkBudget>) -> Result<Gen> {
+             stop_ids: Vec<i32>, think: Option<ThinkBudget>) -> Result<Gen> {
     let (tx, rx) = unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let stop_ids = st.text.eos.iter().map(|&e| e as i32).collect();
     // Prompt-cache point before the last turn header: the next turn of a chat repeats everything up to it.
     let cache_points = st
         .text
@@ -251,7 +299,15 @@ fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens
     st.sched
         .submit(GenRequest { tokens, params, max_tokens, stop_ids, cache_points, think, events: tx, cancel: cancel.clone() })
         .map_err(|_| anyhow!("scheduler stopped"))?;
-    Ok(Gen { rx, cancel, detok: Detok::new(st.text.clone(), stops), prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0 })
+    Ok(Gen {
+        logprobs: Vec::new(),
+        rx,
+        cancel,
+        detok: Detok::new(st.text.clone(), stops),
+        prompt_tokens: 0,
+        cached_tokens: 0,
+        completion_tokens: 0,
+    })
 }
 
 fn usage(g: &Gen) -> Value {
@@ -279,10 +335,10 @@ async fn completions(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -
         Ok(t) => t.into_iter().map(i64::from).collect(),
         Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    let params = sampling_of(&body, &st.cfg.defaults);
+    let params = sampling_of(&body, &st.cfg.defaults, &st.text);
     let max_tokens = body.get("max_tokens").and_then(Value::as_u64).map(|x| x as usize).unwrap_or(16);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut g = match submit(&st, tokens, params, max_tokens, stop_strings(&body)) {
+    let mut g = match submit(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text)) {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     };
@@ -318,8 +374,20 @@ async fn completions(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -
             Piece::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
         }
     }
+    let logprobs = if g.logprobs.is_empty() {
+        Value::Null
+    } else {
+        let tok = |t: u32| st.text.decode(&[t]).unwrap_or_default();
+        json!({
+            "tokens": g.logprobs.iter().map(|(t, _)| tok(*t)).collect::<Vec<_>>(),
+            "token_logprobs": g.logprobs.iter().map(|(_, l)| l.logprob).collect::<Vec<_>>(),
+            "top_logprobs": g.logprobs.iter().map(|(_, l)| {
+                l.top.iter().map(|&(t, lp)| (tok(t as u32), json!(lp))).collect::<serde_json::Map<_, _>>()
+            }).collect::<Vec<_>>(),
+        })
+    };
     Json(json!({"id": id, "object": "text_completion", "created": now(), "model": model,
-                "choices": [{"index": 0, "text": text, "finish_reason": finish_str(finish)}], "usage": usage(&g)}))
+                "choices": [{"index": 0, "text": text, "logprobs": logprobs, "finish_reason": finish_str(finish)}], "usage": usage(&g)}))
     .into_response()
 }
 
@@ -414,7 +482,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
         Ok(t) => t.into_iter().map(i64::from).collect(),
         Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    let params = sampling_of(&body, &st.cfg.defaults);
+    let params = sampling_of(&body, &st.cfg.defaults, &st.text);
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens).map(|x| x as usize).unwrap_or(st.cfg.default_max_tokens);
     let stream = request.stream.unwrap_or(false);
@@ -422,7 +490,7 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
     let starts_in_reasoning = matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"))
         && prompt.trim_end_matches('\n').ends_with("<think>");
     let think = think_budget(&st, &body, starts_in_reasoning);
-    let mut g = match submit_ex(&st, tokens, params, max_tokens, stop_strings(&body), think) {
+    let mut g = match submit_ex(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text), think) {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     };
@@ -439,9 +507,14 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
     .with_reasoning_state(starts_in_reasoning.then_some(true));
     // generation events -> decoded chat events (prompt tokens ride on every event; counts are per event)
     let (meta_tx, mut meta_rx) = tokio::sync::watch::channel((0usize, 0usize, 0usize));
+    // logprobs of the tokens decoded so far, taken by the next response chunk
+    let lps: Arc<std::sync::Mutex<Vec<(u32, TokenLogprob)>>> = Default::default();
+    let lps_gen = lps.clone();
     let decoded = async_stream::stream! {
         loop {
-            match g.next().await {
+            let piece = g.next().await;
+            lps_gen.lock().unwrap().append(&mut g.logprobs);
+            match piece {
                 Some(Piece::Text(t)) => {
                     let _ = meta_tx.send((g.prompt_tokens, g.cached_tokens, g.completion_tokens));
                     yield Ok::<_, ApiError>(DecodedChatEvent { choice: 0, text: t, token_ids: Vec::new(), finish_reason: None,
@@ -466,6 +539,22 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
         json!({"prompt_tokens": m.0, "completion_tokens": m.2, "total_tokens": m.0 + m.2,
                "prompt_tokens_details": {"cached_tokens": m.1}})
     };
+    let text = st.text.clone();
+    let take_lps = move || -> Value {
+        let items = std::mem::take(&mut *lps.lock().unwrap());
+        if items.is_empty() {
+            return Value::Null;
+        }
+        let entry = |t: u32, lp: f32| {
+            let s = text.decode(&[t]).unwrap_or_default();
+            json!({"token": s, "logprob": lp, "bytes": s.as_bytes()})
+        };
+        json!({"content": items.iter().map(|(t, l)| {
+            let mut e = entry(*t, l.logprob);
+            e["top_logprobs"] = l.top.iter().map(|&(t, lp)| entry(t as u32, lp)).collect();
+            e
+        }).collect::<Vec<_>>()})
+    };
     if stream {
         let s = async_stream::stream! {
             while let Some(ev) = events.next().await {
@@ -487,7 +576,8 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
                             }).collect();
                             delta.insert("tool_calls".into(), json!(v));
                         }
-                        yield chunk(json!([{"index": 0, "delta": delta, "finish_reason": finish_reason.map(finish_name)}]), Value::Null);
+                        yield chunk(json!([{"index": 0, "delta": delta, "logprobs": take_lps(),
+                                            "finish_reason": finish_reason.map(finish_name)}]), Value::Null);
                     }
                     Ok(ChatEvent::Usage { .. }) => {
                         let m = *meta_rx.borrow_and_update();
@@ -546,7 +636,8 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
     let m = *meta_rx.borrow_and_update();
     let u = usage_of(m);
     Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "message": message, "finish_reason": finish.map(finish_name).unwrap_or("stop")}],
+                "choices": [{"index": 0, "message": message, "logprobs": take_lps(),
+                             "finish_reason": finish.map(finish_name).unwrap_or("stop")}],
                 "usage": u}))
     .into_response()
 }

@@ -215,13 +215,11 @@ pub struct MetaLayout {
     /// per token: its sequence's KV-table row and length after the step (QSA)
     pub tok_row: usize,
     pub tok_kv_len: usize,
-    // sampling: penalty lists of the sampled rows (ids, counts, offsets [rows + 1]) and per-row coefficients
+    // sampling: logit edits of the sampled rows (ids, (a, b, c) per entry, offsets [rows + 1])
     pub max_pen: usize,
     pub pen_ids: usize,
-    pub pen_counts: usize,
+    pub pen_coef: usize,
     pub pen_off: usize,
-    pub pen_presence: usize,
-    pub pen_frequency: usize,
     pub bytes: usize,
 }
 
@@ -244,12 +242,10 @@ impl MetaLayout {
         let logit_rows = take(max_tokens * 4);
         let tok_row = take(max_tokens * 4);
         let tok_kv_len = take(max_tokens * 4);
-        let max_pen = (max_seqs * 4096).min(1 << 16);
+        let max_pen = (max_seqs * 16384).clamp(1 << 16, 1 << 18);
         let pen_ids = take(max_pen * 4);
-        let pen_counts = take(max_pen * 4);
+        let pen_coef = take(max_pen * 12);
         let pen_off = take((max_tokens + 1) * 4);
-        let pen_presence = take(max_tokens * 4);
-        let pen_frequency = take(max_tokens * 4);
         Self {
             max_tokens,
             max_seqs,
@@ -266,10 +262,8 @@ impl MetaLayout {
             tok_kv_len,
             max_pen,
             pen_ids,
-            pen_counts,
+            pen_coef,
             pen_off,
-            pen_presence,
-            pen_frequency,
             bytes: o,
         }
     }
@@ -332,6 +326,7 @@ struct Work {
     // sampling candidates of this rank's vocabulary shard, and every rank's packed (value, id) pairs
     cand_vals: DevBuf,
     cand_ids: DevBuf,
+    cand_lse: DevBuf,
     cand_pairs: DevBuf,
     // QSA: index queries [t, heads, 128], block scores [score rows, max blocks], selected KV slots [t, table stride] with
     // their counts, the identity row list of the selection table
@@ -932,7 +927,8 @@ impl Model {
             pairs: b((head_rows * 8 * 8).next_multiple_of(16))?,
             cand_vals: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
             cand_ids: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
-            cand_pairs: b((world * head_rows * sys::BLZ_TOPK_MAX * 8).next_multiple_of(16))?,
+            cand_lse: b(head_rows * 4)?,
+            cand_pairs: b((world * head_rows * (sys::BLZ_TOPK_MAX + 1) * 8).next_multiple_of(16))?,
             qsa_q: cfg.qsa.as_ref().map(|q| b(t.max(head_rows) * q.heads * q.head_dim * 2)).transpose()?,
             qsa_scores: cfg.qsa.as_ref().map(|q| b(QSA_SCORE_ROWS * (ctx / q.compress_ratio + 1) * 4)).transpose()?,
             qsa_table: cfg.qsa.as_ref().map(|_| b(t.max(head_rows) * QSA_TABLE_STRIDE * 4)).transpose()?,
@@ -1365,12 +1361,12 @@ impl Model {
         self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), v, s)?;
         check(
             unsafe {
-                sys::blz_apply_penalties(w.logits.ptr(), v as i64, rows as c_int, (rank * v) as c_int, v as c_int, self.meta_ptr(m.pen_ids),
-                                         self.meta_ptr(m.pen_counts), self.meta_ptr(m.pen_off), self.meta_ptr(m.pen_presence),
-                                         self.meta_ptr(m.pen_frequency), s.0)
+                sys::blz_logit_edits(w.logits.ptr(), v as i64, rows as c_int, (rank * v) as c_int, v as c_int, self.meta_ptr(m.pen_ids),
+                                     self.meta_ptr(m.pen_coef), self.meta_ptr(m.pen_off), s.0)
             },
-            "penalties",
+            "logit edits",
         )?;
+        check(unsafe { sys::blz_row_lse(w.logits.ptr(), v as i64, rows as c_int, v as c_int, w.cand_lse.ptr(), s.0) }, "lse")?;
         check(
             unsafe {
                 sys::blz_topk(w.logits.ptr(), v as i64, rows as c_int, v as c_int, (rank * v) as c_int, k as c_int, w.cand_vals.ptr(),
@@ -1378,12 +1374,15 @@ impl Model {
             },
             "top-k",
         )?;
-        let bytes = (world * rows * k * 8).next_multiple_of(16);
+        let bytes = (world * rows * (k + 1) * 8).next_multiple_of(16);
         if world > 1 {
             check(unsafe { sys::cudaMemsetAsync(w.cand_pairs.ptr(), 0, bytes, s.0) }, "memset")?;
         }
         check(
-            unsafe { sys::blz_topk_pack(w.cand_vals.ptr(), w.cand_ids.ptr(), (rows * k) as c_int, w.cand_pairs.at::<f32>(rank * rows * k * 2), s.0) },
+            unsafe {
+                sys::blz_topk_pack(w.cand_vals.ptr(), w.cand_ids.ptr(), w.cand_lse.ptr(), rows as c_int, k as c_int,
+                                   w.cand_pairs.at::<f32>(rank * rows * (k + 1) * 2), s.0)
+            },
             "pack",
         )?;
         if world > 1 {
@@ -1392,10 +1391,11 @@ impl Model {
         Ok(())
     }
 
-    /// The merged candidate pairs of the last sampled forward: [world][rows][K][2] floats.
+    /// The merged candidate pairs of the last sampled forward: [world][rows][K + 1][2] floats (the last pair of a row:
+    /// the shard's log-sum-exp).
     pub fn candidates(&self, rows: usize) -> Result<Vec<f32>> {
         self.stream.sync()?;
-        self.work.cand_pairs.download::<f32>(self.tp.world * rows * sys::BLZ_TOPK_MAX * 2)
+        self.work.cand_pairs.download::<f32>(self.tp.world * rows * (sys::BLZ_TOPK_MAX + 1) * 2)
     }
 
     /// Copy the recurrent state (GDN conv and recurrent, PLE conv and n-gram history) of row `src` to row `dst`.
