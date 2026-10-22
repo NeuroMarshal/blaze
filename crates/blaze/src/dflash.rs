@@ -2,7 +2,7 @@
 //! Tensor-parallel ranks merge vocabulary candidates before the selector walk.
 
 use crate::eagle::{DraftItem, DraftPlan};
-use crate::gpu::{DevBuf, check};
+use crate::gpu::{DevBuf, HostMapped, Stream, check};
 use crate::linear::{Cut, Linear};
 use crate::model::Model;
 use crate::quant::QuantConfig;
@@ -141,7 +141,6 @@ pub struct DFlash {
     ctx_n: DevBuf,
     ctx_kv: DevBuf,
     // block [items * block, ...]
-    q_tok: DevBuf,
     h: DevBuf,
     residual: DevBuf,
     x: DevBuf,
@@ -164,9 +163,14 @@ pub struct DFlash {
     sel_ids: DevBuf,
     sel_unary: DevBuf,
     sel_hproj: DevBuf,
-    anchors: DevBuf,
     drafts: DevBuf,
+    /// the anchors of the call's blocks (in `meta`)
+    anchors: *const i64,
+    /// per-call metadata: written into the pinned staging at a bump offset, copied to `meta` asynchronously (the
+    /// staging is reused only after the call's final synchronization)
+    staging: HostMapped,
     meta: DevBuf,
+    staged: usize,
 }
 
 // The all-reduce handle is used only by the rank's own thread.
@@ -234,6 +238,9 @@ impl DFlash {
         let v_local = model.dims.vocab;
         let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, cfg.block as c_int, 1) } as usize;
         let k = cfg.top_k;
+        // a call's metadata: positions and slots of every context row (at most `window` per item), the blocks'
+        // positions, slots, tokens, rows, lengths, anchors
+        let meta_bytes = (max_items * w * 16 + nq * 24 + max_items * 16 + 64 * 8).next_multiple_of(4096);
         Ok(Self {
             fc: lin(&[("fc".to_string(), Cut::All)])?,
             hidden_norm: vec("hidden_norm.weight")?,
@@ -257,7 +264,6 @@ impl DFlash {
             ctx_h: b(ROWS * h * 2)?,
             ctx_n: b(ROWS * h * 2)?,
             ctx_kv: b(ROWS * 2 * kr * 2)?,
-            q_tok: b(nq * 8)?,
             h: b(nq * h * 2)?,
             residual: b(nq * h * 2)?,
             x: b(nq * h * 2)?,
@@ -279,9 +285,11 @@ impl DFlash {
             sel_ids: b(ns * k * 4)?,
             sel_unary: b(ns * k * 4)?,
             sel_hproj: b(ns * cfg.rank * 2)?,
-            anchors: b(max_items * 8)?,
             drafts: b(ns * 8)?,
-            meta: b((ROWS.max(nq) * 3 + max_items * 2) * 8 + 4096)?,
+            anchors: std::ptr::null(),
+            staging: HostMapped::new(meta_bytes)?,
+            meta: b(meta_bytes)?,
+            staged: 0,
             cfg,
         })
     }
@@ -291,6 +299,24 @@ impl DFlash {
             "DFlash2 draft: {} layers, block {}, window {}, top {} candidates, selector rank {}",
             self.cfg.layers, self.cfg.block, self.cfg.window, self.cfg.top_k, self.cfg.rank
         )
+    }
+
+    /// Copy `data` into the call's metadata (pinned staging, an async copy on the stream); its device pointer.
+    fn stage<T: Copy>(&mut self, s: &Stream, data: &[T]) -> Result<*const T> {
+        let bytes = std::mem::size_of_val(data);
+        let at = self.staged;
+        if at + bytes > self.meta.bytes() {
+            bail!("DFlash metadata of {} bytes exceeds its buffer", at + bytes);
+        }
+        // SAFETY: plain-old-data copy into the pinned staging buffer.
+        self.staging.host_slice_mut()[at..at + bytes].copy_from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), bytes) });
+        let host: *const u8 = self.staging.host_ptr().cast();
+        check(
+            unsafe { sys::cudaMemcpyAsync(self.meta.at::<u8>(at).cast(), host.add(at).cast(), bytes, sys::MEMCPY_H2D, s.0) },
+            "DFlash meta copy",
+        )?;
+        self.staged = (at + bytes).next_multiple_of(64);
+        Ok(self.meta.at::<u8>(at).cast())
     }
 
     /// Context K/V of the items' rows (the last step's hidden states) into every layer, then the drafts after each
@@ -303,10 +329,14 @@ impl DFlash {
         if n > self.max_items {
             bail!("DFlash draft of {n} items (max {})", self.max_items);
         }
+        // the previous call ended with a synchronization: its staging is free
+        self.staged = 0;
         for it in &plan.items {
             self.context(model, it)?;
         }
         if plan.k == 0 {
+            // the staging is reused by the next call: its copies must have run
+            model.stream.sync()?;
             return Ok(vec![Vec::new(); n]);
         }
         self.block(model, &plan.items)?;
@@ -319,8 +349,9 @@ impl DFlash {
     }
 
     /// K/V of one item's context rows (its last `window` ones: no query reads further back) into every layer's ring.
-    fn context(&self, model: &Model, it: &DraftItem) -> Result<()> {
-        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+    fn context(&mut self, model: &Model, it: &DraftItem) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let (c, s, lin) = (&cfg, &model.stream, model.lin_ctx());
         let (h, hd) = (c.hidden, c.head_dim);
         let kr = self.kv_heads * hd;
         let feats = c.target_layers.len() * h;
@@ -332,12 +363,8 @@ impl DFlash {
             let m = (rows - r0).min(ROWS);
             let pos: Vec<i64> = (0..m).map(|j| (it.pos0 + r0 + j) as i64).collect();
             let loc: Vec<i64> = pos.iter().map(|&p| (it.row * w + p as usize % w) as i64).collect();
-            // metadata: positions, slots (one synchronous upload: the stream is idle between draft calls' parts)
-            s.sync()?;
-            self.meta.upload_at(0, &pos)?;
-            self.meta.upload_at(m * 8, &loc)?;
-            let posp: *const i64 = self.meta.ptr();
-            let locp: *const i64 = self.meta.at::<u8>(m * 8).cast();
+            let posp = self.stage(s, &pos)?;
+            let locp = self.stage(s, &loc)?;
             // fc in pieces the NVFP4 GEMV takes directly (its BF16 widening would need more scratch than the
             // target's layers provide)
             for j in (0..m).step_by(sys::BLZ_NVFP4_MMA_MAX_ROWS) {
@@ -368,8 +395,9 @@ impl DFlash {
     }
 
     /// The query blocks: [anchor, mask...] per item through every layer; leaves the mask rows' final hidden in `hm`.
-    fn block(&self, model: &Model, items: &[DraftItem]) -> Result<()> {
-        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+    fn block(&mut self, model: &Model, items: &[DraftItem]) -> Result<()> {
+        let cfg = self.cfg.clone();
+        let (c, s, lin) = (&cfg, &model.stream, model.lin_ctx());
         let (h, hd, bl) = (c.hidden, c.head_dim, c.block);
         let n = items.len();
         let nq = n * bl;
@@ -393,21 +421,16 @@ impl DFlash {
             req.push(it.row as i32);
             kvl.push((p0 + bl) as i32);
         }
-        s.sync()?;
-        self.meta.upload_at(0, &pos)?;
-        self.meta.upload_at(nq * 8, &loc)?;
-        self.meta.upload_at(2 * nq * 8, &req)?;
-        self.meta.upload_at(2 * nq * 8 + n * 4, &kvl)?;
-        self.q_tok.upload(&tok)?;
         let anchors: Vec<i64> = items.iter().map(|it| *it.tokens.last().unwrap()).collect();
-        self.anchors.upload(&anchors)?;
-        let posp: *const i64 = self.meta.ptr();
-        let locp: *const i64 = self.meta.at::<u8>(nq * 8).cast();
-        let reqp: *const i32 = self.meta.at::<u8>(2 * nq * 8).cast();
-        let kvlp: *const i32 = self.meta.at::<u8>(2 * nq * 8 + n * 4).cast();
+        let posp = self.stage(s, &pos)?;
+        let locp = self.stage(s, &loc)?;
+        let reqp = self.stage(s, &req)?;
+        let kvlp = self.stage(s, &kvl)?;
+        let tokp = self.stage(s, &tok)?;
+        self.anchors = self.stage(s, &anchors)?;
         let table = model.embed_table();
         check(
-            unsafe { sys::blz_embed_gather(self.q_tok.ptr(), nq as i64, table.dev_ptr(), c.vocab as i64, (h * 2) as i64, self.h.ptr(), s.0) },
+            unsafe { sys::blz_embed_gather(tokp, nq as i64, table.dev_ptr(), c.vocab as i64, (h * 2) as i64, self.h.ptr(), s.0) },
             "DFlash embed",
         )?;
         if c.embed_scale != 1.0 {
@@ -554,32 +577,14 @@ impl DFlash {
             check(unsafe { sys::blz_host_ar_all_reduce(self.ar, self.cand_pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "DFlash all-reduce")?;
         }
         self.hproj.run(lin, self.hm.ptr(), h, ns, self.sel_hproj.ptr(), c.rank, s)?;
-        s.sync()?;
-        let pairs: Vec<f32> = self.cand_pairs.download(self.world * ns * k1 * 2)?;
-        // merge: the k best (value, id) of the ranks' lists per row (ties: lower id)
-        let (mut ids, mut vals) = (Vec::with_capacity(ns * k), Vec::with_capacity(ns * k));
-        for r in 0..ns {
-            let mut all: Vec<(f32, i32)> = (0..self.world)
-                .flat_map(|w| (0..k).map(move |j| (w, j)))
-                .map(|(w, j)| {
-                    let base = ((w * ns + r) * k1 + j) * 2;
-                    (pairs[base], pairs[base + 1] as i32)
-                })
-                .filter(|&(_, id)| id >= 0)
-                .collect();
-            all.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-            all.truncate(k);
-            while all.len() < k {
-                all.push((f32::NEG_INFINITY, 0));
-            }
-            ids.extend(all.iter().map(|x| x.1));
-            vals.extend(all.iter().map(|x| x.0));
-        }
-        self.sel_ids.upload(&ids)?;
-        self.sel_unary.upload(&vals)?;
+        // the k best of the ranks' lists per row, on the GPU (no host round trip)
+        check(
+            unsafe { sys::blz_cand_merge(self.cand_pairs.ptr(), self.world as c_int, ns as c_int, k as c_int, self.sel_ids.ptr(), self.sel_unary.ptr(), s.0) },
+            "DFlash merge",
+        )?;
         check(
             unsafe {
-                sys::blz_dflash_walk(self.sel_ids.ptr(), self.sel_unary.ptr(), self.sel_hproj.ptr(), self.anchors.ptr(), self.pred.ptr(),
+                sys::blz_dflash_walk(self.sel_ids.ptr(), self.sel_unary.ptr(), self.sel_hproj.ptr(), self.anchors, self.pred.ptr(),
                                      self.succ.ptr(), n as c_int, c.steps() as c_int, k as c_int, c.rank as c_int, self.drafts.ptr(), s.0)
             },
             "DFlash walk",

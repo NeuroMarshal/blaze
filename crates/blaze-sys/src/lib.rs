@@ -175,6 +175,8 @@ unsafe extern "C" {
                          inv_freq: *const f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_candidate_logits(hidden: *const bf16, ld_hidden: i64, rows: c_int, dim: c_int, table: *const bf16,
                                 ids: *const i32, c: c_int, out: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_cand_merge(pairs: *const f32, world: c_int, rows: c_int, k: c_int, ids: *mut i32, vals: *mut f32,
+                          s: cudaStream_t) -> cudaError_t;
     pub fn blz_head_rmsnorm(x: *mut bf16, ld: i64, tokens: c_int, heads: c_int, head_dim: c_int, w: *const bf16, eps: f32,
                             s: cudaStream_t) -> cudaError_t;
     pub fn blz_dflash_grouped_conv(x: *const bf16, ldx: i64, delta: *const bf16, delta_row: i64, delta_tap: i64,

@@ -243,6 +243,38 @@ int main() {
     std::printf("dflash walk: %d mismatches %s\n", bad, bad ? "FAIL" : "ok");
     fails += bad;
   }
+  // merge of two ranks' top-16 lists (with ties and an empty entry) into the best 16
+  {
+    const int world = 2, rows = 5, k = 16;
+    std::vector<float> pairs(size_t(world) * rows * (k + 1) * 2, 0.0f);
+    std::vector<std::vector<std::pair<float, int>>> all(rows);
+    for (int w = 0; w < world; ++w)
+      for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < k; ++c) {
+          float v = float(int(n01(rng) * 4.0f));  // coarse values: ties
+          int id = w * 1000 + int(rng() % 1000);
+          if (r == 3 && c == 5) id = -1;
+          float* p = &pairs[((size_t(w) * rows + r) * (k + 1) + c) * 2];
+          p[0] = v, p[1] = float(id);
+          if (id >= 0) all[r].push_back({v, id});
+        }
+    float* dp = up(pairs);
+    int32_t* di;
+    float* dv;
+    check(cudaMalloc(&di, rows * k * 4), "malloc");
+    check(cudaMalloc(&dv, rows * k * 4), "malloc");
+    check(blz_cand_merge(dp, world, rows, k, di, dv, 0), "merge");
+    const auto gi = down(di, size_t(rows) * k);
+    const auto gv = down(dv, size_t(rows) * k);
+    int bad = 0;
+    for (int r = 0; r < rows; ++r) {
+      auto& a = all[r];
+      std::sort(a.begin(), a.end(), [](auto& x, auto& y) { return x.first > y.first || (x.first == y.first && x.second < y.second); });
+      for (int j = 0; j < k; ++j) bad += gi[r * k + j] != a[j].second || gv[r * k + j] != a[j].first;
+    }
+    std::printf("candidate merge: %d mismatches %s\n", bad, bad ? "FAIL" : "ok");
+    fails += bad;
+  }
   std::printf("%s\n", fails ? "FAILED" : "PASS");
   return fails ? 1 : 0;
 }

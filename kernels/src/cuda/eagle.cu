@@ -180,7 +180,47 @@ __global__ void dflash_walk_kernel(const int32_t* __restrict__ cand, const float
   }
 }
 
+// one warp per row: up to 64 entries, each lane ranks its two against all (value desc, id asc)
+__global__ void cand_merge_kernel(const float* __restrict__ pairs, int world, int rows, int k, int32_t* __restrict__ ids,
+                                  float* __restrict__ vals) {
+  const int row = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (row >= rows) return;
+  const int n = world * k;
+  float v[2];
+  int id[2];
+  for (int j = 0; j < 2; ++j) {
+    const int e = lane + 32 * j;
+    v[j] = -FLT_MAX, id[j] = 0x7fffffff;
+    if (e < n) {
+      const int w = e / k, c = e % k;
+      const float* p = pairs + ((int64_t(w) * rows + row) * (k + 1) + c) * 2;
+      const int pid = int(p[1]);
+      if (pid >= 0) v[j] = p[0], id[j] = pid;
+    }
+  }
+  for (int j = 0; j < 2; ++j) {
+    int rank = 0;
+    for (int o = 0; o < 64; ++o) {
+      const float ov = __shfl_sync(0xffffffffu, v[o / 32], o % 32);
+      const int oi = __shfl_sync(0xffffffffu, id[o / 32], o % 32);
+      rank += ov > v[j] || (ov == v[j] && oi < id[j]);
+    }
+    if (rank < k && lane + 32 * j < n) {
+      ids[int64_t(row) * k + rank] = id[j] == 0x7fffffff ? 0 : id[j];
+      vals[int64_t(row) * k + rank] = v[j];
+    }
+  }
+}
+
 }  // namespace
+
+extern "C" cudaError_t blz_cand_merge(const float* pairs, int world, int rows, int k, int32_t* ids, float* vals,
+                                      cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  if (world * k > 64 || k < 1) return cudaErrorInvalidValue;
+  cand_merge_kernel<<<unsigned((rows * 32 + 255) / 256), 256, 0, stream>>>(pairs, world, rows, k, ids, vals);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_head_rmsnorm(uint16_t* x, int64_t ld, int tokens, int heads, int head_dim,
                                         const uint16_t* w, float eps, cudaStream_t stream) {

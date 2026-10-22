@@ -57,6 +57,11 @@ cudaError_t blz_dflash_walk(const int32_t* cand, const float* unary, const uint1
                             const uint16_t* pred, const uint16_t* succ, int items, int steps, int k, int rank,
                             int64_t* out, cudaStream_t stream);
 
+/// \brief Merge the ranks' top-k lists of every row (pairs [world][rows][k + 1][2] floats as blz_topk_pack writes them,
+/// all-reduced) into the row's best k: ids [rows][k] int32 and values [rows][k] f32 (ties: lower id). world * k <= 64.
+cudaError_t blz_cand_merge(const float* pairs, int world, int rows, int k, int32_t* ids, float* vals,
+                           cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
