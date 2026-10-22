@@ -69,7 +69,7 @@ __global__ void __launch_bounds__(kNormThreads) rmsnorm_kernel(const uint16_t* _
 // One warp per (token, head) row.
 __global__ void gated_rmsnorm_kernel(const uint16_t* __restrict__ x, int64_t ld_x, const uint16_t* __restrict__ z,
                                      int64_t ld_z, const uint16_t* __restrict__ w, float eps, int tokens, int heads,
-                                     int dim, uint16_t* __restrict__ out) {
+                                     int dim, int act, uint16_t* __restrict__ out) {
   const int64_t row = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
   const int lane = threadIdx.x % 32;
   if (row >= int64_t(tokens) * heads) return;
@@ -86,10 +86,9 @@ __global__ void gated_rmsnorm_kernel(const uint16_t* __restrict__ x, int64_t ld_
   for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
   const float inv = rsqrtf(ss / float(dim) + eps);
   for (int i = lane; i < dim; i += 32) {
-    // Reference: weight * bf16(normalized) in bf16, then times silu(z) in fp32, one final rounding.
-    const float normed = bf(to_bf(bf(xr[i]) * inv));
-    const float scaled = bf(to_bf(bf(w[i]) * normed));
-    out[row * dim + i] = to_bf(scaled * siluf(bf(zr[i])));
+    const float zv = bf(zr[i]);
+    const float sg = 1.0f / (1.0f + __expf(-zv));
+    out[row * dim + i] = to_bf(bf(xr[i]) * inv * bf(w[i]) * (act == 1 ? sg : zv * sg));
   }
 }
 
@@ -392,11 +391,12 @@ extern "C" cudaError_t blz_rmsnorm(const uint16_t* x, uint16_t* residual, const 
 }
 
 extern "C" cudaError_t blz_gated_rmsnorm(const uint16_t* x, int64_t ld_x, const uint16_t* z, int64_t ld_z,
-                                         const uint16_t* w, float eps, int tokens, int heads, int dim, uint16_t* out,
-                                         cudaStream_t stream) {
+                                         const uint16_t* w, float eps, int tokens, int heads, int dim, int act,
+                                         uint16_t* out, cudaStream_t stream) {
   const int64_t rows = int64_t(tokens) * heads;
   if (rows == 0) return cudaSuccess;
-  gated_rmsnorm_kernel<<<unsigned((rows + 3) / 4), 128, 0, stream>>>(x, ld_x, z, ld_z, w, eps, tokens, heads, dim, out);
+  gated_rmsnorm_kernel<<<unsigned((rows + 3) / 4), 128, 0, stream>>>(x, ld_x, z, ld_z, w, eps, tokens, heads, dim, act,
+                                                                     out);
   return cudaGetLastError();
 }
 

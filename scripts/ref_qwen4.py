@@ -182,8 +182,10 @@ def gdn(x, p):
     o = rb(torch.stack(outs))
     chk(L + ".attn", o)
     nw = vec(p + "norm.weight")
-    n = rb(o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps))
-    o = rb(rb(nw * n) * silu(z.view(t, vh, dv)))
+    # SGLang's RMSNormGated (norm before gate), activation = config output_gate_type, FP32 inside
+    zz = z.view(t, vh, dv)
+    act = torch.sigmoid(zz) if cfg.get("output_gate_type") == "sigmoid" else silu(zz)
+    o = rb(o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps) * nw * act)
     chk(L + ".norm", o)
     out = lin(o.reshape(t, -1), p + "out_proj")
     chk(L + ".out_proj", out)

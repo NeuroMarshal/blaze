@@ -18,10 +18,14 @@ extern "C" {
 cudaError_t blz_rmsnorm(const uint16_t* x, uint16_t* residual, const uint16_t* w, float eps, int rows, int dim,
                         int zero_centered, uint16_t* out, cudaStream_t stream);
 
-/// \brief Gated RMSNorm of linear attention, per (token, head) row of `dim` values: out = (w * bf16(x / rms(x))) *
-/// silu(z). Head h of token t is at x + t * ld_x + h * dim (likewise z); out is dense [tokens, heads * dim].
+/// \brief Gated RMSNorm of linear attention, per (token, head) row of `dim` values: out = bf16(x / rms(x) * w * act(z))
+/// in FP32 (SGLang's fused RMSNormGated, norm before gate), act = silu (BLZ_GATE_SILU) or sigmoid (BLZ_GATE_SIGMOID,
+/// configs with output_gate_type "sigmoid"). Head h of token t is at x + t * ld_x + h * dim (likewise z); out is dense
+/// [tokens, heads * dim].
+#define BLZ_GATE_SILU 0
+#define BLZ_GATE_SIGMOID 1
 cudaError_t blz_gated_rmsnorm(const uint16_t* x, int64_t ld_x, const uint16_t* z, int64_t ld_z, const uint16_t* w,
-                              float eps, int tokens, int heads, int dim, uint16_t* out, cudaStream_t stream);
+                              float eps, int tokens, int heads, int dim, int act, uint16_t* out, cudaStream_t stream);
 
 // attention
 

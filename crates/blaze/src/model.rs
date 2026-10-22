@@ -1383,7 +1383,7 @@ impl Model {
         check(
             unsafe {
                 sys::blz_gated_rmsnorm(w.core.ptr(), (vh * gc.v_dim) as i64, z, ld as i64, g.norm.ptr(), cfg.rms_eps,
-                                       t as c_int, vh as c_int, gc.v_dim as c_int, w.core_normed.ptr(), s.0)
+                                       t as c_int, vh as c_int, gc.v_dim as c_int, gc.sigmoid_gate as c_int, w.core_normed.ptr(), s.0)
             },
             "gated_rmsnorm",
         )?;

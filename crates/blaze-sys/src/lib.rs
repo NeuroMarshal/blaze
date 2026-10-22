@@ -67,7 +67,8 @@ unsafe extern "C" {
     pub fn blz_rmsnorm(x: *const bf16, residual: *mut bf16, w: *const bf16, eps: f32, rows: c_int, dim: c_int,
                        zero_centered: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_gated_rmsnorm(x: *const bf16, ld_x: i64, z: *const bf16, ld_z: i64, w: *const bf16, eps: f32,
-                             tokens: c_int, heads: c_int, dim: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+                             tokens: c_int, heads: c_int, dim: c_int, act: c_int, out: *mut bf16, s: cudaStream_t)
+                             -> cudaError_t;
     pub fn blz_attn_prep(qg: *const bf16, ld_qg: i64, k: *mut bf16, ld_k: i64, positions: *const i64, q_norm: *const bf16, k_norm: *const bf16,
                          eps: f32, zero_centered: c_int, tokens: c_int, heads: c_int, kv_heads: c_int, head_dim: c_int,
                          rotary_dim: c_int, inv_freq: *const f32, rope_scale: f32, q_out: *mut bf16, gate: *mut bf16,

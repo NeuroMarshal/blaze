@@ -27,6 +27,8 @@ pub struct GdnConfig {
     pub k_dim: usize,
     pub v_dim: usize,
     pub conv_kernel: usize,
+    /// Gate of the output norm: sigmoid(z) when the config's output_gate_type is "sigmoid", else silu(z).
+    pub sigmoid_gate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +159,7 @@ impl ModelConfig {
                 k_dim: need(&t, "linear_key_head_dim")?,
                 v_dim: need(&t, "linear_value_head_dim")?,
                 conv_kernel: usize_of(&t, "linear_conv_kernel_dim").unwrap_or(4),
+                sigmoid_gate: t.get("output_gate_type").and_then(Value::as_str) == Some("sigmoid"),
             })
         } else {
             None
