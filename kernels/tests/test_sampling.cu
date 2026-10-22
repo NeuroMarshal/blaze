@@ -91,6 +91,35 @@ int main() {
   }
   std::printf("top-%d of %d rows x %d: %d mismatches\n", k, rows, vocab, bad);
 
+  // top-128 (the EAGLE-4 candidate head), same rows after the penalties
+  {
+    const int k2 = 128;
+    int32_t* oid2;
+    float* ov2;
+    check(cudaMalloc(&oid2, rows * k2 * 4), "malloc");
+    check(cudaMalloc(&ov2, rows * k2 * 4), "malloc");
+    check(blz_topk(dl, vocab, rows, vocab, col0, k2, ov2, oid2, ws, 0), "topk 128");
+    std::vector<float> v2(rows * k2);
+    std::vector<int32_t> i2(rows * k2);
+    check(cudaMemcpy(v2.data(), ov2, v2.size() * 4, cudaMemcpyDeviceToHost), "copy back");
+    check(cudaMemcpy(i2.data(), oid2, i2.size() * 4, cudaMemcpyDeviceToHost), "copy back");
+    int bad2 = 0;
+    for (int r = 0; r < rows; ++r) {
+      std::vector<int> idx(vocab);
+      std::iota(idx.begin(), idx.end(), 0);
+      std::partial_sort(idx.begin(), idx.begin() + k2, idx.end(), [&](int a, int b) {
+        const float va = fb(ref[size_t(r) * vocab + a]), vb = fb(ref[size_t(r) * vocab + b]);
+        return va > vb || (va == vb && a < b);
+      });
+      for (int j = 0; j < k2; ++j)
+        if (i2[r * k2 + j] != idx[j] + col0 || v2[r * k2 + j] != fb(ref[size_t(r) * vocab + idx[j]])) ++bad2;
+    }
+    std::printf("top-%d of %d rows x %d: %d mismatches\n", k2, rows, vocab, bad2);
+    bad += bad2;
+    cudaFree(oid2);
+    cudaFree(ov2);
+  }
+
   // token mask: shard of ncols columns at col0 of a vocabulary of `full` tokens; mask rows 2 (row 0), none (row 1), 0
   // (row 2); the masks cover full - 40 tokens (the rest forbidden)
   {

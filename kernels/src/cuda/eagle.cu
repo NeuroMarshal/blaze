@@ -1,0 +1,146 @@
+// EAGLE-4 draft kernels (blaze/eagle.h).
+#include <cuda_bf16.h>
+
+#include <cfloat>
+
+#include "blaze/eagle.h"
+
+namespace {
+
+__device__ __forceinline__ float bf(uint16_t v) { return __uint_as_float(uint32_t(v) << 16); }
+__device__ __forceinline__ uint16_t to_bf(float v) { return __bfloat16_as_ushort(__float2bfloat16(v)); }
+
+constexpr int kThreads = 256;
+
+__device__ float block_sum(float v, float* red) {
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = v;
+  __syncthreads();
+  float t = 0.0f;
+  for (int i = 0; i < int(blockDim.x >> 5); ++i) t += red[i];
+  __syncthreads();
+  return t;
+}
+
+// one block per row
+__global__ void __launch_bounds__(kThreads) rmsnorm_ld_kernel(const uint16_t* __restrict__ x, int64_t ldx,
+                                                              const uint16_t* __restrict__ w, float eps, int dim,
+                                                              uint16_t* __restrict__ out, int64_t ldo) {
+  __shared__ float red[kThreads / 32];
+  const uint16_t* xr = x + int64_t(blockIdx.x) * ldx;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += kThreads) {
+    const float v = bf(xr[i]);
+    ss += v * v;
+  }
+  const float inv = rsqrtf(block_sum(ss, red) / float(dim) + eps);
+  uint16_t* o = out + int64_t(blockIdx.x) * ldo;
+  for (int i = threadIdx.x; i < dim; i += kThreads) o[i] = to_bf(bf(xr[i]) * inv * bf(w[i]));
+}
+
+// one thread per (token, head, pair)
+__global__ void rope_neox_kernel(uint16_t* __restrict__ x, int64_t ld, int tokens, int heads, int head_dim,
+                                 const int64_t* __restrict__ positions, const float* __restrict__ inv_freq) {
+  const int half = head_dim / 2;
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= int64_t(tokens) * heads * half) return;
+  const int j = int(i % half);
+  const int64_t th = i / half;
+  const int h = int(th % heads);
+  const int64_t t = th / heads;
+  uint16_t* p = x + t * ld + int64_t(h) * head_dim;
+  float s, c;
+  sincosf(float(positions[t]) * inv_freq[j], &s, &c);
+  const float a = bf(p[j]), b = bf(p[j + half]);
+  p[j] = to_bf(a * c - b * s);
+  p[j + half] = to_bf(b * c + a * s);
+}
+
+// one warp per (row, candidate): 16-byte loads of the table row
+__global__ void candidate_logits_kernel(const uint16_t* __restrict__ hidden, int64_t ld_hidden, int rows, int dim,
+                                        const uint16_t* __restrict__ table, const int32_t* __restrict__ ids, int c,
+                                        float* __restrict__ out) {
+  const int64_t w = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x % 32;
+  if (w >= int64_t(rows) * c) return;
+  const int64_t r = w / c;
+  const int id = ids[w];
+  if (id < 0) {
+    if (lane == 0) out[w] = -FLT_MAX;
+    return;
+  }
+  const uint4* t = reinterpret_cast<const uint4*>(table + int64_t(id) * dim);
+  const uint4* h = reinterpret_cast<const uint4*>(hidden + r * ld_hidden);
+  float acc = 0.0f;
+  for (int i = lane; i < dim / 8; i += 32) {
+    const uint4 a = t[i], b = h[i];
+    const uint32_t aw[4] = {a.x, a.y, a.z, a.w}, bw[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      acc += bf(uint16_t(aw[k])) * bf(uint16_t(bw[k]));
+      acc += bf(uint16_t(aw[k] >> 16)) * bf(uint16_t(bw[k] >> 16));
+    }
+  }
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (lane == 0) out[w] = acc;
+}
+
+// one warp per row
+__global__ void candidate_pick_kernel(const float* __restrict__ logits, const int32_t* __restrict__ ids, int rows,
+                                      int c, int64_t* __restrict__ token, int64_t* __restrict__ record) {
+  const int r = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x % 32;
+  if (r >= rows) return;
+  float best = -FLT_MAX;
+  int bid = 0x7fffffff;
+  for (int j = lane; j < c; j += 32) {
+    const float v = logits[int64_t(r) * c + j];
+    const int id = ids[int64_t(r) * c + j];
+    if (id >= 0 && (v > best || (v == best && id < bid))) best = v, bid = id;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+    const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
+    if (ov > best || (ov == best && oi < bid)) best = ov, bid = oi;
+  }
+  if (lane == 0) {
+    token[r] = bid;
+    if (record) record[r] = bid;
+  }
+}
+
+}  // namespace
+
+extern "C" cudaError_t blz_rmsnorm_ld(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
+                                      uint16_t* out, int64_t ldo, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  rmsnorm_ld_kernel<<<rows, kThreads, 0, stream>>>(x, ldx, w, eps, dim, out, ldo);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_rope_neox(uint16_t* x, int64_t ld, int tokens, int heads, int head_dim,
+                                     const int64_t* positions, const float* inv_freq, cudaStream_t stream) {
+  const int64_t n = int64_t(tokens) * heads * (head_dim / 2);
+  if (n == 0) return cudaSuccess;
+  if (head_dim % 2) return cudaErrorInvalidValue;
+  rope_neox_kernel<<<unsigned((n + 255) / 256), 256, 0, stream>>>(x, ld, tokens, heads, head_dim, positions, inv_freq);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_candidate_logits(const uint16_t* hidden, int64_t ld_hidden, int rows, int dim,
+                                            const uint16_t* table, const int32_t* ids, int c, float* out,
+                                            cudaStream_t stream) {
+  const int64_t warps = int64_t(rows) * c;
+  if (warps == 0) return cudaSuccess;
+  if (dim % 8 || ld_hidden % 8) return cudaErrorInvalidValue;
+  candidate_logits_kernel<<<unsigned((warps * 32 + 255) / 256), 256, 0, stream>>>(hidden, ld_hidden, rows, dim, table,
+                                                                                   ids, c, out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_candidate_pick(const float* logits, const int32_t* ids, int rows, int c, int64_t* token,
+                                          int64_t* record, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  candidate_pick_kernel<<<unsigned((rows * 32 + 255) / 256), 256, 0, stream>>>(logits, ids, rows, c, token, record);
+  return cudaGetLastError();
+}

@@ -12,6 +12,8 @@ extern "C" {
 #endif
 
 #define BLZ_TOPK_MAX 64
+/// largest k of blz_topk (the sampling candidates stay at BLZ_TOPK_MAX)
+#define BLZ_TOPK_LIMIT 128
 
 /// \brief Per-token logit edits (vLLM's logits processors in one pass): for every entry e of row r's list
 /// (ids[off[r] .. off[r+1]], ids outside the shard skipped) logits[r, id - col0] = (x > 0 ? x * a : x * b) + c with
@@ -46,7 +48,7 @@ cudaError_t blz_topk_pack(const float* vals, const int32_t* ids, const float* ls
 size_t blz_topk_workspace_bytes(int rows, int vocab);
 
 /// \brief The K largest logits of each row, sorted descending (ties: lower index first): vals [rows, K] f32,
-/// ids [rows, K] int32 (column + col0; -1 past the row's size). Exact. K <= BLZ_TOPK_MAX.
+/// ids [rows, K] int32 (column + col0; -1 past the row's size). Exact. K <= BLZ_TOPK_LIMIT.
 cudaError_t blz_topk(const uint16_t* logits, int64_t ld, int rows, int vocab, int col0, int k, float* vals,
                      int32_t* ids, void* workspace, cudaStream_t stream);
 

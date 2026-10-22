@@ -52,15 +52,17 @@ __device__ __forceinline__ uint32_t key_of(uint16_t b) { return (b & 0x8000) ? (
 constexpr int kMaxTies = 4096;
 
 // One block per row: radix select of the K-th largest 16-bit key (two histogram passes), then the elements above it
-// plus the lowest-index ties at it, sorted by (value desc, column asc).
+// plus the lowest-index ties at it, sorted by (value desc, column asc). KMAX: the largest k (64, or 128 for the
+// EAGLE-4 candidate head).
+template <int KMAX>
 __global__ void __launch_bounds__(kThreads) topk_radix_kernel(const uint16_t* __restrict__ logits, int64_t ld,
                                                               int vocab, int k, int col0, float* __restrict__ vals,
                                                               int32_t* __restrict__ ids) {
   __shared__ int hist[256];
   __shared__ int sel[4];  // bin, need-in-bin, threshold key, count above threshold
   __shared__ int n_gt, n_eq;
-  __shared__ float cv[BLZ_TOPK_MAX];
-  __shared__ int ci[BLZ_TOPK_MAX];
+  __shared__ float cv[KMAX];
+  __shared__ int ci[KMAX];
   __shared__ int ties[kMaxTies];
   __shared__ float tv[kMaxTies];
   const uint16_t* row = logits + int64_t(blockIdx.x) * ld;
@@ -103,14 +105,14 @@ __global__ void __launch_bounds__(kThreads) topk_radix_kernel(const uint16_t* __
     const uint32_t key = key_of(b);
     if (key > thr) {
       const int slot = atomicAdd(&n_gt, 1);
-      if (slot < BLZ_TOPK_MAX) cv[slot] = bf(b), ci[slot] = c;
+      if (slot < KMAX) cv[slot] = bf(b), ci[slot] = c;
     } else if (key == thr) {
       const int slot = atomicAdd(&n_eq, 1);
       if (slot < kMaxTies) tv[slot] = bf(b), ties[slot] = c;
     }
   }
   __syncthreads();
-  const int gt = min(n_gt, BLZ_TOPK_MAX), eq = min(n_eq, kMaxTies);
+  const int gt = min(n_gt, KMAX), eq = min(n_eq, kMaxTies);
   // ties: lowest columns first
   int ne = 1;
   while (ne < eq) ne <<= 1;
@@ -142,9 +144,9 @@ __global__ void __launch_bounds__(kThreads) topk_radix_kernel(const uint16_t* __
     cv[gt + tid] = bf(b);
   }
   const int n = min(k, gt + eq);
-  for (int i = n + tid; i < BLZ_TOPK_MAX; i += kThreads) cv[i] = -FLT_MAX, ci[i] = 0x7fffffff;
+  for (int i = n + tid; i < KMAX; i += kThreads) cv[i] = -FLT_MAX, ci[i] = 0x7fffffff;
   __syncthreads();
-  bitonic_sort(cv, ci, BLZ_TOPK_MAX);
+  bitonic_sort(cv, ci, KMAX);
   for (int i = tid; i < k; i += kThreads) {
     vals[int64_t(blockIdx.x) * k + i] = cv[i];
     ids[int64_t(blockIdx.x) * k + i] = ci[i] == 0x7fffffff ? -1 : ci[i] + col0;
@@ -285,7 +287,10 @@ extern "C" cudaError_t blz_topk(const uint16_t* logits, int64_t ld, int rows, in
                                 int32_t* ids, void* workspace, cudaStream_t stream) {
   (void)workspace;
   if (rows == 0) return cudaSuccess;
-  if (k < 1 || k > BLZ_TOPK_MAX || k > vocab) return cudaErrorInvalidValue;
-  topk_radix_kernel<<<rows, kThreads, 0, stream>>>(logits, ld, vocab, k, col0, vals, ids);
+  if (k < 1 || k > BLZ_TOPK_LIMIT || k > vocab) return cudaErrorInvalidValue;
+  if (k <= BLZ_TOPK_MAX)
+    topk_radix_kernel<BLZ_TOPK_MAX><<<rows, kThreads, 0, stream>>>(logits, ld, vocab, k, col0, vals, ids);
+  else
+    topk_radix_kernel<BLZ_TOPK_LIMIT><<<rows, kThreads, 0, stream>>>(logits, ld, vocab, k, col0, vals, ids);
   return cudaGetLastError();
 }
