@@ -158,6 +158,12 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
     });
   }
   thread_ = std::thread([this] { run(); });
+  file_bytes_ = table_bytes_;
+  if (cache_sets_) {
+    fd_direct_ = open(path.c_str(), O_RDONLY | O_DIRECT);
+    if (fd_direct_ >= 0)
+      for (int t = 0; t < threads_; ++t) warm_pool_.emplace_back([this] { warm_reader(); });
+  }
   warm_thread_ = std::thread([this] {
     std::vector<int64_t> ids;
     for (;;) {
@@ -166,6 +172,19 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
         warm_cv_.wait(lk, [&] { return stop_.load(std::memory_order_acquire) || !warm_ids_.empty(); });
         if (stop_.load(std::memory_order_acquire)) return;
         ids.swap(warm_ids_);
+      }
+      if (!warm_pool_.empty()) {
+        // hand the ids to the readers and wait until all are taken and read
+        warm_job_.swap(ids);
+        warm_next_.store(0, std::memory_order_relaxed);
+        warm_busy_.store(int(warm_pool_.size()), std::memory_order_relaxed);
+        warm_gen_.fetch_add(1, std::memory_order_release);
+        warm_gen_.notify_all();
+        while (warm_busy_.load(std::memory_order_acquire) > 0 && !stop_.load(std::memory_order_acquire))
+          std::this_thread::sleep_for(std::chrono::microseconds(200));
+        warm_job_.clear();
+        ids.clear();
+        continue;
       }
       const size_t page = 4096, row_bytes = size_t(row_dim_) * 2;
       for (int64_t id : ids) {
@@ -187,6 +206,45 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
   });
 }
 
+// One O_DIRECT reader: takes ids of the current job in batches, reads each row's 4 KiB block(s) into an aligned
+// buffer and puts the row into the cache.
+void PleService::warm_reader() {
+  const size_t blk = 4096, row_bytes = size_t(row_dim_) * 2;
+  void* buf = nullptr;
+  if (posix_memalign(&buf, blk, 2 * blk) != 0) return;
+  auto* b = static_cast<uint8_t*>(buf);
+  uint32_t seen = warm_gen_.load(std::memory_order_acquire);
+  while (!stop_.load(std::memory_order_acquire)) {
+    warm_gen_.wait(seen, std::memory_order_acquire);
+    const uint32_t g = warm_gen_.load(std::memory_order_acquire);
+    if (g == seen) continue;
+    seen = g;
+    if (stop_.load(std::memory_order_acquire)) break;
+    const size_t n = warm_job_.size();
+    for (;;) {
+      const size_t i0 = warm_next_.fetch_add(16, std::memory_order_relaxed);
+      if (i0 >= n) break;
+      for (size_t i = i0; i < std::min(n, i0 + 16); ++i) {
+        const int64_t id = warm_job_[i];
+        if (id < 0 || uint64_t(id) >= rows_) continue;
+        // a racy tag look-up is enough to skip a cached row
+        const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
+        bool cached = false;
+        for (int w = 0; w < kWays; ++w) cached |= cache_tags_[set * kWays + w] == uint64_t(id) + 1;
+        if (cached) continue;
+        const size_t off = size_t(shard_[size_t(uint64_t(id) / shard_rows_)] - table_) +
+                           size_t(uint64_t(id) % shard_rows_) * row_bytes;
+        const size_t a = off & ~(blk - 1), len = ((off + row_bytes + blk - 1) & ~(blk - 1)) - a;
+        if (a + len > file_bytes_ || pread(fd_direct_, b, len, off_t(a)) != ssize_t(len)) continue;
+        cache_put(id, reinterpret_cast<const uint16_t*>(b + (off - a)));
+        warmed_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    warm_busy_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+  free(buf);
+}
+
 void PleService::warm(const int64_t* ids, int n) {
   {
     std::lock_guard<std::mutex> lk(warm_mu_);
@@ -203,7 +261,11 @@ PleService::~PleService() {
     std::lock_guard<std::mutex> lk(warm_mu_);
   }
   warm_cv_.notify_all();
+  warm_gen_.fetch_add(1, std::memory_order_release);
+  warm_gen_.notify_all();
   warm_thread_.join();
+  for (auto& t : warm_pool_) t.join();
+  if (fd_direct_ >= 0) close(fd_direct_);
   thread_.join();
   for (auto& t : pool_) t.join();
   cudaFree(seq_dev_);
@@ -211,9 +273,9 @@ PleService::~PleService() {
   munmap(const_cast<uint8_t*>(table_), table_bytes_);
   if (cache_map_) {
     const uint64_t h = hits_.load(), m = misses_.load();
-    std::fprintf(stderr, "blaze: PLE row cache %.2f GiB: %llu hits, %llu misses (%.1f%%)\n",
+    std::fprintf(stderr, "blaze: PLE row cache %.2f GiB: %llu hits, %llu misses (%.1f%%), %llu rows read ahead\n",
                  double(cache_map_bytes_) / double(1ull << 30), (unsigned long long)h, (unsigned long long)m,
-                 h + m ? 100.0 * double(h) / double(h + m) : 0.0);
+                 h + m ? 100.0 * double(h) / double(h + m) : 0.0, (unsigned long long)warmed_.load());
     munmap(cache_map_, cache_map_bytes_);
   }
   close(fd_);

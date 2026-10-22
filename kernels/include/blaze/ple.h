@@ -52,9 +52,12 @@ class PleService {
   uint64_t cache_hits() const { return hits_.load(std::memory_order_relaxed); }
   uint64_t cache_misses() const { return misses_.load(std::memory_order_relaxed); }
 
-  /// \brief Host side: start reading the pages of these rows into the page cache (asynchronous; a prefill chunk's rows
-  /// while the previous chunk computes). Returns at once.
+  /// \brief Host side: read these rows into the row cache ahead of their request (a prefill chunk's rows while the
+  /// previous chunk computes): a pool of `threads` readers, each reading the 4 KiB block(s) of a row with O_DIRECT
+  /// (no page cache; as many reads in flight as readers). Without a row cache: page-cache read-ahead hints.
+  /// Returns at once.
   void warm(const int64_t* ids, int n);
+  uint64_t warmed() const { return warmed_.load(std::memory_order_relaxed); }
 
  private:
   void run();
@@ -88,11 +91,21 @@ class PleService {
   std::atomic<uint64_t> hits_{0}, misses_{0};
   bool cache_get(int64_t id, uint16_t* dst);
   void cache_put(int64_t id, const uint16_t* src);
-  // warm-up queue (row ids) and its thread
+  // warm-up queue (row ids), its dispatcher and the O_DIRECT reader pool: the dispatcher publishes a job (ids, next
+  // index) and waits until the readers have taken every id
   std::mutex warm_mu_;
   std::condition_variable warm_cv_;
   std::vector<int64_t> warm_ids_;
   std::thread warm_thread_;
+  int fd_direct_ = -1;
+  uint64_t file_bytes_ = 0;
+  std::vector<std::thread> warm_pool_;
+  std::vector<int64_t> warm_job_;
+  std::atomic<size_t> warm_next_{0};
+  std::atomic<int> warm_busy_{0};
+  std::atomic<uint32_t> warm_gen_{0};
+  std::atomic<uint64_t> warmed_{0};
+  void warm_reader();
   // Gather job: counter = (generation << 32) | next task, so a helper still on an older job never takes a task of
   // the current one; work_n_ is written before the counter is reset (release).
   std::atomic<uint64_t> work_ctr_{0};
