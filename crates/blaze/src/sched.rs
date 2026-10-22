@@ -34,9 +34,23 @@ pub struct GenRequest {
     /// prompt positions after which the state is kept for later requests (e.g. before the last turn's header, which
     /// the next turn of the conversation renders differently), ascending
     pub cache_points: Vec<usize>,
+    /// Thinking budget (vLLM's thinking_token_budget): after this many tokens inside a thinking section the tokens of
+    /// `think.force` are emitted instead of samples (they end the section).
+    pub think: Option<ThinkBudget>,
     pub events: UnboundedSender<GenEvent>,
     /// set by the client side (stop string seen, connection closed)
     pub cancel: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ThinkBudget {
+    pub budget: usize,
+    pub start_id: i32,
+    pub end_id: i32,
+    /// the generation starts inside a thinking section (the prompt ends with the start token)
+    pub starts_inside: bool,
+    /// tokens forced when the budget runs out (ending with end_id)
+    pub force: Vec<i32>,
 }
 
 struct CacheEntry {
@@ -57,6 +71,10 @@ struct Active {
     pending: Option<i32>,
     /// cache points still ahead of `fed`
     points: VecDeque<usize>,
+    /// thinking budget state: inside a section, tokens in it, forced tokens still to emit
+    in_think: bool,
+    think_count: usize,
+    forced: VecDeque<i32>,
 }
 
 pub struct SchedConfig {
@@ -247,7 +265,20 @@ impl Loop {
             let rng = req.params.seed.map(Rng::new).unwrap_or_else(Rng::from_time);
             let page = self.engine.info.page;
             let points = req.cache_points.iter().map(|&p| p / page * page).filter(|&p| p > fed && p < req.tokens.len()).collect();
-            self.active.push(Active { req, seq, fed, generated: Vec::new(), counts: HashMap::new(), rng, pending: None, points });
+            let in_think = req.think.as_ref().is_some_and(|t| t.starts_inside);
+            self.active.push(Active {
+                req,
+                seq,
+                fed,
+                generated: Vec::new(),
+                counts: HashMap::new(),
+                rng,
+                pending: None,
+                points,
+                in_think,
+                think_count: 0,
+                forced: VecDeque::new(),
+            });
         }
     }
 
@@ -340,6 +371,24 @@ impl Loop {
                 }
             }
             let a = &mut self.active[i];
+            let mut pick = pick;
+            if let Some(tb) = a.req.think.clone() {
+                if let Some(f) = a.forced.pop_front() {
+                    pick = f;
+                } else if a.in_think && a.think_count >= tb.budget {
+                    a.forced = tb.force.iter().copied().collect();
+                    pick = a.forced.pop_front().unwrap_or(tb.end_id);
+                }
+                if pick == tb.start_id {
+                    a.in_think = true;
+                    a.think_count = 0;
+                } else if pick == tb.end_id {
+                    a.in_think = false;
+                    a.forced.clear();
+                } else if a.in_think {
+                    a.think_count += 1;
+                }
+            }
             a.pending = Some(pick);
             a.generated.push(pick);
             *a.counts.entry(pick).or_insert(0) += 1;

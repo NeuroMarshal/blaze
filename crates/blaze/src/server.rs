@@ -3,7 +3,7 @@
 //! blaze-chat; generation runs on the scheduler.
 
 use crate::sampler::SamplingParams;
-use crate::sched::{Finish, GenEvent, GenRequest, Scheduler};
+use crate::sched::{Finish, GenEvent, GenRequest, Scheduler, ThinkBudget};
 use crate::text::Text;
 use anyhow::{Result, anyhow};
 use axum::extract::State;
@@ -32,6 +32,8 @@ pub struct ServeConfig {
     pub default_max_tokens: usize,
     pub tool_parser: Option<String>,
     pub reasoning_parser: Option<String>,
+    /// default thinking budget of chat requests (None: unlimited)
+    pub thinking_budget: Option<usize>,
 }
 
 struct AppState {
@@ -207,7 +209,34 @@ impl Drop for Gen {
     }
 }
 
+/// The request's thinking budget: vLLM's thinking_token_budget, SGLang-style thinking_budget, or the server default;
+/// the forced ending follows Qwen's recipe for budgeted thinking.
+fn think_budget(st: &AppState, body: &Value, starts_inside: bool) -> Option<ThinkBudget> {
+    let budget = ["thinking_token_budget", "thinking_budget"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(Value::as_u64))
+        .map(|x| x as usize)
+        .or(st.cfg.thinking_budget)?;
+    let start_id = st.text.token_id("<think>")? as i32;
+    let end_id = st.text.token_id("</think>")? as i32;
+    let mut force: Vec<i32> = st
+        .text
+        .encode("\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n")
+        .ok()?
+        .into_iter()
+        .map(|t| t as i32)
+        .collect();
+    force.push(end_id);
+    force.extend(st.text.encode("\n\n").ok()?.into_iter().map(|t| t as i32));
+    Some(ThinkBudget { budget, start_id, end_id, starts_inside, force })
+}
+
 fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>) -> Result<Gen> {
+    submit_ex(st, tokens, params, max_tokens, stops, None)
+}
+
+fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
+             think: Option<ThinkBudget>) -> Result<Gen> {
     let (tx, rx) = unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let stop_ids = st.text.eos.iter().map(|&e| e as i32).collect();
@@ -220,7 +249,7 @@ fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: u
         .into_iter()
         .collect();
     st.sched
-        .submit(GenRequest { tokens, params, max_tokens, stop_ids, cache_points, events: tx, cancel: cancel.clone() })
+        .submit(GenRequest { tokens, params, max_tokens, stop_ids, cache_points, think, events: tx, cancel: cancel.clone() })
         .map_err(|_| anyhow!("scheduler stopped"))?;
     Ok(Gen { rx, cancel, detok: Detok::new(st.text.clone(), stops), prompt_tokens: 0, cached_tokens: 0, completion_tokens: 0 })
 }
@@ -392,7 +421,8 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
     let include_usage = request.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let starts_in_reasoning = matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"))
         && prompt.trim_end_matches('\n').ends_with("<think>");
-    let mut g = match submit(&st, tokens, params, max_tokens, stop_strings(&body)) {
+    let think = think_budget(&st, &body, starts_in_reasoning);
+    let mut g = match submit_ex(&st, tokens, params, max_tokens, stop_strings(&body), think) {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     };
