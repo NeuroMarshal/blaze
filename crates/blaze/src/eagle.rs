@@ -170,9 +170,16 @@ pub struct Draft {
     record: DevBuf,
     staging: HostMapped,
     meta: DevBuf,
-    graphs: std::collections::HashMap<(usize, usize), DraftGraph>,
-    warmed: std::collections::HashSet<(usize, usize)>,
+    graphs: std::collections::HashMap<DraftKey, DraftGraph>,
+    warmed: std::collections::HashSet<DraftKey>,
 }
+
+/// A captured draft call: chain length, per item (row in the target step, extended rows) or (MAX, 1) for a chain
+/// without its extend, whether the extend is in the graph.
+type DraftKey = (usize, Vec<(usize, usize)>, bool);
+const MAX_DRAFT_GRAPHS: usize = 64;
+/// Extends of at most this many rows (after a verify or a decode step) are captured with the chain.
+const GRAPH_EXTEND_ROWS: usize = 64;
 
 struct DraftGraph {
     exec: sys::cudaGraphExec_t,
@@ -416,9 +423,40 @@ impl Draft {
             unsafe { sys::cudaMemcpyAsync(self.meta.ptr(), self.staging.host_ptr(), off, sys::MEMCPY_H2D, s.0) },
             "draft meta copy",
         )?;
-        let (h, aux) = (self.cfg.hidden, model.aux.as_ref().ok_or_else(|| anyhow!("draft without captured hidden states"))?);
-        // extend
-        for (f, fwd) in fwds[..n_ext].iter().enumerate() {
+        // small extends (after a verify or a decode step) and the chain replay as one CUDA graph per shape; a long
+        // extend (a prompt's last window) runs eagerly, its chain through the chain graph
+        let ext_rows: usize = fwds[..n_ext].iter().flat_map(|f| f.spans.iter().map(|s| s.1)).sum();
+        if plan.k > 0 && n_ext == 1 && ext_rows <= GRAPH_EXTEND_ROWS && model.opts.draft_graphs {
+            let key: DraftKey = (plan.k, plan.items.iter().map(|it| (it.aux_row, it.tokens.len())).collect(), true);
+            self.graphed(model, key, |d| {
+                d.extend(model, plan, &fwds[..n_ext], &ext_start)?;
+                d.chain(model, n_items, &fwds[n_ext..])
+            })?;
+        } else {
+            self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
+            if plan.k > 0 {
+                let key: DraftKey = (plan.k, vec![(usize::MAX, 1); n_items], false);
+                if model.opts.draft_graphs {
+                    self.graphed(model, key, |d| d.chain(model, n_items, &fwds[n_ext..]))?;
+                } else {
+                    self.chain(model, n_items, &fwds[n_ext..])?;
+                }
+            }
+        }
+        if plan.k == 0 {
+            return Ok(vec![Vec::new(); n_items]);
+        }
+        s.sync()?;
+        let rec: Vec<i64> = self.record.download(plan.k * n_items)?;
+        Ok((0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect())
+    }
+
+    /// The extend forwards: the target's features of the items' rows (normed per layer, through fc) and their next
+    /// tokens through the layer; the last row of every item feeds the head and the chain.
+    fn extend(&self, model: &Model, plan: &DraftPlan, fwds: &[Fwd], ext_start: &[Vec<usize>]) -> Result<()> {
+        let (h, s) = (self.cfg.hidden, &model.stream);
+        let aux = model.aux.as_ref().ok_or_else(|| anyhow!("draft without captured hidden states"))?;
+        for (f, fwd) in fwds.iter().enumerate() {
             // inputs: the target's features of the rows, normed per layer, through fc
             let mut row = 0;
             for (si, &(i, len)) in fwd.spans.iter().enumerate() {
@@ -456,29 +494,22 @@ impl Draft {
                 }
             }
         }
-        if plan.k == 0 {
-            return Ok(vec![Vec::new(); n_items]);
-        }
-        self.chain_graphed(model, n_items, plan.k, &fwds[n_ext..])?;
-        s.sync()?;
-        let rec: Vec<i64> = self.record.download(plan.k * n_items)?;
-        Ok((0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect())
+        Ok(())
     }
 
-    /// The chain: the head on the extend's last rows, then k - 1 draft steps with their heads. Through a CUDA graph
-    /// per (items, k) (as SGLang's EAGLE draft graph runner): one eager run, then the capture, then replays.
-    fn chain_graphed(&mut self, model: &Model, items: usize, k: usize, steps: &[Fwd]) -> Result<()> {
-        let key = (items, k);
+    /// Run `body` through a CUDA graph per `key` (as SGLang's EAGLE draft graph runner): one eager run, then the
+    /// capture, then replays; eager past MAX_DRAFT_GRAPHS shapes.
+    fn graphed(&mut self, model: &Model, key: DraftKey, body: impl Fn(&Self) -> Result<()>) -> Result<()> {
         let s = &model.stream;
         if let Some(g) = self.graphs.get(&key) {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "draft graph launch");
         }
-        if !model.opts.draft_graphs || self.warmed.insert(key) {
-            return self.chain(model, items, steps);
+        if self.graphs.len() >= MAX_DRAFT_GRAPHS || self.warmed.insert(key.clone()) {
+            return body(self);
         }
         s.sync()?;
         check(unsafe { sys::cudaStreamBeginCapture(s.0, sys::CAPTURE_MODE_THREAD_LOCAL) }, "draft capture")?;
-        let captured = self.chain(model, items, steps);
+        let captured = body(self);
         let mut graph = std::ptr::null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s.0, &mut graph) };
         captured?;
