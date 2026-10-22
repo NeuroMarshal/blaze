@@ -1,4 +1,5 @@
-# External test client (not part of the engine). # Input-token logprobs of a text from a running SGLang server (teacher forcing), same tokenizer as blaze.
+# External test client (not part of the engine).
+# Input-token logprobs of a text from a running SGLang server (teacher forcing), same tokenizer as blaze.
 import json, sys, urllib.request
 from tokenizers import Tokenizer
 model, text_file, out = sys.argv[1:4]

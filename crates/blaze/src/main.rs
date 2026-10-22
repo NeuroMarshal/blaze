@@ -55,6 +55,9 @@ enum Command {
         /// print the top-5 logits of every step
         #[arg(long)]
         logits: bool,
+        /// eager decode steps instead of CUDA graphs
+        #[arg(long)]
+        no_graphs: bool,
     },
 }
 
@@ -75,10 +78,12 @@ fn main() -> Result<()> {
         Command::Score { model, text_file, chunk, moe_threads, reserve_gib } => {
             let text = blaze::text::Text::load(&model)?;
             let ids: Vec<i64> = text.encode(&std::fs::read_to_string(&text_file)?)?.into_iter().map(i64::from).collect();
-            let mut m = load(&model, 65536, chunk, moe_threads, reserve_gib, "host_reserve_gib=2".into())?;
+            let m = load(&model, 65536, chunk, moe_threads, reserve_gib, "host_reserve_gib=2".into())?;
+            let mut e = blaze::engine::Engine::new(m, false)?;
+            let mut seq = e.open()?;
             let mut pos = 0;
             for c in ids.chunks(chunk) {
-                let logits = m.forward_all_logits(c, pos, 0, 0)?;
+                let logits = e.score_chunk(&mut seq, c)?;
                 for (i, row) in logits.iter().enumerate() {
                     let p = pos + i;
                     if p + 1 >= ids.len() {
@@ -94,49 +99,33 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Generate { model, prompt, max_tokens, max_tokens_kv, chunk, moe_threads, reserve_gib, moe_options, logits } => {
-            blaze::gpu::set_device(0)?;
+        Command::Generate { model, prompt, max_tokens, max_tokens_kv, chunk, moe_threads, reserve_gib, moe_options, logits, no_graphs } => {
             let text = blaze::text::Text::load(&model)?;
-            let t0 = Instant::now();
-            let mut m = blaze::model::Model::load(
-                &model,
-                blaze::model::Options {
-                    max_tokens: max_tokens_kv,
-                    max_chunk: chunk,
-                    max_seqs: 1,
-                    moe_threads,
-                    moe_heat: None,
-                    moe_options,
-                    reserve_gib,
-                },
-            )?;
-            eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());
+            let m = load(&model, max_tokens_kv, chunk, moe_threads, reserve_gib, moe_options)?;
+            let mut e = blaze::engine::Engine::new(m, !no_graphs)?;
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
+            let mut seq = e.open()?;
             let t1 = Instant::now();
-            let mut next = 0;
-            for (ci, c) in ids.chunks(chunk).enumerate() {
-                next = m.forward_seq(c, ci * chunk, 0, 0)?;
-            }
+            let next = e.prefill(&mut seq, &ids)?;
             let prefill = t1.elapsed().as_secs_f64();
             let mut out = vec![next as u32];
-            let mut pos = ids.len();
-            let t2 = Instant::now();
             let stdout = std::io::stdout();
             print!("{prompt}{}", text.decode(&out)?);
             stdout.lock().flush()?;
             if logits {
-                show_top(&m, &text)?;
+                show_top(&e.model, &text)?;
             }
+            let t2 = Instant::now();
             while out.len() < max_tokens && !text.eos.contains(out.last().unwrap()) {
-                next = m.forward_seq(&[*out.last().unwrap() as i64], pos, 0, 0)?;
-                pos += 1;
+                let last = [*out.last().unwrap() as i64];
+                let next = e.step(&mut [&mut seq], &[&last])?[0];
                 let prev = text.decode(&out)?;
                 out.push(next as u32);
                 let all = text.decode(&out)?;
                 print!("{}", &all[prev.len().min(all.len())..]);
                 stdout.lock().flush()?;
                 if logits {
-                    show_top(&m, &text)?;
+                    show_top(&e.model, &text)?;
                 }
             }
             let decode = t2.elapsed().as_secs_f64();
@@ -150,13 +139,14 @@ fn main() -> Result<()> {
                 decode,
                 (out.len() - 1) as f64 / decode.max(1e-9)
             );
+            e.close(seq);
             Ok(())
         }
     }
 }
 
 fn show_top(m: &blaze::model::Model, text: &blaze::text::Text) -> Result<()> {
-    let l = m.last_logits()?;
+    let l = m.last_logits(0)?;
     let mut idx: Vec<usize> = (0..l.len()).collect();
     idx.sort_by(|a, b| l[*b].partial_cmp(&l[*a]).unwrap());
     let top: Vec<String> = idx[..5].iter().map(|&i| format!("{:?}={:.2}", text.decode(&[i as u32]).unwrap_or_default(), l[i])).collect();

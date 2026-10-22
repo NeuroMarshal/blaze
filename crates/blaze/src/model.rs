@@ -160,6 +160,51 @@ pub struct Options {
     pub reserve_gib: f64,
 }
 
+/// Byte offsets of the step metadata in one device buffer (filled by one host-to-device copy per step).
+#[derive(Clone, Copy)]
+pub struct MetaLayout {
+    pub max_tokens: usize,
+    pub max_seqs: usize,
+    pub tokens: usize,
+    pub positions: usize,
+    pub locs: usize,
+    pub rt_index: usize,
+    pub seq_start: usize,
+    pub seq_slots: usize,
+    pub req_idx: usize,
+    pub kv_lens: usize,
+    pub logit_rows: usize,
+    pub bytes: usize,
+}
+
+impl MetaLayout {
+    pub fn new(max_tokens: usize, max_seqs: usize) -> Self {
+        let mut o = 0;
+        let mut take = |n: usize| {
+            let at = o;
+            o += n.next_multiple_of(64);
+            at
+        };
+        let tokens = take(max_tokens * 8);
+        let positions = take(max_tokens * 8);
+        let locs = take(max_tokens * 8);
+        let rt_index = take(max_tokens * 8);
+        let seq_start = take((max_seqs + 1) * 4);
+        let seq_slots = take(max_seqs * 4);
+        let req_idx = take(max_seqs * 4);
+        let kv_lens = take(max_seqs * 4);
+        let logit_rows = take(max_seqs * 4);
+        Self { max_tokens, max_seqs, tokens, positions, locs, rt_index, seq_start, seq_slots, req_idx, kv_lens, logit_rows, bytes: o }
+    }
+}
+
+/// One sequence of a step: `len` tokens at `offset` in the step's token list (decode sequences first, len 1).
+#[derive(Clone, Copy, Debug)]
+pub struct Span {
+    pub offset: usize,
+    pub len: usize,
+}
+
 /// Activations of one forward of up to max_chunk tokens.
 struct Work {
     residual: DevBuf,
@@ -182,16 +227,12 @@ struct Work {
     gu: DevBuf,
     partial_o: DevBuf,
     partial_ml: DevBuf,
+    gx: DevBuf,
+    gres: DevBuf,
+    gnormed: DevBuf,
     logits: DevBuf,
     next: DevBuf,
-    tokens: DevBuf,
-    positions: DevBuf,
-    locs: DevBuf,
-    seq_start: DevBuf,
-    seq_slots: DevBuf,
-    req_idx: DevBuf,
-    kv_lens: DevBuf,
-    proj_cols: usize,
+    meta: DevBuf,
 }
 
 pub struct Model {
@@ -212,6 +253,7 @@ pub struct Model {
     conv_state: Vec<DevBuf>,
     rec_state: Vec<DevBuf>,
     work: Work,
+    pub meta: MetaLayout,
     score_logits: Option<DevBuf>,
     pub stream: Stream,
     pub opts: Options,
@@ -360,7 +402,8 @@ impl Model {
             }
         }
 
-        let work = Self::alloc_work(&cfg, &layers, &opts, s)?;
+        let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs), opts.max_seqs);
+        let work = Self::alloc_work(&cfg, &layers, &opts, &meta, s)?;
         s.sync()?;
 
         let mut num_sms: c_int = 0;
@@ -388,6 +431,7 @@ impl Model {
             conv_state,
             rec_state,
             work,
+            meta,
             score_logits: None,
             stream,
             opts,
@@ -429,7 +473,7 @@ impl Model {
         Ok(MoeEngine(engine))
     }
 
-    fn alloc_work(cfg: &ModelConfig, layers: &[Layer], opts: &Options, s: &Stream) -> Result<Work> {
+    fn alloc_work(cfg: &ModelConfig, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
         let t = opts.max_chunk;
         let h = cfg.hidden;
         let mut proj_cols = 0;
@@ -461,12 +505,13 @@ impl Model {
         let parts_prefill = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, cfg.attn.kv_heads as c_int, t as c_int, 1) } as usize;
         let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, cfg.attn.kv_heads as c_int, 1, 64) } as usize;
         let partial_rows = (t * parts_prefill).max(opts.max_seqs * parts_decode);
+        let _ = proj_cols;
         let b = |n: usize| DevBuf::zeroed(n, s);
         Ok(Work {
             residual: b(t * h * 2)?,
             normed: b(t * h * 2)?,
             x: b(t * h * 2)?,
-            proj: b(t * proj_cols * 2)?,
+            proj: b(t.max(opts.max_seqs) * proj_cols * 2)?,
             conv: b(t * conv_ch * 2)?,
             g: b(t * vh * 4)?,
             beta: b(t * vh * 4)?,
@@ -483,136 +528,125 @@ impl Model {
             gu: b(t * 2 * inter * 2)?,
             partial_o: b(partial_rows * heads * hd * 4)?,
             partial_ml: b(partial_rows * heads * 2 * 4)?,
+            gx: b(opts.max_seqs * h * 2)?,
+            gres: b(opts.max_seqs * h * 2)?,
+            gnormed: b(opts.max_seqs * h * 2)?,
             logits: b(opts.max_seqs * cfg.vocab * 2)?,
             next: b(opts.max_seqs * 4)?,
-            tokens: b(t * 8)?,
-            positions: b(t * 8)?,
-            locs: b(t * 8)?,
-            seq_start: b((opts.max_seqs + 1) * 4)?,
-            seq_slots: b(opts.max_seqs * 4)?,
-            req_idx: b(opts.max_seqs * 4)?,
-            kv_lens: b(opts.max_seqs * 4)?,
-            proj_cols,
+            meta: b(meta.bytes)?,
         })
     }
 
-    fn ctx_stride(&self) -> usize {
+    /// Positions per request row of the KV table.
+    pub fn ctx_stride(&self) -> usize {
         self.cfg.max_positions.min(self.opts.max_tokens)
     }
 
-    /// Forward of `tokens` (one sequence, positions start..start + len) with KV request row `req` and GDN state slot
-    /// `seq_slot`; returns the greedy next token. A new sequence (start == 0) resets its GDN state.
-    pub fn forward_seq(&mut self, tokens: &[i64], start: usize, req: usize, seq_slot: usize) -> Result<i32> {
-        self.forward_inner(tokens, start, req, seq_slot, false)?;
-        Ok(self.work.next.download::<i32>(1)?[0])
+    pub fn meta_ptr<T>(&self, offset: usize) -> *mut T {
+        self.work.meta.at::<u8>(offset).cast()
     }
 
-    /// Like forward_seq, but the logits of every position (row i: the distribution after token i), as f32.
-    pub fn forward_all_logits(&mut self, tokens: &[i64], start: usize, req: usize, seq_slot: usize) -> Result<Vec<Vec<f32>>> {
-        self.forward_inner(tokens, start, req, seq_slot, true)?;
-        let v = self.cfg.vocab;
-        let raw = self.score_logits.as_ref().unwrap().download::<u16>(tokens.len() * v)?;
-        Ok(raw.chunks(v).map(|r| r.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()).collect())
+    pub fn meta_buffer(&self) -> &DevBuf {
+        &self.work.meta
     }
 
-    fn forward_inner(&mut self, tokens: &[i64], start: usize, req: usize, seq_slot: usize, all_logits: bool) -> Result<()> {
-        if all_logits && self.score_logits.as_ref().is_none_or(|b| b.bytes() < tokens.len() * self.cfg.vocab * 2) {
-            self.score_logits = Some(DevBuf::new(tokens.len() * self.cfg.vocab * 2)?);
+    /// Zero the GDN state of row `slot` (a new sequence starts from an empty state).
+    pub fn reset_state(&self, slot: usize) -> Result<()> {
+        let s = &self.stream;
+        if let Some(g) = &self.cfg.gdn {
+            let channels = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
+            let conv_bytes = channels * (g.conv_kernel - 1) * 2;
+            let rec_bytes = g.v_heads * g.k_dim * g.v_dim * 4;
+            for (c, r) in self.conv_state.iter().zip(&self.rec_state) {
+                check(unsafe { sys::cudaMemsetAsync(c.at::<u8>(slot * conv_bytes).cast(), 0, conv_bytes, s.0) }, "memset")?;
+                check(unsafe { sys::cudaMemsetAsync(r.at::<u8>(slot * rec_bytes).cast(), 0, rec_bytes, s.0) }, "memset")?;
+            }
         }
-        let t = tokens.len();
-        if t == 0 || t > self.opts.max_chunk {
-            bail!("forward of {t} tokens (max chunk {})", self.opts.max_chunk);
-        }
-        if start + t > self.ctx_stride() {
-            bail!("context of {} tokens exceeds the KV pool ({})", start + t, self.ctx_stride());
+        Ok(())
+    }
+
+    /// Enqueue the forward of a step whose metadata is already in the device buffer (MetaLayout). `spans`: decode
+    /// sequences (len 1) first, then prefill chunks. With `logits` the head runs on the last token of every span and
+    /// leaves greedy picks in `next`; capturable into a CUDA graph (no host synchronization).
+    pub fn forward(&self, spans: &[Span], logits: bool) -> Result<()> {
+        let t: usize = spans.iter().map(|s| s.len).sum();
+        let n = spans.len();
+        if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs {
+            bail!("step of {t} tokens in {n} sequences exceeds the buffers");
         }
         let s = &self.stream;
         let cfg = &self.cfg;
         let h = cfg.hidden;
         let w = &self.work;
-        if start == 0 {
-            if let Some(g) = &cfg.gdn {
-                let channels = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
-                let conv_bytes = channels * (g.conv_kernel - 1) * 2;
-                let rec_bytes = g.v_heads * g.k_dim * g.v_dim * 4;
-                for (c, r) in self.conv_state.iter().zip(&self.rec_state) {
-                    check(unsafe { sys::cudaMemsetAsync(c.at::<u8>(seq_slot * conv_bytes).cast(), 0, conv_bytes, s.0) }, "memset")?;
-                    check(unsafe { sys::cudaMemsetAsync(r.at::<u8>(seq_slot * rec_bytes).cast(), 0, rec_bytes, s.0) }, "memset")?;
-                }
-            }
-        }
-        // Metadata: one sequence, KV slot of position p = req * stride + p (identity pages for now).
-        let positions: Vec<i64> = (start..start + t).map(|p| p as i64).collect();
-        let base = (req * self.ctx_stride()) as i64;
-        let locs: Vec<i64> = positions.iter().map(|p| base + p).collect();
-        let row: Vec<i32> = (0..(start + t) as i32).map(|p| base as i32 + p).collect();
-        w.tokens.upload_async(tokens, s)?;
-        w.positions.upload_async(&positions, s)?;
-        w.locs.upload_async(&locs, s)?;
-        w.seq_start.upload_async(&[0i32, t as i32], s)?;
-        w.seq_slots.upload_async(&[seq_slot as i32], s)?;
-        w.req_idx.upload_async(&[req as i32], s)?;
-        w.kv_lens.upload_async(&[(start + t) as i32], s)?;
+        let m = &self.meta;
         check(
             unsafe {
-                sys::cudaMemcpyAsync(
-                    self.req_to_token.at::<i32>(req * self.ctx_stride()).cast(),
-                    row.as_ptr().cast(),
-                    row.len() * 4,
-                    sys::MEMCPY_H2D,
-                    s.0,
-                )
+                sys::blz_set_req_to_token(self.req_to_token.ptr(), self.meta_ptr(m.rt_index), self.meta_ptr(m.locs), t as c_int, s.0)
             },
-            "req_to_token",
+            "set_req_to_token",
         )?;
-        s.sync()?; // the host vectors above are dropped at return
-
-        // Embedding into the residual stream.
         check(
             unsafe {
-                sys::blz_embed_gather(w.tokens.ptr(), t as i64, self.embed.dev_ptr(), cfg.vocab as i64, (h * 2) as i64,
+                sys::blz_embed_gather(self.meta_ptr(m.tokens), t as i64, self.embed.dev_ptr(), cfg.vocab as i64, (h * 2) as i64,
                                       w.residual.ptr(), s.0)
             },
             "embed",
         )?;
         let eps = cfg.rms_eps;
         for (li, layer) in self.layers.iter().enumerate() {
-            // input norm: the first layer normalizes the embedding, later ones add the previous MLP output first
             let resid = if li == 0 { null_mut() } else { w.residual.ptr() };
             let x_in: *const u16 = if li == 0 { w.residual.ptr() } else { w.x.ptr() };
             check(unsafe { sys::blz_rmsnorm(x_in, resid, layer.input_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
             match layer.kind {
-                LayerKind::Full => self.attention(layer, t, start)?,
-                LayerKind::Linear => self.gdn(layer, t, seq_slot)?,
+                LayerKind::Full => self.attention(layer, t, spans)?,
+                LayerKind::Linear => self.gdn(layer, t, n)?,
             }
             check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), layer.post_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
             self.mlp(li, layer, t)?;
         }
-        if all_logits {
-            let out = self.score_logits.as_ref().unwrap();
-            check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), self.final_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
-            self.lm_head.run(self.gemm, w.normed.ptr(), h, t, out.ptr(), cfg.vocab, s)?;
-            s.sync()?;
-            return Ok(());
+        if logits {
+            // h = x + residual of the last token of every span, normed, through the head, greedy pick.
+            let rows: *const i32 = self.meta_ptr(m.logit_rows);
+            check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
+            check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;
+            check(unsafe { sys::blz_rmsnorm(w.gx.ptr(), w.gres.ptr(), self.final_norm.ptr(), eps, n as c_int, h as c_int, 1, w.gnormed.ptr(), s.0) }, "final norm")?;
+            self.lm_head.run(self.gemm, w.gnormed.ptr(), h, n, w.logits.ptr(), cfg.vocab, s)?;
+            check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), n as c_int, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         }
-        // Final norm of the last token only, then the head and the greedy pick.
-        let last_x: *const u16 = w.x.at((t - 1) * h);
-        let last_res: *mut u16 = w.residual.at((t - 1) * h);
-        check(unsafe { sys::blz_rmsnorm(last_x, last_res, self.final_norm.ptr(), eps, 1, h as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
-        self.lm_head.run(self.gemm, w.normed.ptr(), h, 1, w.logits.ptr(), cfg.vocab, s)?;
-        check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), 1, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
-        s.sync()?;
         Ok(())
     }
 
-    pub fn last_logits(&self) -> Result<Vec<f32>> {
-        let raw = self.work.logits.download::<u16>(self.cfg.vocab)?;
-        Ok(raw.into_iter().map(|b| half::bf16::from_bits(b).to_f32()).collect())
+    /// Greedy picks of the last forward (one per span), after a stream synchronization.
+    pub fn next_tokens(&self, n: usize) -> Result<Vec<i32>> {
+        self.stream.sync()?;
+        self.work.next.download::<i32>(n)
     }
 
-    fn attention(&self, layer: &Layer, t: usize, start: usize) -> Result<()> {
+    /// Logits of every position of one sequence (scoring): the head over all rows of the last forward.
+    pub fn all_logits(&mut self, t: usize) -> Result<Vec<Vec<f32>>> {
+        let v = self.cfg.vocab;
+        if self.score_logits.as_ref().is_none_or(|b| b.bytes() < t * v * 2) {
+            self.score_logits = Some(DevBuf::new(t * v * 2)?);
+        }
+        let (w, s) = (&self.work, &self.stream);
+        let out = self.score_logits.as_ref().unwrap();
+        check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), self.final_norm.ptr(), self.cfg.rms_eps, t as c_int, self.cfg.hidden as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
+        self.lm_head.run(self.gemm, w.normed.ptr(), self.cfg.hidden, t, out.ptr(), v, s)?;
+        s.sync()?;
+        let raw = out.download::<u16>(t * v)?;
+        Ok(raw.chunks(v).map(|r| r.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()).collect())
+    }
+
+    pub fn last_logits(&self, row: usize) -> Result<Vec<f32>> {
+        self.stream.sync()?;
+        let v = self.cfg.vocab;
+        let raw = self.work.logits.download::<u16>((row + 1) * v)?;
+        Ok(raw[row * v..].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect())
+    }
+
+    fn attention(&self, layer: &Layer, t: usize, spans: &[Span]) -> Result<()> {
         let a = layer.attn.as_ref().unwrap();
-        let (cfg, w, s) = (&self.cfg, &self.work, &self.stream);
+        let (cfg, w, s, m) = (&self.cfg, &self.work, &self.stream, &self.meta);
         let (heads, kvh, hd) = (cfg.attn.heads, cfg.attn.kv_heads, cfg.attn.head_dim);
         let ld = a.qkv.n;
         a.qkv.run(self.gemm, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
@@ -620,7 +654,7 @@ impl Model {
         let v: *const u16 = w.proj.at(heads * 2 * hd + kvh * hd);
         check(
             unsafe {
-                sys::blz_attn_prep(w.proj.ptr(), ld as i64, k, ld as i64, w.positions.ptr(), a.q_norm.ptr(), a.k_norm.ptr(),
+                sys::blz_attn_prep(w.proj.ptr(), ld as i64, k, ld as i64, self.meta_ptr(m.positions), a.q_norm.ptr(), a.k_norm.ptr(),
                                    cfg.rms_eps, 1, t as c_int, heads as c_int, kvh as c_int, hd as c_int,
                                    cfg.rope.rotary_dim as c_int, self.inv_freq.ptr(), self.rope_scale, w.q.ptr(),
                                    w.gate.ptr(), s.0)
@@ -630,7 +664,7 @@ impl Model {
         let pool = &self.kv[layer.slot];
         check(
             unsafe {
-                sys::blz_nvfp4_kv_store(k.cast(), v.cast(), ld as i64, ld as i64, sys::BLZ_BF16, w.locs.ptr::<i64>().cast(),
+                sys::blz_nvfp4_kv_store(k.cast(), v.cast(), ld as i64, ld as i64, sys::BLZ_BF16, self.meta_ptr::<i64>(m.locs).cast(),
                                         sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, pool[0].ptr(), pool[1].ptr(),
                                         pool[2].ptr(), pool[3].ptr(), self.kv_global.ptr(), self.kv_global.ptr(), 1, s.0)
             },
@@ -646,40 +680,50 @@ impl Model {
             heads: kvh as c_int,
             dim: hd as c_int,
         };
-        let splits = if t == 1 { (4 * self.num_sms / kvh).clamp(1, 64) } else { 1 };
-        let _ = start;
-        check(
-            unsafe {
-                sys::blz_nvfp4_mha_decode(
-                    w.q.ptr::<u16>().cast(),
-                    (heads * hd) as i64,
-                    hd as i64,
-                    heads as c_int,
-                    view,
-                    self.req_to_token.ptr(),
-                    self.ctx_stride() as i64,
-                    sys::blz_index_ptr { ptr: w.req_idx.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
-                    sys::blz_index_ptr { ptr: w.kv_lens.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
-                    1,
-                    t as c_int,
-                    splits as c_int,
-                    1.0 / (hd as f32).sqrt(),
-                    w.partial_o.ptr(),
-                    w.partial_ml.ptr(),
-                    sys::BLZ_BF16,
-                    w.attn.ptr::<u16>().cast(),
-                    (heads * hd) as i64,
-                    hd as i64,
-                    s.0,
-                )
-            },
-            "mha",
-        )?;
+        // Decode spans (len 1, first) in one call; every prefill span on its own (its own q_len).
+        let n_decode = spans.iter().take_while(|sp| sp.len == 1).count();
+        let mut calls: Vec<(usize, usize, usize, usize)> = Vec::new(); // (first span, spans, q_len, token offset)
+        if n_decode > 0 {
+            calls.push((0, n_decode, 1, 0));
+        }
+        for (i, sp) in spans.iter().enumerate().skip(n_decode) {
+            calls.push((i, 1, sp.len, sp.offset));
+        }
+        for (first, count, q_len, off) in calls {
+            let splits = if q_len == 1 { (4 * self.num_sms / (count * kvh)).clamp(1, 64) } else { 1 };
+            check(
+                unsafe {
+                    sys::blz_nvfp4_mha_decode(
+                        w.q.at::<u16>(off * heads * hd).cast(),
+                        (heads * hd) as i64,
+                        hd as i64,
+                        heads as c_int,
+                        view,
+                        self.req_to_token.ptr(),
+                        self.ctx_stride() as i64,
+                        sys::blz_index_ptr { ptr: self.meta_ptr::<i32>(m.req_idx + first * 4).cast(), kind: sys::BLZ_I32 },
+                        sys::blz_index_ptr { ptr: self.meta_ptr::<i32>(m.kv_lens + first * 4).cast(), kind: sys::BLZ_I32 },
+                        count as c_int,
+                        q_len as c_int,
+                        splits as c_int,
+                        1.0 / (hd as f32).sqrt(),
+                        w.partial_o.ptr(),
+                        w.partial_ml.ptr(),
+                        sys::BLZ_BF16,
+                        w.attn.at::<u16>(off * heads * hd).cast(),
+                        (heads * hd) as i64,
+                        hd as i64,
+                        s.0,
+                    )
+                },
+                "mha",
+            )?;
+        }
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(self.gemm, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)
     }
 
-    fn gdn(&self, layer: &Layer, t: usize, seq_slot: usize) -> Result<()> {
+    fn gdn(&self, layer: &Layer, t: usize, seqs: usize) -> Result<()> {
         let g = layer.gdn.as_ref().unwrap();
         let gc = self.cfg.gdn.as_ref().unwrap();
         let (cfg, w, s) = (&self.cfg, &self.work, &self.stream);
@@ -690,10 +734,10 @@ impl Model {
         let z: *const u16 = w.proj.at(channels);
         let b: *const u16 = w.proj.at(channels + gc.v_heads * gc.v_dim);
         let a: *const u16 = w.proj.at(channels + gc.v_heads * gc.v_dim + gc.v_heads);
-        let _ = seq_slot;
+        let m = &self.meta;
         check(
             unsafe {
-                sys::blz_gdn_conv(w.proj.ptr(), ld as i64, w.seq_start.ptr(), w.seq_slots.ptr(), 1, channels as c_int,
+                sys::blz_gdn_conv(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int, channels as c_int,
                                   gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), s.0)
             },
             "gdn_conv",
@@ -707,7 +751,7 @@ impl Model {
         )?;
         check(
             unsafe {
-                sys::blz_gdn_recurrent(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), w.seq_start.ptr(), w.seq_slots.ptr(), 1, t as c_int,
+                sys::blz_gdn_recurrent(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int, t as c_int,
                                        gc.k_heads as c_int, gc.v_heads as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
                                        self.rec_state[layer.slot].ptr(), w.core.ptr(), s.0)
             },

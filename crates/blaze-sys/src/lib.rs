@@ -34,7 +34,19 @@ unsafe extern "C" {
     pub fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: u32) -> cudaError_t;
     pub fn cudaStreamDestroy(s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamSynchronize(s: cudaStream_t) -> cudaError_t;
+    pub fn cudaStreamBeginCapture(s: cudaStream_t, mode: c_int) -> cudaError_t;
+    pub fn cudaStreamEndCapture(s: cudaStream_t, graph: *mut cudaGraph_t) -> cudaError_t;
+    pub fn cudaGraphInstantiate(exec: *mut cudaGraphExec_t, graph: cudaGraph_t, flags: u64) -> cudaError_t;
+    pub fn cudaGraphLaunch(exec: cudaGraphExec_t, s: cudaStream_t) -> cudaError_t;
+    pub fn cudaGraphExecDestroy(exec: cudaGraphExec_t) -> cudaError_t;
+    pub fn cudaGraphDestroy(graph: cudaGraph_t) -> cudaError_t;
+    pub fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> cudaError_t;
 }
+
+pub type cudaGraph_t = *mut c_void;
+pub type cudaGraphExec_t = *mut c_void;
+pub const CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
+pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 16;
 
 // blaze/ops.h
 #[repr(C)]
@@ -68,6 +80,10 @@ unsafe extern "C" {
                              slots: *const i32, seqs: c_int, tokens: c_int, k_heads: c_int, v_heads: c_int, dk: c_int,
                              dv: c_int, state: *mut f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_argmax_bf16(logits: *const bf16, rows: c_int, vocab: c_int, ld: i64, out: *mut i32,
+                           s: cudaStream_t) -> cudaError_t;
+    pub fn blz_set_req_to_token(req_to_token: *mut i32, index: *const i64, slot: *const i64, n: c_int,
+                                s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gather_rows(src: *const bf16, ld_src: i64, rows: *const i32, n: c_int, dim: c_int, dst: *mut bf16,
                            s: cudaStream_t) -> cudaError_t;
     pub fn blz_fp8_block_dequant(w: *const u8, scale: *const c_void, scale_is_f32: c_int, n: c_int, k: c_int,
                                  block_n: c_int, block_k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;

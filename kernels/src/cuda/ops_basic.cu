@@ -324,6 +324,21 @@ __global__ void gdn_conv_kernel(const uint16_t* __restrict__ x, int64_t ldx, con
   for (int j = 0; j < kernel - 1; ++j) st[j] = to_bf(hist[j]);
 }
 
+__global__ void gather_rows_kernel(const uint16_t* __restrict__ src, int64_t ld_src, const int32_t* __restrict__ rows,
+                                   int n, int dim, uint16_t* __restrict__ dst) {
+  const int64_t total = int64_t(n) * dim;
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t r = i / dim, c = i % dim;
+    dst[i] = src[int64_t(rows[r]) * ld_src + c];
+  }
+}
+
+__global__ void set_req_to_token_kernel(int32_t* __restrict__ rt, const int64_t* __restrict__ index,
+                                        const int64_t* __restrict__ slot, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) rt[index[i]] = int32_t(slot[i]);
+}
+
 int grid_for(int64_t n, int threads) {
   const int64_t blocks = (n + threads - 1) / threads;
   return int(blocks < 65535 * 16 ? blocks : 65535 * 16);
@@ -432,5 +447,19 @@ extern "C" cudaError_t blz_gdn_conv(const uint16_t* x, int64_t ldx, const int32_
   if (kernel < 2 || kernel > kMaxKernel) return cudaErrorInvalidValue;
   const dim3 grid(unsigned((channels + 127) / 128), unsigned(seqs));
   gdn_conv_kernel<<<grid, 128, 0, stream>>>(x, ldx, seq_start, slots, channels, kernel, weight, state, out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_gather_rows(const uint16_t* src, int64_t ld_src, const int32_t* rows, int n, int dim,
+                                       uint16_t* dst, cudaStream_t stream) {
+  if (n == 0) return cudaSuccess;
+  gather_rows_kernel<<<grid_for(int64_t(n) * dim, 256), 256, 0, stream>>>(src, ld_src, rows, n, dim, dst);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_set_req_to_token(int32_t* req_to_token, const int64_t* index, const int64_t* slot, int n,
+                                            cudaStream_t stream) {
+  if (n == 0) return cudaSuccess;
+  set_req_to_token_kernel<<<(n + 255) / 256, 256, 0, stream>>>(req_to_token, index, slot, n);
   return cudaGetLastError();
 }

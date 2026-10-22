@@ -165,6 +165,10 @@ impl HostMapped {
     pub fn dev_ptr<T>(&self) -> *const T {
         self.dev.cast()
     }
+
+    pub fn host_ptr(&self) -> *const std::ffi::c_void {
+        self.host
+    }
 }
 
 impl Drop for HostMapped {

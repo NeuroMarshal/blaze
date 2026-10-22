@@ -1,4 +1,5 @@
-# External test client (not part of the engine). import json, statistics, sys
+# External test client (not part of the engine).
+import json, statistics, sys
 b = {x["pos"]: x for x in map(json.loads, open(sys.argv[1]))}
 r = {x["pos"]: x for x in map(json.loads, open(sys.argv[2]))}
 pos = sorted(set(b) & set(r))

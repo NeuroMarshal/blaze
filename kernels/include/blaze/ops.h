@@ -82,6 +82,14 @@ cudaError_t blz_gdn_recurrent(const uint16_t* qkv, const float* g, const float* 
 
 // misc
 
+/// \brief req_to_token[index[i]] = int32(slot[i]) for i < n: records the KV slots of a forward's new tokens.
+cudaError_t blz_set_req_to_token(int32_t* req_to_token, const int64_t* index, const int64_t* slot, int n,
+                                 cudaStream_t stream);
+
+/// \brief dst[i, :] = src[rows[i], :] for i < n (rows of `dim` bf16 values, source rows `ld_src` apart).
+cudaError_t blz_gather_rows(const uint16_t* src, int64_t ld_src, const int32_t* rows, int n, int dim, uint16_t* dst,
+                            cudaStream_t stream);
+
 /// \brief Row-wise argmax of bf16 logits (ties: lower index); rows `ld` apart.
 cudaError_t blz_argmax_bf16(const uint16_t* logits, int rows, int vocab, int64_t ld, int32_t* out, cudaStream_t stream);
 
