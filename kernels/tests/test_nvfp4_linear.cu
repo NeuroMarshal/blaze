@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <random>
 #include <vector>
 
@@ -93,8 +94,12 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
   return worst / top;
 }
 
+// Cold weights, as in a forward pass: enough copies of the matrix to exceed the L2 cache, used in turn.
 double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
-  Weights W(n, k, rng);
+  const double bytes = double(n) * k / 2 + double(n) * k / 16;
+  const int copies = std::max(2, int(400e6 / bytes));
+  std::vector<Weights*> ws;
+  for (int i = 0; i < copies; ++i) ws.push_back(new Weights(n, k, rng));
   uint16_t *dx, *dy;
   check(cudaMalloc(&dx, size_t(rows) * k * 2), "malloc");
   check(cudaMalloc(&dy, size_t(rows) * n * 2), "malloc");
@@ -103,18 +108,21 @@ double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
   cudaEventCreate(&a);
   cudaEventCreate(&b);
   auto f = mma ? blz_nvfp4_gemv_mma : blz_nvfp4_gemv;
-  for (int i = 0; i < 5; ++i) f(dx, k, W.d_codes, W.d_scales, W.d_alpha, dy, n, rows, n, k, 0);
-  const int iters = 200;
+  for (int i = 0; i < copies; ++i) f(dx, k, ws[i]->d_codes, ws[i]->d_scales, ws[i]->d_alpha, dy, n, rows, n, k, 0);
+  const int iters = 20 * copies;
   cudaEventRecord(a);
-  for (int i = 0; i < iters; ++i) f(dx, k, W.d_codes, W.d_scales, W.d_alpha, dy, n, rows, n, k, 0);
+  for (int i = 0; i < iters; ++i) {
+    const Weights* W = ws[i % copies];
+    f(dx, k, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0);
+  }
   cudaEventRecord(b);
   check(cudaEventSynchronize(b), "bench");
   float ms = 0;
   cudaEventElapsedTime(&ms, a, b);
   const double us = 1000.0 * ms / iters;
-  const double bytes = double(n) * k / 2 + double(n) * k / 16;
   std::printf("  %s %2d x %5d x %5d: %7.1f us, %6.0f GB/s of weights\n", mma ? "mma " : "gemv", rows, n, k, us,
               bytes / us / 1000.0);
+  for (auto* w : ws) delete w;
   cudaFree(dx);
   cudaFree(dy);
   return us;
