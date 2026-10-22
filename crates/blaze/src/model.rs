@@ -200,6 +200,9 @@ pub struct Options {
     pub kv_dtype: KvDtype,
     /// EAGLE-4 drafter checkpoint (run on rank 0; the layers it reads are captured)
     pub draft: Option<std::path::PathBuf>,
+    /// YaRN context extension (Qwen's recipe) by this factor over max_position_embeddings, when the config has no
+    /// rope scaling of its own (the checkpoint stays as is)
+    pub yarn_factor: Option<f64>,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
@@ -507,7 +510,14 @@ impl Model {
     }
 
     pub fn load(dir: &Path, opts: Options, tp: Tp, embed: Arc<HostMapped>) -> Result<Self> {
-        let cfg = ModelConfig::load(dir)?;
+        let mut cfg = ModelConfig::load(dir)?;
+        if let Some(f) = opts.yarn_factor.filter(|&f| f > 1.0) {
+            if !matches!(cfg.rope.scaling, RopeScaling::None) {
+                bail!("--yarn-factor: the config already scales its rope");
+            }
+            cfg.rope.scaling = RopeScaling::Yarn { factor: f, original_max: cfg.max_positions, beta_fast: 32.0, beta_slow: 1.0 };
+            cfg.max_positions = (cfg.max_positions as f64 * f) as usize;
+        }
         let ckpt = Checkpoint::open(dir)?;
         let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let hf_quant = std::fs::read_to_string(dir.join("hf_quant_config.json")).ok().and_then(|s| serde_json::from_str(&s).ok());

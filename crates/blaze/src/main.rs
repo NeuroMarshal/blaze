@@ -71,6 +71,9 @@ struct EngineArgs {
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
     tp: usize,
+    /// YaRN context extension by this factor (Qwen: 2 for 524288 positions from 262144), the checkpoint unchanged
+    #[arg(long)]
+    yarn_factor: Option<f64>,
     /// EAGLE-4 drafter checkpoint (speculative decoding with --spec-method eagle)
     #[arg(long)]
     draft_model: Option<PathBuf>,
@@ -121,6 +124,7 @@ impl EngineArgs {
                 max_verify: self.max_verify,
                 kv_dtype: self.kv_cache_dtype,
                 draft: self.draft_model.clone(),
+                yarn_factor: self.yarn_factor,
             },
             self.tp,
             !self.no_graphs,
