@@ -80,7 +80,9 @@ impl DraftConfig {
 
     /// Target layers whose input (the residual stream) the target captures: the layer after each aux layer.
     pub fn capture_layers(&self) -> Vec<usize> {
-        self.aux_layers.iter().map(|&l| l + 1).collect()
+        // BLAZE_EAGLE_AUX_SHIFT (experiment): capture the input of layer aux + shift instead of aux + 1
+        let shift = std::env::var("BLAZE_EAGLE_AUX_SHIFT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        self.aux_layers.iter().map(|&l| l + shift).collect()
     }
 }
 
