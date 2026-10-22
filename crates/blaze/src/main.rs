@@ -510,6 +510,11 @@ fn main() -> Result<()> {
             if logits {
                 show_top(&e, &text)?;
             }
+            // BLAZE_PROFILE_DECODE: profile the decode only (nsys --capture-range=cudaProfilerApi)
+            let profile = std::env::var_os("BLAZE_PROFILE_DECODE").is_some();
+            if profile {
+                blaze::gpu::profiler(true)?;
+            }
             let t2 = Instant::now();
             while out.len() < max_tokens && !text.eos.contains(out.last().unwrap()) {
                 let last = [*out.last().unwrap() as i64];
@@ -524,6 +529,9 @@ fn main() -> Result<()> {
                 }
             }
             let decode = t2.elapsed().as_secs_f64();
+            if profile {
+                blaze::gpu::profiler(false)?;
+            }
             println!();
             eprintln!(
                 "blaze: prompt {} tokens in {:.2} s ({:.0} tok/s), {} tokens decoded in {:.2} s ({:.1} tok/s)",

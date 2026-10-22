@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use blaze_sys as sys;
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, c_int, c_void};
 use std::ptr::null_mut;
 
 pub fn check(err: sys::cudaError_t, what: &str) -> Result<()> {
@@ -23,6 +23,15 @@ pub fn mem_info() -> Result<(usize, usize)> {
     let (mut free, mut total) = (0usize, 0usize);
     check(unsafe { sys::cudaMemGetInfo(&mut free, &mut total) }, "cudaMemGetInfo")?;
     Ok((free, total))
+}
+
+/// Start or stop the CUDA profiler's capture range (all GPUs of the process).
+pub fn profiler(start: bool) -> Result<()> {
+    unsafe extern "C" {
+        fn cudaProfilerStart() -> c_int;
+        fn cudaProfilerStop() -> c_int;
+    }
+    check(unsafe { if start { cudaProfilerStart() } else { cudaProfilerStop() } }, "cudaProfiler")
 }
 
 pub fn synchronize() -> Result<()> {
