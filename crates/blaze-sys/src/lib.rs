@@ -136,11 +136,14 @@ unsafe extern "C" {
 
 // linear layers
 pub const BLZ_NVFP4_GEMV_MAX_ROWS: usize = 8;
+pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
 
 unsafe extern "C" {
     pub fn blz_nvfp4_gemv(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,
                           ldy: i64, rows: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,
+                              ldy: i64, rows: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_weight_dequant(w: *const u8, scale: *const u8, alpha: *const f32, n: c_int, k: c_int,
                                     out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,

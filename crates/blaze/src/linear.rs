@@ -238,7 +238,15 @@ impl Linear {
             let o = unsafe { out.add(p.col) };
             match &p.store {
                 Store::Nvfp4 { codes, scales, alpha } => {
-                    if m <= sys::BLZ_NVFP4_GEMV_MAX_ROWS {
+                    if m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 {
+                        check(
+                            unsafe {
+                                sys::blz_nvfp4_gemv_mma(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
+                                                        p.n as c_int, k as c_int, s.0)
+                            },
+                            "blz_nvfp4_gemv_mma",
+                        )?;
+                    } else if m <= sys::BLZ_NVFP4_GEMV_MAX_ROWS {
                         check(
                             unsafe {
                                 sys::blz_nvfp4_gemv(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
