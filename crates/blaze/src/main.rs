@@ -517,7 +517,14 @@ fn main() -> Result<()> {
                 blaze::gpu::profiler(true)?;
             }
             let t2 = Instant::now();
+            // BLAZE_DECODE_LOG=N: decode speed of every N tokens on stderr
+            let every: usize = std::env::var("BLAZE_DECODE_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let mut lap = Instant::now();
             while out.len() < max_tokens && !text.eos.contains(out.last().unwrap()) {
+                if every > 0 && out.len() % every == 0 && out.len() > 1 {
+                    eprintln!("blaze: tokens {}..{}: {:.1} tok/s", out.len() - every, out.len(), every as f64 / lap.elapsed().as_secs_f64());
+                    lap = Instant::now();
+                }
                 let last = [*out.last().unwrap() as i64];
                 let next = e.step(&mut [&mut seq], &[&last])?[0];
                 let prev = text.decode(&out)?;
