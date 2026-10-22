@@ -50,7 +50,7 @@ if(BLAZE_BUILD_TESTS)
   target_link_libraries(test_hybrid_graph PRIVATE blaze_cpu blaze_kernels)
   add_test(NAME test_hybrid_graph COMMAND test_hybrid_graph)
   foreach(t test_nvfp4_kv test_nvfp4_qsa test_canon test_moe_gpu test_hc_mix test_moe_wide test_host_allreduce
-          test_skinny_gemm test_nvfp4_mha test_ops test_nvfp4_linear test_fp8_linear)
+          test_skinny_gemm test_nvfp4_mha test_ops test_nvfp4_linear test_fp8_linear test_qwen4)
     add_executable(${t} tests/${t}.cu)
     target_link_libraries(${t} PRIVATE blaze_kernels)
     add_test(NAME ${t} COMMAND ${t})

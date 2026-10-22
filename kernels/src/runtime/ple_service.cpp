@@ -1,3 +1,5 @@
+#include <memory>
+#include <cstdio>
 #include "blaze/ple.h"
 
 #include <fcntl.h>
@@ -188,3 +190,34 @@ void PleService::run() {
 }
 
 }  // namespace blaze
+
+// C API (qwen4.h)
+#include "blaze/qwen4.h"
+
+struct blz_ple {
+  std::unique_ptr<blaze::PleService> svc;
+};
+
+extern "C" int blz_ple_create(const char* path, int max_ids, int threads, blz_ple** out, char* err, size_t err_len) {
+  try {
+    auto* p = new blz_ple;
+    p->svc = std::make_unique<blaze::PleService>(path, max_ids, threads);
+    *out = p;
+    return 0;
+  } catch (const std::exception& e) {
+    if (err && err_len) std::snprintf(err, err_len, "%s", e.what());
+    return 1;
+  }
+}
+
+extern "C" void blz_ple_destroy(blz_ple* p) { delete p; }
+
+extern "C" int blz_ple_row_dim(const blz_ple* p) { return p->svc->row_dim(); }
+
+extern "C" cudaError_t blz_ple_request(blz_ple* p, const int64_t* ids, int n, cudaStream_t stream) {
+  return p->svc->request(ids, n, stream);
+}
+
+extern "C" cudaError_t blz_ple_fetch(blz_ple* p, uint16_t* out, int n, cudaStream_t stream) {
+  return p->svc->fetch(out, n, stream);
+}
