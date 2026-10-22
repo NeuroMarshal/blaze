@@ -261,6 +261,11 @@ impl Loop {
                 }
             };
             let fed = seq.len();
+            // read-ahead of the first prefill chunk
+            {
+                let end = (fed + self.engine.info.max_chunk).min(req.tokens.len());
+                let _ = self.engine.ple_warm(&req.tokens[fed.saturating_sub(2)..fed], &req.tokens[fed..end]);
+            }
             let _ = req.events.send(GenEvent::Started { prompt_tokens: req.tokens.len(), cached_tokens: fed });
             let rng = req.params.seed.map(Rng::new).unwrap_or_else(Rng::from_time);
             let page = self.engine.info.page;
@@ -305,6 +310,16 @@ impl Loop {
         }
         if order.is_empty() {
             return Ok(());
+        }
+        // PLE read-ahead of the next prefill chunk of this request while this step computes
+        if let Some(i) = prefill.filter(|_| chunk_len > 0) {
+            let a = &self.active[i];
+            let next0 = a.fed + chunk_len;
+            let next1 = (next0 + self.engine.info.max_chunk).min(a.req.tokens.len());
+            if next0 < next1 {
+                let prev = &a.req.tokens[next0.saturating_sub(2)..next0];
+                let _ = self.engine.ple_warm(prev, &a.req.tokens[next0..next1]);
+            }
         }
         let toks: Vec<Vec<i64>> = order
             .iter()

@@ -59,6 +59,8 @@ int blz_ple_row_dim(const blz_ple* p);
 cudaError_t blz_ple_request(blz_ple* p, const int64_t* ids, int n, cudaStream_t stream);
 /// \brief Wait for the rows of the last request and copy them into out [n, row_dim] bf16. Capturable.
 cudaError_t blz_ple_fetch(blz_ple* p, uint16_t* out, int n, cudaStream_t stream);
+/// \brief Host: start reading these rows (host ids) into the page cache in the background.
+void blz_ple_warm(blz_ple* p, const int64_t* host_ids, int n);
 
 #ifdef __cplusplus
 }

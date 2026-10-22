@@ -268,6 +268,7 @@ unsafe extern "C" {
     pub fn blz_ple_row_dim(p: *const blz_ple) -> c_int;
     pub fn blz_ple_request(p: *mut blz_ple, ids: *const i64, n: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_ple_fetch(p: *mut blz_ple, out: *mut bf16, n: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_ple_warm(p: *mut blz_ple, host_ids: *const i64, n: c_int);
 }
 
 // QSA indexer (qsa_index.h)

@@ -107,12 +107,45 @@ PleService::PleService(const std::string& path, int max_ids, int threads) : max_
     });
   }
   thread_ = std::thread([this] { run(); });
+  warm_thread_ = std::thread([this] {
+    std::vector<int64_t> ids;
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(warm_mu_);
+        warm_cv_.wait(lk, [&] { return stop_.load(std::memory_order_acquire) || !warm_ids_.empty(); });
+        if (stop_.load(std::memory_order_acquire)) return;
+        ids.swap(warm_ids_);
+      }
+      const size_t page = 4096, row_bytes = size_t(row_dim_) * 2;
+      for (int64_t id : ids) {
+        if (id < 0 || uint64_t(id) >= rows_) continue;
+        const uint8_t* p = shard_[size_t(uint64_t(id) / shard_rows_)] + size_t(uint64_t(id) % shard_rows_) * row_bytes;
+        const uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
+        const uintptr_t b = (reinterpret_cast<uintptr_t>(p) + row_bytes + page - 1) & ~(page - 1);
+        madvise(reinterpret_cast<void*>(a), b - a, MADV_WILLNEED);
+      }
+      ids.clear();
+    }
+  });
+}
+
+void PleService::warm(const int64_t* ids, int n) {
+  {
+    std::lock_guard<std::mutex> lk(warm_mu_);
+    warm_ids_.insert(warm_ids_.end(), ids, ids + n);
+  }
+  warm_cv_.notify_one();
 }
 
 PleService::~PleService() {
   stop_.store(true, std::memory_order_release);
   work_gen_.fetch_add(1, std::memory_order_release);
   work_gen_.notify_all();
+  {
+    std::lock_guard<std::mutex> lk(warm_mu_);
+  }
+  warm_cv_.notify_all();
+  warm_thread_.join();
   thread_.join();
   for (auto& t : pool_) t.join();
   cudaFree(seq_dev_);
@@ -221,3 +254,5 @@ extern "C" cudaError_t blz_ple_request(blz_ple* p, const int64_t* ids, int n, cu
 extern "C" cudaError_t blz_ple_fetch(blz_ple* p, uint16_t* out, int n, cudaStream_t stream) {
   return p->svc->fetch(out, n, stream);
 }
+
+extern "C" void blz_ple_warm(blz_ple* p, const int64_t* host_ids, int n) { p->svc->warm(host_ids, n); }

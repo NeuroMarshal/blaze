@@ -130,6 +130,8 @@ pub struct Ple {
     mult: DevBuf,
     sizes: DevBuf,
     offsets: DevBuf,
+    /// host copies of the hash parameters (row ids of upcoming prefill chunks, for read-ahead)
+    host_hash: (Vec<i64>, Vec<i64>, Vec<i64>),
 }
 
 pub struct PleTable(*mut sys::blz_ple);
@@ -592,6 +594,16 @@ impl Model {
                         mult: DevBuf::from_slice(ckpt.bytes(&format!("{e}layer_multipliers"))?)?,
                         sizes: DevBuf::from_slice(ckpt.bytes(&format!("{e}ngram_heads_vocab_sizes"))?)?,
                         offsets: DevBuf::from_slice(ckpt.bytes(&format!("{e}ngram_heads_offsets"))?)?,
+                        host_hash: {
+                            let i64s = |n: &str| -> Result<Vec<i64>> {
+                                Ok(ckpt.bytes(n)?.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect())
+                            };
+                            (
+                                i64s(&format!("{e}layer_multipliers"))?,
+                                i64s(&format!("{e}ngram_heads_vocab_sizes"))?,
+                                i64s(&format!("{e}ngram_heads_offsets"))?,
+                            )
+                        },
                     })
                 }
                 _ => None,
@@ -1009,6 +1021,35 @@ impl Model {
             },
             "hc combine",
         )
+    }
+
+    /// Start reading the PLE rows of `tokens` (appended after `prev`, the sequence's two previous tokens, or fewer at
+    /// its start) into the page cache: the same hash as blz_ngram_hash, on the host.
+    pub fn ple_warm(&self, prev: &[i64], tokens: &[i64]) {
+        let (Some(table), Some(pc)) = (&self.ple_table, &self.cfg.ple) else { return };
+        let ple = self.layers[pc.layers[0]].ple.as_ref().unwrap();
+        let (mult, sizes, offsets) = &ple.host_hash;
+        let eos = self.cfg.eos.unwrap_or(0);
+        let mut win: Vec<i64> = vec![eos, eos];
+        for (i, &t) in prev.iter().rev().take(2).enumerate() {
+            win[1 - i] = t;
+        }
+        win.extend_from_slice(tokens);
+        let hpn = pc.heads_per_ngram;
+        let mut ids = Vec::with_capacity(tokens.len() * 2 * hpn);
+        for i in 0..tokens.len() {
+            let (w0, w1, w2) = (win[i], win[i + 1], win[i + 2]);
+            let reach = if w1 == eos { 0 } else if w0 == eos { 1 } else { 2 };
+            let t1 = (if reach >= 1 { w1 } else { eos }) as u64;
+            let t2 = (if reach >= 2 { w0 } else { eos }) as u64;
+            let m2 = (w2 as u64).wrapping_mul(mult[0] as u64) ^ t1.wrapping_mul(mult[1] as u64);
+            let m3 = m2 ^ t2.wrapping_mul(mult[2] as u64);
+            for h in 0..2 * hpn {
+                let mix = (if h < hpn { m2 } else { m3 }) as i64;
+                ids.push(mix.rem_euclid(sizes[h]) + offsets[h]);
+            }
+        }
+        unsafe { sys::blz_ple_warm(table.0, ids.as_ptr(), ids.len() as c_int) };
     }
 
     /// n-gram row ids of the step's tokens and the table request (the CPU reads them while the first layers run).

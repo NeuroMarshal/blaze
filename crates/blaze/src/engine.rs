@@ -61,6 +61,8 @@ enum Cmd {
     CopyState(usize, usize),
     /// KV table row and its slots
     SetKvRow(usize, Arc<Vec<i32>>),
+    /// PLE read-ahead: previous tokens, upcoming tokens
+    PleWarm(Arc<(Vec<i64>, Vec<i64>)>),
     /// sequence row, accepted rows of the last verify
     Commit(usize, usize),
     Reset(usize),
@@ -179,6 +181,10 @@ impl Runner {
             Cmd::Step(meta, allow_graph, verify) => self.step(&meta, allow_graph, verify)?,
             Cmd::CopyState(src, dst) => {
                 self.model.copy_state(src, dst)?;
+                Reply::Done
+            }
+            Cmd::PleWarm(w) => {
+                self.model.ple_warm(&w.0, &w.1);
                 Reply::Done
             }
             Cmd::SetKvRow(row, slots) => {
@@ -575,7 +581,13 @@ impl Engine {
     pub fn prefill(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<i32> {
         let chunk = self.info.max_chunk;
         let mut next = 0;
-        for c in tokens.chunks(chunk) {
+        // PLE read-ahead one chunk ahead of the compute
+        self.ple_warm(&[], &tokens[..chunk.min(tokens.len())])?;
+        for (i, c) in tokens.chunks(chunk).enumerate() {
+            let n0 = (i + 1) * chunk;
+            if n0 < tokens.len() {
+                self.ple_warm(&tokens[n0 - 2..n0], &tokens[n0..(n0 + chunk).min(tokens.len())])?;
+            }
             next = self.step(&mut [seq], &[c])?[0];
         }
         Ok(next)
@@ -615,6 +627,16 @@ impl Engine {
         }
         self.broadcast(|| Cmd::Commit(seq.row, accepted))?;
         Ok(())
+    }
+
+    /// Read ahead the PLE rows of `tokens` (after `prev`) on rank 0 (the table is read by the host of every rank).
+    pub fn ple_warm(&self, prev: &[i64], tokens: &[i64]) -> Result<()> {
+        let w = Arc::new((prev.to_vec(), tokens.to_vec()));
+        self.workers[0].tx.send(Cmd::PleWarm(w)).map_err(|_| anyhow!("rank exited"))?;
+        match self.workers[0].rx.recv().map_err(|_| anyhow!("rank exited"))? {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Logits of item `row` of the last step.

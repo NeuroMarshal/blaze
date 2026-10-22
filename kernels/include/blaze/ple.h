@@ -12,6 +12,8 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -46,6 +48,10 @@ class PleService {
 
   uint64_t served() const { return served_.load(std::memory_order_relaxed); }
 
+  /// \brief Host side: start reading the pages of these rows into the page cache (asynchronous; a prefill chunk's rows
+  /// while the previous chunk computes). Returns at once.
+  void warm(const int64_t* ids, int n);
+
  private:
   void run();
   void gather(uint32_t seq, int n);
@@ -66,6 +72,11 @@ class PleService {
   std::atomic<uint64_t> served_{0};
   std::thread thread_;
   std::vector<std::thread> pool_;
+  // warm-up queue (row ids) and its thread
+  std::mutex warm_mu_;
+  std::condition_variable warm_cv_;
+  std::vector<int64_t> warm_ids_;
+  std::thread warm_thread_;
   // Gather job: counter = (generation << 32) | next task, so a helper still on an older job never takes a task of
   // the current one; work_n_ is written before the counter is reset (release).
   std::atomic<uint64_t> work_ctr_{0};
