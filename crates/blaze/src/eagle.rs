@@ -170,6 +170,22 @@ pub struct Draft {
     record: DevBuf,
     staging: HostMapped,
     meta: DevBuf,
+    graphs: std::collections::HashMap<(usize, usize), DraftGraph>,
+    warmed: std::collections::HashSet<(usize, usize)>,
+}
+
+struct DraftGraph {
+    exec: sys::cudaGraphExec_t,
+    graph: sys::cudaGraph_t,
+}
+
+impl Drop for DraftGraph {
+    fn drop(&mut self) {
+        unsafe {
+            sys::cudaGraphExecDestroy(self.exec);
+            sys::cudaGraphDestroy(self.graph);
+        }
+    }
 }
 
 // The all-reduce handle is used only by the rank's own thread.
@@ -286,6 +302,8 @@ impl Draft {
             record: b(MAX_CHAIN * max_items * 8)?,
             staging: HostMapped::new(meta_bytes)?,
             meta: b(meta_bytes)?,
+            graphs: Default::default(),
+            warmed: Default::default(),
             cfg,
         })
     }
@@ -333,6 +351,8 @@ impl Draft {
             let n = spans.len();
             Fwd { pos: alloc(rows, 8), loc: alloc(rows, 8), tok: alloc(rows, 8), req: alloc(n, 4), kvl: alloc(n, 4), spans }
         };
+        // chain forwards first: their metadata offsets depend only on (items, k), so a captured chain replays
+        let chain: Vec<Fwd> = (1..plan.k).map(|_| layout((0..n_items).map(|i| (i, 1)).collect(), &mut alloc)).collect();
         let mut skip = vec![0usize; n_items];
         let mut cur: Vec<(usize, usize)> = Vec::new();
         let mut cur_rows = 0;
@@ -359,9 +379,7 @@ impl Draft {
             ext_start.push(std::mem::take(&mut starts));
         }
         let n_ext = fwds.len();
-        for _ in 1..plan.k {
-            fwds.push(layout((0..n_items).map(|i| (i, 1)).collect(), &mut alloc));
-        }
+        fwds.extend(chain);
         if off > self.staging_len() {
             bail!("draft metadata of {off} bytes exceeds the staging buffer");
         }
@@ -441,22 +459,54 @@ impl Draft {
         if plan.k == 0 {
             return Ok(vec![Vec::new(); n_items]);
         }
-        self.head(model, n_items, 0)?;
-        for (j, fwd) in fwds[n_ext..].iter().enumerate() {
+        self.chain_graphed(model, n_items, plan.k, &fwds[n_ext..])?;
+        s.sync()?;
+        let rec: Vec<i64> = self.record.download(plan.k * n_items)?;
+        Ok((0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect())
+    }
+
+    /// The chain: the head on the extend's last rows, then k - 1 draft steps with their heads. Through a CUDA graph
+    /// per (items, k) (as SGLang's EAGLE draft graph runner): one eager run, then the capture, then replays.
+    fn chain_graphed(&mut self, model: &Model, items: usize, k: usize, steps: &[Fwd]) -> Result<()> {
+        let key = (items, k);
+        let s = &model.stream;
+        if let Some(g) = self.graphs.get(&key) {
+            return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "draft graph launch");
+        }
+        if !model.opts.draft_graphs || self.warmed.insert(key) {
+            return self.chain(model, items, steps);
+        }
+        s.sync()?;
+        check(unsafe { sys::cudaStreamBeginCapture(s.0, sys::CAPTURE_MODE_THREAD_LOCAL) }, "draft capture")?;
+        let captured = self.chain(model, items, steps);
+        let mut graph = std::ptr::null_mut();
+        let end = unsafe { sys::cudaStreamEndCapture(s.0, &mut graph) };
+        captured?;
+        check(end, "draft capture end")?;
+        let mut exec = std::ptr::null_mut();
+        check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "draft graph instantiate")?;
+        let g = DraftGraph { exec, graph };
+        check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "draft graph launch")?;
+        self.graphs.insert(key, g);
+        Ok(())
+    }
+
+    fn chain(&self, model: &Model, items: usize, steps: &[Fwd]) -> Result<()> {
+        let (h, s) = (self.cfg.hidden, &model.stream);
+        self.head(model, items, 0)?;
+        for (j, fwd) in steps.iter().enumerate() {
             check(
-                unsafe { sys::cudaMemcpyAsync(self.hin.ptr(), self.last_next.ptr::<u8>().cast(), n_items * h * 2, sys::MEMCPY_D2D, s.0) },
+                unsafe { sys::cudaMemcpyAsync(self.hin.ptr(), self.last_next.ptr::<u8>().cast(), items * h * 2, sys::MEMCPY_D2D, s.0) },
                 "chain hidden",
             )?;
             let tok: *const i64 = self.tok.ptr();
             self.layer(model, fwd, tok)?;
-            for i in 0..n_items {
+            for i in 0..items {
                 self.keep_last(i, i, s)?;
             }
-            self.head(model, n_items, j + 1)?;
+            self.head(model, items, j + 1)?;
         }
-        s.sync()?;
-        let rec: Vec<i64> = self.record.download(plan.k * n_items)?;
-        Ok((0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect())
+        Ok(())
     }
 
     fn staging_len(&self) -> usize {

@@ -124,6 +124,7 @@ impl EngineArgs {
                 max_verify: self.max_verify,
                 kv_dtype: self.kv_cache_dtype,
                 draft: self.draft_model.clone(),
+                draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
             },
             self.tp,

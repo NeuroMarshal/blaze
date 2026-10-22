@@ -198,8 +198,10 @@ pub struct Options {
     /// every live sequence may verify in the same step); 0: none.
     pub max_verify: usize,
     pub kv_dtype: KvDtype,
-    /// EAGLE-4 drafter checkpoint (run on rank 0; the layers it reads are captured)
+    /// EAGLE-4 drafter checkpoint (run on every rank; the layers it reads are captured)
     pub draft: Option<std::path::PathBuf>,
+    /// CUDA graphs of the drafter's chain
+    pub draft_graphs: bool,
     /// YaRN context extension (Qwen's recipe) by this factor over max_position_embeddings, when the config has no
     /// rope scaling of its own (the checkpoint stays as is)
     pub yarn_factor: Option<f64>,
