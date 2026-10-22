@@ -315,6 +315,7 @@ fn main() -> Result<()> {
             }
             let mut out = vec![first];
             let (mut rounds, mut drafted, mut accepted_total) = (0usize, 0usize, 0usize);
+            let (mut t_verify, mut t_commit, mut t_draft) = (0.0f64, 0.0f64, 0.0f64);
             let t1 = Instant::now();
             while out.len() < max_tokens {
                 let k = draft.min(max_tokens - out.len());
@@ -322,21 +323,29 @@ fn main() -> Result<()> {
                 let start = seq.len();
                 let mut rows = vec![*out.last().unwrap()];
                 rows.extend_from_slice(d);
+                let tv = Instant::now();
                 let picks = e.verify(&mut seq, &rows)?;
+                t_verify += tv.elapsed().as_secs_f64();
                 let mut m = 0;
                 while m < d.len() && picks[m] as i64 == d[m] {
                     m += 1;
                 }
                 let emitted: Vec<i64> = picks[..=m].iter().map(|&p| p as i64).collect();
                 out.extend_from_slice(&emitted);
+                let tc = Instant::now();
                 e.commit(&mut seq, rows.len(), m + 1)?;
+                t_commit += tc.elapsed().as_secs_f64();
                 rounds += 1;
                 drafted += d.len();
                 accepted_total += m;
                 let item = blaze::eagle::DraftItem { row: seq.row, aux_row: 0, tokens: emitted, pos0: start };
+                let td = Instant::now();
                 drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k: draft })?.remove(0);
+                t_draft += td.elapsed().as_secs_f64();
             }
             let spec = (out.len() - 1) as f64 / t1.elapsed().as_secs_f64();
+            let per = |t: f64| 1000.0 * t / rounds.max(1) as f64;
+            println!("per round: verify {:.2} ms, commit {:.2} ms, draft {:.2} ms", per(t_verify), per(t_commit), per(t_draft));
             out.truncate(max_tokens);
             let same = out.iter().zip(&reference).take_while(|(a, b)| a == b).count();
             println!(
