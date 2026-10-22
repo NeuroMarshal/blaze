@@ -183,6 +183,9 @@ enum Command {
         /// n-gram speculative decoding (prompt lookup): draft tokens per step, 0 off (needs --max-verify >= this + 1)
         #[arg(long, default_value_t = 0)]
         spec_ngram: usize,
+        /// always verify the whole n-gram draft (by default drafts are cut or skipped by the measured verify cost)
+        #[arg(long)]
+        spec_fixed: bool,
         #[arg(long, default_value = "qwen3_coder")]
         tool_call_parser: String,
         #[arg(long, default_value = "qwen3")]
@@ -244,10 +247,15 @@ fn main() -> Result<()> {
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
             // reference
             let mut seq = e.open()?;
+            // greedy reference with the top-2 logit gap of every token (a near tie may flip under other batch shapes)
             let mut reference = vec![e.prefill(&mut seq, &ids)? as i64];
+            let mut gaps = vec![f32::INFINITY];
+            let none = [blaze::engine::Penalty { edits: Vec::new() }];
             while reference.len() < max_tokens {
                 let last = [*reference.last().unwrap()];
-                reference.push(e.step(&mut [&mut seq], &[&last])?[0] as i64);
+                let c = e.step_sampled(&mut [&mut seq], &[&last], &none)?.remove(0);
+                reference.push(c.top[0].1 as i64);
+                gaps.push(c.top[0].0 - c.top.get(1).map_or(f32::NEG_INFINITY, |x| x.0));
             }
             e.close(seq);
             // speculative rounds over the reference, a wrong draft token at pseudo-random places
@@ -280,6 +288,7 @@ fn main() -> Result<()> {
             println!("{same}/{max_tokens} tokens match the reference; {rounds} rounds ({:.2} tokens per round, {:.1} tok/s)",
                      out.len() as f64 / rounds as f64, out.len() as f64 / dt);
             if same < max_tokens {
+                println!("first difference at token {same}: reference top-2 logit gap {:.4}", gaps[same]);
                 let r: Vec<u32> = reference.iter().map(|&t| t as u32).collect();
                 let o: Vec<u32> = out.iter().map(|&t| t as u32).collect();
                 println!("reference: {:?}\nspec:      {:?}", text.decode(&r)?, text.decode(&o)?);
@@ -299,6 +308,7 @@ fn main() -> Result<()> {
             max_tokens,
             step_tokens,
             spec_ngram,
+            spec_fixed,
             tool_call_parser,
             reasoning_parser,
             thinking_budget,
@@ -308,7 +318,12 @@ fn main() -> Result<()> {
             let max_context = e.info.ctx_stride;
             let sched = blaze::sched::Scheduler::start(
                 e,
-                blaze::sched::SchedConfig { step_tokens, spec_tokens: spec_ngram, prompt_cache: engine.prompt_cache_slots > 0 },
+                blaze::sched::SchedConfig {
+                    step_tokens,
+                    spec_tokens: spec_ngram,
+                    prompt_cache: engine.prompt_cache_slots > 0,
+                    spec_adaptive: !spec_fixed,
+                },
             );
             let name = served_model_name
                 .unwrap_or_else(|| engine.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());

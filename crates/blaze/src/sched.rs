@@ -84,6 +84,62 @@ struct Active {
     in_think: bool,
     think_count: usize,
     forced: VecDeque<i32>,
+    /// n-gram draft acceptance: decayed counts of accepted draft tokens and of draft tokens tried
+    acc: (f64, f64),
+    /// first draft token proposed while a plain step ran instead (scored against the step's output)
+    shadow: Option<i64>,
+}
+
+/// Online cost model of n-gram speculation: seconds of a one-token decode step and of a verify round of n rows
+/// (verify + commit), as decayed means. A round with a draft of d tokens and per-token acceptance a emits
+/// sum_{j=0..d} a^j tokens on average; the draft is cut to the length with the most tokens per second, and a plain
+/// step runs instead when it is faster.
+#[derive(Default)]
+struct SpecCost {
+    decode: f64,
+    verify: Vec<f64>,
+}
+
+impl SpecCost {
+    fn note(x: &mut f64, t: f64) {
+        *x = if *x == 0.0 { t } else { 0.8 * *x + 0.2 * t };
+    }
+
+    /// Verify seconds of n rows: measured, else interpolated from the nearest measured sizes, else a little above a
+    /// decode step (so that every length is tried once).
+    fn verify_time(&self, n: usize) -> f64 {
+        if let Some(&t) = self.verify.get(n).filter(|&&t| t > 0.0) {
+            return t;
+        }
+        let known: Vec<(usize, f64)> = self.verify.iter().enumerate().filter(|&(_, &t)| t > 0.0).map(|(i, &t)| (i, t)).collect();
+        match known.as_slice() {
+            [] => self.decode * (1.0 + 0.05 * n as f64),
+            [(_, t)] => *t,
+            _ => {
+                let lo = known.iter().rev().find(|k| k.0 < n).or(known.first()).unwrap();
+                let hi = known.iter().find(|k| k.0 > n).or(known.last()).unwrap();
+                if hi.0 == lo.0 { lo.1 } else { lo.1 + (hi.1 - lo.1) * (n as f64 - lo.0 as f64) / (hi.0 as f64 - lo.0 as f64) }
+            }
+        }
+    }
+
+    /// Draft length to verify (0: a plain step) for drafts of up to `max_d` tokens at acceptance `a`.
+    fn best(&self, max_d: usize, a: f64) -> usize {
+        if self.decode == 0.0 {
+            return max_d;
+        }
+        let (mut best, mut rate) = (0, 1.0 / self.decode);
+        let (mut e, mut p) = (1.0, 1.0);
+        for d in 1..=max_d {
+            p *= a;
+            e += p;
+            let r = e / self.verify_time(d + 1);
+            if r > rate {
+                (best, rate) = (d, r);
+            }
+        }
+        best
+    }
 }
 
 pub struct SchedConfig {
@@ -93,6 +149,8 @@ pub struct SchedConfig {
     pub spec_tokens: usize,
     /// keep a snapshot of every prompt (and of every finished conversation) for later requests
     pub prompt_cache: bool,
+    /// cut or skip drafts by the measured cost of a verify against a decode step (else always verify the full draft)
+    pub spec_adaptive: bool,
 }
 
 /// Handle of the scheduler thread.
@@ -116,6 +174,7 @@ impl Scheduler {
                     cache: Vec::new(),
                     clock: 0,
                     spec_stats: (0, 0),
+                    spec_cost: SpecCost::default(),
                 };
                 s.run();
             })
@@ -138,6 +197,7 @@ struct Loop {
     clock: u64,
     /// speculative verifies and the tokens they emitted
     spec_stats: (usize, usize),
+    spec_cost: SpecCost,
 }
 
 impl Loop {
@@ -314,6 +374,8 @@ impl Loop {
                 in_think,
                 think_count: 0,
                 forced: VecDeque::new(),
+                acc: (1.0, 2.0),
+                shadow: None,
             });
         }
     }
@@ -427,10 +489,20 @@ impl Loop {
             return Ok(false);
         }
         let ctx: Vec<i64> = a.req.tokens.iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
-        let draft = propose(&ctx, 4, 1, k);
+        let mut draft = propose(&ctx, 4, 1, k);
         if draft.is_empty() {
             return Ok(false);
         }
+        if self.cfg.spec_adaptive {
+            let (s, n) = a.acc;
+            let d = self.spec_cost.best(draft.len(), s / n);
+            if d == 0 {
+                self.active[0].shadow = Some(draft[0]);
+                return Ok(false);
+            }
+            draft.truncate(d);
+        }
+        let t0 = Instant::now();
         let mut rows = vec![pending as i64];
         rows.extend(&draft);
         let plain = !a.req.params.needs_candidates();
@@ -474,6 +546,15 @@ impl Loop {
         // keep the rows whose inputs were accepted: the pending token and the matched drafts
         let a = &mut self.active[0];
         self.engine.commit(&mut a.seq, rows.len(), emitted)?;
+        let n = rows.len();
+        if self.spec_cost.verify.len() <= n {
+            self.spec_cost.verify.resize(n + 1, 0.0);
+        }
+        SpecCost::note(&mut self.spec_cost.verify[n], t0.elapsed().as_secs_f64());
+        // matched drafts out of the tried ones (a finish cuts the round short: count only what was compared)
+        let matched = emitted - 1;
+        let tried = if finish.is_some() { matched } else { (matched + 1).min(draft.len()) };
+        a.acc = (0.9 * a.acc.0 + matched as f64, 0.9 * a.acc.1 + tried as f64);
         if let Some(reason) = finish {
             let a = self.active.swap_remove(0);
             if reason != Finish::Cancelled {
@@ -557,7 +638,9 @@ impl Loop {
             let n = p.len();
             (p, vec![None; n])
         };
-        let _ = t0;
+        if order.len() == 1 && chunk_len == 0 {
+            SpecCost::note(&mut self.spec_cost.decode, t0.elapsed().as_secs_f64());
+        }
         // apply
         let mut finished = Vec::new();
         for ((&i, pick), lp) in order.iter().zip(picks).zip(lps) {
@@ -576,7 +659,13 @@ impl Loop {
                     continue; // more prompt chunks to go; this pick is not a real output
                 }
             }
-            if let Some(reason) = self.emit(i, pick, lp).1 {
+            let (tok, f) = self.emit(i, pick, lp);
+            let a = &mut self.active[i];
+            if let Some(d) = a.shadow.take() {
+                let hit = (tok as i64 == d) as u8 as f64;
+                a.acc = (0.9 * a.acc.0 + hit, 0.9 * a.acc.1 + 1.0);
+            }
+            if let Some(reason) = f {
                 finished.push((i, reason));
             }
         }
