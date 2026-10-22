@@ -71,6 +71,24 @@ def rb(x):
     return x.to(torch.bfloat16).float()
 
 
+# Optional: SGL_PASS=<SGLang --debug-tensor-dump Pass*.pt of the same prompt>; every chk() point is compared with it.
+_sgl = torch.load(os.environ["SGL_PASS"], weights_only=False) if os.environ.get("SGL_PASS") else None
+MAX_LAYERS = int(os.environ.get("MAX_LAYERS", "1000"))
+
+
+def chk(name, x):
+    if _sgl is None or name not in _sgl:
+        return
+    r = _sgl[name]
+    r = (r[0] if isinstance(r, list) else r).float().to(dev).reshape(-1)
+    y = x.float().reshape(-1)
+    if r.numel() != y.numel():
+        print(f"  {name:55s} size {y.numel()} vs sglang {r.numel()}")
+        return
+    rel = float((y - r).norm() / r.norm().clamp_min(1e-30))
+    print(f"  {name:55s} rel {rel:.4f}{'   <--' if rel > 0.03 else ''}", flush=True)
+
+
 def save(name, x):
     x.to(torch.bfloat16).contiguous().view(torch.int16).cpu().numpy().tofile(f"{OUT}/{name}.bin")
 
@@ -120,6 +138,7 @@ def grouped_norm(x, w, groups):
 
 def hc_mix(streams, pre):
     n = grouped_norm(streams, vec(pre + "hc_norm.weight"), HC)
+    chk(pre.replace(P, "model.") + "hc_norm", n)
     tt = rb(silu((n @ vec(pre + "input_mix_weight_down.weight").t()) / HC))
     u = tt @ vec(pre + "input_mix_weight_up.weight").t()
     out = (torch.sigmoid(u) * n).view(n.shape[0], HC, H).mean(1)
@@ -138,6 +157,9 @@ def gdn(x, p):
     z = lin(x, p + "in_proj_z")
     b = lin(x, p + "in_proj_b")
     a = lin(x, p + "in_proj_a")
+    L = p.replace(P, "model.").replace("linear_attn.", "linear_attn")
+    chk(L + ".in_proj_qkvz", torch.cat([qkv, z], -1))
+    chk(L + ".in_proj_ba", torch.cat([b, a], -1))
     cw = vec(p + "conv1d.weight")[:, 0, :]
     pad = torch.cat([torch.zeros(3, qkv.shape[1], device=dev), qkv])
     conv = sum(cw[:, j] * pad[j:j + t] for j in range(4))
@@ -158,10 +180,14 @@ def gdn(x, p):
         S = S + k[i][:, :, None] * delta[:, None, :]
         outs.append(torch.einsum("hkv,hk->hv", S, q[i]))
     o = rb(torch.stack(outs))
+    chk(L + ".attn", o)
     nw = vec(p + "norm.weight")
     n = rb(o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + eps))
     o = rb(rb(nw * n) * silu(z.view(t, vh, dv)))
-    return lin(o.reshape(t, -1), p + "out_proj")
+    chk(L + ".norm", o)
+    out = lin(o.reshape(t, -1), p + "out_proj")
+    chk(L + ".out_proj", out)
+    return out
 
 
 def attention(x, p, pos):
@@ -171,6 +197,8 @@ def attention(x, p, pos):
     q, gate = qg[..., :hd], qg[..., hd:]
     k = lin(x, p + "k_proj").view(t, kvh, hd)
     v = lin(x, p + "v_proj").view(t, kvh, hd)
+    L = p.replace(P, "model.").replace("self_attn.", "")
+    chk(L + "qkv_proj", torch.cat([qg.reshape(t, -1), k.reshape(t, -1), v.reshape(t, -1)], -1))
 
     def hnorm(y, w):
         return rb(y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps) * (1.0 + w))
@@ -192,13 +220,18 @@ def attention(x, p, pos):
     s = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(hd)
     s = s.masked_fill(torch.triu(torch.ones(t, t, device=dev, dtype=torch.bool), 1), float("-inf"))
     o = rb(torch.einsum("hqk,khd->qhd", torch.softmax(s, -1), v))
+    chk(L + "attn", o)
     o = rb(o * torch.sigmoid(gate))
-    return lin(o.reshape(t, -1), p + "o_proj")
+    out = lin(o.reshape(t, -1), p + "o_proj")
+    chk(L + "o_proj", out)
+    return out
 
 
 def moe(x, p):
     t = x.shape[0]
     logits = lin(x, p + "gate")
+    L = p.replace(P, "model.")
+    chk(L + "gate", logits)
     prob = torch.softmax(logits, -1)
     tw, ti = prob.topk(cfg["num_experts_per_tok"], -1)
     if cfg.get("norm_topk_prob", True):
@@ -210,8 +243,14 @@ def moe(x, p):
             hh = rb(silu(lin(x[i:i + 1], e + "gate_proj")) * lin(x[i:i + 1], e + "up_proj"))
             out[i] += tw[i, j] * lin(hh, e + "down_proj")[0]
     out = rb(out)
+    if _sgl is not None and L + "topk" in _sgl:
+        sw, si = _sgl[L + "topk"][0].to(dev), _sgl[L + "topk"][1].to(dev)
+        same = (si.sort(-1).values == ti.sort(-1).values).float().mean()
+        print(f"  {L + 'topk':55s} ids agree {float(same):.3f}, weights {[round(float(v), 3) for v in sw[0][:4]]} vs {[round(float(v), 3) for v in tw[0][:4]]}")
+    chk(L + "experts", out)
     sh = rb(silu(lin(x, p + "shared_expert.gate_proj")) * lin(x, p + "shared_expert.up_proj"))
     sh = lin(sh, p + "shared_expert.down_proj")
+    chk(L + "shared_expert.down_proj", sh)
     sg = torch.sigmoid(lin(x, p + "shared_expert_gate"))
     return rb(out + sg * sh)
 
@@ -250,12 +289,18 @@ def ple(streams, tokens, p):
     emb = torch.cat(rows).to(dev).float().reshape(t, -1)
     key = lin(emb, p + "ple.key_proj")
     value = lin(emb, p + "ple.value_proj")
+    L = p.replace(P, "model.") + "ple."
+    chk(L + "key_proj", key)
+    chk(L + "value_proj", value)
     kn = grouped_norm(key, vec(p + "ple.norm_key.weight"), HC).view(t, HC, H)
     qn = grouped_norm(streams, vec(p + "ple.norm_query.weight"), HC).view(t, HC, H)
+    chk(L + "norm_key", kn)
+    chk(L + "norm_query", qn)
     gte = (kn * qn).sum(-1) / math.sqrt(H)
     gte = torch.sigmoid(gte.abs().clamp_min(1e-6).sqrt() * gte.sign())
     gated = rb(gte[..., None] * value[:, None, :]).reshape(t, -1)
     gn = grouped_norm(gated, vec(p + "ple.norm_conv.weight"), HC)
+    chk(L + "norm_conv", gn)
     cw = vec(p + "ple.conv1d.weight")[:, 0, :]
     dil = cfg["ngram_size"]
     pad = torch.cat([torch.zeros(3 * dil, gn.shape[1], device=dev), gn])
@@ -271,9 +316,12 @@ t = len(tokens)
 pos = torch.arange(t, device=dev)
 emb_name = P + "embed_tokens.weight"
 emb = torch.cat([handle(emb_name).rows(emb_name, i, i + 1) for i in tokens]).to(dev).float()
+chk("model.embed_tokens", emb)
 streams = emb.repeat(1, HC)
 ple_layers = {i - 1 for i in cfg["ple_layer_ids"]}
 for li, kind in enumerate(cfg["layer_types"]):
+    if li >= MAX_LAYERS:
+        break
     p = P + f"layers.{li}."
     if li in ple_layers:
         streams = ple(streams, tokens, p)
