@@ -235,6 +235,60 @@ int main() {
   }
   std::printf("compressed keys of sequence 0 (%d blocks): max abs err %.2e\n", L / RATIO, max_c);
   ok &= max_c < 2e-2;
+  // block selection alone on long rows: exact top-512 (ties: lower block) against the CPU, and its time
+  {
+    std::mt19937 rng(9);
+    std::normal_distribution<float> n01;
+    for (const int nvis : {63000, 127000})
+      for (int kind = 0; kind < 3; ++kind) {
+        std::vector<float> sc(nvis);
+        for (int i = 0; i < nvis; ++i) {
+          const float x = n01(rng);
+          sc[i] = kind == 0 ? std::max(0.0f, x)                                 // relu sums: many zeros
+                : kind == 1 ? float(int(std::max(0.0f, x) * 8.0f)) / 8.0f       // coarse: ties at the threshold
+                            : (i % 211 == 0 ? std::fabs(x) + 1.0f : 0.0f);      // few positive: threshold at zero
+        }
+        const int64_t pos = int64_t(nvis) * RATIO + 2;
+        std::vector<int64_t> hp = {pos};
+        std::vector<int32_t> trow = {0};
+        const int64_t stride = pos + 8;
+        std::vector<int32_t> rt(stride);
+        for (int64_t i = 0; i < stride; ++i) rt[i] = int32_t(i);
+        float* dsc = dev(sc);
+        int64_t* dp = dev(hp);
+        int32_t* dtr = dev(trow);
+        int32_t* drt = dev(rt);
+        int32_t *table, *counts;
+        check(cudaMalloc(&table, 2056 * 4), "malloc");
+        check(cudaMalloc(&counts, 4), "malloc");
+        check(blz_qsa_select(dsc, nvis, dp, dtr, 0, 1, RATIO, TOPK_BLOCKS, drt, stride, table, 2056, counts, 0), "select");
+        auto ht = host(table, 2056);
+        auto hc = host(counts, 1);
+        std::vector<int> idx(nvis);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::partial_sort(idx.begin(), idx.begin() + TOPK_BLOCKS, idx.end(),
+                          [&](int x, int y) { return sc[x] > sc[y] || (sc[x] == sc[y] && x < y); });
+        std::multiset<int> want, got(ht.begin(), ht.begin() + hc[0]);
+        for (int j = 0; j < TOPK_BLOCKS; ++j)
+          for (int m = 0; m < RATIO; ++m) want.insert(idx[j] * RATIO + m);
+        for (int64_t t = int64_t(nvis) * RATIO; t <= pos; ++t) want.insert(int(t));
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0), cudaEventCreate(&e1);
+        cudaEventRecord(e0);
+        for (int it = 0; it < 50; ++it)
+          blz_qsa_select(dsc, nvis, dp, dtr, 0, 1, RATIO, TOPK_BLOCKS, drt, stride, table, 2056, counts, 0);
+        cudaEventRecord(e1);
+        check(cudaEventSynchronize(e1), "time");
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        const bool same = got == want;
+        std::printf("select %d blocks, %s: %s, %.1f us per row\n", nvis,
+                    kind == 0 ? "relu scores" : kind == 1 ? "coarse ties" : "threshold at zero", same ? "exact" : "MISMATCH",
+                    ms * 1000.0f / 50);
+        ok &= same;
+        cudaFree(dsc), cudaFree(dp), cudaFree(dtr), cudaFree(drt), cudaFree(table), cudaFree(counts);
+      }
+  }
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
