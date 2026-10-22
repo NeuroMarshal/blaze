@@ -2,7 +2,8 @@
 //! Projections with a shared input are stacked at load time.
 
 use crate::config::{LayerKind, MlpConfig, ModelConfig, RopeScaling};
-use crate::gpu::{DevBuf, HostMapped, Stream, check};
+use crate::gpu::{DevBuf, Event, HostMapped, Stream, check, stream_after};
+use std::cell::Cell;
 use crate::linear::{Cut, LinCtx, Linear};
 use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
@@ -115,6 +116,9 @@ pub struct Options {
     pub moe_options: String,
     /// VRAM kept free after the experts' slots (activations of cuBLAS, the allocator, the display).
     pub reserve_gib: f64,
+    /// Decode: stream the next linear layer's weights into L2 on a side stream while the main stream waits on the
+    /// all-reduce or runs the small attention / GDN kernels (MiB per window, 0: off).
+    pub l2_prefetch_mib: usize,
 }
 
 /// Byte offsets of the step metadata in one device buffer (filled by one host-to-device copy per step).
@@ -216,6 +220,10 @@ pub struct Model {
     pub meta: MetaLayout,
     score_logits: Option<DevBuf>,
     pub stream: Stream,
+    pf_stream: Stream,
+    pf_fork: Event,
+    pf_join: Event,
+    pf_active: Cell<bool>,
     pub opts: Options,
     num_sms: usize,
 }
@@ -486,6 +494,10 @@ impl Model {
             meta,
             score_logits: None,
             stream,
+            pf_stream: Stream::new()?,
+            pf_fork: Event::new()?,
+            pf_join: Event::new()?,
+            pf_active: Cell::new(false),
             opts,
             num_sms: num_sms.max(1) as usize,
         };
@@ -654,6 +666,7 @@ impl Model {
             check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), layer.post_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
             self.mlp(li, layer, t)?;
         }
+        self.prefetch_join()?;
         if logits {
             // h = x + residual of the last token of every span, normed, through the head, greedy pick.
             let rows: *const i32 = self.meta_ptr(m.logit_rows);
@@ -664,6 +677,40 @@ impl Model {
             check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), n as c_int, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         }
         Ok(())
+    }
+
+    /// Start pulling up to l2_prefetch_mib of `lin`'s weights into L2 on the side stream (decode steps only); the
+    /// side stream joins the main one at the end of the forward.
+    fn prefetch(&self, lin: &Linear, t: usize) -> Result<()> {
+        let budget = self.opts.l2_prefetch_mib << 20;
+        if budget == 0 || t > 16 {
+            return Ok(());
+        }
+        stream_after(&self.pf_stream, &self.stream, &self.pf_fork)?;
+        let mut left = budget;
+        for (p, bytes) in lin.regions() {
+            if left == 0 {
+                break;
+            }
+            let n = bytes.min(left);
+            check(unsafe { sys::blz_l2_prefetch(p.cast(), n, self.pf_stream.0) }, "l2 prefetch")?;
+            left -= n;
+        }
+        self.pf_active.set(true);
+        Ok(())
+    }
+
+    fn prefetch_join(&self) -> Result<()> {
+        if self.pf_active.replace(false) {
+            stream_after(&self.stream, &self.pf_stream, &self.pf_join)?;
+        }
+        Ok(())
+    }
+
+    /// The first linear layer of layer `li` (what the next layer reads first).
+    fn first_linear(&self, li: usize) -> Option<&Linear> {
+        let l = self.layers.get(li)?;
+        l.attn.as_ref().map(|a| &a.qkv).or(l.gdn.as_ref().map(|g| &g.in_proj))
     }
 
     /// In-place sum of `elems` bf16 values over the tensor-parallel group (nothing with one rank).
@@ -731,6 +778,7 @@ impl Model {
         let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, cfg.attn.head_dim);
         let ld = a.qkv.n;
         a.qkv.run(&self.lin, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
+        self.prefetch(&a.o, t)?;
         let k: *mut u16 = w.proj.at(heads * 2 * hd);
         let v: *const u16 = w.proj.at(heads * 2 * hd + kvh * hd);
         check(
@@ -802,7 +850,15 @@ impl Model {
         }
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
+        self.prefetch_mlp(layer, t)?;
         self.all_reduce(w.x.ptr(), t * cfg.hidden)
+    }
+
+    fn prefetch_mlp(&self, layer: &Layer, t: usize) -> Result<()> {
+        match &layer.mlp {
+            Mlp::Dense { gu, .. } => self.prefetch(gu, t),
+            Mlp::Moe { gate, .. } => self.prefetch(gate, t),
+        }
     }
 
     fn gdn(&self, layer: &Layer, t: usize, seqs: usize) -> Result<()> {
@@ -811,6 +867,7 @@ impl Model {
         let (cfg, w, s) = (&self.cfg, &self.work, &self.stream);
         let ld = g.in_proj.n;
         g.in_proj.run(&self.lin, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
+        self.prefetch(&g.out, t)?;
         let (kh, vh) = (self.dims.k_heads, self.dims.v_heads);
         let key_dim = kh * gc.k_dim;
         let channels = 2 * key_dim + vh * gc.v_dim;
@@ -848,6 +905,7 @@ impl Model {
             "gated_rmsnorm",
         )?;
         g.out.run(&self.lin, w.core_normed.ptr(), vh * gc.v_dim, t, w.x.ptr(), cfg.hidden, s)?;
+        self.prefetch_mlp(layer, t)?;
         self.all_reduce(w.x.ptr(), t * cfg.hidden)
     }
 
@@ -907,6 +965,9 @@ impl Model {
                     "silu_mul",
                 )?;
                 down.run(&self.lin, w.shared_act.ptr(), inter, t, w.x.ptr(), h, s)?;
+                if let Some(next) = self.first_linear(li + 1) {
+                    self.prefetch(next, t)?;
+                }
                 self.all_reduce(w.x.ptr(), t * h)
             }
         }

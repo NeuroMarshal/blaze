@@ -49,6 +49,29 @@ impl Drop for Stream {
     }
 }
 
+/// An event for stream ordering (no timing).
+pub struct Event(pub sys::cudaEvent_t);
+
+impl Event {
+    pub fn new() -> Result<Self> {
+        let mut e = null_mut();
+        check(unsafe { sys::cudaEventCreateWithFlags(&mut e, sys::EVENT_DISABLE_TIMING) }, "cudaEventCreate")?;
+        Ok(Self(e))
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        unsafe { sys::cudaEventDestroy(self.0) };
+    }
+}
+
+/// Make `waiter` wait for the work enqueued on `on` so far (through `ev`).
+pub fn stream_after(waiter: &Stream, on: &Stream, ev: &Event) -> Result<()> {
+    check(unsafe { sys::cudaEventRecord(ev.0, on.0) }, "cudaEventRecord")?;
+    check(unsafe { sys::cudaStreamWaitEvent(waiter.0, ev.0, 0) }, "cudaStreamWaitEvent")
+}
+
 /// Device memory of `bytes` bytes, freed on drop.
 pub struct DevBuf {
     ptr: *mut c_void,

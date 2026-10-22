@@ -226,6 +226,21 @@ impl Linear {
         Ok(Store::Bf16(w))
     }
 
+    /// Device memory the layer reads, in reading order: (address, bytes).
+    pub fn regions(&self) -> Vec<(*const u8, usize)> {
+        let mut v = Vec::new();
+        for p in &self.parts {
+            match &p.store {
+                Store::Nvfp4 { codes, scales, .. } => {
+                    v.push((codes.ptr::<u8>() as *const u8, codes.bytes()));
+                    v.push((scales.ptr::<u8>() as *const u8, scales.bytes()));
+                }
+                Store::Bf16(w) => v.push((w.ptr::<u8>() as *const u8, w.bytes())),
+            }
+        }
+        v
+    }
+
     /// Elements of the widest NVFP4 part (the scratch an input longer than the GEMV needs).
     pub fn scratch_elems(&self) -> usize {
         self.parts.iter().filter(|p| matches!(p.store, Store::Nvfp4 { .. })).map(|p| p.n * self.k).max().unwrap_or(0)

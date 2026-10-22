@@ -40,6 +40,10 @@ struct EngineArgs {
     /// extra options of the expert engine ("key=value,...")
     #[arg(long, default_value = "host_reserve_gib=2")]
     expert_options: String,
+    /// decode: MiB of the next linear layer's weights pulled into L2 while waiting on the all-reduce / small
+    /// kernels (0: off)
+    #[arg(long, default_value_t = 0)]
+    l2_prefetch_mib: usize,
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
     tp: usize,
@@ -75,6 +79,7 @@ impl EngineArgs {
                 moe_heat: heat,
                 moe_options: options,
                 reserve_gib: self.vram_reserve,
+                l2_prefetch_mib: self.l2_prefetch_mib,
             },
             self.tp,
             !self.no_graphs,

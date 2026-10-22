@@ -6,6 +6,8 @@
 
 #include <cfloat>
 
+#include <algorithm>
+
 #include "blaze/ops.h"
 
 namespace blaze {
@@ -339,6 +341,21 @@ __global__ void set_req_to_token_kernel(int32_t* __restrict__ rt, const int64_t*
   if (i < n) rt[index[i]] = int32_t(slot[i]);
 }
 
+__global__ void l2_prefetch_kernel(const char* __restrict__ p, size_t bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  constexpr size_t kChunk = 64 << 10;
+  const size_t off = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * kChunk;
+  if (off < bytes) {
+    const uint32_t n = uint32_t(min(kChunk, bytes - off)) & ~15u;
+    if (n) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(p + off), "r"(n) : "memory");
+  }
+#else
+  for (size_t off = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) * 128; off < bytes;
+       off += size_t(gridDim.x) * blockDim.x * 128)
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
+#endif
+}
+
 int grid_for(int64_t n, int threads) {
   const int64_t blocks = (n + threads - 1) / threads;
   return int(blocks < 65535 * 16 ? blocks : 65535 * 16);
@@ -461,5 +478,19 @@ extern "C" cudaError_t blz_set_req_to_token(int32_t* req_to_token, const int64_t
                                             cudaStream_t stream) {
   if (n == 0) return cudaSuccess;
   set_req_to_token_kernel<<<(n + 255) / 256, 256, 0, stream>>>(req_to_token, index, slot, n);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_l2_prefetch(const void* p, size_t bytes, cudaStream_t stream) {
+  if (bytes < 128) return cudaSuccess;
+  static int major_of[16] = {};
+  int dev = 0;
+  cudaGetDevice(&dev);
+  int& major = major_of[dev & 15];
+  if (!major) cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+  const int threads = 128;
+  const size_t units = major >= 9 ? (bytes + (64 << 10) - 1) >> 16 : (bytes + 127) / 128;
+  const int blocks = int(std::min<size_t>((units + threads - 1) / threads, 1024));
+  l2_prefetch_kernel<<<blocks, threads, 0, stream>>>(static_cast<const char*>(p), bytes);
   return cudaGetLastError();
 }

@@ -41,7 +41,14 @@ unsafe extern "C" {
     pub fn cudaGraphExecDestroy(exec: cudaGraphExec_t) -> cudaError_t;
     pub fn cudaGraphDestroy(graph: cudaGraph_t) -> cudaError_t;
     pub fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> cudaError_t;
+    pub fn cudaEventCreateWithFlags(e: *mut cudaEvent_t, flags: u32) -> cudaError_t;
+    pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventRecord(e: cudaEvent_t, s: cudaStream_t) -> cudaError_t;
+    pub fn cudaStreamWaitEvent(s: cudaStream_t, e: cudaEvent_t, flags: u32) -> cudaError_t;
 }
+
+pub type cudaEvent_t = *mut c_void;
+pub const EVENT_DISABLE_TIMING: u32 = 2;
 
 pub type cudaGraph_t = *mut c_void;
 pub type cudaGraphExec_t = *mut c_void;
@@ -83,6 +90,7 @@ unsafe extern "C" {
                            s: cudaStream_t) -> cudaError_t;
     pub fn blz_set_req_to_token(req_to_token: *mut i32, index: *const i64, slot: *const i64, n: c_int,
                                 s: cudaStream_t) -> cudaError_t;
+    pub fn blz_l2_prefetch(p: *const c_void, bytes: usize, s: cudaStream_t) -> cudaError_t;
     pub fn blz_gather_rows(src: *const bf16, ld_src: i64, rows: *const i32, n: c_int, dim: c_int, dst: *mut bf16,
                            s: cudaStream_t) -> cudaError_t;
     pub fn blz_fp8_block_dequant(w: *const u8, scale: *const c_void, scale_is_f32: c_int, n: c_int, k: c_int,
