@@ -51,6 +51,33 @@ pub struct RopeConfig {
     pub scaling: RopeScaling,
 }
 
+/// Hyper-connections (Qwen4-Exp): `count` residual streams of `hidden` each, low-rank gated mixing.
+#[derive(Debug, Clone)]
+pub struct HcConfig {
+    pub count: usize,
+    pub lowrank: usize,
+}
+
+/// Per-layer n-gram embedding (Qwen4-Exp PLE).
+#[derive(Debug, Clone)]
+pub struct PleConfig {
+    /// Decoder layers that add a PLE embedding to their streams.
+    pub layers: Vec<usize>,
+    pub ngram_size: usize,
+    pub heads_per_ngram: usize,
+    pub embed_dim: usize,
+    pub conv_kernel: usize,
+}
+
+/// Qwen sparse attention (compressed indexer) of the softmax layers.
+#[derive(Debug, Clone)]
+pub struct QsaConfig {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub budget: usize,
+    pub compress_ratio: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub architecture: String,
@@ -65,6 +92,10 @@ pub struct ModelConfig {
     pub mlp: MlpConfig,
     pub rope: RopeConfig,
     pub mtp_layers: usize,
+    pub hc: Option<HcConfig>,
+    pub ple: Option<PleConfig>,
+    pub qsa: Option<QsaConfig>,
+    pub eos: Option<i64>,
     /// The text part of the config (`text_config` of multimodal checkpoints).
     pub raw: Value,
 }
@@ -140,6 +171,34 @@ impl ModelConfig {
             _ => MlpConfig::Dense { intermediate: need(&t, "intermediate_size")? },
         };
         let rope = Self::rope(&t, attn.head_dim)?;
+        let hc = usize_of(&t, "hc_count").filter(|&c| c > 1).map(|count| HcConfig {
+            count,
+            lowrank: usize_of(&t, "hc_lowrank").unwrap_or(16),
+        });
+        let ple = match t.get("ple_layer_ids").and_then(Value::as_array) {
+            Some(ids) if !ids.is_empty() => Some(PleConfig {
+                // SGLang's _has_ple: layer_id + 1 in ple_layer_ids
+                layers: ids.iter().filter_map(Value::as_u64).filter(|&i| i >= 1).map(|i| i as usize - 1).collect(),
+                ngram_size: need(&t, "ngram_size")?,
+                heads_per_ngram: need(&t, "heads_per_ngram")?,
+                embed_dim: need(&t, "ple_embed_dim")?,
+                conv_kernel: usize_of(&t, "ple_conv_kernel_size").unwrap_or(4),
+            }),
+            _ => None,
+        };
+        let qsa = usize_of(&t, "indexer_n_heads").map(|heads| -> Result<QsaConfig> {
+            Ok(QsaConfig {
+                heads,
+                head_dim: need(&t, "indexer_head_dim")?,
+                budget: need(&t, "indexer_budget")?,
+                compress_ratio: need(&t, "indexer_compress_ratio")?,
+            })
+        });
+        let qsa = match qsa {
+            Some(q) => Some(q?),
+            None => None,
+        };
+        let eos = t.get("eos_token_id").or_else(|| root.get("eos_token_id")).and_then(Value::as_i64);
         Ok(Self {
             architecture,
             hidden,
@@ -157,6 +216,10 @@ impl ModelConfig {
             mlp,
             rope,
             mtp_layers: usize_of(&t, "mtp_num_hidden_layers").unwrap_or(0),
+            hc,
+            ple,
+            qsa,
+            eos,
             raw: t,
         })
     }

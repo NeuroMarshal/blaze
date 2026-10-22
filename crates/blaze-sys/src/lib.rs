@@ -158,12 +158,18 @@ unsafe extern "C" {
 pub const BLZ_NVFP4_GEMV_MAX_ROWS: usize = 8;
 pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
+pub const BLZ_FP8_MMA_MAX_ROWS: usize = 16;
 
 unsafe extern "C" {
     pub fn blz_nvfp4_gemv(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,
                           ldy: i64, rows: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,
                               ldy: i64, rows: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_fp8_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, block_scale: *const f32, block_n: c_int,
+                            alpha: *const f32, y: *mut bf16, ldy: i64, rows: c_int, n: c_int, k: c_int,
+                            s: cudaStream_t) -> cudaError_t;
+    pub fn blz_fp8_weight_dequant(w: *const u8, block_scale: *const f32, block_n: c_int, alpha: *const f32, n: c_int,
+                                  k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_weight_dequant(w: *const u8, scale: *const u8, alpha: *const f32, n: c_int, k: c_int,
                                     out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,
@@ -220,4 +226,38 @@ unsafe extern "C" {
     pub fn blz_moe_engine_layers(e: *const blz_moe_engine) -> c_int;
     pub fn blz_moe_engine_forward(e: *mut blz_moe_engine, layer: c_int, x: *const bf16, tokens: c_int, ids: *const i32,
                                   w: *const f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+}
+
+// Qwen4-Exp (qwen4.h, hc_mix.h)
+#[repr(C)]
+pub struct blz_ple {
+    _private: [u8; 0],
+}
+
+unsafe extern "C" {
+    pub fn blz_grouped_rmsnorm(x: *const bf16, w: *const bf16, eps: f32, rows: c_int, groups: c_int, dim: c_int,
+                               out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_hc_combine(streams: *mut bf16, normed: *const bf16, inject: *const bf16, y: *const bf16, ld_y: i64,
+                          rows: c_int, hc: c_int, dim: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_hc_widen(x: *const bf16, rows: c_int, hc: c_int, dim: c_int, streams: *mut bf16, s: cudaStream_t)
+                        -> cudaError_t;
+    pub fn blz_hc_mix_supported(rows: c_int, hc: c_int, hs: c_int, lowrank: c_int) -> c_int;
+    pub fn blz_hc_mix_workspace_bytes(rows: c_int, hc: c_int, hs: c_int, lowrank: c_int) -> usize;
+    pub fn blz_hc_mix(x: *const bf16, w_down: *const bf16, w_up: *const bf16, t: *mut bf16, out: *mut bf16, rows: c_int,
+                      hc: c_int, hs: c_int, lowrank: c_int, workspace: *mut c_void, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_ngram_hash(tokens: *const i64, seq_start: *const i32, slots: *const i32, seqs: c_int, max_tokens: c_int,
+                          hist: *mut i64, update_hist: c_int, multipliers: *const i64, sizes: *const i64,
+                          offsets: *const i64, heads_per_ngram: c_int, eos: i64, ids: *mut i64, s: cudaStream_t)
+                          -> cudaError_t;
+    pub fn blz_ple_gate(key_n: *const bf16, query_n: *const bf16, value: *const bf16, rows: c_int, hc: c_int, dim: c_int,
+                        gated: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_ple_conv(gated_n: *const bf16, gated: *const bf16, seq_start: *const i32, slots: *const i32, seqs: c_int,
+                        channels: c_int, kernel: c_int, dilation: c_int, weight: *const bf16, state: *mut bf16,
+                        write_state: c_int, streams: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_ple_create(path: *const c_char, max_ids: c_int, threads: c_int, out: *mut *mut blz_ple, err: *mut c_char,
+                          err_len: usize) -> c_int;
+    pub fn blz_ple_destroy(p: *mut blz_ple);
+    pub fn blz_ple_row_dim(p: *const blz_ple) -> c_int;
+    pub fn blz_ple_request(p: *mut blz_ple, ids: *const i64, n: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_ple_fetch(p: *mut blz_ple, out: *mut bf16, n: c_int, s: cudaStream_t) -> cudaError_t;
 }

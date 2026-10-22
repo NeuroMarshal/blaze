@@ -23,6 +23,17 @@ pub enum Cut {
 enum Store {
     Bf16(DevBuf),
     Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf },
+    /// E4M3 codes [n, k], optional FP32 scales per [block_n, 128] block, FP32 multiplier per row.
+    Fp8 { codes: DevBuf, block_scale: Option<DevBuf>, block_n: usize, alpha: DevBuf },
+}
+
+/// How a module is kept on the GPU; consecutive modules of one kind share a part.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Nvfp4,
+    Fp8Channel,
+    Fp8Block(usize),
+    Bf16,
 }
 
 struct Part {
@@ -71,9 +82,23 @@ struct Module {
 }
 
 impl Module {
-    fn nvfp4(&self) -> bool {
-        matches!(self.format, Format::Nvfp4 { .. })
+    fn kind(&self) -> Kind {
+        match &self.format {
+            Format::Nvfp4 { .. } => Kind::Nvfp4,
+            Format::Fp8Channel { .. } => Kind::Fp8Channel,
+            Format::Fp8Block { block_n, block_k: 128, inverse: false, .. } => Kind::Fp8Block(*block_n),
+            _ => Kind::Bf16,
+        }
     }
+}
+
+fn to_f32(raw: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
+    Ok(match dtype {
+        Dtype::F32 => raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        Dtype::Bf16 => raw.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        Dtype::F16 => raw.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        other => bail!("scales in {other:?}"),
+    })
 }
 
 impl Linear {
@@ -115,12 +140,16 @@ impl Linear {
         let mut i = 0;
         while i < mods.len() {
             let mut j = i + 1;
-            while j < mods.len() && mods[j].nvfp4() == mods[i].nvfp4() {
+            while j < mods.len() && mods[j].kind() == mods[i].kind() {
                 j += 1;
             }
             let group = &mods[i..j];
             let n: usize = group.iter().map(|m| m.n).sum();
-            let store = if mods[i].nvfp4() { Self::load_nvfp4(ckpt, group, n, k)? } else { Self::load_16bit(ckpt, group, n, k, s)? };
+            let store = match mods[i].kind() {
+                Kind::Nvfp4 => Self::load_nvfp4(ckpt, group, n, k)?,
+                Kind::Fp8Channel | Kind::Fp8Block(_) if k % 128 == 0 => Self::load_fp8(ckpt, group, n, k, mods[i].kind())?,
+                _ => Self::load_16bit(ckpt, group, n, k, s)?,
+            };
             parts.push(Part { store, col, n });
             col += n;
             i = j;
@@ -153,6 +182,46 @@ impl Linear {
             row += m.n;
         }
         Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)? })
+    }
+
+    fn load_fp8(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, kind: Kind) -> Result<Store> {
+        let codes = DevBuf::new(n * k)?;
+        let block_n = if let Kind::Fp8Block(bn) = kind { bn } else { 0 };
+        let mut alpha = Vec::with_capacity(n);
+        let mut blocks = Vec::new();
+        let mut row = 0;
+        for m in group {
+            let info = ckpt.info(&m.names.weight)?;
+            let full_k = info.shape[1];
+            let raw = cut_rows(ckpt.bytes(&m.names.weight)?, full_k, &m.rows, m.cols.clone());
+            codes.upload_at(row * k, &raw)?;
+            let si = ckpt.info(m.names.scale.as_ref().unwrap())?;
+            let sc = to_f32(ckpt.bytes(m.names.scale.as_ref().unwrap())?, si.dtype)?;
+            match m.format {
+                Format::Fp8Channel { per_tensor: true } => alpha.extend(std::iter::repeat_n(sc[0], m.n)),
+                Format::Fp8Channel { per_tensor: false } => {
+                    for r in &m.rows {
+                        alpha.extend_from_slice(&sc[r.clone()]);
+                    }
+                }
+                _ => {
+                    // [ceil(N / block_n), ceil(K / 128)] scales: whole blocks of rows and columns only
+                    if m.rows.iter().any(|r| r.start % block_n != 0 || r.end % block_n != 0) || m.cols.start % 128 != 0 {
+                        bail!("{}: FP8 block cut {:?} / {:?} not aligned to the {}x128 blocks", m.name, m.rows, m.cols, block_n);
+                    }
+                    let kb_full = full_k.div_ceil(128);
+                    for r in &m.rows {
+                        for br in r.start / block_n..r.end / block_n {
+                            blocks.extend_from_slice(&sc[br * kb_full + m.cols.start / 128..br * kb_full + m.cols.end.div_ceil(128)]);
+                        }
+                    }
+                    alpha.extend(std::iter::repeat_n(1.0f32, m.n));
+                }
+            }
+            row += m.n;
+        }
+        let block_scale = if block_n > 0 { Some(DevBuf::from_slice(&blocks)?) } else { None };
+        Ok(Store::Fp8 { codes, block_scale, block_n: block_n.max(1), alpha: DevBuf::from_slice(&alpha)? })
     }
 
     fn load_16bit(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, s: &Stream) -> Result<Store> {
@@ -236,6 +305,7 @@ impl Linear {
                     v.push((scales.ptr::<u8>() as *const u8, scales.bytes()));
                 }
                 Store::Bf16(w) => v.push((w.ptr::<u8>() as *const u8, w.bytes())),
+                Store::Fp8 { codes, .. } => v.push((codes.ptr::<u8>() as *const u8, codes.bytes())),
             }
         }
         v
@@ -243,7 +313,7 @@ impl Linear {
 
     /// Elements of the widest NVFP4 part (the scratch an input longer than the GEMV needs).
     pub fn scratch_elems(&self) -> usize {
-        self.parts.iter().filter(|p| matches!(p.store, Store::Nvfp4 { .. })).map(|p| p.n * self.k).max().unwrap_or(0)
+        self.parts.iter().filter(|p| !matches!(p.store, Store::Bf16(_))).map(|p| p.n * self.k).max().unwrap_or(0)
     }
 
     /// out[m, 0..n] (row stride ldo) = x[m, 0..k] (row stride ldx) . W^T.
@@ -279,6 +349,36 @@ impl Linear {
                                                               ctx.scratch, s.0)
                             },
                             "blz_nvfp4_weight_dequant",
+                        )?;
+                        check(
+                            unsafe {
+                                sys::blz_gemm_bf16(ctx.gemm, x, ldx as i64, ctx.scratch, o, ldo as i64, m as c_int, p.n as c_int,
+                                                   k as c_int, s.0)
+                            },
+                            "blz_gemm_bf16",
+                        )?;
+                    }
+                }
+                Store::Fp8 { codes, block_scale, block_n, alpha } => {
+                    let bs: *const f32 = block_scale.as_ref().map_or(std::ptr::null(), |b| b.ptr::<f32>() as *const f32);
+                    if m <= sys::BLZ_FP8_MMA_MAX_ROWS {
+                        check(
+                            unsafe {
+                                sys::blz_fp8_gemv_mma(x, ldx as i64, codes.ptr(), bs, *block_n as c_int, alpha.ptr(), o, ldo as i64,
+                                                      m as c_int, p.n as c_int, k as c_int, s.0)
+                            },
+                            "blz_fp8_gemv_mma",
+                        )?;
+                    } else {
+                        if p.n * k > ctx.scratch_elems {
+                            bail!("FP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
+                        }
+                        check(
+                            unsafe {
+                                sys::blz_fp8_weight_dequant(codes.ptr(), bs, *block_n as c_int, alpha.ptr(), p.n as c_int, k as c_int,
+                                                            ctx.scratch, s.0)
+                            },
+                            "blz_fp8_weight_dequant",
                         )?;
                         check(
                             unsafe {
