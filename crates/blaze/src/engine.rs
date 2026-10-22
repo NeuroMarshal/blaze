@@ -63,8 +63,9 @@ enum Cmd {
     SetKvRow(usize, Arc<Vec<i32>>),
     /// PLE read-ahead: previous tokens, upcoming tokens
     PleWarm(Arc<(Vec<i64>, Vec<i64>)>),
-    /// sequence row, accepted rows of the last verify
-    Commit(usize, usize),
+    /// sequence row, accepted rows of the last verify, its first position, its tokens
+    Commit(usize, usize, usize, Arc<Vec<i64>>),
+    PreVerify(usize),
     Reset(usize),
     Logits(usize),
     AllLogits(usize),
@@ -191,8 +192,12 @@ impl Runner {
                 self.model.set_kv_row(row, &slots)?;
                 Reply::Done
             }
-            Cmd::Commit(row, accepted) => {
-                self.model.commit(row, accepted)?;
+            Cmd::Commit(row, accepted, start, tokens) => {
+                self.model.commit(row, accepted, start, &tokens)?;
+                Reply::Done
+            }
+            Cmd::PreVerify(row) => {
+                self.model.pre_verify(row)?;
                 Reply::Done
             }
             Cmd::Reset(row) => {
@@ -255,6 +260,8 @@ pub struct Penalty {
 
 pub struct Engine {
     workers: Vec<Worker>,
+    /// the last verify: its first position and tokens (for the commit)
+    last_verify: Option<(usize, Arc<Vec<i64>>)>,
     /// free KV pages and the references of every page (live sequences and snapshots)
     free_pages: Vec<u32>,
     page_refs: Vec<u32>,
@@ -377,6 +384,7 @@ impl Engine {
         let info = info.unwrap();
         Ok(Self {
             workers,
+            last_verify: None,
             free_pages: (0..(info.max_tokens / info.page) as u32).rev().collect(),
             page_refs: vec![0; info.max_tokens / info.page],
             free_rows: (0..info.max_seqs).rev().collect(),
@@ -559,21 +567,7 @@ impl Engine {
             Reply::Cands(p) => p,
             _ => unreachable!(),
         };
-        let (k, world) = (sys::BLZ_TOPK_MAX, self.workers.len());
-        let mut out = Vec::with_capacity(n);
-        for r in 0..n {
-            let mut c: Vec<(f32, i32)> = (0..world)
-                .flat_map(|w| {
-                    let base = (w * n + r) * k * 2;
-                    (0..k).map(move |j| (base + 2 * j, base + 2 * j + 1))
-                })
-                .map(|(vi, ii)| (pairs[vi], pairs[ii] as i32))
-                .filter(|&(_, id)| id >= 0)
-                .collect();
-            c.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
-            c.truncate(k);
-            out.push(c);
-        }
+        let out = self.merge_candidates(&pairs, n);
         Ok(out)
     }
 
@@ -606,11 +600,57 @@ impl Engine {
     /// Speculative verify: `tokens` (the pending token, then the draft) appended to `seq` with the GDN state left
     /// as it was; returns the greedy pick after every row. Follow with `commit`.
     pub fn verify(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<Vec<i32>> {
+        self.broadcast(|| Cmd::PreVerify(seq.row))?;
+        self.last_verify = Some((seq.len(), Arc::new(tokens.to_vec())));
         let meta = Arc::new(self.plan(&mut [seq], &[tokens], true)?);
         match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
             Reply::Tokens(t) => Ok(t),
             _ => unreachable!(),
         }
+    }
+
+    /// Sampled speculative verify: like `verify`, but every row gets its sampling candidates (with row i's penalties
+    /// `pens[i]`, which count the draft tokens before it).
+    pub fn verify_sampled(&mut self, seq: &mut Seq, tokens: &[i64], pens: &[Penalty]) -> Result<Vec<Vec<(f32, i32)>>> {
+        self.broadcast(|| Cmd::PreVerify(seq.row))?;
+        self.last_verify = Some((seq.len(), Arc::new(tokens.to_vec())));
+        let mut m = self.plan(&mut [seq], &[tokens], true)?;
+        m.sample = true;
+        m.pen_off.push(0);
+        for p in pens {
+            for &(id, c) in &p.counts {
+                m.pen_ids.push(id);
+                m.pen_counts.push(c);
+            }
+            m.pen_off.push(m.pen_ids.len() as i32);
+            m.pen_presence.push(p.presence);
+            m.pen_frequency.push(p.frequency);
+        }
+        let n = m.logit_rows.len();
+        let meta = Arc::new(m);
+        let pairs = match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
+            Reply::Cands(p) => p,
+            _ => unreachable!(),
+        };
+        Ok(self.merge_candidates(&pairs, n))
+    }
+
+    fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Vec<(f32, i32)>> {
+        let (k, world) = (sys::BLZ_TOPK_MAX, self.workers.len());
+        (0..n)
+            .map(|r| {
+                let mut c: Vec<(f32, i32)> = (0..world)
+                    .flat_map(|w| {
+                        let base = (w * n + r) * k * 2;
+                        (0..k).map(move |j| (pairs[base + 2 * j], pairs[base + 2 * j + 1] as i32))
+                    })
+                    .filter(|&(_, id)| id >= 0)
+                    .collect();
+                c.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+                c.truncate(k);
+                c
+            })
+            .collect()
     }
 
     /// Keep the first `accepted` of the last verify's `rows` rows: the rest give back their KV slots, the GDN states
@@ -625,7 +665,8 @@ impl Engine {
         for pg in dropped.into_iter().rev() {
             self.unref(pg);
         }
-        self.broadcast(|| Cmd::Commit(seq.row, accepted))?;
+        let (start, toks) = self.last_verify.take().ok_or_else(|| anyhow!("commit without a verify"))?;
+        self.broadcast(|| Cmd::Commit(seq.row, accepted, start, toks.clone()))?;
         Ok(())
     }
 

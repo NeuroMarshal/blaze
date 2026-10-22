@@ -178,6 +178,9 @@ enum Command {
         /// tokens of one step (decode tokens + the prefill chunk)
         #[arg(long, default_value_t = 2048)]
         step_tokens: usize,
+        /// n-gram speculative decoding (prompt lookup): draft tokens per step, 0 off (needs --max-verify >= this + 1)
+        #[arg(long, default_value_t = 0)]
+        spec_ngram: usize,
         #[arg(long, default_value = "qwen3_coder")]
         tool_call_parser: String,
         #[arg(long, default_value = "qwen3")]
@@ -289,6 +292,7 @@ fn main() -> Result<()> {
             presence_penalty,
             max_tokens,
             step_tokens,
+            spec_ngram,
             tool_call_parser,
             reasoning_parser,
             thinking_budget,
@@ -298,7 +302,7 @@ fn main() -> Result<()> {
             let max_context = e.info.ctx_stride;
             let sched = blaze::sched::Scheduler::start(
                 e,
-                blaze::sched::SchedConfig { step_tokens, prompt_cache: engine.prompt_cache_slots > 0 },
+                blaze::sched::SchedConfig { step_tokens, spec_tokens: spec_ngram, prompt_cache: engine.prompt_cache_slots > 0 },
             );
             let name = served_model_name
                 .unwrap_or_else(|| engine.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
