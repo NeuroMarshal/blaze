@@ -60,7 +60,7 @@ uint16_t bf(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
 float fb(uint16_t v) { return __bfloat162float(__ushort_as_bfloat16(v)); }
 
 // Worst |y - ref| / max |ref| of `rows` rows through the GEMV (rows <= 8) or dequant + cuBLAS.
-double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm* gemm) {
+double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm* gemm, bool mma = false) {
   std::normal_distribution<float> d(0.0f, 1.0f);
   std::vector<uint16_t> x(size_t(rows) * ldx);
   for (auto& v : x) v = bf(d(rng));
@@ -68,7 +68,9 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
   check(cudaMalloc(&dx, x.size() * 2), "malloc");
   check(cudaMalloc(&dy, size_t(rows) * W.n * 2), "malloc");
   check(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "copy");
-  if (rows <= BLZ_NVFP4_GEMV_MAX_ROWS) {
+  if (mma) {
+    check(blz_nvfp4_gemv_mma(dx, ldx, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, 0), "gemv_mma");
+  } else if (rows <= BLZ_NVFP4_GEMV_MAX_ROWS) {
     check(blz_nvfp4_gemv(dx, ldx, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, 0), "gemv");
   } else {
     check(cudaMalloc(&dw, size_t(W.n) * W.k * 2), "malloc");
@@ -91,7 +93,7 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
   return worst / top;
 }
 
-double bench(int rows, int n, int k, std::mt19937& rng) {
+double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
   Weights W(n, k, rng);
   uint16_t *dx, *dy;
   check(cudaMalloc(&dx, size_t(rows) * k * 2), "malloc");
@@ -100,17 +102,19 @@ double bench(int rows, int n, int k, std::mt19937& rng) {
   cudaEvent_t a, b;
   cudaEventCreate(&a);
   cudaEventCreate(&b);
-  for (int i = 0; i < 5; ++i) blz_nvfp4_gemv(dx, k, W.d_codes, W.d_scales, W.d_alpha, dy, n, rows, n, k, 0);
+  auto f = mma ? blz_nvfp4_gemv_mma : blz_nvfp4_gemv;
+  for (int i = 0; i < 5; ++i) f(dx, k, W.d_codes, W.d_scales, W.d_alpha, dy, n, rows, n, k, 0);
   const int iters = 200;
   cudaEventRecord(a);
-  for (int i = 0; i < iters; ++i) blz_nvfp4_gemv(dx, k, W.d_codes, W.d_scales, W.d_alpha, dy, n, rows, n, k, 0);
+  for (int i = 0; i < iters; ++i) f(dx, k, W.d_codes, W.d_scales, W.d_alpha, dy, n, rows, n, k, 0);
   cudaEventRecord(b);
   check(cudaEventSynchronize(b), "bench");
   float ms = 0;
   cudaEventElapsedTime(&ms, a, b);
   const double us = 1000.0 * ms / iters;
   const double bytes = double(n) * k / 2 + double(n) * k / 16;
-  std::printf("  gemv %2d x %5d x %5d: %7.1f us, %6.0f GB/s of weights\n", rows, n, k, us, bytes / us / 1000.0);
+  std::printf("  %s %2d x %5d x %5d: %7.1f us, %6.0f GB/s of weights\n", mma ? "mma " : "gemv", rows, n, k, us,
+              bytes / us / 1000.0);
   cudaFree(dx);
   cudaFree(dy);
   return us;
@@ -131,15 +135,26 @@ int main() {
     std::printf("rows %2d (%s): max rel err %.2e %s\n", rows, rows <= BLZ_NVFP4_GEMV_MAX_ROWS ? "gemv" : "dequant+gemm",
                 e, pass ? "ok" : "FAIL");
   }
+  Weights mid(200, 1152, rng);  // k a multiple of 128
+  for (int rows : {1, 2, 7, 8, 9, 16}) {
+    const double e = run(mid, rows, 1152 + (rows == 9 ? 128 : 0), rng, gemm, true);
+    const bool pass = e < 6e-3;
+    ok &= pass;
+    std::printf("rows %2d (mma): max rel err %.2e %s\n", rows, e, pass ? "ok" : "FAIL");
+  }
   Weights big(64, 8704, rng);
   const double e = run(big, 1, 8704, rng, gemm);
   ok &= e < 6e-3;
   std::printf("rows  1, k 8704: max rel err %.2e %s\n", e, e < 6e-3 ? "ok" : "FAIL");
 
   std::printf("bandwidth:\n");
-  for (int rows : {1, 2, 4, 8}) {
-    bench(rows, 17408, 5120, rng);
-    bench(rows, 5120, 8704, rng);
+  for (int rows : {1, 2, 4, 8, 16}) {
+    for (bool mma : {false, true}) {
+      if (!mma && rows > BLZ_NVFP4_GEMV_MAX_ROWS) continue;
+      bench(rows, 17408, 5120, rng, mma);
+      bench(rows, 5120, 8704, rng, mma);
+      bench(rows, 5120, 3072, rng, mma);
+    }
   }
   bench(1, 7168, 5120, rng);
   blz_gemm_destroy(gemm);

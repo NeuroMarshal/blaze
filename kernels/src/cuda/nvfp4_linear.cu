@@ -132,6 +132,126 @@ cudaError_t launch_gemv(const uint16_t* x, int64_t ldx, const uint8_t* w, const 
   return cudaGetLastError();
 }
 
+// tensor-core route
+// For 2..16 rows: mma.m16n8k16 (BF16 in, FP32 accumulate) with A = the input rows (tokens, zero-padded to 16) and
+// B = 8 weight rows. The reduction order is free, so the K index is permuted to fit the stored layout: over a 128-wide
+// chunk, thread (g, t) of a warp holds the 32 consecutive codes [32t, 32t + 32) of weight row g (one 16-byte load,
+// two scale blocks), and mma step s takes its codes 4s .. 4s + 3 as the fragment's k slots (2t, 2t+1, 2t+8, 2t+9);
+// the input fragments are read with the same permutation. Codes become BF16 through two byte-permute table lookups
+// (the E2M1 magnitudes are exact in BF16), times the block scale (exact). Four warps split K, partial sums meet in
+// shared memory; each block covers 8 * kTiles weight rows.
+
+constexpr int kTiles = 4;
+
+__device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                         uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+      "{%0, %1, %2, %3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Four E2M1 codes (16 bits, first code lowest) -> two BF16 pairs.
+__device__ __forceinline__ void e2m1x4_to_bf16(uint32_t q, uint32_t& w0, uint32_t& w1) {
+  const uint32_t sel = q & 0x7777u;
+  const uint32_t hi = __byte_perm(0x3F3F3F00u, 0x40404040u, sel);  // high bytes of 0, .5, 1, 1.5, 2, 3, 4, 6
+  const uint32_t lo = __byte_perm(0xC0800000u, 0xC0804000u, sel);  // low bytes
+  w0 = __byte_perm(lo, hi, 0x5140) | ((q & 0x8u) << 12) | ((q & 0x80u) << 24);
+  w1 = __byte_perm(lo, hi, 0x7362) | ((q & 0x800u) << 4) | ((q & 0x8000u) << 16);
+}
+
+__device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a, uint32_t b) {
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+
+__device__ __forceinline__ uint32_t bf16x2_splat(float v) {
+  const uint32_t h = __bfloat16_as_ushort(__float2bfloat16(v));
+  return h | (h << 16);
+}
+
+template <bool kHi>
+__global__ void __launch_bounds__(kWarps * 32) nvfp4_mma_kernel(const uint16_t* __restrict__ x, int64_t ldx,
+                                                                const uint8_t* __restrict__ w,
+                                                                const uint8_t* __restrict__ scale,
+                                                                const float* __restrict__ alpha,
+                                                                uint16_t* __restrict__ y, int64_t ldy, int m, int n,
+                                                                int k) {
+  __shared__ float red[kWarps][kTiles * 8][17];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int f0 = blockIdx.x * kTiles * 8;
+  const int64_t wrow = k >> 1, srow = k >> 4;
+  const uint8_t* wp[kTiles];
+  const uint8_t* sp[kTiles];
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j) {
+    const int f = min(f0 + 8 * j + g, n - 1);
+    wp[j] = w + f * wrow + 16 * t;
+    sp[j] = scale + f * srow + 2 * t;
+  }
+  const bool lo_ok = g < m, hi_ok = kHi && g + 8 < m;
+  const uint16_t* xlo = x + int64_t(lo_ok ? g : 0) * ldx + 32 * t;
+  const uint16_t* xhi = x + int64_t(hi_ok ? g + 8 : 0) * ldx + 32 * t;
+  float acc[kTiles][4];
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+
+  const int chunks = k >> 7;
+#pragma unroll 2
+  for (int c = warp; c < chunks; c += kWarps) {
+    uint4 wq[kTiles];
+    uint16_t sq[kTiles];
+#pragma unroll
+    for (int j = 0; j < kTiles; ++j) {
+      wq[j] = ldg_stream(wp[j] + c * 64);
+      sq[j] = __ldg(reinterpret_cast<const uint16_t*>(sp[j] + c * 8));
+    }
+    uint32_t xa[16], xb[16];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const uint4 v = lo_ok ? __ldg(reinterpret_cast<const uint4*>(xlo + c * 128) + q) : make_uint4(0, 0, 0, 0);
+      xa[4 * q] = v.x, xa[4 * q + 1] = v.y, xa[4 * q + 2] = v.z, xa[4 * q + 3] = v.w;
+      if (kHi) {
+        const uint4 u = hi_ok ? __ldg(reinterpret_cast<const uint4*>(xhi + c * 128) + q) : make_uint4(0, 0, 0, 0);
+        xb[4 * q] = u.x, xb[4 * q + 1] = u.y, xb[4 * q + 2] = u.z, xb[4 * q + 3] = u.w;
+      } else {
+        xb[4 * q] = xb[4 * q + 1] = xb[4 * q + 2] = xb[4 * q + 3] = 0;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < kTiles; ++j) {
+      const uint32_t s0 = bf16x2_splat(e4m3(sq[j] & 0xff)), s1 = bf16x2_splat(e4m3(sq[j] >> 8));
+      const uint32_t codes[4] = {wq[j].x, wq[j].y, wq[j].z, wq[j].w};
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        uint32_t b0, b1;
+        e2m1x4_to_bf16(codes[s >> 1] >> (16 * (s & 1)), b0, b1);
+        const uint32_t sc = s < 4 ? s0 : s1;
+        mma_bf16(acc[j], xa[2 * s], xb[2 * s], xa[2 * s + 1], xb[2 * s + 1], bf16x2_mul(b0, sc), bf16x2_mul(b1, sc));
+      }
+    }
+  }
+  // c0, c1: token g, rows 8j + 2t, +1; c2, c3: token g + 8
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j) {
+    red[warp][8 * j + 2 * t][g] = acc[j][0];
+    red[warp][8 * j + 2 * t + 1][g] = acc[j][1];
+    red[warp][8 * j + 2 * t][g + 8] = acc[j][2];
+    red[warp][8 * j + 2 * t + 1][g + 8] = acc[j][3];
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < kTiles * 8 * 16; i += blockDim.x) {
+    const int r = i >> 4, tok = i & 15, f = f0 + r;
+    if (tok >= m || f >= n) continue;
+    float v = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kWarps; ++q) v += red[q][r][tok];
+    y[tok * ldy + f] = __bfloat16_as_ushort(__float2bfloat16(v * alpha[f]));
+  }
+}
+
 __global__ void nvfp4_dequant_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ scale,
                                      const float* __restrict__ alpha, int n, int k, uint16_t* __restrict__ out) {
   const int64_t chunks = int64_t(n) * (k >> 5);
@@ -173,6 +293,19 @@ extern "C" cudaError_t blz_nvfp4_gemv(const uint16_t* x, int64_t ldx, const uint
     case 7: return launch_gemv<7, 2>(x, ldx, w, scale, alpha, y, ldy, n, k, stream);
     default: return launch_gemv<8, 2>(x, ldx, w, scale, alpha, y, ldy, n, k, stream);
   }
+}
+
+extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
+                                          const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
+                                          cudaStream_t stream) {
+  if (rows <= 0 || n <= 0) return cudaSuccess;
+  if (k % 128 != 0 || rows > 16) return cudaErrorInvalidValue;
+  const int blocks = (n + kTiles * 8 - 1) / (kTiles * 8);
+  if (rows > 8)
+    nvfp4_mma_kernel<true><<<blocks, kWarps * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+  else
+    nvfp4_mma_kernel<false><<<blocks, kWarps * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t blz_nvfp4_weight_dequant(const uint8_t* w, const uint8_t* scale, const float* alpha, int n, int k,

@@ -22,6 +22,12 @@ extern "C" {
 cudaError_t blz_nvfp4_gemv(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale, const float* alpha,
                            uint16_t* y, int64_t ldy, int rows, int n, int k, cudaStream_t stream);
 
+/// \brief The same product on tensor cores for 1..16 rows (k a multiple of 128): BF16 MMAs over weights widened
+/// in registers, FP32 accumulation.
+cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
+                               const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
+                               cudaStream_t stream);
+
 /// \brief out[j, i] = bf16(e2m1(w[j, i]) * e4m3(scale[j, i / 16]) * alpha[j]): the weight as a BF16 matrix [n, k].
 cudaError_t blz_nvfp4_weight_dequant(const uint8_t* w, const uint8_t* scale, const float* alpha, int n, int k, uint16_t* out,
                               cudaStream_t stream);
