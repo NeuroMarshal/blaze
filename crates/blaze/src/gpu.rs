@@ -76,6 +76,8 @@ pub fn stream_after(waiter: &Stream, on: &Stream, ev: &Event) -> Result<()> {
 pub struct DevBuf {
     ptr: *mut c_void,
     bytes: usize,
+    /// false: a view of another buffer's memory (not freed)
+    owned: bool,
 }
 
 // SAFETY: a device allocation is not tied to a host thread.
@@ -86,7 +88,7 @@ impl DevBuf {
     pub fn new(bytes: usize) -> Result<Self> {
         let mut ptr = null_mut();
         check(unsafe { sys::cudaMalloc(&mut ptr, bytes.max(1)) }, &format!("cudaMalloc({bytes} B)"))?;
-        Ok(Self { ptr, bytes })
+        Ok(Self { ptr, bytes, owned: true })
     }
 
     pub fn zeroed(bytes: usize, s: &Stream) -> Result<Self> {
@@ -103,6 +105,17 @@ impl DevBuf {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// The first `bytes` of this buffer as a buffer that does not own them (scratch reuse between buffers that are
+    /// never live at once); the caller keeps this buffer alive longer than the view.
+    pub fn view(&self, bytes: usize) -> Option<Self> {
+        (bytes <= self.bytes).then_some(Self { ptr: self.ptr, bytes, owned: false })
+    }
+
+    /// Bytes this buffer owns (0 for a view).
+    pub fn owned_bytes(&self) -> usize {
+        if self.owned { self.bytes } else { 0 }
     }
 
     pub fn ptr<T>(&self) -> *mut T {
@@ -155,7 +168,9 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        unsafe { sys::cudaFree(self.ptr) };
+        if self.owned {
+            unsafe { sys::cudaFree(self.ptr) };
+        }
     }
 }
 

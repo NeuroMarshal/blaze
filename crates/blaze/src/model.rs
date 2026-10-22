@@ -350,6 +350,8 @@ impl MetaLayout {
 /// QSA: query rows scored per pass (the scores scratch holds this many rows of the longest context's blocks), and the
 /// row stride of the selection table (block_topk * ratio + ratio - 1 rounded up).
 const QSA_SCORE_ROWS: usize = 128;
+/// Rows of one sparse-attention call (a long prefill chunk goes in groups: smaller split-K partials).
+const SPARSE_ROWS: usize = 1024;
 const QSA_TABLE_STRIDE: usize = 2056;
 
 /// One sequence of a step: `len` tokens at `offset` in the step's token list (decode sequences first, len 1).
@@ -422,55 +424,55 @@ impl Work {
     /// Every buffer's bytes (the VRAM log at load).
     fn sizes(&self) -> Vec<(&'static str, usize)> {
         vec![
-            ("residual", self.residual.bytes()),
-            ("normed", self.normed.bytes()),
-            ("x", self.x.bytes()),
-            ("proj", self.proj.bytes()),
-            ("conv", self.conv.bytes()),
-            ("g", self.g.bytes()),
-            ("beta", self.beta.bytes()),
-            ("core", self.core.bytes()),
-            ("core_normed", self.core_normed.bytes()),
-            ("q", self.q.bytes()),
-            ("gate", self.gate.bytes()),
-            ("attn", self.attn.bytes()),
-            ("ids", self.ids.bytes()),
-            ("weights", self.weights.bytes()),
-            ("moe_out", self.moe_out.bytes()),
-            ("shared", self.shared.bytes()),
-            ("shared_act", self.shared_act.bytes()),
-            ("gu", self.gu.bytes()),
-            ("partial_o", self.partial_o.bytes()),
-            ("partial_ml", self.partial_ml.bytes()),
-            ("gx", self.gx.bytes()),
-            ("gres", self.gres.bytes()),
-            ("gnormed", self.gnormed.bytes()),
-            ("streams", self.streams.as_ref().map_or(0, |b| b.bytes())),
-            ("hnorm", self.hnorm.as_ref().map_or(0, |b| b.bytes())),
-            ("hc_t", self.hc_t.as_ref().map_or(0, |b| b.bytes())),
-            ("hc_ws", self.hc_ws.as_ref().map_or(0, |b| b.bytes())),
-            ("gstreams", self.gstreams.as_ref().map_or(0, |b| b.bytes())),
-            ("hc_partial", self.hc_partial.as_ref().map_or(0, |b| b.bytes())),
-            ("ghnorm", self.ghnorm.as_ref().map_or(0, |b| b.bytes())),
-            ("ple_ids", self.ple_ids.as_ref().map_or(0, |b| b.bytes())),
-            ("ple_emb", self.ple_emb.as_ref().map_or(0, |b| b.bytes())),
-            ("ple_key", self.ple_key.as_ref().map_or(0, |b| b.bytes())),
-            ("ple_value", self.ple_value.as_ref().map_or(0, |b| b.bytes())),
-            ("ple_gated", self.ple_gated.as_ref().map_or(0, |b| b.bytes())),
-            ("ple_gatedn", self.ple_gatedn.as_ref().map_or(0, |b| b.bytes())),
-            ("pairs", self.pairs.bytes()),
-            ("cand_vals", self.cand_vals.bytes()),
-            ("cand_ids", self.cand_ids.bytes()),
-            ("cand_lse", self.cand_lse.bytes()),
-            ("cand_pairs", self.cand_pairs.bytes()),
-            ("qsa_q", self.qsa_q.as_ref().map_or(0, |b| b.bytes())),
-            ("qsa_scores", self.qsa_scores.as_ref().map_or(0, |b| b.bytes())),
-            ("qsa_table", self.qsa_table.as_ref().map_or(0, |b| b.bytes())),
-            ("qsa_counts", self.qsa_counts.as_ref().map_or(0, |b| b.bytes())),
-            ("qsa_rows", self.qsa_rows.as_ref().map_or(0, |b| b.bytes())),
-            ("logits", self.logits.bytes()),
-            ("next", self.next.bytes()),
-            ("meta", self.meta.bytes()),
+            ("residual", self.residual.owned_bytes()),
+            ("normed", self.normed.owned_bytes()),
+            ("x", self.x.owned_bytes()),
+            ("proj", self.proj.owned_bytes()),
+            ("conv", self.conv.owned_bytes()),
+            ("g", self.g.owned_bytes()),
+            ("beta", self.beta.owned_bytes()),
+            ("core", self.core.owned_bytes()),
+            ("core_normed", self.core_normed.owned_bytes()),
+            ("q", self.q.owned_bytes()),
+            ("gate", self.gate.owned_bytes()),
+            ("attn", self.attn.owned_bytes()),
+            ("ids", self.ids.owned_bytes()),
+            ("weights", self.weights.owned_bytes()),
+            ("moe_out", self.moe_out.owned_bytes()),
+            ("shared", self.shared.owned_bytes()),
+            ("shared_act", self.shared_act.owned_bytes()),
+            ("gu", self.gu.owned_bytes()),
+            ("partial_o", self.partial_o.owned_bytes()),
+            ("partial_ml", self.partial_ml.owned_bytes()),
+            ("gx", self.gx.owned_bytes()),
+            ("gres", self.gres.owned_bytes()),
+            ("gnormed", self.gnormed.owned_bytes()),
+            ("streams", self.streams.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("hnorm", self.hnorm.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("hc_t", self.hc_t.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("hc_ws", self.hc_ws.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("gstreams", self.gstreams.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("hc_partial", self.hc_partial.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ghnorm", self.ghnorm.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ple_ids", self.ple_ids.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ple_emb", self.ple_emb.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ple_key", self.ple_key.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ple_value", self.ple_value.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ple_gated", self.ple_gated.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("ple_gatedn", self.ple_gatedn.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("pairs", self.pairs.owned_bytes()),
+            ("cand_vals", self.cand_vals.owned_bytes()),
+            ("cand_ids", self.cand_ids.owned_bytes()),
+            ("cand_lse", self.cand_lse.owned_bytes()),
+            ("cand_pairs", self.cand_pairs.owned_bytes()),
+            ("qsa_q", self.qsa_q.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("qsa_scores", self.qsa_scores.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("qsa_table", self.qsa_table.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("qsa_counts", self.qsa_counts.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("qsa_rows", self.qsa_rows.as_ref().map_or(0, |b| b.owned_bytes())),
+            ("logits", self.logits.owned_bytes()),
+            ("next", self.next.owned_bytes()),
+            ("meta", self.meta.owned_bytes()),
         ]
     }
 }
@@ -1055,7 +1057,7 @@ impl Model {
         if cfg.qsa.is_some() {
             // sparse attention: every row a one-token sequence, rows x splits <= max(rows, 4 x SMs / kv heads)
             let per_split = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, 1, 1) } as usize;
-            partial_rows = partial_rows.max(t.max(opts.max_seqs).max(opts.verify_rows()).max(1024) * per_split);
+            partial_rows = partial_rows.max(t.min(SPARSE_ROWS).max(opts.max_seqs).max(opts.verify_rows()) * per_split);
         }
         let _ = proj_cols;
         // rows the head may take in one step: one per sequence, or every row of a verify
@@ -1064,12 +1066,19 @@ impl Model {
         let hcw = cfg.hc.as_ref().map(|hc| hc.count * h);
         let ple_c = cfg.ple.as_ref().and(hcw);
         let b = |n: usize| DevBuf::zeroed(n, s);
+        let proj = b(t.max(opts.max_seqs) * proj_cols * 2)?;
+        let conv = b(t * conv_ch * 2)?;
+        // PLE runs at the start of its layer, when proj and conv hold nothing live: its key lives in proj, the gate in
+        // conv, and the normed gate (written after the key's last read) in the key's memory again
+        let ple_key = ple_c.map(|c| proj.view(t * c * 2).map_or_else(|| b(t * c * 2), Ok)).transpose()?;
+        let ple_gated = ple_c.map(|c| conv.view(t * c * 2).map_or_else(|| b(t * c * 2), Ok)).transpose()?;
+        let ple_gatedn = ple_key.as_ref().and_then(|k| k.view(k.bytes()));
         Ok(Work {
             residual: b(t * h * 2)?,
             normed: b(t * h * 2)?,
             x: b(t * h * 2)?,
-            proj: b(t.max(opts.max_seqs) * proj_cols * 2)?,
-            conv: b(t * conv_ch * 2)?,
+            proj,
+            conv,
             g: b(t * vh * 4)?,
             beta: b(t * vh * 4)?,
             core: b(t * vh * vd * 2)?,
@@ -1105,10 +1114,10 @@ impl Model {
             ghnorm: hcw.map(|c| b(head_rows * c * 2)).transpose()?,
             ple_ids: cfg.ple.as_ref().map(|p| b(t * 2 * p.heads_per_ngram * 8)).transpose()?,
             ple_emb: cfg.ple.as_ref().map(|p| b(t * p.embed_dim * 2)).transpose()?,
-            ple_key: ple_c.map(|c| b(t * c * 2)).transpose()?,
+            ple_key,
             ple_value: cfg.ple.as_ref().map(|_| b(t * h * 2)).transpose()?,
-            ple_gated: ple_c.map(|c| b(t * c * 2)).transpose()?,
-            ple_gatedn: ple_c.map(|c| b(t * c * 2)).transpose()?,
+            ple_gated,
+            ple_gatedn,
             pairs: b((head_rows * 8 * 8).next_multiple_of(16))?,
             cand_vals: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
             cand_ids: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
@@ -1820,35 +1829,39 @@ impl Model {
         }
         if sparse {
             // every row attends to its selected slots: the selection table is a KV table of one-row "sequences"
+            // in groups of SPARSE_ROWS rows: the split-K partials then need room for one group only
             let (table, counts, rows) = (w.qsa_table.as_ref().unwrap(), w.qsa_counts.as_ref().unwrap(), w.qsa_rows.as_ref().unwrap());
-            let splits = (4 * self.num_sms / (t * kvh)).clamp(1, 16);
-            check(
-                unsafe {
-                    sys::blz_nvfp4_mha_decode(
-                        w.q.ptr::<u16>().cast(),
-                        (heads * hd) as i64,
-                        hd as i64,
-                        heads as c_int,
-                        view,
-                        table.ptr(),
-                        QSA_TABLE_STRIDE as i64,
-                        sys::blz_index_ptr { ptr: rows.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
-                        sys::blz_index_ptr { ptr: counts.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
-                        t as c_int,
-                        1,
-                        splits as c_int,
-                        1.0 / (hd as f32).sqrt(),
-                        w.partial_o.ptr(),
-                        w.partial_ml.ptr(),
-                        sys::BLZ_BF16,
-                        w.attn.ptr::<u16>().cast(),
-                        (heads * hd) as i64,
-                        hd as i64,
-                        s.0,
-                    )
-                },
-                "qsa mha",
-            )?;
+            for r0 in (0..t).step_by(SPARSE_ROWS) {
+                let n = (t - r0).min(SPARSE_ROWS);
+                let splits = (4 * self.num_sms / (n * kvh)).clamp(1, 16);
+                check(
+                    unsafe {
+                        sys::blz_nvfp4_mha_decode(
+                            w.q.at::<u16>(r0 * heads * hd).cast(),
+                            (heads * hd) as i64,
+                            hd as i64,
+                            heads as c_int,
+                            view,
+                            table.at::<i32>(r0 * QSA_TABLE_STRIDE),
+                            QSA_TABLE_STRIDE as i64,
+                            sys::blz_index_ptr { ptr: rows.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
+                            sys::blz_index_ptr { ptr: counts.at::<i32>(r0).cast(), kind: sys::BLZ_I32 },
+                            n as c_int,
+                            1,
+                            splits as c_int,
+                            1.0 / (hd as f32).sqrt(),
+                            w.partial_o.ptr(),
+                            w.partial_ml.ptr(),
+                            sys::BLZ_BF16,
+                            w.attn.at::<u16>(r0 * heads * hd).cast(),
+                            (heads * hd) as i64,
+                            hd as i64,
+                            s.0,
+                        )
+                    },
+                    "qsa mha",
+                )?;
+            }
             check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
             a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
             return self.prefetch_mlp(layer, t);
