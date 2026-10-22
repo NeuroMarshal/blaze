@@ -29,6 +29,15 @@ cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok, int64_t q_
                                  float scale, float* partial_o, float* partial_ml, blz_half_t dtype, void* out,
                                  int64_t out_stride_tok, int64_t out_stride_head, cudaStream_t stream);
 
+/// \brief blz_nvfp4_mha_decode with a head dim of 128 (BF16 pools only) and a sliding window: with window > 0 the
+/// query at position p attends to positions p - window + 1 .. p (an EAGLE-4 draft layer). The workspaces hold
+/// pool.dim values per (row, head, part).
+cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                  blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                                  blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len, int splits,
+                                  float scale, int window, float* partial_o, float* partial_ml, blz_half_t dtype,
+                                  void* out, int64_t out_stride_tok, int64_t out_stride_head, cudaStream_t stream);
+
 /// \brief Context parts of blz_nvfp4_mha_decode (the partial workspaces' third dimension): splits times the warps a CTA
 /// runs along the context for this query geometry; 0 for an unsupported one.
 int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits);

@@ -218,6 +218,72 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
   g_failures += !ok;
 }
 
+// Head dim 128 from a BF16 pool with a sliding window (the EAGLE-4 draft layer: MHA, window 4096) against a double
+// reference over positions max(0, p - window + 1) .. p of each query.
+void test_window(const char* what, int heads, int q_len, std::vector<int> kv_lens, int window, int splits,
+                 std::mt19937& rng) {
+  constexpr int D = 128;
+  const int batch = int(kv_lens.size()), slots = 12000;
+  const int max_len = *std::max_element(kv_lens.begin(), kv_lens.end());
+  std::normal_distribution<float> n01;
+  std::vector<__nv_bfloat16> kd(size_t(slots) * heads * D), vd(kd.size());
+  for (auto& x : kd) x = __float2bfloat16(n01(rng) * 2.0f);
+  for (auto& x : vd) x = __float2bfloat16(n01(rng));
+  const int reqs = batch + 1, stride = max_len + 8;
+  std::vector<int32_t> r2t(size_t(reqs) * stride);
+  for (auto& x : r2t) x = int32_t(rng() % slots);
+  std::vector<int32_t> req_idx(batch), lens(kv_lens.begin(), kv_lens.end());
+  for (int b = 0; b < batch; ++b) req_idx[b] = (b + 1) % reqs;
+  const int tokens = batch * q_len;
+  std::vector<__nv_bfloat16> q(size_t(tokens) * heads * D);
+  for (auto& x : q) x = __float2bfloat16(n01(rng));
+  Dev<__nv_bfloat16> dk(kd), dv(vd), dq(q), dout(q.size());
+  Dev<int32_t> d_r2t(r2t), d_req(req_idx), d_lens(lens);
+  Dev<float> g(std::vector<float>{1.0f});
+  Dev<uint8_t> dummy(16);
+  blz_nvfp4_pool pool{reinterpret_cast<uint8_t*>(dk.ptr), reinterpret_cast<uint8_t*>(dv.ptr), dummy.ptr, dummy.ptr,
+                      g.ptr, g.ptr, heads, D, BLZ_KV_BF16};
+  const int parts = blz_nvfp4_mha_parts(heads, heads, q_len, splits);
+  Dev<float> po(size_t(tokens) * heads * parts * D), pml(size_t(tokens) * heads * parts * 2);
+  const float scale = 1.0f / std::sqrt(float(D));
+  CHECK_CUDA(blz_mha_decode_window(dq.ptr, int64_t(heads) * D, D, heads, pool, d_r2t.ptr, stride, {d_req.ptr, BLZ_I32},
+                                   {d_lens.ptr, BLZ_I32}, batch, q_len, splits, scale, window, po.ptr, pml.ptr,
+                                   BLZ_BF16, dout.ptr, int64_t(heads) * D, D, nullptr));
+  CHECK_CUDA(cudaDeviceSynchronize());
+  const auto out = dout.get();
+  double worst = 0, peak = 0;
+  std::vector<double> sc;
+  for (int b = 0; b < batch; ++b)
+    for (int i = 0; i < q_len; ++i)
+      for (int h = 0; h < heads; ++h) {
+        const int p = lens[b] - q_len + i, lo = window > 0 ? std::max(0, p - window + 1) : 0;
+        const __nv_bfloat16* qr = &q[((size_t(b) * q_len + i) * heads + h) * D];
+        sc.assign(p + 1, 0.0);
+        double mx = -1e300;
+        for (int t = lo; t <= p; ++t) {
+          const size_t row = size_t(r2t[size_t(req_idx[b]) * stride + t]) * heads + h;
+          double d = 0;
+          for (int k = 0; k < D; ++k) d += double(__bfloat162float(qr[k])) * __bfloat162float(kd[row * D + k]);
+          sc[t] = d * scale, mx = std::max(mx, sc[t]);
+        }
+        double sum = 0;
+        for (int t = lo; t <= p; ++t) sum += (sc[t] = std::exp(sc[t] - mx));
+        for (int k = 0; k < D; ++k) {
+          double ref = 0;
+          for (int t = lo; t <= p; ++t)
+            ref += sc[t] * __bfloat162float(vd[(size_t(r2t[size_t(req_idx[b]) * stride + t]) * heads + h) * D + k]);
+          ref /= sum;
+          const double got = __bfloat162float(out[((size_t(b) * q_len + i) * heads + h) * D + k]);
+          worst = std::max(worst, std::fabs(got - ref)), peak = std::max(peak, std::fabs(ref));
+        }
+      }
+  const double rel = worst / std::max(peak, 1e-30);
+  const bool ok = rel < 1.5e-2;
+  std::printf("bf16 d128 %-38s window %4d splits %2d: max error / max |out| %.2e %s\n", what, window, splits, rel,
+              ok ? "ok" : "FAIL");
+  g_failures += !ok;
+}
+
 void test_dequant_rows(std::mt19937& rng) {
   const int heads = 2, slots = 1000, n = 333;
   Pool p = make_pool(slots, heads, rng);
@@ -299,6 +365,11 @@ int main() {
     test_case("decode, GQA 16, length 777", 1, 16, 1, {777}, 3, rng, f);
     test_store_dense(f, rng);
   }
+  test_window("decode, MHA 8 heads, lengths 1 / 300 / 9000", 8, 1, {1, 300, 9000}, 4096, 16, rng);
+  test_window("verify 9 tokens, lengths 9 / 5000", 8, 9, {9, 5000}, 4096, 8, rng);
+  test_window("extend 300 tokens, length 5000", 4, 300, {5000}, 4096, 1, rng);
+  test_window("verify 5 tokens, short window", 4, 5, {700}, 37, 4, rng);
+  test_window("decode, no window", 4, 1, {2000}, 0, 8, rng);
   test_dequant_rows(rng);
   for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
     bench(122000, 1, 1, 64, rng, f);
