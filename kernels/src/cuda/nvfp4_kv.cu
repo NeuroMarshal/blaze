@@ -1,0 +1,195 @@
+// NVFP4 KV cache store (plain or searched block scales) and NVFP4 row dequantization.
+//
+// One thread owns 8 consecutive elements (one 16-byte load), so a 16-element scale block is a lane pair;
+// amax and the candidates' squared errors are combined with one shuffle each. With four over six every block
+// is quantized with its maximum mapped to 6 and to 4 (Cook et al., arXiv 2512.02010) and with the E4M3 scales a few
+// steps around max/6 (kScaleSearchFirst..kScaleSearchLast), and the candidate with the lowest squared error is
+// stored; the storage format does not change, so every NVFP4 reader works unchanged. Division is IEEE (the target
+// is built without fast math), so the output matches nvfp4_quantize_row_ref in blaze/nvfp4.h bit for bit, except
+// where two candidates' errors tie to the last ulp.
+
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
+#include "blaze/kv.h"
+#include "blaze/nvfp4.h"
+
+namespace blaze {
+namespace {
+
+constexpr int kPerThread = 8;
+
+__device__ __forceinline__ uint8_t e4m3_bits(float v) {
+  const __nv_fp8_e4m3 q(fminf(v, kE4m3Max));  // cvt.rn.satfinite.e4m3x2.f32
+  return reinterpret_cast<const uint8_t&>(q);
+}
+
+struct Candidate {
+  float err;       // squared error over this thread's 8 elements
+  uint32_t codes;  // element i in bits [4i, 4i + 4): byte j = elements 2j (low) and 2j+1 (high)
+  uint8_t scale;   // E4M3 bits
+};
+
+__device__ __forceinline__ Candidate quantize8(const float (&x)[kPerThread], uint8_t scale, float g) {
+  Candidate c;
+  c.scale = scale;
+  const float t = e4m3_to_float(scale) * g;
+  const float inv = t > 0.0f ? 1.0f / t : 0.0f;
+  c.err = 0.0f;
+  c.codes = 0;
+#pragma unroll
+  for (int i = 0; i < kPerThread; ++i) {
+    const float v = x[i] * inv;
+    const int idx = e2m1_index(fabsf(v));
+    const float lvl = e2m1_level(idx);
+    const float d = (v < 0.0f ? -lvl : lvl) * t - x[i];
+    c.err += d * d;
+    c.codes |= uint32_t(idx | (v < 0.0f ? 8 : 0)) << (4 * i);
+  }
+  return c;
+}
+
+template <typename T>
+__device__ __forceinline__ void load8(const T* p, float (&x)[kPerThread]) {
+  const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
+  const T* e = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+  for (int i = 0; i < kPerThread; ++i) x[i] = static_cast<float>(e[i]);
+}
+
+template <typename T, typename IdxT, bool kScaleSearch>
+__global__ void __launch_bounds__(512) kv_store_kernel(
+    const T* __restrict__ k, const T* __restrict__ v, int64_t k_stride, int64_t v_stride,
+    const IdxT* __restrict__ loc, uint8_t* __restrict__ k_data, uint8_t* __restrict__ v_data,
+    uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_scale, const float* __restrict__ k_g,
+    const float* __restrict__ v_g, int heads, int dim) {
+  const int64_t token = blockIdx.x;
+  const int64_t slot = static_cast<int64_t>(loc[token]);
+  const int per_side = heads * dim / kPerThread;  // threads for K, then the same number for V
+  const int tid = blockIdx.y * blockDim.x + threadIdx.x;
+  // Idle lanes still reach every shuffle (with zeros) and only skip the stores.
+  const bool active = tid < 2 * per_side && slot >= 0;
+  const bool is_v = tid >= per_side;
+  const int e = (is_v ? tid - per_side : tid) * kPerThread;  // element offset in [heads, dim]
+
+  float x[kPerThread] = {};
+  if (active) load8((is_v ? v + token * v_stride : k + token * k_stride) + e, x);
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kPerThread; ++i) amax = fmaxf(amax, fabsf(x[i]));
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  const float g = active ? __ldg(is_v ? v_g : k_g) : 1.0f;
+
+  const int lo = e4m3_bits(amax / (6.0f * g));
+  Candidate c = quantize8(x, uint8_t(lo), g);
+  if constexpr (kScaleSearch) {
+    // Both lanes of a block add the same two partial sums, so they pick the same candidate. Every lane reaches every
+    // shuffle; an out-of-range code is evaluated as max/6 and discarded.
+    float best = c.err + __shfl_xor_sync(0xffffffffu, c.err, 1);
+    auto consider = [&](int code) {
+      const bool valid = code >= 0 && code <= 0x7E;
+      const Candidate t = quantize8(x, uint8_t(valid ? code : lo), g);
+      const float err = t.err + __shfl_xor_sync(0xffffffffu, t.err, 1);
+      if (valid && err < best) {
+        best = err;
+        c = t;
+      }
+    };
+    consider(e4m3_bits(amax / (4.0f * g)));
+#pragma unroll
+    for (int s = kScaleSearchFirst; s <= kScaleSearchLast; ++s) {
+      if (s != 0) consider(lo + s);
+    }
+  }
+  if (!active) return;
+
+  const int head = e / dim;
+  const int d = e - head * dim;
+  const int64_t row = slot * heads + head;
+  *reinterpret_cast<uint32_t*>((is_v ? v_data : k_data) + row * (dim / 2) + d / 2) = c.codes;
+  if ((d & (kNvfp4Block - 1)) == 0) (is_v ? v_scale : k_scale)[row * (dim / kNvfp4Block) + d / kNvfp4Block] = c.scale;
+}
+
+template <typename T>
+__global__ void dequant_kernel(const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
+                               const float* __restrict__ g_ptr, T* __restrict__ out, int64_t groups) {
+  const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;  // one thread per 8 values
+  if (i >= groups) return;
+  const int64_t e = i * kPerThread;
+  const uint32_t codes = __ldg(reinterpret_cast<const uint32_t*>(data + e / 2));
+  const float s = e4m3_to_float(__ldg(scale + e / kNvfp4Block)) * __ldg(g_ptr);
+  alignas(16) T vals[kPerThread];
+#pragma unroll
+  for (int j = 0; j < kPerThread; ++j) vals[j] = static_cast<T>(e2m1_value((codes >> (4 * j)) & 15) * s);
+  *reinterpret_cast<uint4*>(out + e) = *reinterpret_cast<const uint4*>(vals);
+}
+
+template <typename T, typename IdxT>
+cudaError_t launch_store(const void* k, const void* v, int64_t k_stride, int64_t v_stride, const void* loc,
+                         int64_t tokens, int heads, int dim, uint8_t* k_data, uint8_t* v_data, uint8_t* k_scale,
+                         uint8_t* v_scale, const float* k_g, const float* v_g, bool four_over_six,
+                         cudaStream_t stream) {
+  const int needed = 2 * heads * dim / kPerThread;
+  const int block = needed < 512 ? (needed + 31) / 32 * 32 : 512;
+  const dim3 grid(static_cast<unsigned>(tokens), (needed + block - 1) / block);
+  auto args = [&](auto kernel) {
+    kernel<<<grid, block, 0, stream>>>(static_cast<const T*>(k), static_cast<const T*>(v), k_stride, v_stride,
+                                       static_cast<const IdxT*>(loc), k_data, v_data, k_scale, v_scale, k_g, v_g,
+                                       heads, dim);
+  };
+  if (four_over_six) {
+    args(kv_store_kernel<T, IdxT, true>);
+  } else {
+    args(kv_store_kernel<T, IdxT, false>);
+  }
+  return cudaGetLastError();
+}
+
+template <typename T>
+cudaError_t store_for_index(blz_index_t loc_type, const void* k, const void* v, int64_t k_stride,
+                            int64_t v_stride, const void* loc, int64_t tokens, int heads, int dim, uint8_t* k_data,
+                            uint8_t* v_data, uint8_t* k_scale, uint8_t* v_scale, const float* k_g, const float* v_g,
+                            bool four_over_six, cudaStream_t stream) {
+  if (loc_type == BLZ_I64) {
+    return launch_store<T, int64_t>(k, v, k_stride, v_stride, loc, tokens, heads, dim, k_data, v_data, k_scale,
+                                    v_scale, k_g, v_g, four_over_six, stream);
+  }
+  return launch_store<T, int32_t>(k, v, k_stride, v_stride, loc, tokens, heads, dim, k_data, v_data, k_scale,
+                                  v_scale, k_g, v_g, four_over_six, stream);
+}
+
+}  // namespace
+}  // namespace blaze
+
+extern "C" cudaError_t blz_nvfp4_kv_store(const void* k, const void* v, int64_t k_stride, int64_t v_stride,
+                                          blz_half_t dtype, const void* loc, blz_index_t loc_type, int64_t tokens,
+                                          int heads, int dim, uint8_t* k_data, uint8_t* v_data, uint8_t* k_scale,
+                                          uint8_t* v_scale, const float* k_g, const float* v_g, int four_over_six,
+                                          cudaStream_t stream) {
+  if (dim % blaze::kNvfp4Block != 0 || k_stride % 8 != 0 || v_stride % 8 != 0 || heads <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (tokens == 0) return cudaSuccess;
+  if (dtype == BLZ_BF16) {
+    return blaze::store_for_index<__nv_bfloat16>(loc_type, k, v, k_stride, v_stride, loc, tokens, heads, dim, k_data,
+                                               v_data, k_scale, v_scale, k_g, v_g, four_over_six != 0, stream);
+  }
+  return blaze::store_for_index<__half>(loc_type, k, v, k_stride, v_stride, loc, tokens, heads, dim, k_data, v_data,
+                                      k_scale, v_scale, k_g, v_g, four_over_six != 0, stream);
+}
+
+extern "C" cudaError_t blz_nvfp4_dequant(const uint8_t* data, const uint8_t* scale, const float* g, int64_t rows,
+                                         int dim, blz_half_t out_dtype, void* out, cudaStream_t stream) {
+  if (dim % blaze::kNvfp4Block != 0) return cudaErrorInvalidValue;
+  const int64_t groups = rows * dim / blaze::kPerThread;
+  if (groups == 0) return cudaSuccess;
+  const int block = 256;
+  const auto grid = static_cast<unsigned>((groups + block - 1) / block);
+  if (out_dtype == BLZ_BF16) {
+    blaze::dequant_kernel<<<grid, block, 0, stream>>>(data, scale, g, static_cast<__nv_bfloat16*>(out), groups);
+  } else {
+    blaze::dequant_kernel<<<grid, block, 0, stream>>>(data, scale, g, static_cast<__half*>(out), groups);
+  }
+  return cudaGetLastError();
+}

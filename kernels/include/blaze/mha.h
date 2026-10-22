@@ -1,0 +1,42 @@
+// C API of dense attention straight from an NVFP4 KV pool (full-attention layers of Qwen3.5/3.6/3.8 dense models,
+// --kv-cache-dtype nvfp4_4over6): decode and speculative verify read the 4-bit codes directly, flash-decode style
+// (the context split over blocks, partial results merged by log-sum-exp); prefill dequantizes the prefix rows into a
+// 16-bit workspace for the extend kernel. Raw device pointers, caller's stream; no torch dependency.
+#pragma once
+
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+#include "blaze/qsa.h"  // blz_nvfp4_pool, blz_index_ptr
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/// \brief Attention of q_len query tokens per request (decode: 1; verify: the draft tokens, causal among themselves)
+/// over positions [0, kv_len) of the request, all of them already in the pool.
+/// \param q            [batch * q_len, q_heads, 256] 16-bit, query token i of request b at row b * q_len + i
+/// \param pool         K/V codes and scales; head dim 256, q_heads / pool.heads <= 16
+/// \param req_to_token [requests, req_stride] pool slot of every position
+/// \param kv_lens      [batch] positions per request, the q_len query tokens included (the last q_len)
+/// \param splits       CTAs per (request, kv head, query group) along the context; 1 .. 64
+/// \param partial_o    float32 [batch * q_len, q_heads, parts, 256] workspace, parts = blz_nvfp4_mha_parts(...)
+/// \param partial_ml   float32 [batch * q_len, q_heads, parts, 2] workspace (running max in log2 units, sum)
+/// \param out          [batch * q_len, q_heads, 256] with the given strides (elements)
+cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                 blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                                 blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len, int splits,
+                                 float scale, float* partial_o, float* partial_ml, blz_half_t dtype, void* out,
+                                 int64_t out_stride_tok, int64_t out_stride_head, cudaStream_t stream);
+
+/// \brief Context parts of blz_nvfp4_mha_decode (the partial workspaces' third dimension): splits times the warps a CTA
+/// runs along the context for this query geometry; 0 for an unsupported one.
+int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits);
+
+/// \brief Dequantize the pool rows of n slots (all heads) into [n, heads, dim] 16-bit K and V.
+cudaError_t blz_nvfp4_dequant_rows(blz_nvfp4_pool pool, blz_index_ptr slots, int64_t n, blz_half_t dtype,
+                                   void* out_k, void* out_v, cudaStream_t stream);
+
+#ifdef __cplusplus
+}
+#endif
