@@ -207,7 +207,7 @@ template <int F, int D, int MT, int KW>
 __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t sq_tok, int64_t sq_head, int group, int tokens_per_tile, int tiles,
     int q_heads, blz_nvfp4_pool pool, const int32_t* __restrict__ req_to_token, int64_t req_stride,
-    blz_index_ptr req_indices, blz_index_ptr kv_lens, int q_len, int splits, float scale, int window,
+    blz_index_ptr req_indices, blz_index_ptr kv_lens, int q_len, int splits, float scale, int window, int causal,
     float* __restrict__ part_o, float* __restrict__ part_ml) {
   static_assert(D == 256 || (D == 128 && F == BLZ_KV_BF16), "head dim 128 only from BF16 pools");
   constexpr int kRows = 16 * MT;
@@ -227,13 +227,15 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const int r = 16 * mt + gr + 8 * h;
     lim[h] = r < valid_rows ? kv_len - q_len + qi0 + r / group : -1;
   }
-  const int64_t vis_end = kv_len - q_len + qi0 + nq;  // one past the last position any row of the CTA sees
+  // one past the last position any row of the CTA sees (non-causal: the whole sequence, the query block included)
+  const int64_t vis_end = causal ? kv_len - q_len + qi0 + nq : kv_len;
   // the first position any row of the CTA sees (its first query token's window)
   const int64_t vis_begin = window > 0 ? max(int64_t(0), kv_len - q_len + qi0 - window + 1) : 0;
   const int64_t span = ((vis_end - vis_begin + splits - 1) / splits + kChunk * KW - 1) / (kChunk * KW) * (kChunk * KW);
   const int64_t t0 = vis_begin + int64_t(s) * span, t1 = min(t0 + span, vis_end);
   // One past the last position each of this thread's rows sees in the part, and the first one (window).
-  const int64_t row_end[2] = {min(t1, lim[0] + 1), min(t1, lim[1] + 1)};
+  const int64_t row_end[2] = {causal ? min(t1, lim[0] + 1) : (lim[0] >= 0 ? t1 : 0),
+                              causal ? min(t1, lim[1] + 1) : (lim[1] >= 0 ? t1 : 0)};
   const int64_t row_begin[2] = {window > 0 ? lim[0] - window + 1 : 0, window > 0 ? lim[1] - window + 1 : 0};
   const float qscale = scale * kLog2e * __ldg(pool.k_g), vg = __ldg(pool.v_g);
 
@@ -518,7 +520,7 @@ extern "C" int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int spl
 extern "C" cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
                                              blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
                                              blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len,
-                                             int splits, float scale, int window, float* partial_o,
+                                             int splits, float scale, int window, int causal, float* partial_o,
                                              float* partial_ml, blz_half_t dtype, void* out, int64_t out_stride_tok,
                                              int64_t out_stride_head, cudaStream_t stream) {
   const bool dim_ok = pool.dim == 256 || (pool.dim == 128 && pool.format == BLZ_KV_BF16);
@@ -538,7 +540,7 @@ extern "C" cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok
   auto launch = [&](auto kernel, int warps) {
     kernel<<<grid, 32 * warps, smem, stream>>>(
         static_cast<const __nv_bfloat16*>(q), q_stride_tok, q_stride_head, group, per_tile, tiles, q_heads, pool,
-        req_to_token, req_stride, req_indices, kv_lens, q_len, splits, scale, window, partial_o, partial_ml);
+        req_to_token, req_stride, req_indices, kv_lens, q_len, splits, scale, window, causal, partial_o, partial_ml);
   };
   auto by_tiles = [&](auto fmt, auto dim) {
     constexpr int F = decltype(fmt)::value, Dc = decltype(dim)::value;
@@ -579,7 +581,7 @@ extern "C" cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok,
                                             blz_half_t dtype, void* out, int64_t out_stride_tok,
                                             int64_t out_stride_head, cudaStream_t stream) {
   return blz_mha_decode_window(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride, req_indices,
-                               kv_lens, batch, q_len, splits, scale, 0, partial_o, partial_ml, dtype, out,
+                               kv_lens, batch, q_len, splits, scale, 0, 1, partial_o, partial_ml, dtype, out,
                                out_stride_tok, out_stride_head, stream);
 }
 

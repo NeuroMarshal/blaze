@@ -221,7 +221,7 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
 // Head dim 128 from a BF16 pool with a sliding window (the EAGLE-4 draft layer: MHA, window 4096) against a double
 // reference over positions max(0, p - window + 1) .. p of each query.
 void test_window(const char* what, int heads, int q_len, std::vector<int> kv_lens, int window, int splits,
-                 std::mt19937& rng) {
+                 std::mt19937& rng, int causal = 1) {
   constexpr int D = 128;
   const int batch = int(kv_lens.size()), slots = 12000;
   const int max_len = *std::max_element(kv_lens.begin(), kv_lens.end());
@@ -247,7 +247,7 @@ void test_window(const char* what, int heads, int q_len, std::vector<int> kv_len
   Dev<float> po(size_t(tokens) * heads * parts * D), pml(size_t(tokens) * heads * parts * 2);
   const float scale = 1.0f / std::sqrt(float(D));
   CHECK_CUDA(blz_mha_decode_window(dq.ptr, int64_t(heads) * D, D, heads, pool, d_r2t.ptr, stride, {d_req.ptr, BLZ_I32},
-                                   {d_lens.ptr, BLZ_I32}, batch, q_len, splits, scale, window, po.ptr, pml.ptr,
+                                   {d_lens.ptr, BLZ_I32}, batch, q_len, splits, scale, window, causal, po.ptr, pml.ptr,
                                    BLZ_BF16, dout.ptr, int64_t(heads) * D, D, nullptr));
   CHECK_CUDA(cudaDeviceSynchronize());
   const auto out = dout.get();
@@ -257,20 +257,21 @@ void test_window(const char* what, int heads, int q_len, std::vector<int> kv_len
     for (int i = 0; i < q_len; ++i)
       for (int h = 0; h < heads; ++h) {
         const int p = lens[b] - q_len + i, lo = window > 0 ? std::max(0, p - window + 1) : 0;
+        const int hi = causal ? p : lens[b] - 1;  // non-causal: the whole query block
         const __nv_bfloat16* qr = &q[((size_t(b) * q_len + i) * heads + h) * D];
-        sc.assign(p + 1, 0.0);
+        sc.assign(hi + 1, 0.0);
         double mx = -1e300;
-        for (int t = lo; t <= p; ++t) {
+        for (int t = lo; t <= hi; ++t) {
           const size_t row = size_t(r2t[size_t(req_idx[b]) * stride + t]) * heads + h;
           double d = 0;
           for (int k = 0; k < D; ++k) d += double(__bfloat162float(qr[k])) * __bfloat162float(kd[row * D + k]);
           sc[t] = d * scale, mx = std::max(mx, sc[t]);
         }
         double sum = 0;
-        for (int t = lo; t <= p; ++t) sum += (sc[t] = std::exp(sc[t] - mx));
+        for (int t = lo; t <= hi; ++t) sum += (sc[t] = std::exp(sc[t] - mx));
         for (int k = 0; k < D; ++k) {
           double ref = 0;
-          for (int t = lo; t <= p; ++t)
+          for (int t = lo; t <= hi; ++t)
             ref += sc[t] * __bfloat162float(vd[(size_t(r2t[size_t(req_idx[b]) * stride + t]) * heads + h) * D + k]);
           ref /= sum;
           const double got = __bfloat162float(out[((size_t(b) * q_len + i) * heads + h) * D + k]);
@@ -279,7 +280,8 @@ void test_window(const char* what, int heads, int q_len, std::vector<int> kv_len
       }
   const double rel = worst / std::max(peak, 1e-30);
   const bool ok = rel < 1.5e-2;
-  std::printf("bf16 d128 %-38s window %4d splits %2d: max error / max |out| %.2e %s\n", what, window, splits, rel,
+  std::printf("bf16 d128 %-38s window %4d %s splits %2d: max error / max |out| %.2e %s\n", what, window,
+              causal ? "causal" : "block ", splits, rel,
               ok ? "ok" : "FAIL");
   g_failures += !ok;
 }
@@ -370,6 +372,8 @@ int main() {
   test_window("extend 300 tokens, length 5000", 4, 300, {5000}, 4096, 1, rng);
   test_window("verify 5 tokens, short window", 4, 5, {700}, 37, 4, rng);
   test_window("decode, no window", 4, 1, {2000}, 0, 8, rng);
+  test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
+  test_window("DFlash block 8, short window", 2, 8, {500}, 37, 2, rng, 0);
   test_dequant_rows(rng);
   for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
     bench(122000, 1, 1, 64, rng, f);

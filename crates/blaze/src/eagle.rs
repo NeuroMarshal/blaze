@@ -643,6 +643,7 @@ impl Draft {
                         splits as c_int,
                         1.0 / (hd as f32).sqrt(),
                         c.window as c_int,
+                        1,
                         self.partial_o.ptr(),
                         self.partial_ml.ptr(),
                         sys::BLZ_BF16,
