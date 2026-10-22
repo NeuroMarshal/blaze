@@ -308,6 +308,7 @@ fn worker_main(
     dir: PathBuf,
     opts: Options,
     embed: Arc<HostMapped>,
+    draft_head: Option<Arc<HostMapped>>,
     use_graphs: bool,
     barrier: Arc<Barrier>,
     rx: Receiver<Cmd>,
@@ -339,10 +340,12 @@ fn worker_main(
         let draft_dir = opts.draft.clone();
         let model = Model::load(&dir, opts, Tp { rank, world, ar, ar_bytes }, embed)?;
         let staging = HostMapped::new(model.meta.bytes)?;
-        let draft = match (rank, draft_dir) {
-            (0, Some(d)) => {
-                let dr = crate::eagle::Draft::load(&d, &model, model.opts.max_seqs, model.ctx_stride())?;
-                eprintln!("blaze: {}", dr.describe());
+        let draft = match (draft_dir, draft_head) {
+            (Some(d), Some(head)) => {
+                let dr = crate::eagle::Draft::load(&d, &model, model.opts.max_seqs, model.ctx_stride(), head)?;
+                if rank == 0 {
+                    eprintln!("blaze: {}", dr.describe());
+                }
                 Some(dr)
             }
             _ => None,
@@ -391,15 +394,17 @@ impl Engine {
             opts.capture_layers = crate::eagle::DraftConfig::load(d)?.capture_layers();
         }
         let embed = Arc::new(Model::load_embedding(dir)?);
+        let draft_head = opts.draft.as_deref().map(crate::eagle::load_lm_head).transpose()?.map(Arc::new);
         let barrier = Arc::new(Barrier::new(world));
         let mut workers = Vec::with_capacity(world);
         for rank in 0..world {
             let (ctx, crx) = channel();
             let (rtx, rrx) = channel();
             let (dir, opts, embed, barrier) = (dir.to_path_buf(), opts.clone(), embed.clone(), barrier.clone());
+            let draft_head = draft_head.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("blaze-rank{rank}"))
-                .spawn(move || worker_main(rank, world, dir, opts, embed, use_graphs, barrier, crx, rtx))?;
+                .spawn(move || worker_main(rank, world, dir, opts, embed, draft_head, use_graphs, barrier, crx, rtx))?;
             workers.push(Worker { tx: ctx, rx: rrx, handle: Some(handle) });
         }
         let mut info = None;
@@ -743,13 +748,13 @@ impl Engine {
         self.commit_many(&mut [seq], &[accepted])
     }
 
-    /// EAGLE-4: extend the drafter over rows of the last step and draft `plan.k` tokens after each item (rank 0).
+    /// EAGLE-4: extend the drafter over rows of the last step and draft `plan.k` tokens after each item (every rank
+    /// runs its share; rank 0's tokens).
     pub fn draft(&self, plan: crate::eagle::DraftPlan) -> Result<Vec<Vec<i64>>> {
-        self.workers[0].tx.send(Cmd::Draft(Arc::new(plan))).map_err(|_| anyhow!("rank exited"))?;
-        match self.workers[0].rx.recv().map_err(|_| anyhow!("rank exited"))? {
-            Ok(Reply::Drafts(d)) => Ok(d),
-            Ok(_) => unreachable!(),
-            Err(e) => Err(e),
+        let plan = Arc::new(plan);
+        match self.broadcast(|| Cmd::Draft(plan.clone()))? {
+            Reply::Drafts(d) => Ok(d),
+            _ => unreachable!(),
         }
     }
 

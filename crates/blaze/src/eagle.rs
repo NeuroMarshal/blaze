@@ -1,15 +1,8 @@
-//! EAGLE-4 drafter (eagle-hq/EAGLE-4, checkpoint class LlamaForCausalLMEagle4), on the GPU of rank 0 next to the
-//! target. One Llama layer whose attention reads concat(norm(embed(next token)), norm(hidden)): the hidden is the
-//! target's hidden states after three layers (each normed, through `fc`) for positions the target computed, the
-//! draft's own normed output for positions it drafts. Sliding-window attention (BF16 KV in a ring of `window`
-//! positions per sequence row), a low-rank candidate head (rank-r scores, top C) re-scored with the full LM head at the
-//! candidates' rows only (the head stays in pinned host memory).
-//!
-//! A position p of the draft takes the target's features of p and the token at p + 1 and predicts the token at p + 2.
-//! After every target step the draft is extended over the step's kept rows (`DraftItem`), which also yields the first
-//! draft token; then it runs alone for the rest of the chain, on the GPU without host round trips.
+//! EAGLE-4 drafter (eagle-hq/EAGLE-4): target features at p and token p + 1 predict token p + 2.
+//! The draft uses a BF16 KV ring; tensor-parallel ranks share the candidate selection.
 
 use crate::gpu::{DevBuf, HostMapped, check};
+use std::sync::Arc;
 use crate::linear::{Cut, Linear};
 use crate::model::Model;
 use crate::quant::QuantConfig;
@@ -136,7 +129,12 @@ pub struct Draft {
     down: Linear,
     lr_down: Linear,
     lr_head: Linear,
-    lm_head: HostMapped,
+    lm_head: Arc<HostMapped>,
+    /// this rank's heads, KV heads and MLP rows
+    heads: usize,
+    kv_heads: usize,
+    inter: usize,
+    ar: *mut sys::blz_host_ar,
     inv_freq: DevBuf,
     one: DevBuf,
     k_pool: DevBuf,
@@ -174,10 +172,25 @@ pub struct Draft {
     meta: DevBuf,
 }
 
+// The all-reduce handle is used only by the rank's own thread.
+unsafe impl Send for Draft {}
+
+/// The drafter's LM head as a pinned host table (shared by every rank; only the candidates' rows are read).
+pub fn load_lm_head(dir: &Path) -> Result<HostMapped> {
+    let ckpt = Checkpoint::open(dir)?;
+    let lm = ckpt.info("lm_head.weight")?.clone();
+    if lm.dtype != Dtype::Bf16 {
+        bail!("draft lm_head: bf16 expected");
+    }
+    let mut t = HostMapped::new(lm.bytes())?;
+    t.host_slice_mut().copy_from_slice(ckpt.bytes("lm_head.weight")?);
+    Ok(t)
+}
+
 impl Draft {
-    /// Load the drafter of `dir` on the current GPU (that of `model`), for `max_items` sequence rows and contexts of
-    /// `stride` positions.
-    pub fn load(dir: &Path, model: &Model, max_items: usize, stride: usize) -> Result<Self> {
+    /// Load this rank's part of the drafter of `dir` on the current GPU (that of `model`), for `max_items` sequence
+    /// rows and contexts of `stride` positions.
+    pub fn load(dir: &Path, model: &Model, max_items: usize, stride: usize, lm_head: Arc<HostMapped>) -> Result<Self> {
         let cfg = DraftConfig::load(dir)?;
         let s = &model.stream;
         let ckpt = Checkpoint::open(dir)?;
@@ -198,36 +211,48 @@ impl Draft {
             b.upload(ckpt.bytes(name)?)?;
             Ok(b)
         };
-        let lin = |names: &[&str]| Linear::load(&ckpt, &quant, &names.iter().map(|n| (n.to_string(), Cut::All)).collect::<Vec<_>>(), s);
+        let lin = |mods: &[(&str, Cut)]| Linear::load(&ckpt, &quant, &mods.iter().map(|(n, c)| (n.to_string(), c.clone())).collect::<Vec<_>>(), s);
         let fc_norm = if cfg.fc_norm { (0..3).map(|i| vec(&format!("fc_norm.{i}.weight"))).collect::<Result<_>>()? } else { Vec::new() };
-        let lm = ckpt.info("lm_head.weight")?.clone();
-        let mut lm_head = HostMapped::new(lm.bytes())?;
-        lm_head.host_slice_mut().copy_from_slice(ckpt.bytes("lm_head.weight")?);
+        let (r, world) = (model.tp.rank, model.tp.world);
+        if cfg.heads % world != 0 || cfg.kv_heads % world != 0 || cfg.inter % world != 0 {
+            bail!("draft: heads / KV heads / MLP rows do not split {world} ways");
+        }
+        let (heads, kv_heads, inter) = (cfg.heads / world, cfg.kv_heads / world, cfg.inter / world);
+        let part = |n: usize| Cut::Rows(vec![r * n..(r + 1) * n]);
+        let (qr, kr) = (heads * hd, kv_heads * hd);
         let freqs: Vec<f32> = (0..hd / 2).map(|i| cfg.theta.powf(-2.0 * i as f64 / hd as f64) as f32).collect();
         // ring slot of position p of row r: r * window + p % window
         let w = cfg.window;
         let table: Vec<i32> = (0..max_items).flat_map(|r| (0..stride).map(move |p| (r * w + p % w) as i32)).collect();
-        let kv_row = cfg.kv_heads * hd * 2;
+        let kv_row = kv_heads * hd * 2;
         let b = |n: usize| DevBuf::zeroed(n, s);
-        let (qd, kvd) = (cfg.heads * hd, cfg.kv_heads * hd);
-        let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(cfg.heads as c_int, cfg.kv_heads as c_int, 1, 64) } as usize;
-        let partial_rows = (ROWS * cfg.heads).max(max_items * cfg.heads * parts_decode);
+        let (qd, kvd) = (heads * hd, kv_heads * hd);
+        let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, 1, 64) } as usize;
+        let partial_rows = (ROWS * heads).max(max_items * heads * parts_decode);
         let meta_bytes = (MAX_CHAIN + 8) * (3 * 8 * ROWS + 2 * 4 * max_items.max(1) + 256) + 4096;
         let c = cfg.candidates;
         Ok(Self {
-            fc: lin(&["fc"])?,
+            fc: lin(&[("fc", Cut::All)])?,
             fc_norm,
             input_ln: vec("layers.0.input_layernorm.weight")?,
             hidden_ln: vec("layers.0.hidden_norm.weight")?,
             post_ln: vec("layers.0.post_attention_layernorm.weight")?,
             norm: vec("norm.weight")?,
-            qkv: lin(&["layers.0.self_attn.q_proj", "layers.0.self_attn.k_proj", "layers.0.self_attn.v_proj"])?,
-            o: lin(&["layers.0.self_attn.o_proj"])?,
-            gu: lin(&["layers.0.mlp.gate_proj", "layers.0.mlp.up_proj"])?,
-            down: lin(&["layers.0.mlp.down_proj"])?,
-            lr_down: lin(&["efficient_lm_head_down_proj"])?,
-            lr_head: lin(&["efficient_lm_head"])?,
+            qkv: lin(&[
+                ("layers.0.self_attn.q_proj", part(qr)),
+                ("layers.0.self_attn.k_proj", part(kr)),
+                ("layers.0.self_attn.v_proj", part(kr)),
+            ])?,
+            o: lin(&[("layers.0.self_attn.o_proj", Cut::Cols(r * qr..(r + 1) * qr))])?,
+            gu: lin(&[("layers.0.mlp.gate_proj", part(inter)), ("layers.0.mlp.up_proj", part(inter))])?,
+            down: lin(&[("layers.0.mlp.down_proj", Cut::Cols(r * inter..(r + 1) * inter))])?,
+            lr_down: lin(&[("efficient_lm_head_down_proj", Cut::All)])?,
+            lr_head: lin(&[("efficient_lm_head", Cut::All)])?,
             lm_head,
+            heads,
+            kv_heads,
+            inter,
+            ar: if world > 1 { model.tp.ar } else { std::ptr::null_mut() },
             inv_freq: DevBuf::from_slice(&freqs)?,
             one: DevBuf::from_slice(&[1.0f32])?,
             k_pool: b(max_items * w * kv_row)?,
@@ -244,8 +269,8 @@ impl Draft {
             attn: b(ROWS * qd * 2)?,
             o_out: b(ROWS * h * 2)?,
             x2: b(ROWS * h * 2)?,
-            gu_out: b(ROWS * 2 * cfg.inter * 2)?,
-            act: b(ROWS * cfg.inter * 2)?,
+            gu_out: b(ROWS * 2 * inter * 2)?,
+            act: b(ROWS * inter * 2)?,
             mlp: b(ROWS * h * 2)?,
             normed: b(ROWS * h * 2)?,
             partial_o: b(partial_rows * hd * 4)?,
@@ -456,7 +481,8 @@ impl Draft {
     fn layer(&self, model: &Model, fwd: &Fwd, tok: *const i64) -> Result<()> {
         let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
         let (h, hd) = (c.hidden, c.head_dim);
-        let (qd, kvd) = (c.heads * hd, c.kv_heads * hd);
+        let (heads, kv_heads, inter) = (self.heads, self.kv_heads, self.inter);
+        let (qd, kvd) = (heads * hd, kv_heads * hd);
         let ldq = qd + 2 * kvd;
         let n: usize = fwd.spans.iter().map(|s| s.1).sum();
         let pos: *const i64 = self.meta.at::<u8>(fwd.pos).cast();
@@ -486,11 +512,11 @@ impl Draft {
         let q: *mut u16 = self.qkv_out.ptr();
         let k: *mut u16 = self.qkv_out.at(qd);
         let v: *const u16 = self.qkv_out.at(qd + kvd);
-        check(unsafe { sys::blz_rope_neox(q, ldq as i64, n as c_int, c.heads as c_int, hd as c_int, pos, self.inv_freq.ptr(), s.0) }, "draft rope q")?;
-        check(unsafe { sys::blz_rope_neox(k, ldq as i64, n as c_int, c.kv_heads as c_int, hd as c_int, pos, self.inv_freq.ptr(), s.0) }, "draft rope k")?;
+        check(unsafe { sys::blz_rope_neox(q, ldq as i64, n as c_int, heads as c_int, hd as c_int, pos, self.inv_freq.ptr(), s.0) }, "draft rope q")?;
+        check(unsafe { sys::blz_rope_neox(k, ldq as i64, n as c_int, kv_heads as c_int, hd as c_int, pos, self.inv_freq.ptr(), s.0) }, "draft rope k")?;
         check(
             unsafe {
-                sys::blz_kv_store_dense(k.cast(), v.cast(), ldq as i64, ldq as i64, loc.cast(), sys::BLZ_I64, n as i64, c.kv_heads as c_int,
+                sys::blz_kv_store_dense(k.cast(), v.cast(), ldq as i64, ldq as i64, loc.cast(), sys::BLZ_I64, n as i64, kv_heads as c_int,
                                         hd as c_int, sys::BLZ_KV_BF16, self.k_pool.ptr(), self.v_pool.ptr(), self.one.ptr(), self.one.ptr(), s.0)
             },
             "draft kv store",
@@ -502,7 +528,7 @@ impl Draft {
             v_scale: self.no_scales.ptr(),
             k_g: self.one.ptr(),
             v_g: self.one.ptr(),
-            heads: c.kv_heads as c_int,
+            heads: kv_heads as c_int,
             dim: hd as c_int,
             format: sys::BLZ_KV_BF16,
         };
@@ -518,14 +544,14 @@ impl Draft {
             row += sp.1;
         }
         for (first, count, q_len, r0) in calls {
-            let splits = if q_len == 1 { (4 * model.sms() / (count * c.kv_heads)).clamp(1, 64) } else { 1 };
+            let splits = if q_len == 1 { (4 * model.sms() / (count * kv_heads)).clamp(1, 64) } else { 1 };
             check(
                 unsafe {
                     sys::blz_mha_decode_window(
                         self.qkv_out.at::<u16>(r0 * ldq).cast(),
                         ldq as i64,
                         hd as i64,
-                        c.heads as c_int,
+                        heads as c_int,
                         pool,
                         self.r2t.ptr(),
                         self.stride as i64,
@@ -549,25 +575,29 @@ impl Draft {
             )?;
         }
         self.o.run(lin, self.attn.ptr(), qd, n, self.o_out.ptr(), h, s)?;
-        // residual: hin += attention; x2 = norm(hin)
-        check(
-            unsafe { sys::blz_rmsnorm(self.o_out.ptr(), self.hin.ptr(), self.post_ln.ptr(), c.eps, n as c_int, h as c_int, 0, self.x2.ptr(), s.0) },
-            "draft post norm",
-        )?;
-        self.gu.run(lin, self.x2.ptr(), h, n, self.gu_out.ptr(), 2 * c.inter, s)?;
+        // residual: hin += attention (summed over the ranks); x2 = norm(hin)
+        self.add_norm(self.o_out.ptr(), self.post_ln.ptr(), self.x2.ptr(), n, s)?;
+        self.gu.run(lin, self.x2.ptr(), h, n, self.gu_out.ptr(), 2 * inter, s)?;
         check(
             unsafe {
-                sys::blz_silu_mul(self.gu_out.ptr(), (2 * c.inter) as i64, self.gu_out.at(c.inter), (2 * c.inter) as i64, n as c_int,
-                                  c.inter as c_int, self.act.ptr(), s.0)
+                sys::blz_silu_mul(self.gu_out.ptr(), (2 * inter) as i64, self.gu_out.at(inter), (2 * inter) as i64, n as c_int,
+                                  inter as c_int, self.act.ptr(), s.0)
             },
             "draft silu",
         )?;
-        self.down.run(lin, self.act.ptr(), c.inter, n, self.mlp.ptr(), h, s)?;
+        self.down.run(lin, self.act.ptr(), inter, n, self.mlp.ptr(), h, s)?;
         // hin += mlp (the layer's output); normed = norm(hin)
-        check(
-            unsafe { sys::blz_rmsnorm(self.mlp.ptr(), self.hin.ptr(), self.norm.ptr(), c.eps, n as c_int, h as c_int, 0, self.normed.ptr(), s.0) },
-            "draft final norm",
-        )
+        self.add_norm(self.mlp.ptr(), self.norm.ptr(), self.normed.ptr(), n, s)
+    }
+
+    /// hin += x (all-reduced over the ranks first), out = rmsnorm(hin, w).
+    fn add_norm(&self, x: *mut u16, w: *const u16, out: *mut u16, n: usize, s: &crate::gpu::Stream) -> Result<()> {
+        let (h, eps) = (self.cfg.hidden, self.cfg.eps);
+        if self.ar.is_null() {
+            check(unsafe { sys::blz_rmsnorm(x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 0, out, s.0) }, "draft norm")
+        } else {
+            check(unsafe { sys::blz_host_ar_rmsnorm(self.ar, x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 0, out, s.0) }, "draft all-reduce norm")
+        }
     }
 
     /// Candidate head on `last_normed`: draft token of chain step `step` for every item, in `tok` and the record.
