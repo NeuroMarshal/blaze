@@ -130,7 +130,8 @@ impl ModelConfig {
             Some(kinds) => kinds
                 .iter()
                 .map(|k| match k.as_str() {
-                    Some("full_attention") => Ok(LayerKind::Full),
+                    // Qwen4-Exp names its softmax layers by their sparse indexer (QsaConfig)
+                    Some("full_attention" | "attention" | "qwen_sparse_attention") => Ok(LayerKind::Full),
                     Some("linear_attention") => Ok(LayerKind::Linear),
                     other => Err(anyhow!("config: unknown layer type {other:?}")),
                 })
