@@ -3,6 +3,7 @@
 
 use crate::engine::{Engine, Penalty, Seq, Snapshot};
 use crate::sampler::{Rng, SamplingParams, sample};
+use crate::suffix::{SuffixConfig, SuffixIndex};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -86,16 +87,44 @@ struct Active {
     in_think: bool,
     think_count: usize,
     forced: VecDeque<i32>,
-    /// n-gram draft acceptance: decayed counts of accepted draft tokens and of draft tokens tried
-    acc: (f64, f64),
+    /// draft acceptance by depth
+    acc: Acceptance,
+    /// suffix decoding: the request's prompt and output
+    suffix: Option<SuffixIndex>,
     /// first draft token proposed while a plain step ran instead (scored against the step's output)
     shadow: Option<i64>,
 }
 
-/// Online cost model of n-gram speculation: seconds of a one-token decode step and of a verify round of n rows
-/// (verify + commit), as decayed means. A round with a draft of d tokens and per-token acceptance a emits
-/// sum_{j=0..d} a^j tokens on average; the draft is cut to the length with the most tokens per second, and a plain
-/// step runs instead when it is faster.
+/// Draft acceptance of one request by depth: decayed counts of the draft tokens at depth j that were compared (all
+/// before them accepted) and accepted. Copying is bursty (a draft that starts right tends to stay right), so the
+/// chance at depth j given j - 1 is tracked per depth, shrunk towards the depth before when j has few samples.
+#[derive(Default)]
+struct Acceptance {
+    reached: [f64; 16],
+    accepted: [f64; 16],
+}
+
+impl Acceptance {
+    /// A round: the first `matched` of `tried` compared draft tokens were accepted.
+    fn note(&mut self, matched: usize, tried: usize) {
+        for j in 0..tried.min(16) {
+            self.reached[j] = 0.9 * self.reached[j] + 1.0;
+            self.accepted[j] = 0.9 * self.accepted[j] + (j < matched) as u8 as f64;
+        }
+    }
+
+    /// Chance that the draft token at depth d (from 1) is accepted given the ones before were; `prev`: the estimate
+    /// at depth d - 1 (0.5 before depth 1).
+    fn conditional(&self, d: usize, prev: f64) -> f64 {
+        let j = (d - 1).min(15);
+        (self.accepted[j] + prev) / (self.reached[j] + 1.0)
+    }
+}
+
+/// Online cost model of speculation: seconds of a one-token decode step and of a verify round of n rows (verify +
+/// commit), as decayed means. A round with a draft of d tokens emits 1 + sum_{j=1..d} prod_{i<=j} c_i tokens on
+/// average (c_i: the request's acceptance at depth i); the draft is cut to the length with the most tokens per second,
+/// and a plain step runs instead when it is faster.
 #[derive(Default)]
 struct SpecCost {
     decode: f64,
@@ -125,15 +154,17 @@ impl SpecCost {
         }
     }
 
-    /// Draft length to verify (0: a plain step) for drafts of up to `max_d` tokens at acceptance `a`.
-    fn best(&self, max_d: usize, a: f64) -> usize {
+    /// Draft length to verify (0: a plain step) for drafts of up to `max_d` tokens.
+    fn best(&self, max_d: usize, acc: &Acceptance) -> usize {
         if self.decode == 0.0 {
             return max_d;
         }
         let (mut best, mut rate) = (0, 1.0 / self.decode);
         let (mut e, mut p) = (1.0, 1.0);
+        let mut c = 0.5;
         for d in 1..=max_d {
-            p *= a;
+            c = acc.conditional(d, c);
+            p *= c;
             e += p;
             let r = e / self.verify_time(d + 1);
             if r > rate {
@@ -153,7 +184,20 @@ pub struct SchedConfig {
     pub prompt_cache: bool,
     /// cut or skip drafts by the measured cost of a verify against a decode step (else always verify the full draft)
     pub spec_adaptive: bool,
+    pub spec_method: SpecMethod,
 }
+
+/// Where drafts come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecMethod {
+    /// prompt lookup: the continuation of the last earlier match of the context's last 4..1 tokens
+    Ngram,
+    /// suffix decoding over the request and the outputs of earlier requests
+    Suffix,
+}
+
+/// Tokens of earlier outputs kept for suffix decoding.
+const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
 
 /// Handle of the scheduler thread.
 #[derive(Clone)]
@@ -177,6 +221,8 @@ impl Scheduler {
                     clock: 0,
                     spec_stats: (0, 0),
                     spec_cost: SpecCost::default(),
+                    suffix_global: SuffixIndex::default(),
+                    suffix_cfg: SuffixConfig::default(),
                 };
                 s.run();
             })
@@ -200,6 +246,9 @@ struct Loop {
     /// speculative verifies and the tokens they emitted
     spec_stats: (usize, usize),
     spec_cost: SpecCost,
+    /// suffix decoding: outputs of finished requests
+    suffix_global: SuffixIndex,
+    suffix_cfg: SuffixConfig,
 }
 
 impl Loop {
@@ -376,7 +425,8 @@ impl Loop {
                 in_think,
                 think_count: 0,
                 forced: VecDeque::new(),
-                acc: (1.0, 2.0),
+                acc: Acceptance::default(),
+                suffix: None,
                 shadow: None,
             });
         }
@@ -447,6 +497,9 @@ impl Loop {
         }
         a.pending = Some(pick);
         a.generated.push(pick);
+        if let Some(ix) = a.suffix.as_mut() {
+            ix.push(pick);
+        }
         *a.counts.entry(pick).or_insert(0) += 1;
         let _ = a.req.events.send(GenEvent::Token(pick, lp));
         let stop = a.req.stop_ids.contains(&pick);
@@ -499,14 +552,19 @@ impl Loop {
         if k == 0 {
             return Ok(false);
         }
-        let ctx: Vec<i64> = a.req.tokens.iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
-        let mut draft = propose(&ctx, 4, 1, k);
+        let mut draft = match self.cfg.spec_method {
+            SpecMethod::Ngram => {
+                let ctx: Vec<i64> = a.req.tokens.iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
+                propose(&ctx, 4, 1, k)
+            }
+            SpecMethod::Suffix => self.suffix_draft(k),
+        };
+        let a = &self.active[0];
         if draft.is_empty() {
             return Ok(false);
         }
         if self.cfg.spec_adaptive {
-            let (s, n) = a.acc;
-            let d = self.spec_cost.best(draft.len(), s / n);
+            let d = self.spec_cost.best(draft.len(), &a.acc);
             if d == 0 {
                 self.active[0].shadow = Some(draft[0]);
                 return Ok(false);
@@ -565,7 +623,7 @@ impl Loop {
         // matched drafts out of the tried ones (a finish cuts the round short: count only what was compared)
         let matched = emitted - 1;
         let tried = if finish.is_some() { matched } else { (matched + 1).min(draft.len()) };
-        a.acc = (0.9 * a.acc.0 + matched as f64, 0.9 * a.acc.1 + tried as f64);
+        a.acc.note(matched, tried);
         if let Some(reason) = finish {
             let a = self.active.swap_remove(0);
             if reason != Finish::Cancelled {
@@ -574,9 +632,40 @@ impl Loop {
                 self.remember(&a.seq, tokens);
             }
             let _ = a.req.events.send(GenEvent::Done(reason));
+            self.keep_output(&a);
             self.engine.close(a.seq);
         }
         Ok(true)
+    }
+
+    /// Suffix decoding draft of up to `k` tokens for active request 0: the better of its own prompt and output and the
+    /// earlier outputs.
+    fn suffix_draft(&mut self, k: usize) -> Vec<i64> {
+        let cfg = self.suffix_cfg;
+        let a = &mut self.active[0];
+        let ix = a.suffix.get_or_insert_with(|| {
+            let mut ix = SuffixIndex::default();
+            ix.extend(a.req.tokens.iter().map(|&t| t as i32));
+            ix.extend(a.generated.iter().copied());
+            ix
+        });
+        let n = a.req.tokens.len() + a.generated.len();
+        let skip = n.saturating_sub(cfg.max_depth + 1);
+        let tail: Vec<i32> =
+            a.req.tokens.iter().map(|&t| t as i32).chain(a.generated.iter().copied()).skip(skip).collect();
+        let own = ix.draft(&tail, k, &cfg);
+        let global = self.suffix_global.draft(&tail, k, &cfg);
+        let best = if global.1 > own.1 { global.0 } else { own.0 };
+        best.into_iter().map(i64::from).collect()
+    }
+
+    /// Suffix decoding: a finished output joins the earlier outputs.
+    fn keep_output(&mut self, a: &Active) {
+        if self.cfg.spec_method == SpecMethod::Suffix && self.cfg.spec_tokens > 0 && !a.generated.is_empty() {
+            self.suffix_global.extend(a.generated.iter().copied());
+            self.suffix_global.end_seq();
+            self.suffix_global.trim(SUFFIX_GLOBAL_TOKENS);
+        }
     }
 
     fn step(&mut self) -> Result<()> {
@@ -691,8 +780,8 @@ impl Loop {
             let (tok, f) = self.emit(i, pick, lp);
             let a = &mut self.active[i];
             if let Some(d) = a.shadow.take() {
-                let hit = (tok as i64 == d) as u8 as f64;
-                a.acc = (0.9 * a.acc.0 + hit, 0.9 * a.acc.1 + 1.0);
+                let hit = tok as i64 == d;
+                a.acc.note(hit as usize, 1);
             }
             if let Some(reason) = f {
                 finished.push((i, reason));
@@ -708,6 +797,7 @@ impl Loop {
                 self.remember(&a.seq, tokens);
             }
             let _ = a.req.events.send(GenEvent::Done(reason));
+            self.keep_output(&a);
             self.engine.close(a.seq);
         }
         Ok(())

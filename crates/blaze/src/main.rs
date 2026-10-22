@@ -186,6 +186,9 @@ enum Command {
         /// always verify the whole n-gram draft (by default drafts are cut or skipped by the measured verify cost)
         #[arg(long)]
         spec_fixed: bool,
+        /// draft source: ngram (prompt lookup) or suffix (suffix decoding over the request and earlier outputs)
+        #[arg(long, default_value = "ngram")]
+        spec_method: String,
         #[arg(long, default_value = "qwen3_coder")]
         tool_call_parser: String,
         #[arg(long, default_value = "qwen3")]
@@ -309,6 +312,7 @@ fn main() -> Result<()> {
             step_tokens,
             spec_ngram,
             spec_fixed,
+            spec_method,
             tool_call_parser,
             reasoning_parser,
             thinking_budget,
@@ -324,6 +328,11 @@ fn main() -> Result<()> {
                     spec_tokens: spec_ngram,
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
+                    spec_method: match spec_method.as_str() {
+                        "ngram" => blaze::sched::SpecMethod::Ngram,
+                        "suffix" => blaze::sched::SpecMethod::Suffix,
+                        m => anyhow::bail!("unknown --spec-method {m} (ngram, suffix)"),
+                    },
                 },
             );
             let name = served_model_name
