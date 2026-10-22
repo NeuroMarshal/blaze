@@ -1,6 +1,7 @@
-// Kernels of the EAGLE-4 draft (one Llama-style layer over the target's hidden states and the next token, a low-rank
-// candidate head, a full LM head read only at the candidates' rows). Raw device pointers (the LM head may be mapped
-// host memory), caller's stream.
+// Kernels of the drafters: EAGLE-4 (one Llama-style layer over the target's hidden states and the next token, a
+// low-rank candidate head, a full LM head read only at the candidates' rows) and DFlash2 (a block of mask tokens
+// drafted in one pass: grouped convolutions over the block's positions, a candidate selector walking pairwise scores).
+// Raw device pointers (the LM head may be mapped host memory), caller's stream.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -29,6 +30,32 @@ cudaError_t blz_candidate_logits(const uint16_t* hidden, int64_t ld_hidden, int 
 /// `record` non-null, also record[r] = token (a chain step's draft output).
 cudaError_t blz_candidate_pick(const float* logits, const int32_t* ids, int rows, int c, int64_t* token,
                                int64_t* record, cudaStream_t stream);
+
+/// \brief RMSNorm of every head in place: x[t * ld + h * head_dim + i] for heads h < heads, the same weight w[head_dim]
+/// for every head (q_norm / k_norm).
+cudaError_t blz_head_rmsnorm(uint16_t* x, int64_t ld, int tokens, int heads, int head_dim, const uint16_t* w, float eps,
+                             cudaStream_t stream);
+
+/// \brief DFlash2 grouped convolution over the positions of each query block (rows of a request's block are
+/// consecutive; position = row % block_size): out[r, c] = sum over taps t <= position of
+/// (base[t, c] + delta[r, t, c / group]) * x[r - t, c], FP32 sums. delta [rows, taps, groups] bf16 with the given row
+/// and tap strides (elements); base [taps, channels] bf16.
+cudaError_t blz_dflash_grouped_conv(const uint16_t* x, int64_t ldx, const uint16_t* delta, int64_t delta_row,
+                                    int64_t delta_tap, const uint16_t* base, uint16_t* out, int64_t ldo, int rows,
+                                    int channels, int block_size, int group_size, int taps, cudaStream_t stream);
+
+/// \brief DFlash2 candidate walk (greedy): for every item, step s picks the candidate c maximizing
+/// unary[s, c] + sum_r pred[prev, r] * hproj[s, r] * succ[cand[s, c], r], where prev is the anchor token at step 0 and
+/// the token picked at step s - 1 after it; ties: the lower candidate index.
+/// \param cand    [items, steps, k] int32 token ids (k <= 32)
+/// \param unary   [items, steps, k] f32 (the candidates' logits)
+/// \param hproj   [items * steps, rank] bf16 (the hidden states through the selector's projection)
+/// \param anchor  [items] int64: the token before each block's first drafted position
+/// \param pred, succ  [vocab, rank] bf16 codebooks
+/// \param out     [items, steps] int64 drafted tokens
+cudaError_t blz_dflash_walk(const int32_t* cand, const float* unary, const uint16_t* hproj, const int64_t* anchor,
+                            const uint16_t* pred, const uint16_t* succ, int items, int steps, int k, int rank,
+                            int64_t* out, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

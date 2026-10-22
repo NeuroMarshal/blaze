@@ -109,7 +109,107 @@ __global__ void candidate_pick_kernel(const float* __restrict__ logits, const in
   }
 }
 
+// one warp per (token, head)
+__global__ void head_rmsnorm_kernel(uint16_t* __restrict__ x, int64_t ld, int tokens, int heads, int head_dim,
+                                    const uint16_t* __restrict__ w, float eps) {
+  const int64_t row = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x % 32;
+  if (row >= int64_t(tokens) * heads) return;
+  uint16_t* p = x + (row / heads) * ld + (row % heads) * head_dim;
+  float ss = 0.0f;
+  for (int i = lane; i < head_dim; i += 32) {
+    const float v = bf(p[i]);
+    ss += v * v;
+  }
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const float inv = rsqrtf(ss / float(head_dim) + eps);
+  for (int i = lane; i < head_dim; i += 32) p[i] = to_bf(bf(p[i]) * inv * bf(w[i]));
+}
+
+// one thread per (row, channel)
+__global__ void dflash_conv_kernel(const uint16_t* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ delta,
+                                   int64_t delta_row, int64_t delta_tap, const uint16_t* __restrict__ base,
+                                   uint16_t* __restrict__ out, int64_t ldo, int rows, int channels, int block_size,
+                                   int group_size, int taps) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= int64_t(rows) * channels) return;
+  const int r = int(i / channels), c = int(i % channels), g = c / group_size, pos = r % block_size;
+  float acc = 0.0f;
+  for (int t = 0; t < taps && t <= pos; ++t) {
+    const float coef = bf(base[int64_t(t) * channels + c]) + bf(delta[int64_t(r) * delta_row + int64_t(t) * delta_tap + g]);
+    acc += coef * bf(x[int64_t(r - t) * ldx + c]);
+  }
+  out[int64_t(r) * ldo + c] = to_bf(acc);
+}
+
+// one block per item: steps in order, one warp per candidate's dot product
+constexpr int kWalkMaxK = 32, kWalkMaxRank = 512;
+__global__ void dflash_walk_kernel(const int32_t* __restrict__ cand, const float* __restrict__ unary,
+                                   const uint16_t* __restrict__ hproj, const int64_t* __restrict__ anchor,
+                                   const uint16_t* __restrict__ pred, const uint16_t* __restrict__ succ, int steps,
+                                   int k, int rank, int64_t* __restrict__ out) {
+  __shared__ float v[kWalkMaxRank];
+  __shared__ float score[kWalkMaxK];
+  __shared__ int prev_idx;
+  const int item = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
+  if (threadIdx.x == 0) prev_idx = 0;
+  __syncthreads();
+  for (int s = 0; s < steps; ++s) {
+    const int64_t base = (int64_t(item) * steps + s) * k;
+    const int64_t prev_tok = s == 0 ? anchor[item] : int64_t(cand[base - k + prev_idx]);
+    // v = pred[prev] * hproj[s]
+    for (int r = threadIdx.x; r < rank; r += blockDim.x)
+      v[r] = bf(pred[prev_tok * rank + r]) * bf(hproj[(int64_t(item) * steps + s) * rank + r]);
+    __syncthreads();
+    for (int c = warp; c < k; c += warps) {
+      const uint16_t* sv = succ + int64_t(cand[base + c]) * rank;
+      float d = 0.0f;
+      for (int r = lane; r < rank; r += 32) d += v[r] * bf(sv[r]);
+      for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
+      if (lane == 0) score[c] = unary[base + c] + d;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int best = 0;
+      for (int c = 1; c < k; ++c)
+        if (score[c] > score[best]) best = c;
+      out[int64_t(item) * steps + s] = cand[base + best];
+      prev_idx = best;
+    }
+    __syncthreads();
+  }
+}
+
 }  // namespace
+
+extern "C" cudaError_t blz_head_rmsnorm(uint16_t* x, int64_t ld, int tokens, int heads, int head_dim,
+                                        const uint16_t* w, float eps, cudaStream_t stream) {
+  const int64_t rows = int64_t(tokens) * heads;
+  if (rows == 0) return cudaSuccess;
+  head_rmsnorm_kernel<<<unsigned((rows * 32 + 255) / 256), 256, 0, stream>>>(x, ld, tokens, heads, head_dim, w, eps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_dflash_grouped_conv(const uint16_t* x, int64_t ldx, const uint16_t* delta, int64_t delta_row,
+                                               int64_t delta_tap, const uint16_t* base, uint16_t* out, int64_t ldo,
+                                               int rows, int channels, int block_size, int group_size, int taps,
+                                               cudaStream_t stream) {
+  const int64_t n = int64_t(rows) * channels;
+  if (n == 0) return cudaSuccess;
+  if (channels % group_size || block_size < 1) return cudaErrorInvalidValue;
+  dflash_conv_kernel<<<unsigned((n + 255) / 256), 256, 0, stream>>>(x, ldx, delta, delta_row, delta_tap, base, out, ldo,
+                                                                    rows, channels, block_size, group_size, taps);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_dflash_walk(const int32_t* cand, const float* unary, const uint16_t* hproj,
+                                       const int64_t* anchor, const uint16_t* pred, const uint16_t* succ, int items,
+                                       int steps, int k, int rank, int64_t* out, cudaStream_t stream) {
+  if (items == 0 || steps == 0) return cudaSuccess;
+  if (k < 1 || k > kWalkMaxK || rank > kWalkMaxRank) return cudaErrorInvalidValue;
+  dflash_walk_kernel<<<items, 512, 0, stream>>>(cand, unary, hproj, anchor, pred, succ, steps, k, rank, out);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_rmsnorm_ld(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
                                       uint16_t* out, int64_t ldo, cudaStream_t stream) {
