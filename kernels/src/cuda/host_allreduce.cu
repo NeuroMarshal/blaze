@@ -176,20 +176,21 @@ __global__ void __launch_bounds__(kThreads) host_ar_kernel(uint8_t* buf, uint32_
 
 // All-reduce of a few rows fused with the residual add and RMSNorm that follow it (decode): one block per row, the
 // same rounding steps as host_ar_kernel + rmsnorm (sum in rank order -> bf16, + residual -> bf16, normalized).
-constexpr int kNormThreads = 256;
+// One thread per 16-byte pack of the row, so the PCIe reads of the other ranks' rows go out in one round.
+constexpr int kNormMaxThreads = 1024;
 
 __device__ __forceinline__ float bf16f(uint16_t v) { return __uint_as_float(uint32_t(v) << 16); }
 __device__ __forceinline__ uint16_t f2bf(float v) { return __bfloat16_as_ushort(__float2bfloat16(v)); }
 
-__global__ void __launch_bounds__(kNormThreads) host_ar_rmsnorm_kernel(uint8_t* buf, uint32_t* ctl, int rank, int world,
+__global__ void __launch_bounds__(kNormMaxThreads) host_ar_rmsnorm_kernel(uint8_t* buf, uint32_t* ctl, int rank, int world,
                                                                        int64_t max_bytes, const uint16_t* x,
                                                                        uint16_t* residual, const uint16_t* w,
                                                                        float eps, int dim, int zero_centered,
                                                                        uint16_t* out) {
   extern __shared__ float h[];
-  __shared__ float red[kNormThreads / 32];
+  __shared__ float red[kNormMaxThreads / 32];
   __shared__ uint32_t s_seq;
-  const int b = blockIdx.x, tid = threadIdx.x;
+  const int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
   if (tid == 0) s_seq = *reinterpret_cast<volatile uint32_t*>(ctl) + 1;
   __syncthreads();
   const uint32_t seq = s_seq;
@@ -200,7 +201,7 @@ __global__ void __launch_bounds__(kNormThreads) host_ar_rmsnorm_kernel(uint8_t* 
   };
   const uint4* xr = reinterpret_cast<const uint4*>(x + int64_t(b) * dim);
   uint4* mine = slot(rank);
-  for (int p = tid; p < packs; p += kNormThreads) store_sys(mine + p, xr[p]);
+  for (int p = tid; p < packs; p += nt) store_sys(mine + p, xr[p]);
   __threadfence_system();
   __syncthreads();
   if (tid == 0) {
@@ -211,7 +212,7 @@ __global__ void __launch_bounds__(kNormThreads) host_ar_rmsnorm_kernel(uint8_t* 
   __syncthreads();
   uint16_t* res = residual + int64_t(b) * dim;
   float ss = 0.0f;
-  for (int p = tid; p < packs; p += kNormThreads) {
+  for (int p = tid; p < packs; p += nt) {
     float acc[8], v[8];
     const uint4 own = xr[p];
     for (int r = 0; r < world; ++r) {
@@ -236,9 +237,10 @@ __global__ void __launch_bounds__(kNormThreads) host_ar_rmsnorm_kernel(uint8_t* 
   __syncthreads();
   float total = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kNormThreads / 32; ++i) total += red[i];
+  for (int i = 0; i < kNormMaxThreads / 32; ++i)
+    if (i < nt / 32) total += red[i];
   const float inv = rsqrtf(total / float(dim) + eps);
-  for (int e = tid; e < dim; e += kNormThreads) {
+  for (int e = tid; e < dim; e += nt) {
     const float wi = zero_centered ? 1.0f + bf16f(w[e]) : bf16f(w[e]);
     out[int64_t(b) * dim + e] = f2bf(h[e] * inv * wi);
   }
@@ -260,7 +262,8 @@ extern "C" cudaError_t blz_host_ar_rmsnorm(blz_host_ar* ar, const uint16_t* x, u
   if (ar == nullptr || rows <= 0 || rows > blaze::kMaxBlocks || dim % 8 != 0 ||
       int64_t(rows) * dim * 2 > ar->max_bytes || reinterpret_cast<uintptr_t>(x) % 16 != 0)
     return cudaErrorInvalidValue;
-  blaze::host_ar_rmsnorm_kernel<<<rows, blaze::kNormThreads, size_t(dim) * sizeof(float), stream>>>(
+  const int threads = std::min(blaze::kNormMaxThreads, (dim / 8 + 31) / 32 * 32);
+  blaze::host_ar_rmsnorm_kernel<<<rows, threads, size_t(dim) * sizeof(float), stream>>>(
       ar->dev, ar->ctl, ar->rank, ar->world, ar->max_bytes, x, residual, w, eps, dim, zero_centered, out);
   return cudaGetLastError();
 }
