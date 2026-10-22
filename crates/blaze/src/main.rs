@@ -142,8 +142,10 @@ enum Command {
     SelfSpec {
         #[command(flatten)]
         engine: EngineArgs,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         prompt: String,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         #[arg(long, default_value_t = 96)]
         max_tokens: usize,
         /// draft tokens per round
@@ -232,7 +234,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::SelfSpec { engine, prompt, max_tokens, draft } => {
+        Command::SelfSpec { engine, prompt, prompt_file, max_tokens, draft } => {
+            let prompt = match prompt_file {
+                Some(f) => prompt + &std::fs::read_to_string(f)?,
+                None => prompt,
+            };
             let text = blaze::text::Text::load(&engine.model)?;
             let mut e = engine.load(None, false)?;
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
