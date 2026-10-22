@@ -656,16 +656,19 @@ impl Model {
         )?;
         let eps = cfg.rms_eps;
         for (li, layer) in self.layers.iter().enumerate() {
-            let resid = if li == 0 { null_mut() } else { w.residual.ptr() };
-            let x_in: *const u16 = if li == 0 { w.residual.ptr() } else { w.x.ptr() };
-            check(unsafe { sys::blz_rmsnorm(x_in, resid, layer.input_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
+            if li == 0 {
+                check(unsafe { sys::blz_rmsnorm(w.residual.ptr(), null_mut(), layer.input_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
+            } else {
+                self.reduce_norm(&layer.input_norm, t)?;
+            }
             match layer.kind {
                 LayerKind::Full => self.attention(layer, t, spans)?,
                 LayerKind::Linear => self.gdn(layer, t, n)?,
             }
-            check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), layer.post_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
+            self.reduce_norm(&layer.post_norm, t)?;
             self.mlp(li, layer, t)?;
         }
+        self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
         if logits {
             // h = x + residual of the last token of every span, normed, through the head, greedy pick.
@@ -677,6 +680,23 @@ impl Model {
             check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), n as c_int, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         }
         Ok(())
+    }
+
+    /// x holds this rank's partial sums of a row-parallel projection: residual += sum over the group, normed =
+    /// RMSNorm(residual) * (1 + w). One fused kernel for decode-sized steps.
+    fn reduce_norm(&self, norm: &DevBuf, t: usize) -> Result<()> {
+        let (w, s, h, eps) = (&self.work, &self.stream, self.cfg.hidden, self.cfg.rms_eps);
+        if self.tp.world > 1 && t <= 64 {
+            return check(
+                unsafe {
+                    sys::blz_host_ar_rmsnorm(self.tp.ar, w.x.ptr(), w.residual.ptr(), norm.ptr(), eps, t as c_int, h as c_int, 1,
+                                             w.normed.ptr(), s.0)
+                },
+                "all-reduce + rmsnorm",
+            );
+        }
+        self.all_reduce(w.x.ptr(), t * h)?;
+        check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")
     }
 
     /// Start pulling up to l2_prefetch_mib of `lin`'s weights into L2 on the side stream (decode steps only); the
@@ -850,8 +870,7 @@ impl Model {
         }
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
-        self.prefetch_mlp(layer, t)?;
-        self.all_reduce(w.x.ptr(), t * cfg.hidden)
+        self.prefetch_mlp(layer, t)
     }
 
     fn prefetch_mlp(&self, layer: &Layer, t: usize) -> Result<()> {
@@ -905,8 +924,7 @@ impl Model {
             "gated_rmsnorm",
         )?;
         g.out.run(&self.lin, w.core_normed.ptr(), vh * gc.v_dim, t, w.x.ptr(), cfg.hidden, s)?;
-        self.prefetch_mlp(layer, t)?;
-        self.all_reduce(w.x.ptr(), t * cfg.hidden)
+        self.prefetch_mlp(layer, t)
     }
 
     fn mlp(&self, li: usize, layer: &Layer, t: usize) -> Result<()> {
@@ -968,7 +986,7 @@ impl Model {
                 if let Some(next) = self.first_linear(li + 1) {
                     self.prefetch(next, t)?;
                 }
-                self.all_reduce(w.x.ptr(), t * h)
+                Ok(())
             }
         }
     }

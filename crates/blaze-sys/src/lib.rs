@@ -172,6 +172,9 @@ unsafe extern "C" {
                             out: *mut *mut blz_host_ar) -> cudaError_t;
     pub fn blz_host_ar_unlink(name: *const c_char);
     pub fn blz_host_ar_close(ar: *mut blz_host_ar);
+    pub fn blz_host_ar_rmsnorm(ar: *mut blz_host_ar, x: *const bf16, residual: *mut bf16, w: *const bf16, eps: f32,
+                               rows: c_int, dim: c_int, zero_centered: c_int, out: *mut bf16, s: cudaStream_t)
+                               -> cudaError_t;
     pub fn blz_host_ar_all_reduce(ar: *mut blz_host_ar, data: *mut c_void, bytes: i64, dtype: c_int,
                                   s: cudaStream_t) -> cudaError_t;
 }

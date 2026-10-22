@@ -41,6 +41,12 @@ void blz_host_ar_close(blz_host_ar* ar);
 cudaError_t blz_host_ar_all_reduce(blz_host_ar* ar, void* data, int64_t bytes, blz_ar_dtype_t dtype,
                                    cudaStream_t stream);
 
+/// \brief Decode form of all-reduce + residual add + RMSNorm in one kernel (one block per row, rows <= 64): x [rows, dim]
+/// is summed over the group, residual += sum (bf16), out = norm(residual) * (zero_centered ? 1 + w : w). Same bits as
+/// blz_host_ar_all_reduce followed by blz_rmsnorm; x is left unchanged.
+cudaError_t blz_host_ar_rmsnorm(blz_host_ar* ar, const uint16_t* x, uint16_t* residual, const uint16_t* w, float eps,
+                                int rows, int dim, int zero_centered, uint16_t* out, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

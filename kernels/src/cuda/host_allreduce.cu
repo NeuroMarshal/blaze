@@ -174,8 +174,96 @@ __global__ void __launch_bounds__(kThreads) host_ar_kernel(uint8_t* buf, uint32_
   }
 }
 
+// All-reduce of a few rows fused with the residual add and RMSNorm that follow it (decode): one block per row, the
+// same rounding steps as host_ar_kernel + rmsnorm (sum in rank order -> bf16, + residual -> bf16, normalized).
+constexpr int kNormThreads = 256;
+
+__device__ __forceinline__ float bf16f(uint16_t v) { return __uint_as_float(uint32_t(v) << 16); }
+__device__ __forceinline__ uint16_t f2bf(float v) { return __bfloat16_as_ushort(__float2bfloat16(v)); }
+
+__global__ void __launch_bounds__(kNormThreads) host_ar_rmsnorm_kernel(uint8_t* buf, uint32_t* ctl, int rank, int world,
+                                                                       int64_t max_bytes, const uint16_t* x,
+                                                                       uint16_t* residual, const uint16_t* w,
+                                                                       float eps, int dim, int zero_centered,
+                                                                       uint16_t* out) {
+  extern __shared__ float h[];
+  __shared__ float red[kNormThreads / 32];
+  __shared__ uint32_t s_seq;
+  const int b = blockIdx.x, tid = threadIdx.x;
+  if (tid == 0) s_seq = *reinterpret_cast<volatile uint32_t*>(ctl) + 1;
+  __syncthreads();
+  const uint32_t seq = s_seq;
+  uint32_t* flags = reinterpret_cast<uint32_t*>(buf);
+  const int packs = dim / 8;  // 8 bf16 per 16-byte pack
+  auto slot = [&](int r) {
+    return reinterpret_cast<uint4*>(buf + kFlagBytes + (int64_t(r) * 2 + (seq & 1)) * max_bytes) + int64_t(b) * packs;
+  };
+  const uint4* xr = reinterpret_cast<const uint4*>(x + int64_t(b) * dim);
+  uint4* mine = slot(rank);
+  for (int p = tid; p < packs; p += kNormThreads) store_sys(mine + p, xr[p]);
+  __threadfence_system();
+  __syncthreads();
+  if (tid == 0) {
+    store_release_sys(flags + rank * kMaxBlocks + b, seq);
+    for (int r = 0; r < world; ++r)
+      if (r != rank) wait_for(flags + r * kMaxBlocks + b, seq);
+  }
+  __syncthreads();
+  uint16_t* res = residual + int64_t(b) * dim;
+  float ss = 0.0f;
+  for (int p = tid; p < packs; p += kNormThreads) {
+    float acc[8], v[8];
+    const uint4 own = xr[p];
+    for (int r = 0; r < world; ++r) {
+      Pack<__nv_bfloat16>::to_float(r == rank ? own : load_sys(slot(r) + p), r == 0 ? acc : v);
+      if (r > 0)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) acc[i] += v[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int e = p * 8 + i;
+      const uint16_t sum = f2bf(bf16f(f2bf(acc[i])) + bf16f(res[e]));
+      res[e] = sum;
+      const float hv = bf16f(sum);
+      h[e] = hv;
+      ss += hv * hv;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  if ((tid & 31) == 0) red[tid >> 5] = ss;
+  __syncthreads();
+  float total = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kNormThreads / 32; ++i) total += red[i];
+  const float inv = rsqrtf(total / float(dim) + eps);
+  for (int e = tid; e < dim; e += kNormThreads) {
+    const float wi = zero_centered ? 1.0f + bf16f(w[e]) : bf16f(w[e]);
+    out[int64_t(b) * dim + e] = f2bf(h[e] * inv * wi);
+  }
+  if (tid == 0) {
+    __threadfence();
+    if (atomicAdd(ctl + 1, 1u) == gridDim.x - 1) {
+      ctl[1] = 0;
+      *reinterpret_cast<volatile uint32_t*>(ctl) = seq;
+    }
+  }
+}
+
 }  // namespace
 }  // namespace blaze
+
+extern "C" cudaError_t blz_host_ar_rmsnorm(blz_host_ar* ar, const uint16_t* x, uint16_t* residual, const uint16_t* w,
+                                           float eps, int rows, int dim, int zero_centered, uint16_t* out,
+                                           cudaStream_t stream) {
+  if (ar == nullptr || rows <= 0 || rows > blaze::kMaxBlocks || dim % 8 != 0 ||
+      int64_t(rows) * dim * 2 > ar->max_bytes || reinterpret_cast<uintptr_t>(x) % 16 != 0)
+    return cudaErrorInvalidValue;
+  blaze::host_ar_rmsnorm_kernel<<<rows, blaze::kNormThreads, size_t(dim) * sizeof(float), stream>>>(
+      ar->dev, ar->ctl, ar->rank, ar->world, ar->max_bytes, x, residual, w, eps, dim, zero_centered, out);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_host_ar_open(const char* name, int rank, int world, int64_t max_bytes, int create,
                                         blz_host_ar** out) {
