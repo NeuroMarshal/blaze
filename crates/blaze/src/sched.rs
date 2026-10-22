@@ -91,6 +91,8 @@ struct Active {
     acc: Acceptance,
     /// suffix decoding: the request's prompt and output
     suffix: Option<SuffixIndex>,
+    /// EAGLE-4: the drafter's tokens after the request's last output
+    eagle: Vec<i64>,
     /// first draft token proposed while a plain step ran instead (scored against the step's output)
     shadow: Option<i64>,
 }
@@ -206,6 +208,8 @@ pub enum SpecMethod {
     Ngram,
     /// suffix decoding over the request and the outputs of earlier requests
     Suffix,
+    /// the EAGLE-4 drafter (engine loaded with a draft model)
+    Eagle,
 }
 
 /// Tokens of earlier outputs kept for suffix decoding.
@@ -440,6 +444,7 @@ impl Loop {
                 acc: Acceptance::default(),
                 suffix: None,
                 shadow: None,
+                eagle: Vec::new(),
             });
         }
     }
@@ -572,7 +577,26 @@ impl Loop {
                 propose(&ctx, 4, 1, k)
             }
             SpecMethod::Suffix => self.suffix_draft(i, k),
+            SpecMethod::Eagle => a.eagle.iter().copied().take(k).collect(),
         }
+    }
+
+    /// EAGLE-4: extend the drafter over the rows the last step kept (`items`) and keep its next drafts per request.
+    fn eagle_extend(&mut self, items: Vec<(usize, crate::eagle::DraftItem)>) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let k = self.cfg.spec_tokens.min(crate::eagle::MAX_CHAIN);
+        let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
+        let drafts = self.engine.draft(crate::eagle::DraftPlan { items, k })?;
+        for (i, d) in idx.into_iter().zip(drafts) {
+            self.active[i].eagle = d;
+        }
+        Ok(())
+    }
+
+    fn eagle_on(&self) -> bool {
+        self.cfg.spec_method == SpecMethod::Eagle && self.cfg.spec_tokens > 0
     }
 
     /// Speculative step of every active request (all decoding): drafts verified in one step, each request keeps its
@@ -700,6 +724,21 @@ impl Loop {
         let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
         self.engine.commit_many(&mut seqs, &accepted)?;
         drop(seqs);
+        if self.eagle_on() {
+            // the drafter over every request's kept rows (its emitted tokens follow them), in verify-row order
+            let mut items = Vec::new();
+            let mut aux_row = 0;
+            for (o, &i) in order.iter().enumerate() {
+                let a = &self.active[i];
+                let e = accepted[o];
+                if !finished.iter().any(|f| f.0 == i) {
+                    let tokens: Vec<i64> = a.generated[a.generated.len() - e..].iter().map(|&t| t as i64).collect();
+                    items.push((i, crate::eagle::DraftItem { row: a.seq.row, aux_row, tokens, pos0: a.seq.len() - e }));
+                }
+                aux_row += rows[o].len();
+            }
+            self.eagle_extend(items)?;
+        }
         let total: usize = rows.iter().map(Vec::len).sum();
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
@@ -845,8 +884,13 @@ impl Loop {
         }
         // apply
         let mut finished = Vec::new();
-        for ((&i, pick), lp) in order.iter().zip(picks).zip(lps) {
+        let eagle = self.eagle_on();
+        let window = self.engine.info.draft_window;
+        let mut items: Vec<(usize, crate::eagle::DraftItem)> = Vec::new();
+        for (ri, ((&i, pick), lp)) in order.iter().zip(picks).zip(lps).enumerate() {
             let a = &mut self.active[i];
+            let decoding = a.pending.is_some();
+            let fed0 = a.fed;
             if a.pending.is_none() {
                 a.fed += chunk_len;
                 if a.points.front() == Some(&a.fed) {
@@ -867,9 +911,36 @@ impl Loop {
                 let hit = tok as i64 == d;
                 a.acc.note(hit as usize, 1);
             }
+            if eagle && f.is_none() {
+                if decoding {
+                    items.push((i, crate::eagle::DraftItem { row: a.seq.row, aux_row: ri, tokens: vec![tok as i64], pos0: a.seq.len() - 1 }));
+                } else {
+                    // the prompt's last chunk: its rows within the drafter's window
+                    let n = a.req.tokens.len();
+                    let lo = fed0.max(n.saturating_sub(window));
+                    let tokens: Vec<i64> = (lo..n).map(|p| if p + 1 < n { a.req.tokens[p + 1] } else { tok as i64 }).collect();
+                    items.push((i, crate::eagle::DraftItem { row: a.seq.row, aux_row: ri + lo - fed0, tokens, pos0: lo }));
+                }
+            }
             if let Some(reason) = f {
                 finished.push((i, reason));
             }
+        }
+        if eagle {
+            // earlier prompt chunks that reach into the drafter's window (their next tokens are prompt tokens)
+            if let Some(i) = prefill.filter(|_| chunk_len > 0) {
+                let a = &self.active[i];
+                if a.fed < a.req.tokens.len() {
+                    let (n, fed0) = (a.req.tokens.len(), a.fed - chunk_len);
+                    let lo = fed0.max(n.saturating_sub(window));
+                    if lo < a.fed {
+                        let tokens: Vec<i64> = (lo..a.fed).map(|p| a.req.tokens[p + 1]).collect();
+                        let ri = order.iter().position(|&j| j == i).unwrap();
+                        items.push((i, crate::eagle::DraftItem { row: a.seq.row, aux_row: ri + lo - fed0, tokens, pos0: lo }));
+                    }
+                }
+            }
+            self.eagle_extend(items)?;
         }
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {

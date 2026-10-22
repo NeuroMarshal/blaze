@@ -212,8 +212,9 @@ enum Command {
         /// always verify the whole n-gram draft (by default drafts are cut or skipped by the measured verify cost)
         #[arg(long)]
         spec_fixed: bool,
-        /// draft source: suffix (suffix decoding over the request and earlier outputs) or ngram (prompt lookup)
-        #[arg(long, default_value = "suffix")]
+        /// draft source: suffix (suffix decoding over the request and earlier outputs), ngram (prompt lookup), eagle
+        /// (the --draft-model drafter); default: eagle with a draft model, else suffix
+        #[arg(long, default_value = "auto")]
         spec_method: String,
         #[arg(long, default_value = "qwen3_coder")]
         tool_call_parser: String,
@@ -429,6 +430,7 @@ fn main() -> Result<()> {
             let text = blaze::text::Text::load(&engine.model)?;
             let e = engine.load(None, false)?;
             let max_context = e.info.ctx_stride;
+            let drafter = e.info.draft_window > 0;
             let vocab = e.info.vocab;
             let sched = blaze::sched::Scheduler::start(
                 e,
@@ -437,10 +439,12 @@ fn main() -> Result<()> {
                     spec_tokens: spec_ngram,
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
-                    spec_method: match spec_method.as_str() {
-                        "ngram" => blaze::sched::SpecMethod::Ngram,
-                        "suffix" => blaze::sched::SpecMethod::Suffix,
-                        m => anyhow::bail!("unknown --spec-method {m} (ngram, suffix)"),
+                    spec_method: match (spec_method.as_str(), drafter) {
+                        ("ngram", _) => blaze::sched::SpecMethod::Ngram,
+                        ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,
+                        ("eagle", true) | ("auto", true) => blaze::sched::SpecMethod::Eagle,
+                        ("eagle", false) => anyhow::bail!("--spec-method eagle needs --draft-model"),
+                        (m, _) => anyhow::bail!("unknown --spec-method {m} (auto, suffix, ngram, eagle)"),
                     },
                 },
             );
