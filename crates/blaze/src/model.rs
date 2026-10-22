@@ -1162,6 +1162,11 @@ impl Model {
         &self.lin
     }
 
+    /// This rank's LM head (its vocabulary shard: dims.vocab rows from rank * dims.vocab).
+    pub fn lm_head(&self) -> &Linear {
+        &self.lm_head
+    }
+
     /// The pinned token embedding table [vocab, hidden] bf16.
     pub fn embed_table(&self) -> &HostMapped {
         &self.embed

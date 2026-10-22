@@ -175,6 +175,14 @@ unsafe extern "C" {
                          inv_freq: *const f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_candidate_logits(hidden: *const bf16, ld_hidden: i64, rows: c_int, dim: c_int, table: *const bf16,
                                 ids: *const i32, c: c_int, out: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_head_rmsnorm(x: *mut bf16, ld: i64, tokens: c_int, heads: c_int, head_dim: c_int, w: *const bf16, eps: f32,
+                            s: cudaStream_t) -> cudaError_t;
+    pub fn blz_dflash_grouped_conv(x: *const bf16, ldx: i64, delta: *const bf16, delta_row: i64, delta_tap: i64,
+                                   base: *const bf16, out: *mut bf16, ldo: i64, rows: c_int, channels: c_int,
+                                   block_size: c_int, group_size: c_int, taps: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_dflash_walk(cand: *const i32, unary: *const f32, hproj: *const bf16, anchor: *const i64, pred: *const bf16,
+                           succ: *const bf16, items: c_int, steps: c_int, k: c_int, rank: c_int, out: *mut i64,
+                           s: cudaStream_t) -> cudaError_t;
     pub fn blz_candidate_pick(logits: *const f32, ids: *const i32, rows: c_int, c: c_int, token: *mut i64,
                               record: *mut i64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_embed_gather(ids: *const i64, n: i64, table: *const u8, rows: i64, row_bytes: i64, out: *mut u8,

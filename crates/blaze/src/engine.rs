@@ -110,7 +110,7 @@ const MAX_VERIFY_GRAPHS: usize = 48;
 /// One rank: its model shard and the per-step machinery.
 struct Runner {
     model: Model,
-    draft: Option<crate::eagle::Draft>,
+    draft: Option<crate::drafter::Drafter>,
     staging: HostMapped,
     graphs: HashMap<GraphKey, Graph>,
     warmed: HashSet<GraphKey>,
@@ -354,9 +354,10 @@ fn worker_main(
         let draft_dir = opts.draft.clone();
         let model = Model::load(&dir, opts, Tp { rank, world, ar, ar_bytes }, embed)?;
         let staging = HostMapped::new(model.meta.bytes)?;
-        let draft = match (draft_dir, draft_head) {
-            (Some(d), Some(head)) => {
-                let dr = crate::eagle::Draft::load(&d, &model, model.opts.max_seqs, model.ctx_stride(), head)?;
+        let draft = match draft_dir {
+            Some(d) => {
+                let head = draft_head;
+                let dr = crate::drafter::Drafter::load(&d, &model, model.opts.max_seqs, model.ctx_stride(), head)?;
                 if rank == 0 {
                     eprintln!("blaze: {}", dr.describe());
                 }
@@ -377,7 +378,7 @@ fn worker_main(
                 cache_rows: r.model.opts.cache_rows,
                 page: r.model.page_size(),
                 qsa_budget: r.model.qsa_budget(),
-                draft_window: r.draft.as_ref().map_or(0, |d| d.cfg.window),
+                draft_window: r.draft.as_ref().map_or(0, |d| d.window()),
             };
             let _ = tx.send(Ok(Reply::Logits(vec![info.max_tokens as f32, info.max_seqs as f32, info.max_chunk as f32,
                                                    info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32,
@@ -405,10 +406,14 @@ impl Engine {
         gpu::set_device(0)?;
         if let Some(d) = &opts.draft {
             // the drafter reads the target's hidden states after its aux layers
-            opts.capture_layers = crate::eagle::DraftConfig::load(d)?.capture_layers();
+            opts.capture_layers = crate::drafter::capture_layers(d)?;
         }
         let embed = Arc::new(Model::load_embedding(dir)?);
-        let draft_head = opts.draft.as_deref().map(crate::eagle::load_lm_head).transpose()?.map(Arc::new);
+        // the EAGLE-4 LM head as one pinned table for every rank (DFlash uses the target's head)
+        let draft_head = match opts.draft.as_deref() {
+            Some(d) if crate::drafter::kind(d)? == crate::drafter::Kind::Eagle => Some(Arc::new(crate::eagle::load_lm_head(d)?)),
+            _ => None,
+        };
         let barrier = Arc::new(Barrier::new(world));
         let mut workers = Vec::with_capacity(world);
         for rank in 0..world {

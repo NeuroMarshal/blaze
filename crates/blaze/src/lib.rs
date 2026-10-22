@@ -2,6 +2,8 @@
 //! CUDA C++ kernels are exposed through blaze-sys.
 
 pub mod config;
+pub mod dflash;
+pub mod drafter;
 pub mod eagle;
 pub mod engine;
 pub mod gpu;
