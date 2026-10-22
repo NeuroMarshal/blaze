@@ -351,7 +351,7 @@ fn main() -> Result<()> {
             out.truncate(max_tokens);
             let same = out.iter().zip(&reference).take_while(|(a, b)| a == b).count();
             println!(
-                "prompt {n} tokens; plain {plain:.1} tok/s; EAGLE-4 {spec:.1} tok/s ({:.2}x): {rounds} rounds, {:.2} tokens per round, \
+                "prompt {n} tokens; plain {plain:.1} tok/s; drafter {spec:.1} tok/s ({:.2}x): {rounds} rounds, {:.2} tokens per round, \
                  {accepted_total}/{drafted} drafts accepted ({:.0}%); {same}/{max_tokens} tokens match the reference",
                 spec / plain,
                 (out.len() - 1) as f64 / rounds.max(1) as f64,
