@@ -1,0 +1,11 @@
+/refs/
+/target/
+/build/
+/kernels/build*/
+/.venv*/
+/scripts/vision_ref/out/
+__pycache__/
+*.pyc
+*.nsys-rep
+*.ncu-rep
+*.sqlite
