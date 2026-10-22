@@ -119,6 +119,8 @@ pub struct Options {
     /// Decode: stream the next linear layer's weights into L2 on a side stream while the main stream waits on the
     /// all-reduce or runs the small attention / GDN kernels (MiB per window, 0: off).
     pub l2_prefetch_mib: usize,
+    /// Keep the full logits of every step (tensor parallelism otherwise exchanges only each shard's best token).
+    pub full_logits: bool,
 }
 
 /// Byte offsets of the step metadata in one device buffer (filled by one host-to-device copy per step).
@@ -191,6 +193,7 @@ struct Work {
     gx: DevBuf,
     gres: DevBuf,
     gnormed: DevBuf,
+    pairs: DevBuf,
     logits: DevBuf,
     next: DevBuf,
     meta: DevBuf,
@@ -592,6 +595,7 @@ impl Model {
             gx: b(opts.max_seqs * h * 2)?,
             gres: b(opts.max_seqs * h * 2)?,
             gnormed: b(opts.max_seqs * h * 2)?,
+            pairs: b((opts.max_seqs * 8 * 8).next_multiple_of(16))?,
             logits: b(opts.max_seqs * cfg.vocab * 2)?,
             next: b(opts.max_seqs * 4)?,
             meta: b(meta.bytes)?,
@@ -676,6 +680,9 @@ impl Model {
             check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
             check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;
             check(unsafe { sys::blz_rmsnorm(w.gx.ptr(), w.gres.ptr(), self.final_norm.ptr(), eps, n as c_int, h as c_int, 1, w.gnormed.ptr(), s.0) }, "final norm")?;
+            if self.tp.world > 1 && !self.opts.full_logits {
+                return self.greedy_sharded(w.gnormed.ptr(), n);
+            }
             self.head(w.gnormed.ptr(), n, w.logits.ptr())?;
             check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), n as c_int, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         }
@@ -755,6 +762,25 @@ impl Model {
         let col0 = self.tp.rank * self.dims.vocab;
         self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, unsafe { out.add(col0) }, v, s)?;
         self.all_reduce(out, rows * v)
+    }
+
+    /// Greedy picks of `rows` normed states into `next` without the full logits: each rank takes the argmax of its
+    /// vocabulary shard, the (value, index) pairs of all ranks meet in a 16-byte-per-row all-reduce.
+    fn greedy_sharded(&self, normed: *const u16, rows: usize) -> Result<()> {
+        let (w, s, v) = (&self.work, &self.stream, self.dims.vocab);
+        let (rank, world) = (self.tp.rank, self.tp.world);
+        self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), v, s)?;
+        let bytes = (world * rows * 8).next_multiple_of(16);
+        check(unsafe { sys::cudaMemsetAsync(w.pairs.ptr(), 0, bytes, s.0) }, "memset pairs")?;
+        check(
+            unsafe {
+                sys::blz_argmax_part(w.logits.ptr(), rows as c_int, v as c_int, v as i64, (rank * v) as c_int,
+                                     w.pairs.at::<f32>(rank * rows * 2), s.0)
+            },
+            "argmax part",
+        )?;
+        check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, w.pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "all-reduce")?;
+        check(unsafe { sys::blz_argmax_merge(w.pairs.ptr(), world as c_int, rows as c_int, w.next.ptr(), s.0) }, "argmax merge")
     }
 
     /// Greedy picks of the last forward (one per span), after a stream synchronization.

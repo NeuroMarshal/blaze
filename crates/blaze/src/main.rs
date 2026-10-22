@@ -42,7 +42,7 @@ struct EngineArgs {
     expert_options: String,
     /// decode: MiB of the next linear layer's weights pulled into L2 while waiting on the all-reduce / small
     /// kernels (0: off)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 4)]
     l2_prefetch_mib: usize,
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
@@ -53,7 +53,7 @@ struct EngineArgs {
 }
 
 impl EngineArgs {
-    fn load(&self, chunk: Option<usize>) -> Result<blaze::engine::Engine> {
+    fn load(&self, chunk: Option<usize>, full_logits: bool) -> Result<blaze::engine::Engine> {
         let heat = match self.expert_heat.as_deref() {
             Some("none") => None,
             Some(p) => Some(p.to_string()),
@@ -80,6 +80,7 @@ impl EngineArgs {
                 moe_options: options,
                 reserve_gib: self.vram_reserve,
                 l2_prefetch_mib: self.l2_prefetch_mib,
+                full_logits,
             },
             self.tp,
             !self.no_graphs,
@@ -124,7 +125,7 @@ fn main() -> Result<()> {
         Command::Score { engine, text_file, score_chunk: chunk } => {
             let text = blaze::text::Text::load(&engine.model)?;
             let ids: Vec<i64> = text.encode(&std::fs::read_to_string(&text_file)?)?.into_iter().map(i64::from).collect();
-            let mut e = engine.load(Some(chunk))?;
+            let mut e = engine.load(Some(chunk), true)?;
             let mut seq = e.open()?;
             let mut pos = 0;
             for c in ids.chunks(chunk) {
@@ -146,7 +147,7 @@ fn main() -> Result<()> {
         }
         Command::Generate { engine, prompt, max_tokens, logits } => {
             let text = blaze::text::Text::load(&engine.model)?;
-            let mut e = engine.load(None)?;
+            let mut e = engine.load(None, logits)?;
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
             let mut seq = e.open()?;
             let t1 = Instant::now();

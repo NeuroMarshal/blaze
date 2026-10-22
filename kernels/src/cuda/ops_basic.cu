@@ -237,7 +237,8 @@ __global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int64_t 
 constexpr int kArgmaxThreads = 512;
 
 __global__ void __launch_bounds__(kArgmaxThreads) argmax_kernel(const uint16_t* __restrict__ logits, int vocab,
-                                                                int64_t ld, int32_t* __restrict__ out) {
+                                                                int64_t ld, int32_t* __restrict__ out,
+                                                                float* __restrict__ pair, int col0) {
   __shared__ float sv[kArgmaxThreads / 32];
   __shared__ int si[kArgmaxThreads / 32];
   const uint16_t* row = logits + int64_t(blockIdx.x) * ld;
@@ -265,7 +266,10 @@ __global__ void __launch_bounds__(kArgmaxThreads) argmax_kernel(const uint16_t* 
       const int oi = __shfl_xor_sync(0xffffffffu, best_i, o);
       if (ov > best || (ov == best && oi < best_i)) best = ov, best_i = oi;
     }
-    if (lane == 0) out[blockIdx.x] = best_i;
+    if (lane == 0) {
+      if (out) out[blockIdx.x] = best_i;
+      if (pair) pair[2 * blockIdx.x] = best, pair[2 * blockIdx.x + 1] = float(best_i + col0);
+    }
   }
 }
 
@@ -356,6 +360,18 @@ __global__ void l2_prefetch_kernel(const char* __restrict__ p, size_t bytes) {
 #endif
 }
 
+// pairs [world][rows][2] (value, index as float; exact below 2^24) -> the best per row, ties to the lower index.
+__global__ void argmax_merge_kernel(const float* __restrict__ pairs, int world, int rows, int32_t* __restrict__ out) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= rows) return;
+  float best = -FLT_MAX, best_i = 3.4e38f;
+  for (int w = 0; w < world; ++w) {
+    const float v = pairs[(int64_t(w) * rows + r) * 2], i = pairs[(int64_t(w) * rows + r) * 2 + 1];
+    if (v > best || (v == best && i < best_i)) best = v, best_i = i;
+  }
+  out[r] = int32_t(best_i);
+}
+
 int grid_for(int64_t n, int threads) {
   const int64_t blocks = (n + threads - 1) / threads;
   return int(blocks < 65535 * 16 ? blocks : 65535 * 16);
@@ -436,7 +452,7 @@ extern "C" cudaError_t blz_router_topk(const uint16_t* logits, int64_t ld, int t
 extern "C" cudaError_t blz_argmax_bf16(const uint16_t* logits, int rows, int vocab, int64_t ld, int32_t* out,
                                        cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
-  argmax_kernel<<<rows, kArgmaxThreads, 0, stream>>>(logits, vocab, ld, out);
+  argmax_kernel<<<rows, kArgmaxThreads, 0, stream>>>(logits, vocab, ld, out, nullptr, 0);
   return cudaGetLastError();
 }
 
@@ -492,5 +508,18 @@ extern "C" cudaError_t blz_l2_prefetch(const void* p, size_t bytes, cudaStream_t
   const size_t units = major >= 9 ? (bytes + (64 << 10) - 1) >> 16 : (bytes + 127) / 128;
   const int blocks = int(std::min<size_t>((units + threads - 1) / threads, 1024));
   l2_prefetch_kernel<<<blocks, threads, 0, stream>>>(static_cast<const char*>(p), bytes);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_argmax_part(const uint16_t* logits, int rows, int vocab, int64_t ld, int col0, float* pairs,
+                                       cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  argmax_kernel<<<rows, kArgmaxThreads, 0, stream>>>(logits, vocab, ld, nullptr, pairs, col0);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_argmax_merge(const float* pairs, int world, int rows, int32_t* out, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  argmax_merge_kernel<<<(rows + 127) / 128, 128, 0, stream>>>(pairs, world, rows, out);
   return cudaGetLastError();
 }

@@ -94,6 +94,13 @@ cudaError_t blz_l2_prefetch(const void* p, size_t bytes, cudaStream_t stream);
 cudaError_t blz_gather_rows(const uint16_t* src, int64_t ld_src, const int32_t* rows, int n, int dim, uint16_t* dst,
                             cudaStream_t stream);
 
+/// \brief Argmax of a vocabulary shard: pairs[row] = (max value, col0 + index) as two floats (tensor parallelism:
+/// shards of all ranks are summed into [world][rows][2] by an all-reduce, then merged).
+cudaError_t blz_argmax_part(const uint16_t* logits, int rows, int vocab, int64_t ld, int col0, float* pairs,
+                            cudaStream_t stream);
+/// \brief out[row] = index of the best pair over the ranks (ties: lower index).
+cudaError_t blz_argmax_merge(const float* pairs, int world, int rows, int32_t* out, cudaStream_t stream);
+
 /// \brief Row-wise argmax of bf16 logits (ties: lower index); rows `ld` apart.
 cudaError_t blz_argmax_bf16(const uint16_t* logits, int rows, int vocab, int64_t ld, int32_t* out, cudaStream_t stream);
 

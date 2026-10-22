@@ -88,6 +88,9 @@ unsafe extern "C" {
                              dv: c_int, state: *mut f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_argmax_bf16(logits: *const bf16, rows: c_int, vocab: c_int, ld: i64, out: *mut i32,
                            s: cudaStream_t) -> cudaError_t;
+    pub fn blz_argmax_part(logits: *const bf16, rows: c_int, vocab: c_int, ld: i64, col0: c_int, pairs: *mut f32,
+                           s: cudaStream_t) -> cudaError_t;
+    pub fn blz_argmax_merge(pairs: *const f32, world: c_int, rows: c_int, out: *mut i32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_set_req_to_token(req_to_token: *mut i32, index: *const i64, slot: *const i64, n: c_int,
                                 s: cudaStream_t) -> cudaError_t;
     pub fn blz_l2_prefetch(p: *const c_void, bytes: usize, s: cudaStream_t) -> cudaError_t;
