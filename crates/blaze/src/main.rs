@@ -62,6 +62,9 @@ struct EngineArgs {
     /// prompt-cache snapshots of the recurrent state (each holds the GDN state of one prefix)
     #[arg(long, default_value_t = 0)]
     prompt_cache_slots: usize,
+    /// CPU threads reading PLE n-gram rows from the checkpoint
+    #[arg(long, default_value_t = 64)]
+    ple_threads: usize,
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
     tp: usize,
@@ -104,6 +107,7 @@ impl EngineArgs {
                 full_logits,
                 capture_layers: Vec::new(),
                 cache_rows: self.prompt_cache_slots,
+                ple_threads: self.ple_threads,
                 max_verify: self.max_verify,
             },
             self.tp,
