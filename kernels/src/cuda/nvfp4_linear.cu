@@ -325,11 +325,13 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
                                           cudaStream_t stream) {
   if (rows <= 0 || n <= 0) return cudaSuccess;
   if (k % 128 != 0 || rows > 16) return cudaErrorInvalidValue;
-  // BLZ_MMA_SPLIT: warps splitting K per block of 8 weight rows (experiments)
-  static const int split = [] {
+  // Warps splitting K per block of 8 weight rows. Cold weights on the RTX 5070 Ti: 8 for long rows of a few tokens
+  // (17408 x 5120: 879 GB/s), 2 for short rows (k <= 4096) and for 9..16 tokens. BLZ_MMA_SPLIT overrides.
+  static const int forced = [] {
     const char* e = getenv("BLZ_MMA_SPLIT");
-    return e ? atoi(e) : 4;
+    return e ? atoi(e) : 0;
   }();
+  const int split = forced ? forced : (rows <= 8 && k >= 5120 ? 8 : 2);
 #define BLZ_MMA_LAUNCH(S)                                                                                            \
   {                                                                                                                  \
     const int blocks = (n + 7) / 8;                                                                                  \
