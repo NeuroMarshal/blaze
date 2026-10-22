@@ -66,7 +66,13 @@ int main() {
   check(cudaMemcpy(di, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "copy");
   check(cudaMemcpy(dc, counts.data(), counts.size() * 4, cudaMemcpyHostToDevice), "copy");
   check(cudaMemcpy(doff, off.data(), off.size() * 4, cudaMemcpyHostToDevice), "copy");
-  check(blz_apply_penalties(dl, vocab, rows, col0, vocab, di, dc, doff, presence, frequency, 0), "penalties");
+  std::vector<float> pres(rows, presence), freq(rows, frequency);
+  float *dp, *df;
+  check(cudaMalloc(&dp, rows * 4), "malloc");
+  check(cudaMalloc(&df, rows * 4), "malloc");
+  check(cudaMemcpy(dp, pres.data(), rows * 4, cudaMemcpyHostToDevice), "copy");
+  check(cudaMemcpy(df, freq.data(), rows * 4, cudaMemcpyHostToDevice), "copy");
+  check(blz_apply_penalties(dl, vocab, rows, col0, vocab, di, dc, doff, dp, df, 0), "penalties");
   check(blz_topk(dl, vocab, rows, vocab, col0, k, ov, oid, ws, 0), "topk");
   std::vector<float> gv(rows * k);
   std::vector<int32_t> gi(rows * k);

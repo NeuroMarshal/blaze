@@ -151,10 +151,19 @@ __global__ void __launch_bounds__(kThreads) topk_radix_kernel(const uint16_t* __
   }
 }
 
+__global__ void pack_kernel(const float* __restrict__ vals, const int32_t* __restrict__ ids, int n,
+                            float* __restrict__ pairs) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) pairs[2 * i] = vals[i], pairs[2 * i + 1] = float(ids[i]);
+}
+
 __global__ void penalties_kernel(uint16_t* __restrict__ logits, int64_t ld, int col0, int ncols,
                                  const int32_t* __restrict__ ids, const int32_t* __restrict__ counts,
-                                 const int32_t* __restrict__ off, float presence, float frequency) {
+                                 const int32_t* __restrict__ off, const float* __restrict__ pres,
+                                 const float* __restrict__ freq) {
   const int row = blockIdx.x;
+  const float presence = pres ? pres[row] : 0.0f, frequency = freq ? freq[row] : 0.0f;
+  if (presence == 0.0f && frequency == 0.0f) return;
   for (int i = off[row] + threadIdx.x; i < off[row + 1]; i += blockDim.x) {
     const int c = ids[i] - col0;
     if (c < 0 || c >= ncols) continue;
@@ -165,10 +174,16 @@ __global__ void penalties_kernel(uint16_t* __restrict__ logits, int64_t ld, int 
 
 }  // namespace
 
+extern "C" cudaError_t blz_topk_pack(const float* vals, const int32_t* ids, int n, float* pairs, cudaStream_t stream) {
+  if (n == 0) return cudaSuccess;
+  pack_kernel<<<(n + 255) / 256, 256, 0, stream>>>(vals, ids, n, pairs);
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t blz_apply_penalties(uint16_t* logits, int64_t ld, int rows, int col0, int ncols,
                                            const int32_t* ids, const int32_t* counts, const int32_t* off,
-                                           float presence, float frequency, cudaStream_t stream) {
-  if (rows == 0 || (presence == 0.0f && frequency == 0.0f)) return cudaSuccess;
+                                           const float* presence, const float* frequency, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
   penalties_kernel<<<rows, 128, 0, stream>>>(logits, ld, col0, ncols, ids, counts, off, presence, frequency);
   return cudaGetLastError();
 }

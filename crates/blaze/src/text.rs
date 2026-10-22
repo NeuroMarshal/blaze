@@ -40,4 +40,13 @@ impl Text {
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.tok.decode(ids, false).map_err(|e| anyhow!("decode: {e}"))
     }
+
+    pub fn token_id(&self, token: &str) -> Option<u32> {
+        self.tok.token_to_id(token)
+    }
+
+    /// Decode without the special tokens (chat output: the stop token is not part of the text).
+    pub fn decode_skip(&self, ids: &[u32]) -> Result<String> {
+        self.tok.decode(ids, true).map_err(|e| anyhow!("decode: {e}"))
+    }
 }

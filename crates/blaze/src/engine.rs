@@ -41,11 +41,22 @@ struct StepMeta {
     kv_lens: Vec<i32>,
     logit_rows: Vec<i32>,
     spans: Vec<Span>,
+    /// sampled step: penalty lists per logit row
+    sample: bool,
+    pen_ids: Vec<i32>,
+    pen_counts: Vec<i32>,
+    pen_off: Vec<i32>,
+    pen_presence: Vec<f32>,
+    pen_frequency: Vec<f32>,
 }
 
 enum Cmd {
     /// metadata, CUDA graph allowed, speculative verify
     Step(Arc<StepMeta>, bool, bool),
+    /// recurrent state row src -> dst
+    CopyState(usize, usize),
+    /// KV table row and its slots
+    SetKvRow(usize, Arc<Vec<i32>>),
     /// sequence row, accepted rows of the last verify
     Commit(usize, usize),
     Reset(usize),
@@ -56,6 +67,8 @@ enum Cmd {
 
 enum Reply {
     Tokens(Vec<i32>),
+    /// sampling candidates [world][rows][K][2]
+    Cands(Vec<f32>),
     Logits(Vec<f32>),
     AllLogits(Vec<Vec<f32>>),
     Done,
@@ -79,8 +92,8 @@ impl Drop for Graph {
 struct Runner {
     model: Model,
     staging: HostMapped,
-    graphs: HashMap<usize, Graph>,
-    warmed: HashSet<usize>,
+    graphs: HashMap<(usize, bool), Graph>,
+    warmed: HashSet<(usize, bool)>,
     use_graphs: bool,
 }
 
@@ -92,7 +105,7 @@ impl Runner {
         dst.copy_from_slice(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes) });
     }
 
-    fn step(&mut self, meta: &StepMeta, allow_graph: bool, verify: bool) -> Result<Vec<i32>> {
+    fn step(&mut self, meta: &StepMeta, allow_graph: bool, verify: bool) -> Result<Reply> {
         let m = self.model.meta;
         self.put(m.tokens, &meta.tokens);
         self.put(m.positions, &meta.positions);
@@ -103,6 +116,16 @@ impl Runner {
         self.put(m.req_idx, &meta.rows);
         self.put(m.kv_lens, &meta.kv_lens);
         self.put(m.logit_rows, &meta.logit_rows);
+        if meta.sample {
+            if meta.pen_ids.len() > m.max_pen {
+                bail!("{} penalty entries (max {})", meta.pen_ids.len(), m.max_pen);
+            }
+            self.put(m.pen_ids, &meta.pen_ids);
+            self.put(m.pen_counts, &meta.pen_counts);
+            self.put(m.pen_off, &meta.pen_off);
+            self.put(m.pen_presence, &meta.pen_presence);
+            self.put(m.pen_frequency, &meta.pen_frequency);
+        }
         let s = self.model.stream.0;
         check(
             unsafe { sys::cudaMemcpyAsync(self.model.meta_buffer().ptr(), self.staging.host_ptr(), m.bytes, sys::MEMCPY_H2D, s) },
@@ -110,27 +133,29 @@ impl Runner {
         )?;
         let n = meta.logit_rows.len();
         if allow_graph && self.use_graphs && !verify && meta.spans.iter().all(|sp| sp.len == 1) {
-            self.run_graph(n, &meta.spans)?;
+            self.run_graph(n, meta.sample, &meta.spans)?;
         } else {
-            self.model.forward(&meta.spans, n, verify)?;
+            self.model.forward(&meta.spans, n, verify, meta.sample)?;
         }
-        self.model.next_tokens(n)
+        if meta.sample { Ok(Reply::Cands(self.model.candidates(n)?)) } else { Ok(Reply::Tokens(self.model.next_tokens(n)?)) }
     }
 
-    /// Decode step of `n` sequences through its CUDA graph: one eager run to load every kernel, then the capture,
-    /// then replays. Every rank takes the same path for the same `n`, so their all-reduces stay paired.
-    fn run_graph(&mut self, n: usize, spans: &[Span]) -> Result<()> {
-        if let Some(g) = self.graphs.get(&n) {
+    /// Decode step of `n` sequences through its CUDA graph (one per batch size and head mode): one eager run to load
+    /// every kernel, then the capture, then replays. Every rank takes the same path for the same key, so their
+    /// all-reduces stay paired.
+    fn run_graph(&mut self, n: usize, sample: bool, spans: &[Span]) -> Result<()> {
+        let key = (n, sample);
+        if let Some(g) = self.graphs.get(&key) {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
-        if self.warmed.insert(n) {
-            return self.model.forward(spans, n, false);
+        if self.warmed.insert(key) {
+            return self.model.forward(spans, n, false, sample);
         }
         // The step's own metadata copy is already enqueued; capture after it completes.
         self.model.stream.sync()?;
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, false);
+        let captured = self.model.forward(spans, n, false, sample);
         let mut graph = null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
         captured?;
@@ -139,13 +164,21 @@ impl Runner {
         check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "cudaGraphInstantiate")?;
         let g = Graph { exec, graph };
         check(unsafe { sys::cudaGraphLaunch(g.exec, s) }, "cudaGraphLaunch")?;
-        self.graphs.insert(n, g);
+        self.graphs.insert(key, g);
         Ok(())
     }
 
     fn handle(&mut self, cmd: Cmd) -> Result<Reply> {
         Ok(match cmd {
-            Cmd::Step(meta, allow_graph, verify) => Reply::Tokens(self.step(&meta, allow_graph, verify)?),
+            Cmd::Step(meta, allow_graph, verify) => self.step(&meta, allow_graph, verify)?,
+            Cmd::CopyState(src, dst) => {
+                self.model.copy_state(src, dst)?;
+                Reply::Done
+            }
+            Cmd::SetKvRow(row, slots) => {
+                self.model.set_kv_row(row, &slots)?;
+                Reply::Done
+            }
             Cmd::Commit(row, accepted) => {
                 self.model.commit(row, accepted)?;
                 Reply::Done
@@ -175,12 +208,42 @@ pub struct Info {
     pub max_chunk: usize,
     pub ctx_stride: usize,
     pub vocab: usize,
+    pub cache_rows: usize,
+}
+
+/// A cached prefix: the recurrent state after its tokens (state row `row`, outside the live rows) and the KV slots of
+/// its positions (shared with the sequences started from it).
+pub struct Snapshot {
+    pub row: usize,
+    pub slots: Vec<u32>,
+}
+
+impl Snapshot {
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
+/// Penalties of one sampled item (OpenAI presence / frequency over its generated tokens).
+#[derive(Clone, Default)]
+pub struct Penalty {
+    pub presence: f32,
+    pub frequency: f32,
+    /// (token, count) of the tokens generated so far
+    pub counts: Vec<(i32, i32)>,
 }
 
 pub struct Engine {
     workers: Vec<Worker>,
     free_slots: Vec<u32>,
+    /// references of every KV slot (live sequences and snapshots)
+    slot_refs: Vec<u32>,
     free_rows: Vec<usize>,
+    free_cache_rows: Vec<usize>,
     pub info: Info,
 }
 
@@ -231,9 +294,10 @@ fn worker_main(
                 max_chunk: r.model.opts.max_chunk,
                 ctx_stride: r.model.ctx_stride(),
                 vocab: r.model.cfg.vocab,
+                cache_rows: r.model.opts.cache_rows,
             };
             let _ = tx.send(Ok(Reply::Logits(vec![info.max_tokens as f32, info.max_seqs as f32, info.max_chunk as f32,
-                                                   info.ctx_stride as f32, info.vocab as f32])));
+                                                   info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32])));
             r
         }
         Err(e) => {
@@ -277,6 +341,7 @@ impl Engine {
                         max_chunk: v[2] as usize,
                         ctx_stride: v[3] as usize,
                         vocab: v[4] as usize,
+                        cache_rows: v[5] as usize,
                     });
                 }
                 Ok(_) => unreachable!(),
@@ -292,7 +357,9 @@ impl Engine {
         Ok(Self {
             workers,
             free_slots: (0..info.max_tokens as u32).rev().collect(),
+            slot_refs: vec![0; info.max_tokens],
             free_rows: (0..info.max_seqs).rev().collect(),
+            free_cache_rows: (info.max_seqs..info.max_seqs + info.cache_rows).rev().collect(),
             info,
         })
     }
@@ -324,15 +391,65 @@ impl Engine {
         self.free_slots.len()
     }
 
+    pub fn free_rows(&self) -> usize {
+        self.free_rows.len()
+    }
+
+    fn unref(&mut self, slot: u32) {
+        let r = &mut self.slot_refs[slot as usize];
+        *r -= 1;
+        if *r == 0 {
+            self.free_slots.push(slot);
+        }
+    }
+
     pub fn open(&mut self) -> Result<Seq> {
+        self.open_from(None)
+    }
+
+    /// A new sequence, empty or continuing a cached prefix (its state copied, its KV slots shared).
+    pub fn open_from(&mut self, prefix: Option<&Snapshot>) -> Result<Seq> {
         let Some(row) = self.free_rows.pop() else { bail!("no free sequence row (max_seqs {})", self.info.max_seqs) };
-        self.broadcast(|| Cmd::Reset(row))?;
-        Ok(Seq { row, slots: Vec::new() })
+        match prefix {
+            None => {
+                self.broadcast(|| Cmd::Reset(row))?;
+                Ok(Seq { row, slots: Vec::new() })
+            }
+            Some(snap) => {
+                self.broadcast(|| Cmd::CopyState(snap.row, row))?;
+                let slots: Arc<Vec<i32>> = Arc::new(snap.slots.iter().map(|&s| s as i32).collect());
+                self.broadcast(|| Cmd::SetKvRow(row, slots.clone()))?;
+                for &s in &snap.slots {
+                    self.slot_refs[s as usize] += 1;
+                }
+                Ok(Seq { row, slots: snap.slots.clone() })
+            }
+        }
     }
 
     pub fn close(&mut self, seq: Seq) {
-        self.free_slots.extend(seq.slots.iter().rev());
+        for &s in seq.slots.iter().rev() {
+            self.unref(s);
+        }
         self.free_rows.push(seq.row);
+    }
+
+    /// Keep the state after the first `len` tokens of `seq` (they must be all of its tokens: the state stands after
+    /// the last one) as a prefix-cache entry; None when every cache row is taken.
+    pub fn snapshot(&mut self, seq: &Seq) -> Result<Option<Snapshot>> {
+        let Some(row) = self.free_cache_rows.pop() else { return Ok(None) };
+        self.broadcast(|| Cmd::CopyState(seq.row, row))?;
+        for &s in &seq.slots {
+            self.slot_refs[s as usize] += 1;
+        }
+        Ok(Some(Snapshot { row, slots: seq.slots.clone() }))
+    }
+
+    pub fn release(&mut self, snap: Snapshot) {
+        for &s in snap.slots.iter().rev() {
+            self.unref(s);
+        }
+        self.free_cache_rows.push(snap.row);
     }
 
     /// Metadata of a step; `all_rows`: greedy picks for every row (a verify) instead of each item's last row.
@@ -350,6 +467,7 @@ impl Engine {
             m.spans.push(Span { offset: m.tokens.len(), len: t.len() });
             for &id in t.iter() {
                 let slot = self.free_slots.pop().unwrap();
+                self.slot_refs[slot as usize] = 1;
                 let p = seq.len();
                 m.tokens.push(id);
                 m.positions.push(p as i64);
@@ -377,6 +495,45 @@ impl Engine {
             Reply::Tokens(t) => Ok(t),
             _ => unreachable!(),
         }
+    }
+
+    /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
+    /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
+    pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Vec<(f32, i32)>>> {
+        let mut m = self.plan(seqs, tokens, false)?;
+        m.sample = true;
+        m.pen_off.push(0);
+        for p in pens {
+            for &(id, c) in &p.counts {
+                m.pen_ids.push(id);
+                m.pen_counts.push(c);
+            }
+            m.pen_off.push(m.pen_ids.len() as i32);
+            m.pen_presence.push(p.presence);
+            m.pen_frequency.push(p.frequency);
+        }
+        let n = m.logit_rows.len();
+        let meta = Arc::new(m);
+        let pairs = match self.broadcast(|| Cmd::Step(meta.clone(), true, false))? {
+            Reply::Cands(p) => p,
+            _ => unreachable!(),
+        };
+        let (k, world) = (sys::BLZ_TOPK_MAX, self.workers.len());
+        let mut out = Vec::with_capacity(n);
+        for r in 0..n {
+            let mut c: Vec<(f32, i32)> = (0..world)
+                .flat_map(|w| {
+                    let base = (w * n + r) * k * 2;
+                    (0..k).map(move |j| (base + 2 * j, base + 2 * j + 1))
+                })
+                .map(|(vi, ii)| (pairs[vi], pairs[ii] as i32))
+                .filter(|&(_, id)| id >= 0)
+                .collect();
+            c.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
+            c.truncate(k);
+            out.push(c);
+        }
+        Ok(out)
     }
 
     /// Prefill `tokens` into `seq` in chunks; returns the greedy token after the last one.
@@ -413,7 +570,10 @@ impl Engine {
     /// advance over the kept rows.
     pub fn commit(&mut self, seq: &mut Seq, rows: usize, accepted: usize) -> Result<()> {
         let keep = seq.len() - (rows - accepted);
-        self.free_slots.extend(seq.slots.drain(keep..).rev());
+        let dropped: Vec<u32> = seq.slots.drain(keep..).collect();
+        for s in dropped.into_iter().rev() {
+            self.unref(s);
+        }
         self.broadcast(|| Cmd::Commit(seq.row, accepted))?;
         Ok(())
     }

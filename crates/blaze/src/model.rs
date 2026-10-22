@@ -181,6 +181,8 @@ pub struct Options {
     pub l2_prefetch_mib: usize,
     /// Keep the full logits of every step (tensor parallelism otherwise exchanges only each shard's best token).
     pub full_logits: bool,
+    /// Extra recurrent-state rows (GDN, PLE) for prefix-cache snapshots, after the max_seqs rows of live sequences.
+    pub cache_rows: usize,
     /// Layers whose input hidden state (the residual stream entering the layer) every forward copies out, in order
     /// (a speculative drafter's features).
     pub capture_layers: Vec<usize>,
@@ -202,6 +204,13 @@ pub struct MetaLayout {
     pub req_idx: usize,
     pub kv_lens: usize,
     pub logit_rows: usize,
+    // sampling: penalty lists of the sampled rows (ids, counts, offsets [rows + 1]) and per-row coefficients
+    pub max_pen: usize,
+    pub pen_ids: usize,
+    pub pen_counts: usize,
+    pub pen_off: usize,
+    pub pen_presence: usize,
+    pub pen_frequency: usize,
     pub bytes: usize,
 }
 
@@ -221,8 +230,33 @@ impl MetaLayout {
         let seq_slots = take(max_seqs * 4);
         let req_idx = take(max_seqs * 4);
         let kv_lens = take(max_seqs * 4);
-        let logit_rows = take(max_seqs * 4);
-        Self { max_tokens, max_seqs, tokens, positions, locs, rt_index, seq_start, seq_slots, req_idx, kv_lens, logit_rows, bytes: o }
+        let logit_rows = take(max_tokens * 4);
+        let max_pen = (max_seqs * 4096).min(1 << 16);
+        let pen_ids = take(max_pen * 4);
+        let pen_counts = take(max_pen * 4);
+        let pen_off = take((max_tokens + 1) * 4);
+        let pen_presence = take(max_tokens * 4);
+        let pen_frequency = take(max_tokens * 4);
+        Self {
+            max_tokens,
+            max_seqs,
+            tokens,
+            positions,
+            locs,
+            rt_index,
+            seq_start,
+            seq_slots,
+            req_idx,
+            kv_lens,
+            logit_rows,
+            max_pen,
+            pen_ids,
+            pen_counts,
+            pen_off,
+            pen_presence,
+            pen_frequency,
+            bytes: o,
+        }
     }
 }
 
@@ -273,6 +307,10 @@ struct Work {
     ple_gated: Option<DevBuf>,
     ple_gatedn: Option<DevBuf>,
     pairs: DevBuf,
+    // sampling candidates of this rank's vocabulary shard, and every rank's packed (value, id) pairs
+    cand_vals: DevBuf,
+    cand_ids: DevBuf,
+    cand_pairs: DevBuf,
     logits: DevBuf,
     next: DevBuf,
     meta: DevBuf,
@@ -554,12 +592,13 @@ impl Model {
         }
         let kv_global = DevBuf::from_slice(&[1.0f32])?;
         let req_to_token = DevBuf::zeroed(opts.max_seqs * cfg.max_positions.min(opts.max_tokens) * 4, s)?;
+        let state_rows = opts.max_seqs + opts.cache_rows;
         let (mut conv_state, mut rec_state) = (Vec::new(), Vec::new());
         if let Some(g) = &cfg.gdn {
             let channels = 2 * dims.k_heads * g.k_dim + dims.v_heads * g.v_dim;
             for _ in 0..n_gdn {
-                conv_state.push(DevBuf::zeroed(opts.max_seqs * channels * (g.conv_kernel - 1) * 2, s)?);
-                rec_state.push(DevBuf::zeroed(opts.max_seqs * dims.v_heads * g.k_dim * g.v_dim * 4, s)?);
+                conv_state.push(DevBuf::zeroed(state_rows * channels * (g.conv_kernel - 1) * 2, s)?);
+                rec_state.push(DevBuf::zeroed(state_rows * dims.v_heads * g.k_dim * g.v_dim * 4, s)?);
             }
         }
 
@@ -598,9 +637,9 @@ impl Model {
             }
             let channels = hc.count * cfg.hidden;
             let state_len = (pc.conv_kernel - 1) * pc.ngram_size;
-            let conv = DevBuf::zeroed(opts.max_seqs * channels * state_len * 2, s)?;
+            let conv = DevBuf::zeroed(state_rows * channels * state_len * 2, s)?;
             let eos = cfg.eos.ok_or_else(|| anyhow!("PLE needs eos_token_id"))?;
-            let hist = DevBuf::from_slice(&vec![eos; opts.max_seqs * 2])?;
+            let hist = DevBuf::from_slice(&vec![eos; state_rows * 2])?;
             ple_table = Some(table);
             ple_state = Some((conv, hist));
         }
@@ -610,7 +649,7 @@ impl Model {
         } else {
             Some(DevBuf::zeroed(meta.max_tokens * opts.capture_layers.len() * cfg.hidden * 2, s)?)
         };
-        let work = Self::alloc_work(&cfg, &dims, &layers, &opts, &meta, s)?;
+        let work = Self::alloc_work(&cfg, &dims, w, &layers, &opts, &meta, s)?;
         // Scratch NVFP4 weights are widened into for prefill GEMMs.
         let mut scratch_elems = lm_head.scratch_elems();
         for l in &layers {
@@ -723,7 +762,7 @@ impl Model {
         Ok(MoeEngine(engine))
     }
 
-    fn alloc_work(cfg: &ModelConfig, d: &Dims, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
+    fn alloc_work(cfg: &ModelConfig, d: &Dims, world: usize, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
         let t = opts.max_chunk;
         let h = cfg.hidden;
         let mut proj_cols = 0;
@@ -803,6 +842,9 @@ impl Model {
             ple_gated: ple_c.map(|c| b(t * c * 2)).transpose()?,
             ple_gatedn: ple_c.map(|c| b(t * c * 2)).transpose()?,
             pairs: b((head_rows * 8 * 8).next_multiple_of(16))?,
+            cand_vals: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
+            cand_ids: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
+            cand_pairs: b((world * head_rows * sys::BLZ_TOPK_MAX * 8).next_multiple_of(16))?,
             logits: b(head_rows * cfg.vocab * 2)?,
             next: b(head_rows * 4)?,
             meta: b(meta.bytes)?,
@@ -954,7 +996,7 @@ impl Model {
     /// sequences (len 1) first, then prefill chunks. The head runs on the first `n_logits` rows listed in
     /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
     /// (its inputs are recorded for commit). Capturable into a CUDA graph (no host synchronization).
-    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool) -> Result<()> {
+    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool) -> Result<()> {
         let t: usize = spans.iter().map(|s| s.len).sum();
         let n = spans.len();
         if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
@@ -1058,6 +1100,9 @@ impl Model {
                     self.hc_enter(mixer, n, gs.ptr(), gh.ptr(), w.gnormed.ptr())?;
                 }
             }
+            if sample {
+                return self.sample_candidates(w.gnormed.ptr(), n);
+            }
             if self.tp.world > 1 && !self.opts.full_logits {
                 return self.greedy_sharded(w.gnormed.ptr(), n);
             }
@@ -1159,6 +1204,84 @@ impl Model {
         )?;
         check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, w.pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "all-reduce")?;
         check(unsafe { sys::blz_argmax_merge(w.pairs.ptr(), world as c_int, rows as c_int, w.next.ptr(), s.0) }, "argmax merge")
+    }
+
+    /// Sampling candidates of `rows` normed states: this rank's vocabulary shard through the head, the rows' penalties,
+    /// the shard's top BLZ_TOPK_MAX, packed as (value, id) pairs at the rank's slot of cand_pairs and merged over the
+    /// group (cand_pairs: [world][rows][K][2] floats).
+    fn sample_candidates(&self, normed: *const u16, rows: usize) -> Result<()> {
+        let (w, s, v, m) = (&self.work, &self.stream, self.dims.vocab, &self.meta);
+        let (rank, world, k) = (self.tp.rank, self.tp.world, sys::BLZ_TOPK_MAX);
+        self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), v, s)?;
+        check(
+            unsafe {
+                sys::blz_apply_penalties(w.logits.ptr(), v as i64, rows as c_int, (rank * v) as c_int, v as c_int, self.meta_ptr(m.pen_ids),
+                                         self.meta_ptr(m.pen_counts), self.meta_ptr(m.pen_off), self.meta_ptr(m.pen_presence),
+                                         self.meta_ptr(m.pen_frequency), s.0)
+            },
+            "penalties",
+        )?;
+        check(
+            unsafe {
+                sys::blz_topk(w.logits.ptr(), v as i64, rows as c_int, v as c_int, (rank * v) as c_int, k as c_int, w.cand_vals.ptr(),
+                              w.cand_ids.ptr(), null_mut(), s.0)
+            },
+            "top-k",
+        )?;
+        let bytes = (world * rows * k * 8).next_multiple_of(16);
+        if world > 1 {
+            check(unsafe { sys::cudaMemsetAsync(w.cand_pairs.ptr(), 0, bytes, s.0) }, "memset")?;
+        }
+        check(
+            unsafe { sys::blz_topk_pack(w.cand_vals.ptr(), w.cand_ids.ptr(), (rows * k) as c_int, w.cand_pairs.at::<f32>(rank * rows * k * 2), s.0) },
+            "pack",
+        )?;
+        if world > 1 {
+            check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, w.cand_pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "all-reduce")?;
+        }
+        Ok(())
+    }
+
+    /// The merged candidate pairs of the last sampled forward: [world][rows][K][2] floats.
+    pub fn candidates(&self, rows: usize) -> Result<Vec<f32>> {
+        self.stream.sync()?;
+        self.work.cand_pairs.download::<f32>(self.tp.world * rows * sys::BLZ_TOPK_MAX * 2)
+    }
+
+    /// Copy the recurrent state (GDN conv and recurrent, PLE conv and n-gram history) of row `src` to row `dst`.
+    pub fn copy_state(&self, src: usize, dst: usize) -> Result<()> {
+        let s = &self.stream;
+        let copy = |buf: &DevBuf, row_bytes: usize| -> Result<()> {
+            check(
+                unsafe {
+                    sys::cudaMemcpyAsync(buf.at::<u8>(dst * row_bytes).cast(), buf.at::<u8>(src * row_bytes).cast(), row_bytes,
+                                         sys::MEMCPY_D2D, s.0)
+                },
+                "state copy",
+            )
+        };
+        if let Some(g) = &self.cfg.gdn {
+            let d = &self.dims;
+            let channels = 2 * d.k_heads * g.k_dim + d.v_heads * g.v_dim;
+            for (c, r) in self.conv_state.iter().zip(&self.rec_state) {
+                copy(c, channels * (g.conv_kernel - 1) * 2)?;
+                copy(r, d.v_heads * g.k_dim * g.v_dim * 4)?;
+            }
+        }
+        if let (Some((conv, hist)), Some(pc), Some(hc)) = (&self.ple_state, &self.cfg.ple, &self.cfg.hc) {
+            copy(conv, hc.count * self.cfg.hidden * (pc.conv_kernel - 1) * pc.ngram_size * 2)?;
+            copy(hist, 16)?;
+        }
+        Ok(())
+    }
+
+    /// Row `row` of the KV table: position p's KV slot = slots[p] (a sequence starting from a cached prefix).
+    pub fn set_kv_row(&self, row: usize, slots: &[i32]) -> Result<()> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        self.stream.sync()?;
+        self.req_to_token.upload_at(row * self.ctx_stride() * 4, slots)
     }
 
     /// Greedy picks of the last forward (one per span), after a stream synchronization.

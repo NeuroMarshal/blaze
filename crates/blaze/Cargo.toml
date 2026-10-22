@@ -15,3 +15,10 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+blaze-chat = { path = "../blaze-chat" }
+axum.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+uuid.workspace = true
+minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
