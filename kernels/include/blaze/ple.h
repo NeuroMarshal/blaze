@@ -106,7 +106,6 @@ class PleService {
   std::atomic<uint32_t> warm_gen_{0};
   std::atomic<uint64_t> warmed_{0};
   void warm_reader();
-  bool read_direct(const uint8_t* src, uint16_t* dst);
   // Gather job: counter = (generation << 32) | next task, so a helper still on an older job never takes a task of
   // the current one; work_n_ is written before the counter is reset (release).
   std::atomic<uint64_t> work_ctr_{0};
