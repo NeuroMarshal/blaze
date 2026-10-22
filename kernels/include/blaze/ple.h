@@ -34,7 +34,9 @@ class PleService {
   ///                  [rows_per_shard, dim] (orcarouter's checkpoint)
   /// \param max_ids   largest request (ids per call)
   /// \param threads   CPU gather threads
-  PleService(const std::string& path, int max_ids, int threads);
+  /// \param cache_bytes  RAM for a row cache (8-way set associative, rows of row_dim BF16): the page cache keeps a
+  ///                    320-byte row as a 4 KiB page, this keeps 12.8x more hot rows in the same memory; 0: none
+  PleService(const std::string& path, int max_ids, int threads, size_t cache_bytes = 0);
   ~PleService();
   PleService(const PleService&) = delete;
   PleService& operator=(const PleService&) = delete;
@@ -47,6 +49,8 @@ class PleService {
   cudaError_t fetch(uint16_t* out, int n, cudaStream_t stream);
 
   uint64_t served() const { return served_.load(std::memory_order_relaxed); }
+  uint64_t cache_hits() const { return hits_.load(std::memory_order_relaxed); }
+  uint64_t cache_misses() const { return misses_.load(std::memory_order_relaxed); }
 
   /// \brief Host side: start reading the pages of these rows into the page cache (asynchronous; a prefill chunk's rows
   /// while the previous chunk computes). Returns at once.
@@ -72,6 +76,18 @@ class PleService {
   std::atomic<uint64_t> served_{0};
   std::thread thread_;
   std::vector<std::thread> pool_;
+  // row cache: sets x 8 ways; tag = id + 1 (0: empty); one spin lock and a round-robin victim per set
+  static constexpr int kWays = 8;
+  size_t cache_sets_ = 0;
+  uint64_t* cache_tags_ = nullptr;
+  uint8_t* cache_rows_ = nullptr;
+  std::atomic<uint8_t>* cache_lock_ = nullptr;
+  uint8_t* cache_next_ = nullptr;
+  size_t cache_map_bytes_ = 0;
+  void* cache_map_ = nullptr;
+  std::atomic<uint64_t> hits_{0}, misses_{0};
+  bool cache_get(int64_t id, uint16_t* dst);
+  void cache_put(int64_t id, const uint16_t* src);
   // warm-up queue (row ids) and its thread
   std::mutex warm_mu_;
   std::condition_variable warm_cv_;

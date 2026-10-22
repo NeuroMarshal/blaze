@@ -189,6 +189,8 @@ pub struct Options {
     pub cache_rows: usize,
     /// CPU threads reading PLE n-gram rows from the checkpoint (random reads: more threads, more reads in flight)
     pub ple_threads: usize,
+    /// GiB of RAM for the PLE row cache
+    pub ple_cache_gib: f64,
     /// Layers whose input hidden state (the residual stream entering the layer) every forward copies out, in order
     /// (a speculative drafter's features).
     pub capture_layers: Vec<usize>,
@@ -684,7 +686,7 @@ impl Model {
             let max_ids = opts.max_chunk.max(opts.max_seqs).max(opts.max_verify) * 2 * pc.heads_per_ngram;
             let mut table = null_mut();
             let mut err = vec![0i8; 512];
-            if unsafe { sys::blz_ple_create(cpath.as_ptr(), max_ids as c_int, opts.ple_threads as c_int, &mut table, err.as_mut_ptr().cast(), err.len()) } != 0 {
+            if unsafe { sys::blz_ple_create(cpath.as_ptr(), max_ids as c_int, opts.ple_threads as c_int, opts.ple_cache_gib, &mut table, err.as_mut_ptr().cast(), err.len()) } != 0 {
                 let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr().cast()) }.to_string_lossy().into_owned();
                 bail!("PLE table: {msg}");
             }

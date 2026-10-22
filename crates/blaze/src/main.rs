@@ -65,6 +65,9 @@ struct EngineArgs {
     /// CPU threads reading PLE n-gram rows from the checkpoint
     #[arg(long, default_value_t = 64)]
     ple_threads: usize,
+    /// GiB of RAM for the PLE row cache (rows of the n-gram table kept at row granularity)
+    #[arg(long, default_value_t = 4.0)]
+    ple_cache_gib: f64,
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
     tp: usize,
@@ -108,6 +111,7 @@ impl EngineArgs {
                 capture_layers: Vec::new(),
                 cache_rows: self.prompt_cache_slots,
                 ple_threads: self.ple_threads,
+                ple_cache_gib: self.ple_cache_gib,
                 max_verify: self.max_verify,
             },
             self.tp,

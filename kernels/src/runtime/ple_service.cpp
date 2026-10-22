@@ -72,7 +72,45 @@ Bf16Shards find_bf16_shards(int fd, const std::string& path) {
 
 }  // namespace
 
-PleService::PleService(const std::string& path, int max_ids, int threads) : max_ids_(max_ids), threads_(threads) {
+bool PleService::cache_get(int64_t id, uint16_t* dst) {
+  if (!cache_sets_) return false;
+  const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
+  const size_t row_bytes = size_t(row_dim_) * 2;
+  auto& lk = cache_lock_[set];
+  uint8_t expected = 0;
+  while (!lk.compare_exchange_weak(expected, 1, std::memory_order_acquire)) expected = 0, _mm_pause();
+  bool hit = false;
+  for (int w = 0; w < kWays; ++w)
+    if (cache_tags_[set * kWays + w] == uint64_t(id) + 1) {
+      std::memcpy(dst, cache_rows_ + (set * kWays + w) * row_bytes, row_bytes);
+      hit = true;
+      break;
+    }
+  lk.store(0, std::memory_order_release);
+  return hit;
+}
+
+void PleService::cache_put(int64_t id, const uint16_t* src) {
+  if (!cache_sets_) return;
+  const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
+  const size_t row_bytes = size_t(row_dim_) * 2;
+  auto& lk = cache_lock_[set];
+  uint8_t expected = 0;
+  while (!lk.compare_exchange_weak(expected, 1, std::memory_order_acquire)) expected = 0, _mm_pause();
+  int way = -1;
+  for (int w = 0; w < kWays && way < 0; ++w)
+    if (cache_tags_[set * kWays + w] == uint64_t(id) + 1) way = w;  // another thread inserted it
+  if (way < 0) {
+    way = cache_next_[set] % kWays;
+    cache_next_[set] = uint8_t(way + 1);
+    cache_tags_[set * kWays + way] = uint64_t(id) + 1;
+    std::memcpy(cache_rows_ + (set * kWays + way) * row_bytes, src, row_bytes);
+  }
+  lk.store(0, std::memory_order_release);
+}
+
+PleService::PleService(const std::string& path, int max_ids, int threads, size_t cache_bytes)
+    : max_ids_(max_ids), threads_(threads) {
   fd_ = open(path.c_str(), O_RDONLY);
   if (fd_ < 0) throw std::runtime_error("cannot open " + path);
   const Bf16Shards t = find_bf16_shards(fd_, path);
@@ -85,6 +123,19 @@ PleService::PleService(const std::string& path, int max_ids, int threads) : max_
   madvise(m, table_bytes_, MADV_RANDOM);
   table_ = static_cast<const uint8_t*>(m);
   for (uint64_t off : t.offset) shard_.push_back(table_ + off);
+  if (cache_bytes > 0) {
+    const size_t row_bytes = size_t(row_dim_) * 2, per_set = kWays * (row_bytes + 8) + 2;
+    cache_sets_ = std::max<size_t>(1, cache_bytes / per_set);
+    cache_map_bytes_ = cache_sets_ * per_set + 4096;
+    cache_map_ = mmap(nullptr, cache_map_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (cache_map_ == MAP_FAILED) throw std::runtime_error("PLE row cache: out of memory");
+    madvise(cache_map_, cache_map_bytes_, MADV_HUGEPAGE);
+    auto* base = static_cast<uint8_t*>(cache_map_);
+    cache_tags_ = reinterpret_cast<uint64_t*>(base);
+    cache_rows_ = base + cache_sets_ * kWays * 8;
+    cache_lock_ = reinterpret_cast<std::atomic<uint8_t>*>(cache_rows_ + cache_sets_ * kWays * row_bytes);
+    cache_next_ = reinterpret_cast<uint8_t*>(cache_lock_) + cache_sets_;
+  }
   const size_t bytes = rows_offset(max_ids_) + size_t(max_ids_) * row_dim_ * 2;
   check(cudaHostAlloc(reinterpret_cast<void**>(&mail_), bytes, cudaHostAllocMapped | cudaHostAllocPortable), "mailbox");
   std::memset(mail_, 0, bytes);
@@ -119,6 +170,13 @@ PleService::PleService(const std::string& path, int max_ids, int threads) : max_
       const size_t page = 4096, row_bytes = size_t(row_dim_) * 2;
       for (int64_t id : ids) {
         if (id < 0 || uint64_t(id) >= rows_) continue;
+        if (cache_sets_) {
+          // a racy tag look-up is enough for a hint
+          const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
+          bool cached = false;
+          for (int w = 0; w < kWays; ++w) cached |= cache_tags_[set * kWays + w] == uint64_t(id) + 1;
+          if (cached) continue;
+        }
         const uint8_t* p = shard_[size_t(uint64_t(id) / shard_rows_)] + size_t(uint64_t(id) % shard_rows_) * row_bytes;
         const uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
         const uintptr_t b = (reinterpret_cast<uintptr_t>(p) + row_bytes + page - 1) & ~(page - 1);
@@ -151,6 +209,13 @@ PleService::~PleService() {
   cudaFree(seq_dev_);
   cudaFreeHost(mail_);
   munmap(const_cast<uint8_t*>(table_), table_bytes_);
+  if (cache_map_) {
+    const uint64_t h = hits_.load(), m = misses_.load();
+    std::fprintf(stderr, "blaze: PLE row cache %.2f GiB: %llu hits, %llu misses (%.1f%%)\n",
+                 double(cache_map_bytes_) / double(1ull << 30), (unsigned long long)h, (unsigned long long)m,
+                 h + m ? 100.0 * double(h) / double(h + m) : 0.0);
+    munmap(cache_map_, cache_map_bytes_);
+  }
   close(fd_);
 }
 
@@ -195,8 +260,14 @@ void PleService::gather(uint32_t gen, int n) {
         std::memset(dst, 0, size_t(dim) * 2);
         continue;
       }
+      if (cache_get(id, dst)) {
+        hits_.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      misses_.fetch_add(1, std::memory_order_relaxed);
       std::memcpy(dst, shard_[size_t(uint64_t(id) / shard_rows_)] + size_t(uint64_t(id) % shard_rows_) * dim * 2,
                   size_t(dim) * 2);
+      cache_put(id, dst);
     }
     work_done_.fetch_add(1, std::memory_order_acq_rel);
   }
@@ -231,10 +302,11 @@ struct blz_ple {
   std::unique_ptr<blaze::PleService> svc;
 };
 
-extern "C" int blz_ple_create(const char* path, int max_ids, int threads, blz_ple** out, char* err, size_t err_len) {
+extern "C" int blz_ple_create(const char* path, int max_ids, int threads, double cache_gib, blz_ple** out, char* err,
+                              size_t err_len) {
   try {
     auto* p = new blz_ple;
-    p->svc = std::make_unique<blaze::PleService>(path, max_ids, threads);
+    p->svc = std::make_unique<blaze::PleService>(path, max_ids, threads, size_t(cache_gib * double(1ull << 30)));
     *out = p;
     return 0;
   } catch (const std::exception& e) {

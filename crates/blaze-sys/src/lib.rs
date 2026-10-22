@@ -264,8 +264,8 @@ unsafe extern "C" {
     pub fn blz_ple_conv(gated_n: *const bf16, gated: *const bf16, seq_start: *const i32, slots: *const i32, seqs: c_int,
                         channels: c_int, kernel: c_int, dilation: c_int, weight: *const bf16, state: *mut bf16,
                         write_state: c_int, streams: *mut bf16, s: cudaStream_t) -> cudaError_t;
-    pub fn blz_ple_create(path: *const c_char, max_ids: c_int, threads: c_int, out: *mut *mut blz_ple, err: *mut c_char,
-                          err_len: usize) -> c_int;
+    pub fn blz_ple_create(path: *const c_char, max_ids: c_int, threads: c_int, cache_gib: f64, out: *mut *mut blz_ple,
+                          err: *mut c_char, err_len: usize) -> c_int;
     pub fn blz_ple_destroy(p: *mut blz_ple);
     pub fn blz_ple_row_dim(p: *const blz_ple) -> c_int;
     pub fn blz_ple_request(p: *mut blz_ple, ids: *const i64, n: c_int, s: cudaStream_t) -> cudaError_t;

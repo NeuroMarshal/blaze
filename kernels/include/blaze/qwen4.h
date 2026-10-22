@@ -57,7 +57,7 @@ cudaError_t blz_ple_conv(const uint16_t* gated_n, const uint16_t* gated, const i
 
 /// \brief PLE n-gram table service (blaze::PleService): rows gathered from the safetensors shards on demand.
 typedef struct blz_ple blz_ple;
-int blz_ple_create(const char* path, int max_ids, int threads, blz_ple** out, char* err, size_t err_len);
+int blz_ple_create(const char* path, int max_ids, int threads, double cache_gib, blz_ple** out, char* err, size_t err_len);
 void blz_ple_destroy(blz_ple* p);
 int blz_ple_row_dim(const blz_ple* p);
 /// \brief Publish n row ids (device int64); the CPU service starts reading. Capturable.
