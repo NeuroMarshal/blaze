@@ -1,0 +1,292 @@
+//! Checkpoint linear layers, grouped by shared input and storage format.
+//! Tensor-parallel shards are cut before upload.
+
+use crate::gpu::{DevBuf, Stream, check};
+use crate::quant::{Format, QuantConfig, WeightNames};
+use crate::weights::{Checkpoint, Dtype};
+use anyhow::{Result, bail};
+use blaze_sys as sys;
+use std::borrow::Cow;
+use std::ffi::c_int;
+use std::ops::Range;
+
+/// The part of a module this rank keeps.
+#[derive(Clone, Debug)]
+pub enum Cut {
+    All,
+    /// Output rows (column parallel), several ranges concatenated in order.
+    Rows(Vec<Range<usize>>),
+    /// Input columns (row parallel: the outputs are partial sums to all-reduce).
+    Cols(Range<usize>),
+}
+
+enum Store {
+    Bf16(DevBuf),
+    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf },
+}
+
+struct Part {
+    store: Store,
+    /// First output column of the part.
+    col: usize,
+    n: usize,
+}
+
+pub struct Linear {
+    parts: Vec<Part>,
+    pub n: usize,
+    pub k: usize,
+}
+
+/// What every linear launch needs: the cuBLAS handle and the scratch matrix NVFP4 weights are widened into for
+/// inputs longer than the GEMV serves.
+pub struct LinCtx {
+    pub gemm: *mut sys::blz_gemm,
+    pub scratch: *mut u16,
+    pub scratch_elems: usize,
+}
+
+/// Rows `rows` of a row-major tensor with `row_bytes` per row, bytes `cols` of each.
+fn cut_rows<'a>(raw: &'a [u8], row_bytes: usize, rows: &[Range<usize>], cols: Range<usize>) -> Cow<'a, [u8]> {
+    if cols.start == 0 && cols.end == row_bytes && rows.len() == 1 {
+        return Cow::Borrowed(&raw[rows[0].start * row_bytes..rows[0].end * row_bytes]);
+    }
+    let mut v = Vec::with_capacity(rows.iter().map(|r| r.len()).sum::<usize>() * cols.len());
+    for r in rows {
+        for i in r.clone() {
+            v.extend_from_slice(&raw[i * row_bytes + cols.start..i * row_bytes + cols.end]);
+        }
+    }
+    Cow::Owned(v)
+}
+
+struct Module {
+    name: String,
+    format: Format,
+    names: WeightNames,
+    rows: Vec<Range<usize>>,
+    cols: Range<usize>,
+    /// Rows kept.
+    n: usize,
+}
+
+impl Module {
+    fn nvfp4(&self) -> bool {
+        matches!(self.format, Format::Nvfp4 { .. })
+    }
+}
+
+impl Linear {
+    /// Load `modules` (name without `.weight`, cut) stacked in order.
+    pub fn load(ckpt: &Checkpoint, quant: &QuantConfig, modules: &[(String, Cut)], s: &Stream) -> Result<Self> {
+        let mut mods = Vec::with_capacity(modules.len());
+        let mut k_local = None;
+        for (name, cut) in modules {
+            let (scheme, names) = quant.resolve(ckpt, name)?;
+            let info = ckpt.info(&names.weight)?;
+            let full_n = info.shape[0];
+            let full_k = match scheme.format {
+                Format::Nvfp4 { group, .. } => {
+                    if group != 16 {
+                        bail!("{name}: NVFP4 group {group} (16 supported)");
+                    }
+                    info.shape[1] * 2
+                }
+                _ => info.shape[1..].iter().product(),
+            };
+            let (rows, cols) = match cut {
+                Cut::All => (vec![0..full_n], 0..full_k),
+                Cut::Rows(r) => (r.clone(), 0..full_k),
+                Cut::Cols(c) => (vec![0..full_n], c.clone()),
+            };
+            if rows.iter().any(|r| r.end > full_n) || cols.end > full_k {
+                bail!("{name}: cut {cut:?} outside [{full_n}, {full_k}]");
+            }
+            let k = cols.len();
+            if *k_local.get_or_insert(k) != k {
+                bail!("stacked modules {modules:?} have different input sizes");
+            }
+            let n = rows.iter().map(|r| r.len()).sum();
+            mods.push(Module { name: name.clone(), format: scheme.format, names, rows, cols, n });
+        }
+        let k = k_local.unwrap();
+        let mut parts = Vec::new();
+        let mut col = 0;
+        let mut i = 0;
+        while i < mods.len() {
+            let mut j = i + 1;
+            while j < mods.len() && mods[j].nvfp4() == mods[i].nvfp4() {
+                j += 1;
+            }
+            let group = &mods[i..j];
+            let n: usize = group.iter().map(|m| m.n).sum();
+            let store = if mods[i].nvfp4() { Self::load_nvfp4(ckpt, group, n, k)? } else { Self::load_16bit(ckpt, group, n, k, s)? };
+            parts.push(Part { store, col, n });
+            col += n;
+            i = j;
+        }
+        Ok(Self { parts, n: col, k })
+    }
+
+    fn load_nvfp4(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize) -> Result<Store> {
+        if k % 32 != 0 {
+            bail!("{}: NVFP4 input size {k} is not a multiple of 32", group[0].name);
+        }
+        let codes = DevBuf::new(n * k / 2)?;
+        let scales = DevBuf::new(n * k / 16)?;
+        let mut alpha = Vec::with_capacity(n);
+        let mut row = 0;
+        for m in group {
+            let Format::Nvfp4 { global_inverse, .. } = m.format else { unreachable!() };
+            if m.cols.start % 32 != 0 {
+                bail!("{}: column cut {:?} is not aligned to 32", m.name, m.cols);
+            }
+            let full_k = ckpt.info(&m.names.weight)?.shape[1] * 2;
+            let c = cut_rows(ckpt.bytes(&m.names.weight)?, full_k / 2, &m.rows, m.cols.start / 2..m.cols.end / 2);
+            let sc = cut_rows(ckpt.bytes(m.names.scale.as_ref().unwrap())?, full_k / 16, &m.rows, m.cols.start / 16..m.cols.end / 16);
+            codes.upload_at(row * k / 2, &c)?;
+            scales.upload_at(row * k / 16, &sc)?;
+            let g_name = m.names.global.as_ref().unwrap();
+            let g = f32::from_le_bytes(ckpt.bytes(g_name)?[..4].try_into()?);
+            let a = if global_inverse { 1.0 / g } else { g };
+            alpha.extend(std::iter::repeat_n(a, m.n));
+            row += m.n;
+        }
+        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)? })
+    }
+
+    fn load_16bit(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, s: &Stream) -> Result<Store> {
+        let w = DevBuf::new(n * k * 2)?;
+        let mut row = 0;
+        for m in group {
+            let info = ckpt.info(&m.names.weight)?;
+            let full_k: usize = info.shape[1..].iter().product();
+            let dst: *mut u16 = w.at(row * k);
+            match &m.format {
+                Format::Dense(d @ (Dtype::Bf16 | Dtype::F16 | Dtype::F32)) => {
+                    let es = d.size();
+                    let raw = cut_rows(ckpt.bytes(&m.names.weight)?, full_k * es, &m.rows, m.cols.start * es..m.cols.end * es);
+                    match d {
+                        Dtype::Bf16 => w.upload_at(row * k * 2, &raw)?,
+                        Dtype::F16 => {
+                            let v: Vec<u16> = raw
+                                .chunks_exact(2)
+                                .map(|c| half::bf16::from_f32(half::f16::from_le_bytes([c[0], c[1]]).to_f32()).to_bits())
+                                .collect();
+                            w.upload_at(row * k * 2, &v)?
+                        }
+                        _ => {
+                            let v: Vec<u16> =
+                                raw.chunks_exact(4).map(|c| half::bf16::from_f32(f32::from_le_bytes(c.try_into().unwrap())).to_bits()).collect();
+                            w.upload_at(row * k * 2, &v)?
+                        }
+                    }
+                }
+                Format::Fp8Block { block_n, block_k, scale_dtype, inverse } => {
+                    if m.rows.len() != 1 || m.rows[0] != (0..info.shape[0]) || m.cols != (0..full_k) {
+                        bail!("{}: FP8 block weights cannot be cut for tensor parallelism yet", m.name);
+                    }
+                    if *inverse {
+                        bail!("{}: weight_scale_inv checkpoints are not supported yet", m.name);
+                    }
+                    let scale_name = m.names.scale.as_ref().unwrap();
+                    let (wq, sc) = (DevBuf::from_slice(ckpt.bytes(&m.names.weight)?)?, DevBuf::from_slice(ckpt.bytes(scale_name)?)?);
+                    let is_f32 = match scale_dtype {
+                        Dtype::F32 => 1,
+                        Dtype::Bf16 => 0,
+                        other => bail!("{}: fp8 block scales in {other:?}", m.name),
+                    };
+                    check(
+                        unsafe {
+                            sys::blz_fp8_block_dequant(wq.ptr(), sc.ptr(), is_f32, m.n as c_int, k as c_int, *block_n as c_int,
+                                                       *block_k as c_int, dst, s.0)
+                        },
+                        "blz_fp8_block_dequant",
+                    )?;
+                    s.sync()?;
+                }
+                Format::Fp8Channel { per_tensor } => {
+                    if m.rows.len() != 1 || m.rows[0] != (0..info.shape[0]) || m.cols != (0..full_k) {
+                        bail!("{}: FP8 weights cannot be cut for tensor parallelism yet", m.name);
+                    }
+                    let scale_name = m.names.scale.as_ref().unwrap();
+                    let si = ckpt.info(scale_name)?;
+                    let (wq, sc) = (DevBuf::from_slice(ckpt.bytes(&m.names.weight)?)?, DevBuf::from_slice(ckpt.bytes(scale_name)?)?);
+                    let (bn, is_f32) = (if *per_tensor { m.n } else { 1 }, (si.dtype == Dtype::F32) as c_int);
+                    check(
+                        unsafe { sys::blz_fp8_block_dequant(wq.ptr(), sc.ptr(), is_f32, m.n as c_int, k as c_int, bn as c_int, k as c_int, dst, s.0) },
+                        "blz_fp8_block_dequant",
+                    )?;
+                    s.sync()?;
+                }
+                other => bail!("{}: {} weights in a 16-bit part", m.name, other.describe()),
+            }
+            row += m.n;
+        }
+        Ok(Store::Bf16(w))
+    }
+
+    /// Elements of the widest NVFP4 part (the scratch an input longer than the GEMV needs).
+    pub fn scratch_elems(&self) -> usize {
+        self.parts.iter().filter(|p| matches!(p.store, Store::Nvfp4 { .. })).map(|p| p.n * self.k).max().unwrap_or(0)
+    }
+
+    /// out[m, 0..n] (row stride ldo) = x[m, 0..k] (row stride ldx) . W^T.
+    pub fn run(&self, ctx: &LinCtx, x: *const u16, ldx: usize, m: usize, out: *mut u16, ldo: usize, s: &Stream) -> Result<()> {
+        let k = self.k;
+        for p in &self.parts {
+            let o = unsafe { out.add(p.col) };
+            match &p.store {
+                Store::Nvfp4 { codes, scales, alpha } => {
+                    if m <= sys::BLZ_NVFP4_GEMV_MAX_ROWS {
+                        check(
+                            unsafe {
+                                sys::blz_nvfp4_gemv(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
+                                                    p.n as c_int, k as c_int, s.0)
+                            },
+                            "blz_nvfp4_gemv",
+                        )?;
+                    } else {
+                        if p.n * k > ctx.scratch_elems {
+                            bail!("NVFP4 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
+                        }
+                        check(
+                            unsafe {
+                                sys::blz_nvfp4_weight_dequant(codes.ptr(), scales.ptr(), alpha.ptr(), p.n as c_int, k as c_int,
+                                                              ctx.scratch, s.0)
+                            },
+                            "blz_nvfp4_weight_dequant",
+                        )?;
+                        check(
+                            unsafe {
+                                sys::blz_gemm_bf16(ctx.gemm, x, ldx as i64, ctx.scratch, o, ldo as i64, m as c_int, p.n as c_int,
+                                                   k as c_int, s.0)
+                            },
+                            "blz_gemm_bf16",
+                        )?;
+                    }
+                }
+                Store::Bf16(w) => {
+                    if m == 1 && p.n <= 4096 && k % 8 == 0 {
+                        check(
+                            unsafe {
+                                sys::blz_skinny_gemm(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), 1, p.n as c_int, k as c_int,
+                                                     sys::BLZ_BF16, s.0)
+                            },
+                            "blz_skinny_gemm",
+                        )?;
+                    } else {
+                        check(
+                            unsafe {
+                                sys::blz_gemm_bf16(ctx.gemm, x, ldx as i64, w.ptr(), o, ldo as i64, m as c_int, p.n as c_int, k as c_int,
+                                                   s.0)
+                            },
+                            "blz_gemm_bf16",
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

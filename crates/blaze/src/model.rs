@@ -3,108 +3,64 @@
 
 use crate::config::{LayerKind, MlpConfig, ModelConfig, RopeScaling};
 use crate::gpu::{DevBuf, HostMapped, Stream, check};
-use crate::quant::{Format, QuantConfig};
+use crate::linear::{Cut, LinCtx, Linear};
+use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, anyhow, bail};
 use blaze_sys as sys;
 use std::ffi::{CString, c_int};
+use std::ops::Range;
 use std::path::Path;
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 
-/// A linear layer as one bf16 matrix [n, k] (rows of every stacked module).
-pub struct Linear {
-    pub w: DevBuf,
-    pub n: usize,
-    pub k: usize,
+/// This rank of a tensor-parallel group: heads, GDN heads, MLP rows and vocabulary are split `world` ways; the
+/// row-parallel projections (o_proj, out_proj, down_proj) are summed over the group with the host all-reduce.
+pub struct Tp {
+    pub rank: usize,
+    pub world: usize,
+    pub ar: *mut sys::blz_host_ar,
+    pub ar_bytes: usize,
 }
 
-impl Linear {
-    pub fn load(ckpt: &Checkpoint, quant: &QuantConfig, modules: &[String], s: &Stream) -> Result<Self> {
-        let mut parts = Vec::with_capacity(modules.len());
-        for m in modules {
-            let (scheme, names) = quant.resolve(ckpt, m)?;
-            let info = ckpt.info(&names.weight)?.clone();
-            let n = info.shape[0];
-            let k = match scheme.format {
-                Format::Nvfp4 { .. } => info.shape[1] * 2,
-                _ => info.shape[1],
-            };
-            parts.push((m.clone(), scheme, names, n, k));
-        }
-        let k = parts[0].4;
-        if parts.iter().any(|p| p.4 != k) {
-            bail!("stacked modules {modules:?} have different input sizes");
-        }
-        let n: usize = parts.iter().map(|p| p.3).sum();
-        let w = DevBuf::new(n * k * 2)?;
-        let mut row = 0;
-        for (m, scheme, names, rows, _) in &parts {
-            let dst: *mut u16 = w.at(row * k);
-            match &scheme.format {
-                Format::Dense(Dtype::Bf16) => w.upload_at(row * k * 2, ckpt.bytes(&names.weight)?)?,
-                Format::Dense(d @ (Dtype::F16 | Dtype::F32)) => {
-                    let raw = ckpt.bytes(&names.weight)?;
-                    let v: Vec<u16> = if *d == Dtype::F16 {
-                        raw.chunks_exact(2)
-                            .map(|c| half::bf16::from_f32(half::f16::from_le_bytes([c[0], c[1]]).to_f32()).to_bits())
-                            .collect()
-                    } else {
-                        raw.chunks_exact(4).map(|c| half::bf16::from_f32(f32::from_le_bytes(c.try_into().unwrap())).to_bits()).collect()
-                    };
-                    w.upload_at(row * k * 2, &v)?;
-                }
-                Format::Fp8Block { block_n, block_k, scale_dtype, inverse } => {
-                    if *inverse {
-                        bail!("{m}: weight_scale_inv checkpoints are not supported yet");
-                    }
-                    let scale_name = names.scale.as_ref().unwrap();
-                    let (wq, sc) = (DevBuf::from_slice(ckpt.bytes(&names.weight)?)?, DevBuf::from_slice(ckpt.bytes(scale_name)?)?);
-                    let is_f32 = match scale_dtype {
-                        Dtype::F32 => 1,
-                        Dtype::Bf16 => 0,
-                        other => bail!("{m}: fp8 block scales in {other:?}"),
-                    };
-                    check(
-                        unsafe {
-                            sys::blz_fp8_block_dequant(wq.ptr(), sc.ptr(), is_f32, *rows as c_int, k as c_int, *block_n as c_int,
-                                                       *block_k as c_int, dst, s.0)
-                        },
-                        "blz_fp8_block_dequant",
-                    )?;
-                    s.sync()?;
-                }
-                Format::Fp8Channel { per_tensor } => {
-                    let scale_name = names.scale.as_ref().unwrap();
-                    let si = ckpt.info(scale_name)?;
-                    let (wq, sc) = (DevBuf::from_slice(ckpt.bytes(&names.weight)?)?, DevBuf::from_slice(ckpt.bytes(scale_name)?)?);
-                    let (bn, is_f32) = (if *per_tensor { *rows } else { 1 }, (si.dtype == Dtype::F32) as c_int);
-                    check(
-                        unsafe { sys::blz_fp8_block_dequant(wq.ptr(), sc.ptr(), is_f32, *rows as c_int, k as c_int, bn as c_int, k as c_int, dst, s.0) },
-                        "blz_fp8_block_dequant",
-                    )?;
-                    s.sync()?;
-                }
-                other => bail!("{m}: {} linear layers need the Marlin kernels (not ported yet)", other.describe()),
-            }
-            row += rows;
-        }
-        Ok(Self { w, n, k })
-    }
+/// Head counts and sizes this rank computes.
+#[derive(Clone, Copy, Debug)]
+pub struct Dims {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub k_heads: usize,
+    pub v_heads: usize,
+    pub inter: usize,
+    pub vocab: usize,
+}
 
-    pub fn run(&self, gemm: *mut sys::blz_gemm, x: *const u16, ldx: usize, m: usize, out: *mut u16, ldo: usize, s: &Stream) -> Result<()> {
-        check(
-            unsafe { sys::blz_gemm_bf16(gemm, x, ldx as i64, self.w.ptr(), out, ldo as i64, m as c_int, self.n as c_int, self.k as c_int, s.0) },
-            "blz_gemm_bf16",
-        )
-    }
+fn part(total: usize, rank: usize, world: usize) -> Range<usize> {
+    let n = total / world;
+    rank * n..(rank + 1) * n
 }
 
 fn load_vec(ckpt: &Checkpoint, name: &str) -> Result<DevBuf> {
+    load_rows(ckpt, name, None)
+}
+
+/// A bf16 tensor, or rows `rows` of it (first dimension).
+fn load_rows(ckpt: &Checkpoint, name: &str, rows: Option<&[Range<usize>]>) -> Result<DevBuf> {
     let t = ckpt.info(name)?;
     if t.dtype != Dtype::Bf16 {
         bail!("{name}: expected bf16, got {:?}", t.dtype);
     }
-    DevBuf::from_slice(ckpt.bytes(name)?)
+    let raw = ckpt.bytes(name)?;
+    match rows {
+        None => DevBuf::from_slice(raw),
+        Some(rows) => {
+            let row_bytes = raw.len() / t.shape[0];
+            let mut v = Vec::new();
+            for r in rows {
+                v.extend_from_slice(&raw[r.start * row_bytes..r.end * row_bytes]);
+            }
+            DevBuf::from_slice(&v)
+        }
+    }
 }
 
 pub struct Attn {
@@ -149,6 +105,7 @@ impl Drop for MoeEngine {
     }
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub max_tokens: usize,
     pub max_chunk: usize,
@@ -237,12 +194,15 @@ struct Work {
 
 pub struct Model {
     pub cfg: ModelConfig,
+    pub dims: Dims,
+    pub tp: Tp,
     layers: Vec<Layer>,
     final_norm: DevBuf,
     lm_head: Linear,
-    embed: HostMapped,
+    embed: Arc<HostMapped>,
     moe: Option<MoeEngine>,
-    gemm: *mut sys::blz_gemm,
+    lin: LinCtx,
+    _scratch: DevBuf,
     inv_freq: DevBuf,
     rope_scale: f32,
     // KV pools of the softmax layers (NVFP4): [slots, kv_heads, head_dim / 2] codes, [.., head_dim / 16] scales
@@ -286,7 +246,21 @@ fn inv_freq(cfg: &ModelConfig) -> (Vec<f32>, f32) {
 }
 
 impl Model {
-    pub fn load(dir: &Path, opts: Options) -> Result<Self> {
+    /// The token embedding of a checkpoint as a pinned host table (shared by every rank; the GPUs read the rows
+    /// they need over PCIe instead of keeping 1-2.5 GB in VRAM).
+    pub fn load_embedding(dir: &Path) -> Result<HostMapped> {
+        let ckpt = Checkpoint::open(dir)?;
+        let name = format!("{}embed_tokens.weight", ckpt.text_prefix());
+        let et = ckpt.info(&name)?.clone();
+        if et.dtype != Dtype::Bf16 {
+            bail!("{name}: expected bf16");
+        }
+        let mut embed = HostMapped::new(et.bytes())?;
+        embed.host_slice_mut().copy_from_slice(ckpt.bytes(&name)?);
+        Ok(embed)
+    }
+
+    pub fn load(dir: &Path, opts: Options, tp: Tp, embed: Arc<HostMapped>) -> Result<Self> {
         let cfg = ModelConfig::load(dir)?;
         let ckpt = Checkpoint::open(dir)?;
         let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
@@ -295,22 +269,57 @@ impl Model {
         let stream = Stream::new()?;
         let s = &stream;
         let p = ckpt.text_prefix();
-        let mut gemm = null_mut();
-        if unsafe { sys::blz_gemm_create(&mut gemm) } != 0 {
-            bail!("cuBLAS init failed");
+        let (r, w) = (tp.rank, tp.world);
+        let inter = match cfg.mlp {
+            MlpConfig::Dense { intermediate } => intermediate,
+            MlpConfig::Moe { shared_intermediate, .. } => shared_intermediate,
+        };
+        let (gk, gv) = cfg.gdn.as_ref().map_or((0, 0), |g| (g.k_heads, g.v_heads));
+        for (what, n) in [("attention heads", cfg.attn.heads), ("KV heads", cfg.attn.kv_heads), ("GDN key heads", gk),
+                          ("GDN value heads", gv), ("MLP rows", inter), ("vocabulary", cfg.vocab)] {
+            if n % w != 0 {
+                bail!("{what} ({n}) do not split {w} ways");
+            }
         }
+        if w > 1 && matches!(cfg.mlp, MlpConfig::Moe { .. }) {
+            bail!("tensor parallelism of MoE models is not supported yet");
+        }
+        let dims = Dims {
+            heads: cfg.attn.heads / w,
+            kv_heads: cfg.attn.kv_heads / w,
+            k_heads: gk / w,
+            v_heads: gv / w,
+            inter: inter / w,
+            vocab: cfg.vocab / w,
+        };
+        let all = |name: String| (name, Cut::All);
+        let rows = |name: String, ranges: Vec<Range<usize>>| (name, if w == 1 { Cut::All } else { Cut::Rows(ranges) });
+        let cols = |name: String, range: Range<usize>| (name, if w == 1 { Cut::All } else { Cut::Cols(range) });
 
         let mut layers = Vec::with_capacity(cfg.layers.len());
         let (mut n_full, mut n_gdn) = (0, 0);
+        let hd = cfg.attn.head_dim;
         for (i, kind) in cfg.layers.iter().enumerate() {
             let l = format!("{p}layers.{i}.");
             let (attn, gdn, slot) = match kind {
                 LayerKind::Full => {
                     let a = format!("{l}self_attn.");
-                    let qkv = Linear::load(&ckpt, &quant, &[format!("{a}q_proj"), format!("{a}k_proj"), format!("{a}v_proj")], s)?;
+                    // q_proj rows per head: [query D | gate D]
+                    let qr = part(cfg.attn.heads, r, w);
+                    let kvr = part(cfg.attn.kv_heads, r, w);
+                    let qkv = Linear::load(
+                        &ckpt,
+                        &quant,
+                        &[
+                            rows(format!("{a}q_proj"), vec![qr.start * 2 * hd..qr.end * 2 * hd]),
+                            rows(format!("{a}k_proj"), vec![kvr.start * hd..kvr.end * hd]),
+                            rows(format!("{a}v_proj"), vec![kvr.start * hd..kvr.end * hd]),
+                        ],
+                        s,
+                    )?;
                     let attn = Attn {
                         qkv,
-                        o: Linear::load(&ckpt, &quant, &[format!("{a}o_proj")], s)?,
+                        o: Linear::load(&ckpt, &quant, &[cols(format!("{a}o_proj"), qr.start * hd..qr.end * hd)], s)?,
                         q_norm: load_vec(&ckpt, &format!("{a}q_norm.weight"))?,
                         k_norm: load_vec(&ckpt, &format!("{a}k_norm.weight"))?,
                     };
@@ -318,19 +327,34 @@ impl Model {
                     (Some(attn), None, n_full - 1)
                 }
                 LayerKind::Linear => {
+                    let gc = cfg.gdn.as_ref().unwrap();
                     let g = format!("{l}linear_attn.");
+                    let key_dim = gc.k_heads * gc.k_dim;
+                    let (kr, vr) = (part(gc.k_heads, r, w), part(gc.v_heads, r, w));
+                    // conv channels / in_proj_qkv rows: [q (key heads) | k (key heads) | v (value heads)]
+                    let qkv_rows = vec![
+                        kr.start * gc.k_dim..kr.end * gc.k_dim,
+                        key_dim + kr.start * gc.k_dim..key_dim + kr.end * gc.k_dim,
+                        2 * key_dim + vr.start * gc.v_dim..2 * key_dim + vr.end * gc.v_dim,
+                    ];
                     let in_proj = Linear::load(
                         &ckpt,
                         &quant,
-                        &[format!("{g}in_proj_qkv"), format!("{g}in_proj_z"), format!("{g}in_proj_b"), format!("{g}in_proj_a")],
+                        &[
+                            rows(format!("{g}in_proj_qkv"), qkv_rows.clone()),
+                            rows(format!("{g}in_proj_z"), vec![vr.start * gc.v_dim..vr.end * gc.v_dim]),
+                            rows(format!("{g}in_proj_b"), vec![vr.clone()]),
+                            rows(format!("{g}in_proj_a"), vec![vr.clone()]),
+                        ],
                         s,
                     )?;
+                    let cut = |v: Vec<Range<usize>>| if w == 1 { None } else { Some(v) };
                     let gdn = Gdn {
                         in_proj,
-                        out: Linear::load(&ckpt, &quant, &[format!("{g}out_proj")], s)?,
-                        conv_w: load_vec(&ckpt, &format!("{g}conv1d.weight"))?,
-                        a_log: load_vec(&ckpt, &format!("{g}A_log"))?,
-                        dt_bias: load_vec(&ckpt, &format!("{g}dt_bias"))?,
+                        out: Linear::load(&ckpt, &quant, &[cols(format!("{g}out_proj"), vr.start * gc.v_dim..vr.end * gc.v_dim)], s)?,
+                        conv_w: load_rows(&ckpt, &format!("{g}conv1d.weight"), cut(qkv_rows).as_deref())?,
+                        a_log: load_rows(&ckpt, &format!("{g}A_log"), cut(vec![vr.clone()]).as_deref())?,
+                        dt_bias: load_rows(&ckpt, &format!("{g}dt_bias"), cut(vec![vr.clone()]).as_deref())?,
                         norm: load_vec(&ckpt, &format!("{g}norm.weight"))?,
                     };
                     n_gdn += 1;
@@ -341,21 +365,34 @@ impl Model {
             let mlp = match &cfg.mlp {
                 MlpConfig::Moe { .. } => {
                     let has_shared_gate = ckpt.get(&format!("{m}shared_expert_gate.weight")).is_some();
-                    let mut gate_mods = vec![format!("{m}gate")];
+                    let mut gate_mods = vec![all(format!("{m}gate"))];
                     if has_shared_gate {
-                        gate_mods.push(format!("{m}shared_expert_gate"));
+                        gate_mods.push(all(format!("{m}shared_expert_gate")));
                     }
                     Mlp::Moe {
                         gate: Linear::load(&ckpt, &quant, &gate_mods, s)?,
-                        shared_gu: Linear::load(&ckpt, &quant, &[format!("{m}shared_expert.gate_proj"), format!("{m}shared_expert.up_proj")], s)?,
-                        shared_down: Linear::load(&ckpt, &quant, &[format!("{m}shared_expert.down_proj")], s)?,
+                        shared_gu: Linear::load(
+                            &ckpt,
+                            &quant,
+                            &[all(format!("{m}shared_expert.gate_proj")), all(format!("{m}shared_expert.up_proj"))],
+                            s,
+                        )?,
+                        shared_down: Linear::load(&ckpt, &quant, &[all(format!("{m}shared_expert.down_proj"))], s)?,
                         has_shared_gate,
                     }
                 }
-                MlpConfig::Dense { .. } => Mlp::Dense {
-                    gu: Linear::load(&ckpt, &quant, &[format!("{m}gate_proj"), format!("{m}up_proj")], s)?,
-                    down: Linear::load(&ckpt, &quant, &[format!("{m}down_proj")], s)?,
-                },
+                MlpConfig::Dense { intermediate } => {
+                    let ir = part(*intermediate, r, w);
+                    Mlp::Dense {
+                        gu: Linear::load(
+                            &ckpt,
+                            &quant,
+                            &[rows(format!("{m}gate_proj"), vec![ir.clone()]), rows(format!("{m}up_proj"), vec![ir.clone()])],
+                            s,
+                        )?,
+                        down: Linear::load(&ckpt, &quant, &[cols(format!("{m}down_proj"), ir)], s)?,
+                    }
+                }
             };
             layers.push(Layer {
                 kind: *kind,
@@ -369,60 +406,75 @@ impl Model {
         }
         let final_norm = load_vec(&ckpt, &format!("{p}norm.weight"))?;
         let lm_name = if cfg.tie_embeddings { format!("{p}embed_tokens") } else { "lm_head".into() };
-        let lm_head = Linear::load(&ckpt, &quant, &[lm_name], s)?;
-
-        // Token embedding: pinned host table read by the GPU (it costs VRAM worth of KV cache otherwise).
-        let embed_name = format!("{p}embed_tokens.weight");
-        let et = ckpt.info(&embed_name)?.clone();
-        if et.dtype != Dtype::Bf16 {
-            bail!("{embed_name}: expected bf16");
-        }
-        let mut embed = HostMapped::new(et.bytes())?;
-        embed.host_slice_mut().copy_from_slice(ckpt.bytes(&embed_name)?);
+        let lm_head = Linear::load(&ckpt, &quant, &[rows(lm_name, vec![part(cfg.vocab, r, w)])], s)?;
 
         let (freqs, rope_scale) = inv_freq(&cfg);
         let inv_freq = DevBuf::from_slice(&freqs)?;
 
-        // KV pools (NVFP4) for every softmax layer, GDN states for every linear layer.
-        let (kvh, hd) = (cfg.attn.kv_heads, cfg.attn.head_dim);
+        // KV pools (NVFP4) for every softmax layer, GDN states for every linear layer, this rank's heads.
         let mut kv = Vec::new();
         for _ in 0..n_full {
-            let codes = opts.max_tokens * kvh * hd / 2;
-            let scales = opts.max_tokens * kvh * hd / 16;
+            let codes = opts.max_tokens * dims.kv_heads * hd / 2;
+            let scales = opts.max_tokens * dims.kv_heads * hd / 16;
             kv.push([DevBuf::zeroed(codes, s)?, DevBuf::zeroed(codes, s)?, DevBuf::zeroed(scales, s)?, DevBuf::zeroed(scales, s)?]);
         }
         let kv_global = DevBuf::from_slice(&[1.0f32])?;
         let req_to_token = DevBuf::zeroed(opts.max_seqs * cfg.max_positions.min(opts.max_tokens) * 4, s)?;
         let (mut conv_state, mut rec_state) = (Vec::new(), Vec::new());
         if let Some(g) = &cfg.gdn {
-            let channels = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
+            let channels = 2 * dims.k_heads * g.k_dim + dims.v_heads * g.v_dim;
             for _ in 0..n_gdn {
                 conv_state.push(DevBuf::zeroed(opts.max_seqs * channels * (g.conv_kernel - 1) * 2, s)?);
-                rec_state.push(DevBuf::zeroed(opts.max_seqs * g.v_heads * g.k_dim * g.v_dim * 4, s)?);
+                rec_state.push(DevBuf::zeroed(opts.max_seqs * dims.v_heads * g.k_dim * g.v_dim * 4, s)?);
             }
         }
 
         let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs), opts.max_seqs);
-        let work = Self::alloc_work(&cfg, &layers, &opts, &meta, s)?;
+        let work = Self::alloc_work(&cfg, &dims, &layers, &opts, &meta, s)?;
+        // Scratch NVFP4 weights are widened into for prefill GEMMs.
+        let mut scratch_elems = lm_head.scratch_elems();
+        for l in &layers {
+            let mut lins: Vec<&Linear> = Vec::new();
+            if let Some(a) = &l.attn {
+                lins.extend([&a.qkv, &a.o]);
+            }
+            if let Some(g) = &l.gdn {
+                lins.extend([&g.in_proj, &g.out]);
+            }
+            match &l.mlp {
+                Mlp::Moe { gate, shared_gu, shared_down, .. } => lins.extend([gate, shared_gu, shared_down]),
+                Mlp::Dense { gu, down } => lins.extend([gu, down]),
+            }
+            scratch_elems = scratch_elems.max(lins.iter().map(|l| l.scratch_elems()).max().unwrap_or(0));
+        }
+        let scratch = DevBuf::new(scratch_elems.max(1) * 2)?;
+        let mut gemm = null_mut();
+        if unsafe { sys::blz_gemm_create(&mut gemm) } != 0 {
+            bail!("cuBLAS init failed");
+        }
         s.sync()?;
 
         let mut num_sms: c_int = 0;
+        let mut dev: c_int = 0;
         unsafe {
-            // cudaDevAttrMultiProcessorCount = 16
             unsafe extern "C" {
-                fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> c_int;
+                fn cudaGetDevice(device: *mut c_int) -> c_int;
             }
-            cudaDeviceGetAttribute(&mut num_sms, 16, 0);
+            cudaGetDevice(&mut dev);
+            sys::cudaDeviceGetAttribute(&mut num_sms, sys::ATTR_MULTIPROCESSOR_COUNT, dev);
         }
 
         let mut model = Self {
             cfg,
+            dims,
+            tp,
             layers,
             final_norm,
             lm_head,
             embed,
             moe: None,
-            gemm,
+            lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems },
+            _scratch: scratch,
             inv_freq,
             rope_scale,
             kv,
@@ -473,7 +525,7 @@ impl Model {
         Ok(MoeEngine(engine))
     }
 
-    fn alloc_work(cfg: &ModelConfig, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
+    fn alloc_work(cfg: &ModelConfig, d: &Dims, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
         let t = opts.max_chunk;
         let h = cfg.hidden;
         let mut proj_cols = 0;
@@ -489,21 +541,18 @@ impl Model {
                 Mlp::Dense { gu, .. } => proj_cols = proj_cols.max(gu.n),
             }
         }
-        let (heads, hd) = (cfg.attn.heads, cfg.attn.head_dim);
+        let (heads, hd) = (d.heads, cfg.attn.head_dim);
         let (conv_ch, vh, vd) = match &cfg.gdn {
-            Some(g) => (2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim, g.v_heads, g.v_dim),
+            Some(g) => (2 * d.k_heads * g.k_dim + d.v_heads * g.v_dim, d.v_heads, g.v_dim),
             None => (0, 0, 0),
         };
         let topk = match cfg.mlp {
             MlpConfig::Moe { top_k, .. } => top_k,
             _ => 0,
         };
-        let inter = match cfg.mlp {
-            MlpConfig::Moe { shared_intermediate, .. } => shared_intermediate,
-            MlpConfig::Dense { intermediate } => intermediate,
-        };
-        let parts_prefill = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, cfg.attn.kv_heads as c_int, t as c_int, 1) } as usize;
-        let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, cfg.attn.kv_heads as c_int, 1, 64) } as usize;
+        let inter = d.inter;
+        let parts_prefill = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, t as c_int, 1) } as usize;
+        let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, 1, 64) } as usize;
         let partial_rows = (t * parts_prefill).max(opts.max_seqs * parts_decode);
         let _ = proj_cols;
         let b = |n: usize| DevBuf::zeroed(n, s);
@@ -554,9 +603,10 @@ impl Model {
     pub fn reset_state(&self, slot: usize) -> Result<()> {
         let s = &self.stream;
         if let Some(g) = &self.cfg.gdn {
-            let channels = 2 * g.k_heads * g.k_dim + g.v_heads * g.v_dim;
+            let d = &self.dims;
+            let channels = 2 * d.k_heads * g.k_dim + d.v_heads * g.v_dim;
             let conv_bytes = channels * (g.conv_kernel - 1) * 2;
-            let rec_bytes = g.v_heads * g.k_dim * g.v_dim * 4;
+            let rec_bytes = d.v_heads * g.k_dim * g.v_dim * 4;
             for (c, r) in self.conv_state.iter().zip(&self.rec_state) {
                 check(unsafe { sys::cudaMemsetAsync(c.at::<u8>(slot * conv_bytes).cast(), 0, conv_bytes, s.0) }, "memset")?;
                 check(unsafe { sys::cudaMemsetAsync(r.at::<u8>(slot * rec_bytes).cast(), 0, rec_bytes, s.0) }, "memset")?;
@@ -610,10 +660,34 @@ impl Model {
             check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
             check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;
             check(unsafe { sys::blz_rmsnorm(w.gx.ptr(), w.gres.ptr(), self.final_norm.ptr(), eps, n as c_int, h as c_int, 1, w.gnormed.ptr(), s.0) }, "final norm")?;
-            self.lm_head.run(self.gemm, w.gnormed.ptr(), h, n, w.logits.ptr(), cfg.vocab, s)?;
+            self.head(w.gnormed.ptr(), n, w.logits.ptr())?;
             check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), n as c_int, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         }
         Ok(())
+    }
+
+    /// In-place sum of `elems` bf16 values over the tensor-parallel group (nothing with one rank).
+    fn all_reduce(&self, data: *mut u16, elems: usize) -> Result<()> {
+        if self.tp.world == 1 {
+            return Ok(());
+        }
+        let bytes = elems * 2;
+        if bytes > self.tp.ar_bytes {
+            bail!("all-reduce of {bytes} B exceeds the buffer ({} B)", self.tp.ar_bytes);
+        }
+        check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, data.cast(), bytes as i64, sys::BLZ_AR_BF16, self.stream.0) }, "all-reduce")
+    }
+
+    /// Logits of `rows` normed hidden states into out [rows, vocab]: this rank's vocabulary slice, then the sum over
+    /// the group (the other slices are zero).
+    fn head(&self, normed: *const u16, rows: usize, out: *mut u16) -> Result<()> {
+        let (v, s) = (self.cfg.vocab, &self.stream);
+        if self.tp.world > 1 {
+            check(unsafe { sys::cudaMemsetAsync(out.cast(), 0, rows * v * 2, s.0) }, "memset logits")?;
+        }
+        let col0 = self.tp.rank * self.dims.vocab;
+        self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, unsafe { out.add(col0) }, v, s)?;
+        self.all_reduce(out, rows * v)
     }
 
     /// Greedy picks of the last forward (one per span), after a stream synchronization.
@@ -631,7 +705,14 @@ impl Model {
         let (w, s) = (&self.work, &self.stream);
         let out = self.score_logits.as_ref().unwrap();
         check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), self.final_norm.ptr(), self.cfg.rms_eps, t as c_int, self.cfg.hidden as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
-        self.lm_head.run(self.gemm, w.normed.ptr(), self.cfg.hidden, t, out.ptr(), v, s)?;
+        // in blocks of rows the all-reduce buffer holds
+        let block = if self.tp.world == 1 { t } else { (self.tp.ar_bytes / (v * 2)).max(1) };
+        let mut r0 = 0;
+        while r0 < t {
+            let n = block.min(t - r0);
+            self.head(w.normed.at::<u16>(r0 * self.cfg.hidden), n, out.at::<u16>(r0 * v))?;
+            r0 += n;
+        }
         s.sync()?;
         let raw = out.download::<u16>(t * v)?;
         Ok(raw.chunks(v).map(|r| r.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()).collect())
@@ -647,9 +728,9 @@ impl Model {
     fn attention(&self, layer: &Layer, t: usize, spans: &[Span]) -> Result<()> {
         let a = layer.attn.as_ref().unwrap();
         let (cfg, w, s, m) = (&self.cfg, &self.work, &self.stream, &self.meta);
-        let (heads, kvh, hd) = (cfg.attn.heads, cfg.attn.kv_heads, cfg.attn.head_dim);
+        let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, cfg.attn.head_dim);
         let ld = a.qkv.n;
-        a.qkv.run(self.gemm, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
+        a.qkv.run(&self.lin, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
         let k: *mut u16 = w.proj.at(heads * 2 * hd);
         let v: *const u16 = w.proj.at(heads * 2 * hd + kvh * hd);
         check(
@@ -720,7 +801,8 @@ impl Model {
             )?;
         }
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
-        a.o.run(self.gemm, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)
+        a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
+        self.all_reduce(w.x.ptr(), t * cfg.hidden)
     }
 
     fn gdn(&self, layer: &Layer, t: usize, seqs: usize) -> Result<()> {
@@ -728,12 +810,13 @@ impl Model {
         let gc = self.cfg.gdn.as_ref().unwrap();
         let (cfg, w, s) = (&self.cfg, &self.work, &self.stream);
         let ld = g.in_proj.n;
-        g.in_proj.run(self.gemm, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
-        let key_dim = gc.k_heads * gc.k_dim;
-        let channels = 2 * key_dim + gc.v_heads * gc.v_dim;
+        g.in_proj.run(&self.lin, w.normed.ptr(), cfg.hidden, t, w.proj.ptr(), ld, s)?;
+        let (kh, vh) = (self.dims.k_heads, self.dims.v_heads);
+        let key_dim = kh * gc.k_dim;
+        let channels = 2 * key_dim + vh * gc.v_dim;
         let z: *const u16 = w.proj.at(channels);
-        let b: *const u16 = w.proj.at(channels + gc.v_heads * gc.v_dim);
-        let a: *const u16 = w.proj.at(channels + gc.v_heads * gc.v_dim + gc.v_heads);
+        let b: *const u16 = w.proj.at(channels + vh * gc.v_dim);
+        let a: *const u16 = w.proj.at(channels + vh * gc.v_dim + vh);
         let m = &self.meta;
         check(
             unsafe {
@@ -744,7 +827,7 @@ impl Model {
         )?;
         check(
             unsafe {
-                sys::blz_gdn_gate(a, ld as i64, b, ld as i64, g.a_log.ptr(), g.dt_bias.ptr(), t as c_int, gc.v_heads as c_int,
+                sys::blz_gdn_gate(a, ld as i64, b, ld as i64, g.a_log.ptr(), g.dt_bias.ptr(), t as c_int, vh as c_int,
                                   w.g.ptr(), w.beta.ptr(), s.0)
             },
             "gdn_gate",
@@ -752,19 +835,20 @@ impl Model {
         check(
             unsafe {
                 sys::blz_gdn_recurrent(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int, t as c_int,
-                                       gc.k_heads as c_int, gc.v_heads as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
+                                       kh as c_int, vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
                                        self.rec_state[layer.slot].ptr(), w.core.ptr(), s.0)
             },
             "gdn_recurrent",
         )?;
         check(
             unsafe {
-                sys::blz_gated_rmsnorm(w.core.ptr(), (gc.v_heads * gc.v_dim) as i64, z, ld as i64, g.norm.ptr(), cfg.rms_eps,
-                                       t as c_int, gc.v_heads as c_int, gc.v_dim as c_int, w.core_normed.ptr(), s.0)
+                sys::blz_gated_rmsnorm(w.core.ptr(), (vh * gc.v_dim) as i64, z, ld as i64, g.norm.ptr(), cfg.rms_eps,
+                                       t as c_int, vh as c_int, gc.v_dim as c_int, w.core_normed.ptr(), s.0)
             },
             "gated_rmsnorm",
         )?;
-        g.out.run(self.gemm, w.core_normed.ptr(), gc.v_heads * gc.v_dim, t, w.x.ptr(), cfg.hidden, s)
+        g.out.run(&self.lin, w.core_normed.ptr(), vh * gc.v_dim, t, w.x.ptr(), cfg.hidden, s)?;
+        self.all_reduce(w.x.ptr(), t * cfg.hidden)
     }
 
     fn mlp(&self, li: usize, layer: &Layer, t: usize) -> Result<()> {
@@ -773,7 +857,7 @@ impl Model {
         match &layer.mlp {
             Mlp::Moe { gate, shared_gu, shared_down, has_shared_gate } => {
                 let MlpConfig::Moe { experts, top_k, norm_topk, shared_intermediate, .. } = cfg.mlp else { unreachable!() };
-                gate.run(self.gemm, w.normed.ptr(), h, t, w.proj.ptr(), gate.n, s)?;
+                gate.run(&self.lin, w.normed.ptr(), h, t, w.proj.ptr(), gate.n, s)?;
                 check(
                     unsafe {
                         sys::blz_router_topk(w.proj.ptr(), gate.n as i64, t as c_int, experts as c_int, top_k as c_int,
@@ -791,7 +875,7 @@ impl Model {
                 )?;
                 // shared expert
                 let gu_ld = shared_gu.n;
-                shared_gu.run(self.gemm, w.normed.ptr(), h, t, w.gu.ptr(), gu_ld, s)?;
+                shared_gu.run(&self.lin, w.normed.ptr(), h, t, w.gu.ptr(), gu_ld, s)?;
                 let up: *const u16 = w.gu.at(shared_intermediate);
                 check(
                     unsafe {
@@ -800,7 +884,7 @@ impl Model {
                     },
                     "silu_mul",
                 )?;
-                shared_down.run(self.gemm, w.shared_act.ptr(), shared_intermediate, t, w.shared.ptr(), h, s)?;
+                shared_down.run(&self.lin, w.shared_act.ptr(), shared_intermediate, t, w.shared.ptr(), h, s)?;
                 if *has_shared_gate {
                     let logit: *const u16 = w.proj.at(experts);
                     check(
@@ -816,13 +900,14 @@ impl Model {
             }
             Mlp::Dense { gu, down } => {
                 let inter = gu.n / 2;
-                gu.run(self.gemm, w.normed.ptr(), h, t, w.proj.ptr(), gu.n, s)?;
+                gu.run(&self.lin, w.normed.ptr(), h, t, w.proj.ptr(), gu.n, s)?;
                 let up: *const u16 = w.proj.at(inter);
                 check(
                     unsafe { sys::blz_silu_mul(w.proj.ptr(), gu.n as i64, up, gu.n as i64, t as c_int, inter as c_int, w.shared_act.ptr(), s.0) },
                     "silu_mul",
                 )?;
-                down.run(self.gemm, w.shared_act.ptr(), inter, t, w.x.ptr(), h, s)
+                down.run(&self.lin, w.shared_act.ptr(), inter, t, w.x.ptr(), h, s)?;
+                self.all_reduce(w.x.ptr(), t * h)
             }
         }
     }
@@ -831,7 +916,12 @@ impl Model {
 impl Drop for Model {
     fn drop(&mut self) {
         self.moe = None;
-        unsafe { sys::blz_gemm_destroy(self.gemm) };
+        unsafe {
+            sys::blz_gemm_destroy(self.lin.gemm);
+            if !self.tp.ar.is_null() {
+                sys::blz_host_ar_close(self.tp.ar);
+            }
+        }
     }
 }
 

@@ -134,6 +134,37 @@ unsafe extern "C" {
                             s: cudaStream_t) -> cudaError_t;
 }
 
+// linear layers
+pub const BLZ_NVFP4_GEMV_MAX_ROWS: usize = 8;
+pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
+
+unsafe extern "C" {
+    pub fn blz_nvfp4_gemv(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,
+                          ldy: i64, rows: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_weight_dequant(w: *const u8, scale: *const u8, alpha: *const f32, n: c_int, k: c_int,
+                                    out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,
+                           k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
+}
+
+// host all-reduce
+#[repr(C)]
+pub struct blz_host_ar {
+    _private: [u8; 0],
+}
+
+pub const BLZ_AR_BF16: c_int = 0;
+pub const BLZ_AR_FP32: c_int = 2;
+
+unsafe extern "C" {
+    pub fn blz_host_ar_open(name: *const c_char, rank: c_int, world: c_int, max_bytes: i64, create: c_int,
+                            out: *mut *mut blz_host_ar) -> cudaError_t;
+    pub fn blz_host_ar_unlink(name: *const c_char);
+    pub fn blz_host_ar_close(ar: *mut blz_host_ar);
+    pub fn blz_host_ar_all_reduce(ar: *mut blz_host_ar, data: *mut c_void, bytes: i64, dtype: c_int,
+                                  s: cudaStream_t) -> cudaError_t;
+}
+
 // MoE engine
 #[repr(C)]
 pub struct blz_moe_engine {

@@ -40,11 +40,16 @@ struct EngineArgs {
     /// extra options of the expert engine ("key=value,...")
     #[arg(long, default_value = "host_reserve_gib=2")]
     expert_options: String,
+    /// GPUs (tensor-parallel ranks)
+    #[arg(long, default_value_t = 1)]
+    tp: usize,
+    /// eager decode steps instead of CUDA graphs
+    #[arg(long)]
+    no_graphs: bool,
 }
 
 impl EngineArgs {
-    fn load(&self, chunk: Option<usize>) -> Result<blaze::model::Model> {
-        blaze::gpu::set_device(0)?;
+    fn load(&self, chunk: Option<usize>) -> Result<blaze::engine::Engine> {
         let heat = match self.expert_heat.as_deref() {
             Some("none") => None,
             Some(p) => Some(p.to_string()),
@@ -60,7 +65,7 @@ impl EngineArgs {
             options = format!("defer={},{options}", self.expert_defer);
         }
         let t0 = Instant::now();
-        let m = blaze::model::Model::load(
+        let e = blaze::engine::Engine::new(
             &self.model,
             blaze::model::Options {
                 max_tokens: self.kv_tokens,
@@ -71,9 +76,11 @@ impl EngineArgs {
                 moe_options: options,
                 reserve_gib: self.vram_reserve,
             },
+            self.tp,
+            !self.no_graphs,
         )?;
         eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());
-        Ok(m)
+        Ok(e)
     }
 }
 
@@ -103,9 +110,6 @@ enum Command {
         /// print the top-5 logits of every step
         #[arg(long)]
         logits: bool,
-        /// eager decode steps instead of CUDA graphs
-        #[arg(long)]
-        no_graphs: bool,
     },
 }
 
@@ -115,8 +119,7 @@ fn main() -> Result<()> {
         Command::Score { engine, text_file, score_chunk: chunk } => {
             let text = blaze::text::Text::load(&engine.model)?;
             let ids: Vec<i64> = text.encode(&std::fs::read_to_string(&text_file)?)?.into_iter().map(i64::from).collect();
-            let m = engine.load(Some(chunk))?;
-            let mut e = blaze::engine::Engine::new(m, false)?;
+            let mut e = engine.load(Some(chunk))?;
             let mut seq = e.open()?;
             let mut pos = 0;
             for c in ids.chunks(chunk) {
@@ -136,10 +139,9 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Generate { engine, prompt, max_tokens, logits, no_graphs } => {
+        Command::Generate { engine, prompt, max_tokens, logits } => {
             let text = blaze::text::Text::load(&engine.model)?;
-            let m = engine.load(None)?;
-            let mut e = blaze::engine::Engine::new(m, !no_graphs)?;
+            let mut e = engine.load(None)?;
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
             let mut seq = e.open()?;
             let t1 = Instant::now();
@@ -150,7 +152,7 @@ fn main() -> Result<()> {
             print!("{prompt}{}", text.decode(&out)?);
             stdout.lock().flush()?;
             if logits {
-                show_top(&e.model, &text)?;
+                show_top(&e, &text)?;
             }
             let t2 = Instant::now();
             while out.len() < max_tokens && !text.eos.contains(out.last().unwrap()) {
@@ -162,7 +164,7 @@ fn main() -> Result<()> {
                 print!("{}", &all[prev.len().min(all.len())..]);
                 stdout.lock().flush()?;
                 if logits {
-                    show_top(&e.model, &text)?;
+                    show_top(&e, &text)?;
                 }
             }
             let decode = t2.elapsed().as_secs_f64();
@@ -182,8 +184,8 @@ fn main() -> Result<()> {
     }
 }
 
-fn show_top(m: &blaze::model::Model, text: &blaze::text::Text) -> Result<()> {
-    let l = m.last_logits(0)?;
+fn show_top(e: &blaze::engine::Engine, text: &blaze::text::Text) -> Result<()> {
+    let l = e.last_logits(0)?;
     let mut idx: Vec<usize> = (0..l.len()).collect();
     idx.sort_by(|a, b| l[*b].partial_cmp(&l[*a]).unwrap());
     let top: Vec<String> = idx[..5].iter().map(|&i| format!("{:?}={:.2}", text.decode(&[i as u32]).unwrap_or_default(), l[i])).collect();

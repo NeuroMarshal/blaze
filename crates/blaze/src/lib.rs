@@ -5,6 +5,7 @@ pub mod config;
 pub mod engine;
 pub mod gpu;
 pub mod inspect;
+pub mod linear;
 pub mod model;
 pub mod quant;
 pub mod text;
