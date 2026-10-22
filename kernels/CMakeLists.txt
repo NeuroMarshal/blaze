@@ -25,7 +25,7 @@ find_package(Threads REQUIRED)
 file(GLOB BLAZE_CUDA_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/*.cu)
 add_library(blaze_kernels STATIC ${BLAZE_CUDA_SOURCES})
 target_include_directories(blaze_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(blaze_kernels PUBLIC CUDA::cudart)
+target_link_libraries(blaze_kernels PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_options(blaze_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo --expt-relaxed-constexpr -Xcompiler=-Wall>
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
@@ -50,7 +50,7 @@ if(BLAZE_BUILD_TESTS)
   target_link_libraries(test_hybrid_graph PRIVATE blaze_cpu blaze_kernels)
   add_test(NAME test_hybrid_graph COMMAND test_hybrid_graph)
   foreach(t test_nvfp4_kv test_nvfp4_qsa test_canon test_moe_gpu test_hc_mix test_moe_wide test_host_allreduce
-          test_skinny_gemm test_nvfp4_mha)
+          test_skinny_gemm test_nvfp4_mha test_ops)
     add_executable(${t} tests/${t}.cu)
     target_link_libraries(${t} PRIVATE blaze_kernels)
     add_test(NAME ${t} COMMAND ${t})
