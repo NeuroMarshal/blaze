@@ -10,7 +10,6 @@ import os
 import sys
 
 import torch
-from safetensors import safe_open
 from tokenizers import Tokenizer
 
 M, OUT, PROMPT = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -20,17 +19,48 @@ cfg = json.load(open(f"{M}/config.json"))["text_config"]
 index = json.load(open(f"{M}/model.safetensors.index.json"))["weight_map"]
 _files = {}
 P = "model.language_model."
+_DT = {"BF16": (torch.bfloat16, 2), "F32": (torch.float32, 4), "F8_E4M3": (torch.float8_e4m3fn, 1), "U8": (torch.uint8, 1),
+       "I64": (torch.int64, 8), "F16": (torch.float16, 2)}
+
+
+class _File:
+    """safetensors file read with pread (a 100 GB shard cannot be mapped under the server's overcommit policy)."""
+
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDONLY)
+        n = int.from_bytes(os.pread(self.fd, 8, 0), "little")
+        self.header = json.loads(os.pread(self.fd, n, 8))
+        self.base = 8 + n
+
+    def shape(self, name):
+        return self.header[name]["shape"]
+
+    def rows(self, name, a, b):
+        h = self.header[name]
+        dt, size = _DT[h["dtype"]]
+        row = size * math.prod(h["shape"][1:])
+        raw = os.pread(self.fd, row * (b - a), self.base + h["data_offsets"][0] + row * a)
+        return torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(dt).reshape(b - a, *h["shape"][1:])
+
+    def get(self, name):
+        h = self.header[name]
+        shape = h["shape"]
+        if not shape:
+            dt, size = _DT[h["dtype"]]
+            raw = os.pread(self.fd, size, self.base + h["data_offsets"][0])
+            return torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(dt).reshape(())
+        return self.rows(name, 0, shape[0])
 
 
 def handle(name):
     f = index[name]
     if f not in _files:
-        _files[f] = safe_open(f"{M}/{f}", "pt", device="cpu")
+        _files[f] = _File(f"{M}/{f}")
     return _files[f]
 
 
 def T(name):
-    return handle(name).get_tensor(name).to(dev)
+    return handle(name).get(name).to(dev)
 
 
 def has(name):
@@ -212,11 +242,11 @@ def ple(streams, tokens, p):
         for h in range(2 * hpn):
             ids.append(((m2 if h < hpn else m3) % sizes[h]) + offs[h])
     shard_name = e + "ngram_embedding.shard_0.weight"
-    shard_rows = handle(shard_name).get_slice(shard_name).get_shape()[0]
+    shard_rows = handle(shard_name).shape(shard_name)[0]
     rows = []
     for r in ids:
         name = e + f"ngram_embedding.shard_{r // shard_rows}.weight"
-        rows.append(handle(name).get_slice(name)[r % shard_rows:r % shard_rows + 1])
+        rows.append(handle(name).rows(name, r % shard_rows, r % shard_rows + 1))
     emb = torch.cat(rows).to(dev).float().reshape(t, -1)
     key = lin(emb, p + "ple.key_proj")
     value = lin(emb, p + "ple.value_proj")
@@ -240,7 +270,7 @@ print("tokens", tokens)
 t = len(tokens)
 pos = torch.arange(t, device=dev)
 emb_name = P + "embed_tokens.weight"
-emb = torch.cat([handle(emb_name).get_slice(emb_name)[i:i + 1] for i in tokens]).to(dev).float()
+emb = torch.cat([handle(emb_name).rows(emb_name, i, i + 1) for i in tokens]).to(dev).float()
 streams = emb.repeat(1, HC)
 ple_layers = {i - 1 for i in cfg["ple_layer_ids"]}
 for li, kind in enumerate(cfg["layer_types"]):
