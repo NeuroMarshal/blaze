@@ -210,7 +210,7 @@ pub enum SpecMethod {
     Ngram,
     /// suffix decoding over the request and the outputs of earlier requests
     Suffix,
-    /// the EAGLE-4 drafter (engine loaded with a draft model)
+    /// the engine's drafter (EAGLE-4 or DFlash2, loaded with a draft model)
     Eagle,
 }
 

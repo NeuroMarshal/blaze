@@ -217,8 +217,9 @@ enum Command {
         /// always verify the whole n-gram draft (by default drafts are cut or skipped by the measured verify cost)
         #[arg(long)]
         spec_fixed: bool,
-        /// draft source: suffix (suffix decoding over the request and earlier outputs), ngram (prompt lookup), eagle
-        /// (the --draft-model drafter); default: eagle with a draft model, else suffix
+        /// draft source: suffix (suffix decoding over the request and earlier outputs), ngram (prompt lookup), draft
+        /// (the --draft-model drafter: EAGLE-4 or DFlash2; also "eagle", "dflash"); default: the drafter if one is
+        /// loaded, else suffix
         #[arg(long, default_value = "auto")]
         spec_method: String,
         #[arg(long, default_value = "qwen3_coder")]
@@ -456,9 +457,9 @@ fn main() -> Result<()> {
                     spec_method: match (spec_method.as_str(), drafter) {
                         ("ngram", _) => blaze::sched::SpecMethod::Ngram,
                         ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,
-                        ("eagle", true) | ("auto", true) => blaze::sched::SpecMethod::Eagle,
-                        ("eagle", false) => anyhow::bail!("--spec-method eagle needs --draft-model"),
-                        (m, _) => anyhow::bail!("unknown --spec-method {m} (auto, suffix, ngram, eagle)"),
+                        ("draft" | "eagle" | "dflash", true) | ("auto", true) => blaze::sched::SpecMethod::Eagle,
+                        ("draft" | "eagle" | "dflash", false) => anyhow::bail!("--spec-method {spec_method} needs --draft-model"),
+                        (m, _) => anyhow::bail!("unknown --spec-method {m} (auto, suffix, ngram, draft)"),
                     },
                 },
             );
