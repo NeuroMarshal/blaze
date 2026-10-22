@@ -129,7 +129,9 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
     cache_map_bytes_ = cache_sets_ * per_set + 4096;
     cache_map_ = mmap(nullptr, cache_map_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (cache_map_ == MAP_FAILED) throw std::runtime_error("PLE row cache: out of memory");
-    madvise(cache_map_, cache_map_bytes_, MADV_HUGEPAGE);
+    // 4 KiB pages: a first touch of a huge page under memory pressure (pinned experts fill most of RAM) stalls in
+    // direct compaction for milliseconds, on the decode path (Flash Next decode 62.6 -> 6.1 tok/s with huge pages)
+    madvise(cache_map_, cache_map_bytes_, MADV_NOHUGEPAGE);
     auto* base = static_cast<uint8_t*>(cache_map_);
     cache_tags_ = reinterpret_cast<uint64_t*>(base);
     cache_rows_ = base + cache_sets_ * kWays * 8;
