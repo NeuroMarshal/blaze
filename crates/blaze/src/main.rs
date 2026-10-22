@@ -179,8 +179,11 @@ enum Command {
     Generate {
         #[command(flatten)]
         engine: EngineArgs,
-        #[arg(long)]
+        #[arg(long, default_value = "")]
         prompt: String,
+        /// read the prompt from a file (appended to --prompt)
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
         /// print the top-5 logits of every step
@@ -307,7 +310,11 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
             rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context))
         }
-        Command::Generate { engine, prompt, max_tokens, logits } => {
+        Command::Generate { engine, prompt, prompt_file, max_tokens, logits } => {
+            let prompt = match prompt_file {
+                Some(f) => prompt + &std::fs::read_to_string(f)?,
+                None => prompt,
+            };
             let text = blaze::text::Text::load(&engine.model)?;
             let mut e = engine.load(None, logits)?;
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
@@ -317,7 +324,12 @@ fn main() -> Result<()> {
             let prefill = t1.elapsed().as_secs_f64();
             let mut out = vec![next as u32];
             let stdout = std::io::stdout();
-            print!("{prompt}{}", text.decode(&out)?);
+            if ids.len() > 200 {
+                eprintln!("blaze: prompt of {} tokens", ids.len());
+                print!("{}", text.decode(&out)?);
+            } else {
+                print!("{prompt}{}", text.decode(&out)?);
+            }
             stdout.lock().flush()?;
             if logits {
                 show_top(&e, &text)?;

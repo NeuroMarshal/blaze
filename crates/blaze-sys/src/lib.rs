@@ -269,3 +269,21 @@ unsafe extern "C" {
     pub fn blz_ple_request(p: *mut blz_ple, ids: *const i64, n: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_ple_fetch(p: *mut blz_ple, out: *mut bf16, n: c_int, s: cudaStream_t) -> cudaError_t;
 }
+
+// QSA indexer (qsa_index.h)
+unsafe extern "C" {
+    pub fn blz_qsa_index_q(proj: *const bf16, ld: i64, col: c_int, positions: *const i64, norm_w: *const bf16, eps: f32,
+                           tokens: c_int, heads: c_int, dim: c_int, rotary_dim: c_int, inv_freq: *const f32, rope_scale: f32,
+                           out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_qsa_compress(proj: *const bf16, ld: i64, kcol: c_int, positions: *const i64, tok_row: *const i32,
+                            tok_kv_len: *const i32, tokens: c_int, dim: c_int, ratio: c_int, norm_w: *const bf16, eps: f32,
+                            rotary_dim: c_int, inv_freq: *const f32, rope_scale: f32, req_to_token: *const i32,
+                            rt_stride: i64, ring: *mut bf16, comp: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_qsa_scores(q: *const bf16, heads: c_int, dim: c_int, positions: *const i64, tok_row: *const i32, row0: c_int,
+                          rows: c_int, same_seq: c_int, ratio: c_int, req_to_token: *const i32, rt_stride: i64,
+                          comp: *const bf16, max_blocks: c_int, scores: *mut f32, ld_scores: i64, s: cudaStream_t)
+                          -> cudaError_t;
+    pub fn blz_qsa_select(scores: *const f32, ld_scores: i64, positions: *const i64, tok_row: *const i32, row0: c_int,
+                          rows: c_int, ratio: c_int, block_topk: c_int, req_to_token: *const i32, rt_stride: i64,
+                          table: *mut i32, table_stride: i64, counts: *mut i32, s: cudaStream_t) -> cudaError_t;
+}

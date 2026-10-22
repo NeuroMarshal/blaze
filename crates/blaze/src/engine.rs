@@ -40,7 +40,11 @@ struct StepMeta {
     rows: Vec<i32>,
     kv_lens: Vec<i32>,
     logit_rows: Vec<i32>,
+    tok_row: Vec<i32>,
+    tok_kv_len: Vec<i32>,
     spans: Vec<Span>,
+    /// some sequence's context exceeds the QSA budget: select instead of attending to every token
+    sparse: bool,
     /// sampled step: penalty lists per logit row
     sample: bool,
     pen_ids: Vec<i32>,
@@ -92,8 +96,8 @@ impl Drop for Graph {
 struct Runner {
     model: Model,
     staging: HostMapped,
-    graphs: HashMap<(usize, bool), Graph>,
-    warmed: HashSet<(usize, bool)>,
+    graphs: HashMap<(usize, bool, bool), Graph>,
+    warmed: HashSet<(usize, bool, bool)>,
     use_graphs: bool,
 }
 
@@ -116,6 +120,8 @@ impl Runner {
         self.put(m.req_idx, &meta.rows);
         self.put(m.kv_lens, &meta.kv_lens);
         self.put(m.logit_rows, &meta.logit_rows);
+        self.put(m.tok_row, &meta.tok_row);
+        self.put(m.tok_kv_len, &meta.tok_kv_len);
         if meta.sample {
             if meta.pen_ids.len() > m.max_pen {
                 bail!("{} penalty entries (max {})", meta.pen_ids.len(), m.max_pen);
@@ -133,9 +139,9 @@ impl Runner {
         )?;
         let n = meta.logit_rows.len();
         if allow_graph && self.use_graphs && !verify && meta.spans.iter().all(|sp| sp.len == 1) {
-            self.run_graph(n, meta.sample, &meta.spans)?;
+            self.run_graph(n, meta.sample, meta.sparse, &meta.spans)?;
         } else {
-            self.model.forward(&meta.spans, n, verify, meta.sample)?;
+            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse)?;
         }
         if meta.sample { Ok(Reply::Cands(self.model.candidates(n)?)) } else { Ok(Reply::Tokens(self.model.next_tokens(n)?)) }
     }
@@ -143,19 +149,19 @@ impl Runner {
     /// Decode step of `n` sequences through its CUDA graph (one per batch size and head mode): one eager run to load
     /// every kernel, then the capture, then replays. Every rank takes the same path for the same key, so their
     /// all-reduces stay paired.
-    fn run_graph(&mut self, n: usize, sample: bool, spans: &[Span]) -> Result<()> {
-        let key = (n, sample);
+    fn run_graph(&mut self, n: usize, sample: bool, sparse: bool, spans: &[Span]) -> Result<()> {
+        let key = (n, sample, sparse);
         if let Some(g) = self.graphs.get(&key) {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
         if self.warmed.insert(key) {
-            return self.model.forward(spans, n, false, sample);
+            return self.model.forward(spans, n, false, sample, sparse);
         }
         // The step's own metadata copy is already enqueued; capture after it completes.
         self.model.stream.sync()?;
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, false, sample);
+        let captured = self.model.forward(spans, n, false, sample, sparse);
         let mut graph = null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
         captured?;
@@ -209,6 +215,10 @@ pub struct Info {
     pub ctx_stride: usize,
     pub vocab: usize,
     pub cache_rows: usize,
+    /// KV slots per page (a sequence takes whole pages; snapshots end on a page boundary)
+    pub page: usize,
+    /// context above which the step selects (QSA); usize::MAX: never
+    pub qsa_budget: usize,
 }
 
 /// A cached prefix: the recurrent state after its tokens (state row `row`, outside the live rows) and the KV slots of
@@ -239,9 +249,9 @@ pub struct Penalty {
 
 pub struct Engine {
     workers: Vec<Worker>,
-    free_slots: Vec<u32>,
-    /// references of every KV slot (live sequences and snapshots)
-    slot_refs: Vec<u32>,
+    /// free KV pages and the references of every page (live sequences and snapshots)
+    free_pages: Vec<u32>,
+    page_refs: Vec<u32>,
     free_rows: Vec<usize>,
     free_cache_rows: Vec<usize>,
     pub info: Info,
@@ -295,9 +305,12 @@ fn worker_main(
                 ctx_stride: r.model.ctx_stride(),
                 vocab: r.model.cfg.vocab,
                 cache_rows: r.model.opts.cache_rows,
+                page: r.model.page_size(),
+                qsa_budget: r.model.qsa_budget(),
             };
             let _ = tx.send(Ok(Reply::Logits(vec![info.max_tokens as f32, info.max_seqs as f32, info.max_chunk as f32,
-                                                   info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32])));
+                                                   info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32,
+                                                   info.page as f32, info.qsa_budget.min(1 << 24) as f32])));
             r
         }
         Err(e) => {
@@ -342,6 +355,8 @@ impl Engine {
                         ctx_stride: v[3] as usize,
                         vocab: v[4] as usize,
                         cache_rows: v[5] as usize,
+                        page: v[6] as usize,
+                        qsa_budget: if v[7] as usize >= 1 << 24 { usize::MAX } else { v[7] as usize },
                     });
                 }
                 Ok(_) => unreachable!(),
@@ -356,8 +371,8 @@ impl Engine {
         let info = info.unwrap();
         Ok(Self {
             workers,
-            free_slots: (0..info.max_tokens as u32).rev().collect(),
-            slot_refs: vec![0; info.max_tokens],
+            free_pages: (0..(info.max_tokens / info.page) as u32).rev().collect(),
+            page_refs: vec![0; info.max_tokens / info.page],
             free_rows: (0..info.max_seqs).rev().collect(),
             free_cache_rows: (info.max_seqs..info.max_seqs + info.cache_rows).rev().collect(),
             info,
@@ -387,20 +402,27 @@ impl Engine {
         }
     }
 
+    /// Free KV slots (whole free pages).
     pub fn free_slots(&self) -> usize {
-        self.free_slots.len()
+        self.free_pages.len() * self.info.page
     }
 
     pub fn free_rows(&self) -> usize {
         self.free_rows.len()
     }
 
-    fn unref(&mut self, slot: u32) {
-        let r = &mut self.slot_refs[slot as usize];
+    fn unref(&mut self, page: u32) {
+        let r = &mut self.page_refs[page as usize];
         *r -= 1;
         if *r == 0 {
-            self.free_slots.push(slot);
+            self.free_pages.push(page);
         }
+    }
+
+    /// The pages of a slot list (one per page-aligned position).
+    fn pages_of(&self, slots: &[u32]) -> Vec<u32> {
+        let p = self.info.page;
+        slots.iter().step_by(p).map(|&s| s / p as u32).collect()
     }
 
     pub fn open(&mut self) -> Result<Seq> {
@@ -419,8 +441,8 @@ impl Engine {
                 self.broadcast(|| Cmd::CopyState(snap.row, row))?;
                 let slots: Arc<Vec<i32>> = Arc::new(snap.slots.iter().map(|&s| s as i32).collect());
                 self.broadcast(|| Cmd::SetKvRow(row, slots.clone()))?;
-                for &s in &snap.slots {
-                    self.slot_refs[s as usize] += 1;
+                for pg in self.pages_of(&snap.slots) {
+                    self.page_refs[pg as usize] += 1;
                 }
                 Ok(Seq { row, slots: snap.slots.clone() })
             }
@@ -428,26 +450,29 @@ impl Engine {
     }
 
     pub fn close(&mut self, seq: Seq) {
-        for &s in seq.slots.iter().rev() {
-            self.unref(s);
+        for pg in self.pages_of(&seq.slots).into_iter().rev() {
+            self.unref(pg);
         }
         self.free_rows.push(seq.row);
     }
 
-    /// Keep the state after the first `len` tokens of `seq` (they must be all of its tokens: the state stands after
-    /// the last one) as a prefix-cache entry; None when every cache row is taken.
+    /// Keep the state after all tokens of `seq` (they must end on a page boundary) as a prefix-cache entry; None when
+    /// every cache row is taken or the length is not page-aligned.
     pub fn snapshot(&mut self, seq: &Seq) -> Result<Option<Snapshot>> {
+        if seq.len() % self.info.page != 0 {
+            return Ok(None);
+        }
         let Some(row) = self.free_cache_rows.pop() else { return Ok(None) };
         self.broadcast(|| Cmd::CopyState(seq.row, row))?;
-        for &s in &seq.slots {
-            self.slot_refs[s as usize] += 1;
+        for pg in self.pages_of(&seq.slots) {
+            self.page_refs[pg as usize] += 1;
         }
         Ok(Some(Snapshot { row, slots: seq.slots.clone() }))
     }
 
     pub fn release(&mut self, snap: Snapshot) {
-        for &s in snap.slots.iter().rev() {
-            self.unref(s);
+        for pg in self.pages_of(&snap.slots).into_iter().rev() {
+            self.unref(pg);
         }
         self.free_cache_rows.push(snap.row);
     }
@@ -455,24 +480,34 @@ impl Engine {
     /// Metadata of a step; `all_rows`: greedy picks for every row (a verify) instead of each item's last row.
     fn plan(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], all_rows: bool) -> Result<StepMeta> {
         let stride = self.info.ctx_stride;
-        let total: usize = tokens.iter().map(|t| t.len()).sum();
-        if self.free_slots.len() < total {
-            bail!("KV cache full: {} free slots for {total} tokens", self.free_slots.len());
+        let page = self.info.page;
+        let pages: usize = seqs.iter().zip(tokens).map(|(s, t)| (s.len() + t.len()).div_ceil(page) - s.len().div_ceil(page)).sum();
+        if self.free_pages.len() < pages {
+            bail!("KV cache full: {} free pages for {pages}", self.free_pages.len());
         }
         let mut m = StepMeta { seq_start: vec![0], ..Default::default() };
         for (seq, t) in seqs.iter_mut().zip(tokens) {
             if seq.len() + t.len() > stride {
                 bail!("sequence of {} tokens exceeds the context ({stride})", seq.len() + t.len());
             }
+            let kv_len = seq.len() + t.len();
+            m.sparse |= kv_len > self.info.qsa_budget;
             m.spans.push(Span { offset: m.tokens.len(), len: t.len() });
             for &id in t.iter() {
-                let slot = self.free_slots.pop().unwrap();
-                self.slot_refs[slot as usize] = 1;
                 let p = seq.len();
+                let slot = if p % page == 0 {
+                    let pg = self.free_pages.pop().unwrap();
+                    self.page_refs[pg as usize] = 1;
+                    pg * page as u32
+                } else {
+                    seq.slots[p - 1] + 1
+                };
                 m.tokens.push(id);
                 m.positions.push(p as i64);
                 m.locs.push(slot as i64);
                 m.rt_index.push((seq.row * stride + p) as i64);
+                m.tok_row.push(seq.row as i32);
+                m.tok_kv_len.push(kv_len as i32);
                 seq.slots.push(slot);
             }
             m.seq_start.push(m.tokens.len() as i32);
@@ -570,9 +605,13 @@ impl Engine {
     /// advance over the kept rows.
     pub fn commit(&mut self, seq: &mut Seq, rows: usize, accepted: usize) -> Result<()> {
         let keep = seq.len() - (rows - accepted);
-        let dropped: Vec<u32> = seq.slots.drain(keep..).collect();
-        for s in dropped.into_iter().rev() {
-            self.unref(s);
+        let page = self.info.page;
+        // whole pages past the kept positions go back; a partly kept page stays with the sequence
+        let first_free = keep.div_ceil(page) * page;
+        let dropped: Vec<u32> = (first_free..seq.len()).step_by(page).map(|i| seq.slots[i] / page as u32).collect();
+        seq.slots.truncate(keep);
+        for pg in dropped.into_iter().rev() {
+            self.unref(pg);
         }
         self.broadcast(|| Cmd::Commit(seq.row, accepted))?;
         Ok(())

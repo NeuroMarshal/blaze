@@ -158,7 +158,11 @@ impl Loop {
     }
 
     fn remember(&mut self, seq: &Seq, tokens: Vec<i64>) {
-        if !self.cfg.prompt_cache || tokens.len() != seq.len() || self.cache.iter().any(|e| e.tokens == tokens) {
+        if !self.cfg.prompt_cache
+            || tokens.len() != seq.len()
+            || tokens.len() % self.engine.info.page != 0
+            || self.cache.iter().any(|e| e.tokens == tokens)
+        {
             return;
         }
         let snap = match self.engine.snapshot(seq) {
@@ -241,7 +245,8 @@ impl Loop {
             let fed = seq.len();
             let _ = req.events.send(GenEvent::Started { prompt_tokens: req.tokens.len(), cached_tokens: fed });
             let rng = req.params.seed.map(Rng::new).unwrap_or_else(Rng::from_time);
-            let points = req.cache_points.iter().copied().filter(|&p| p > fed && p < req.tokens.len()).collect();
+            let page = self.engine.info.page;
+            let points = req.cache_points.iter().map(|&p| p / page * page).filter(|&p| p > fed && p < req.tokens.len()).collect();
             self.active.push(Active { req, seq, fed, generated: Vec::new(), counts: HashMap::new(), rng, pending: None, points });
         }
     }

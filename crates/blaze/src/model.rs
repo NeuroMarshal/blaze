@@ -79,6 +79,8 @@ pub struct Attn {
     o: Linear,
     q_norm: DevBuf,
     k_norm: DevBuf,
+    /// QSA indexer: its projection is the last module of `qkv`; Gemma norms of the index query and keys
+    index: Option<(DevBuf, DevBuf)>,
 }
 
 pub struct Gdn {
@@ -204,6 +206,9 @@ pub struct MetaLayout {
     pub req_idx: usize,
     pub kv_lens: usize,
     pub logit_rows: usize,
+    /// per token: its sequence's KV-table row and length after the step (QSA)
+    pub tok_row: usize,
+    pub tok_kv_len: usize,
     // sampling: penalty lists of the sampled rows (ids, counts, offsets [rows + 1]) and per-row coefficients
     pub max_pen: usize,
     pub pen_ids: usize,
@@ -231,6 +236,8 @@ impl MetaLayout {
         let req_idx = take(max_seqs * 4);
         let kv_lens = take(max_seqs * 4);
         let logit_rows = take(max_tokens * 4);
+        let tok_row = take(max_tokens * 4);
+        let tok_kv_len = take(max_tokens * 4);
         let max_pen = (max_seqs * 4096).min(1 << 16);
         let pen_ids = take(max_pen * 4);
         let pen_counts = take(max_pen * 4);
@@ -249,6 +256,8 @@ impl MetaLayout {
             req_idx,
             kv_lens,
             logit_rows,
+            tok_row,
+            tok_kv_len,
             max_pen,
             pen_ids,
             pen_counts,
@@ -259,6 +268,11 @@ impl MetaLayout {
         }
     }
 }
+
+/// QSA: query rows scored per pass (the scores scratch holds this many rows of the longest context's blocks), and the
+/// row stride of the selection table (block_topk * ratio + ratio - 1 rounded up).
+const QSA_SCORE_ROWS: usize = 128;
+const QSA_TABLE_STRIDE: usize = 2056;
 
 /// One sequence of a step: `len` tokens at `offset` in the step's token list (decode sequences first, len 1).
 #[derive(Clone, Copy, Debug)]
@@ -311,6 +325,13 @@ struct Work {
     cand_vals: DevBuf,
     cand_ids: DevBuf,
     cand_pairs: DevBuf,
+    // QSA: index queries [t, heads, 128], block scores [score rows, max blocks], selected KV slots [t, table stride] with
+    // their counts, the identity row list of the selection table
+    qsa_q: Option<DevBuf>,
+    qsa_scores: Option<DevBuf>,
+    qsa_table: Option<DevBuf>,
+    qsa_counts: Option<DevBuf>,
+    qsa_rows: Option<DevBuf>,
     logits: DevBuf,
     next: DevBuf,
     meta: DevBuf,
@@ -335,6 +356,10 @@ pub struct Model {
     // KV pools of the softmax layers (NVFP4): [slots, kv_heads, head_dim / 2] codes, [.., head_dim / 16] scales
     kv: Vec<[DevBuf; 4]>,
     kv_global: DevBuf,
+    /// QSA: compressed index keys per softmax layer [pages, 128] and the raw keys of each sequence's incomplete block
+    /// [max_seqs, ratio, 128]
+    qsa_comp: Vec<DevBuf>,
+    qsa_ring: Vec<DevBuf>,
     req_to_token: DevBuf,
     // GDN states: conv [seqs, channels, kernel - 1] bf16, recurrent [seqs, v_heads, dk, dv] f32
     conv_state: Vec<DevBuf>,
@@ -443,21 +468,31 @@ impl Model {
                     // q_proj rows per head: [query D | gate D]
                     let qr = part(cfg.attn.heads, r, w);
                     let kvr = part(cfg.attn.kv_heads, r, w);
-                    let qkv = Linear::load(
-                        &ckpt,
-                        &quant,
-                        &[
-                            rows(format!("{a}q_proj"), vec![qr.start * 2 * hd..qr.end * 2 * hd]),
-                            rows(format!("{a}k_proj"), vec![kvr.start * hd..kvr.end * hd]),
-                            rows(format!("{a}v_proj"), vec![kvr.start * hd..kvr.end * hd]),
-                        ],
-                        s,
-                    )?;
+                    let mut mods = vec![
+                        rows(format!("{a}q_proj"), vec![qr.start * 2 * hd..qr.end * 2 * hd]),
+                        rows(format!("{a}k_proj"), vec![kvr.start * hd..kvr.end * hd]),
+                        rows(format!("{a}v_proj"), vec![kvr.start * hd..kvr.end * hd]),
+                    ];
+                    if cfg.qsa.is_some() {
+                        if w > 1 {
+                            bail!("tensor parallelism of QSA models is not supported yet");
+                        }
+                        mods.push(all(format!("{a}indexer.index_qk_proj")));
+                    }
+                    let qkv = Linear::load(&ckpt, &quant, &mods, s)?;
+                    let index = match &cfg.qsa {
+                        Some(_) => Some((
+                            load_vec(&ckpt, &format!("{a}indexer.q_layernorm.weight"))?,
+                            load_vec(&ckpt, &format!("{a}indexer.k_layernorm.weight"))?,
+                        )),
+                        None => None,
+                    };
                     let attn = Attn {
                         qkv,
                         o: Linear::load(&ckpt, &quant, &[cols(format!("{a}o_proj"), qr.start * hd..qr.end * hd)], s)?,
                         q_norm: load_vec(&ckpt, &format!("{a}q_norm.weight"))?,
                         k_norm: load_vec(&ckpt, &format!("{a}k_norm.weight"))?,
+                        index,
                     };
                     n_full += 1;
                     (Some(attn), None, n_full - 1)
@@ -591,6 +626,13 @@ impl Model {
             kv.push([DevBuf::zeroed(codes, s)?, DevBuf::zeroed(codes, s)?, DevBuf::zeroed(scales, s)?, DevBuf::zeroed(scales, s)?]);
         }
         let kv_global = DevBuf::from_slice(&[1.0f32])?;
+        let (mut qsa_comp, mut qsa_ring) = (Vec::new(), Vec::new());
+        if let Some(q) = &cfg.qsa {
+            for _ in 0..n_full {
+                qsa_comp.push(DevBuf::zeroed((opts.max_tokens / q.compress_ratio + 1) * q.head_dim * 2, s)?);
+                qsa_ring.push(DevBuf::zeroed(opts.max_seqs * q.compress_ratio * q.head_dim * 2, s)?);
+            }
+        }
         let req_to_token = DevBuf::zeroed(opts.max_seqs * cfg.max_positions.min(opts.max_tokens) * 4, s)?;
         let state_rows = opts.max_seqs + opts.cache_rows;
         let (mut conv_state, mut rec_state) = (Vec::new(), Vec::new());
@@ -703,6 +745,8 @@ impl Model {
             rope_scale,
             kv,
             kv_global,
+            qsa_comp,
+            qsa_ring,
             req_to_token,
             conv_state,
             rec_state,
@@ -790,10 +834,16 @@ impl Model {
         let inter = d.inter;
         let parts_prefill = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, t as c_int, 1) } as usize;
         let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, 1, 64) } as usize;
-        let partial_rows = (t * parts_prefill).max(opts.max_seqs * parts_decode);
+        let mut partial_rows = (t * parts_prefill).max(opts.max_seqs * parts_decode);
+        if cfg.qsa.is_some() {
+            // sparse attention: every row a one-token sequence, rows x splits <= max(rows, 4 x SMs / kv heads)
+            let per_split = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, 1, 1) } as usize;
+            partial_rows = partial_rows.max(t.max(opts.max_seqs).max(opts.max_verify).max(1024) * per_split);
+        }
         let _ = proj_cols;
         // rows the head may take in one step: one per sequence, or every row of a verify
         let head_rows = opts.max_seqs.max(opts.max_verify);
+        let ctx = cfg.max_positions.min(opts.max_tokens);
         let hcw = cfg.hc.as_ref().map(|hc| hc.count * h);
         let ple_c = cfg.ple.as_ref().and(hcw);
         let b = |n: usize| DevBuf::zeroed(n, s);
@@ -845,10 +895,29 @@ impl Model {
             cand_vals: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
             cand_ids: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
             cand_pairs: b((world * head_rows * sys::BLZ_TOPK_MAX * 8).next_multiple_of(16))?,
+            qsa_q: cfg.qsa.as_ref().map(|q| b(t.max(head_rows) * q.heads * q.head_dim * 2)).transpose()?,
+            qsa_scores: cfg.qsa.as_ref().map(|q| b(QSA_SCORE_ROWS * (ctx / q.compress_ratio + 1) * 4)).transpose()?,
+            qsa_table: cfg.qsa.as_ref().map(|_| b(t.max(head_rows) * QSA_TABLE_STRIDE * 4)).transpose()?,
+            qsa_counts: cfg.qsa.as_ref().map(|_| b(t.max(head_rows) * 4)).transpose()?,
+            qsa_rows: cfg
+                .qsa
+                .as_ref()
+                .map(|_| DevBuf::from_slice(&(0..t.max(head_rows) as i32).collect::<Vec<i32>>()))
+                .transpose()?,
             logits: b(head_rows * cfg.vocab * 2)?,
             next: b(head_rows * 4)?,
             meta: b(meta.bytes)?,
         })
+    }
+
+    /// KV slots per page: QSA keeps one compressed key per page of `compress_ratio` slots.
+    pub fn page_size(&self) -> usize {
+        self.cfg.qsa.as_ref().map_or(1, |q| q.compress_ratio)
+    }
+
+    /// Context above which QSA selects (below it, the selection is every visible token: dense attention).
+    pub fn qsa_budget(&self) -> usize {
+        self.cfg.qsa.as_ref().map_or(usize::MAX, |q| q.budget)
     }
 
     /// Positions per request row of the KV table.
@@ -996,7 +1065,7 @@ impl Model {
     /// sequences (len 1) first, then prefill chunks. The head runs on the first `n_logits` rows listed in
     /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
     /// (its inputs are recorded for commit). Capturable into a CUDA graph (no host synchronization).
-    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool) -> Result<()> {
+    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool) -> Result<()> {
         let t: usize = spans.iter().map(|s| s.len).sum();
         let n = spans.len();
         if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
@@ -1060,7 +1129,7 @@ impl Model {
                 )?;
             }
             match layer.kind {
-                LayerKind::Full => self.attention(layer, t, spans)?,
+                LayerKind::Full => self.attention(layer, t, spans, sparse)?,
                 LayerKind::Linear => self.gdn(layer, t, n, verify)?,
             }
             match &layer.mix {
@@ -1328,7 +1397,80 @@ impl Model {
         Ok(raw[row * v..].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect())
     }
 
-    fn attention(&self, layer: &Layer, t: usize, spans: &[Span]) -> Result<()> {
+    /// QSA of a softmax layer: index queries and compressed keys of the step (always, so later steps can select), then
+    /// with `sparse` the KV slots every row attends to, in the selection table (rows 0..t, counts per row).
+    fn qsa_index(&self, layer: &Layer, t: usize, spans: &[Span], sparse: bool) -> Result<()> {
+        let (a, q) = (layer.attn.as_ref().unwrap(), self.cfg.qsa.as_ref().unwrap());
+        let (qn, kn) = a.index.as_ref().unwrap();
+        let (cfg, w, s, m) = (&self.cfg, &self.work, &self.stream, &self.meta);
+        let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, cfg.attn.head_dim);
+        let ld = a.qkv.n;
+        let col = heads * 2 * hd + 2 * kvh * hd;
+        let qbuf = w.qsa_q.as_ref().unwrap();
+        check(
+            unsafe {
+                sys::blz_qsa_index_q(w.proj.ptr(), ld as i64, col as c_int, self.meta_ptr(m.positions), qn.ptr(), cfg.rms_eps, t as c_int,
+                                     q.heads as c_int, q.head_dim as c_int, cfg.rope.rotary_dim as c_int, self.inv_freq.ptr(),
+                                     self.rope_scale, qbuf.ptr(), s.0)
+            },
+            "qsa index q",
+        )?;
+        let (comp, ring) = (&self.qsa_comp[layer.slot], &self.qsa_ring[layer.slot]);
+        check(
+            unsafe {
+                sys::blz_qsa_compress(w.proj.ptr(), ld as i64, (col + q.heads * q.head_dim) as c_int, self.meta_ptr(m.positions),
+                                      self.meta_ptr(m.tok_row), self.meta_ptr(m.tok_kv_len), t as c_int, q.head_dim as c_int,
+                                      q.compress_ratio as c_int, kn.ptr(), cfg.rms_eps, cfg.rope.rotary_dim as c_int,
+                                      self.inv_freq.ptr(), self.rope_scale, self.req_to_token.ptr(), self.ctx_stride() as i64,
+                                      ring.ptr(), comp.ptr(), s.0)
+            },
+            "qsa compress",
+        )?;
+        if !sparse {
+            return Ok(());
+        }
+        let max_blocks = self.ctx_stride() / q.compress_ratio + 1;
+        let (scores, table, counts) = (w.qsa_scores.as_ref().unwrap(), w.qsa_table.as_ref().unwrap(), w.qsa_counts.as_ref().unwrap());
+        let block_topk = q.budget / q.compress_ratio;
+        // decode rows one sequence each, prefill spans in passes of QSA_SCORE_ROWS rows of one sequence
+        let mut passes: Vec<(usize, usize, bool)> = Vec::new();
+        for sp in spans {
+            if sp.len == 1 {
+                match passes.last_mut() {
+                    Some((r0, n, false)) if *r0 + *n == sp.offset && *n < QSA_SCORE_ROWS => *n += 1,
+                    _ => passes.push((sp.offset, 1, false)),
+                }
+            } else {
+                let mut r = sp.offset;
+                while r < sp.offset + sp.len {
+                    let n = QSA_SCORE_ROWS.min(sp.offset + sp.len - r);
+                    passes.push((r, n, true));
+                    r += n;
+                }
+            }
+        }
+        for (r0, n, same) in passes {
+            check(
+                unsafe {
+                    sys::blz_qsa_scores(qbuf.ptr(), q.heads as c_int, q.head_dim as c_int, self.meta_ptr(m.positions), self.meta_ptr(m.tok_row),
+                                        r0 as c_int, n as c_int, same as c_int, q.compress_ratio as c_int, self.req_to_token.ptr(),
+                                        self.ctx_stride() as i64, comp.ptr(), max_blocks as c_int, scores.ptr(), max_blocks as i64, s.0)
+                },
+                "qsa scores",
+            )?;
+            check(
+                unsafe {
+                    sys::blz_qsa_select(scores.ptr(), max_blocks as i64, self.meta_ptr(m.positions), self.meta_ptr(m.tok_row), r0 as c_int,
+                                        n as c_int, q.compress_ratio as c_int, block_topk as c_int, self.req_to_token.ptr(),
+                                        self.ctx_stride() as i64, table.ptr(), QSA_TABLE_STRIDE as i64, counts.ptr(), s.0)
+                },
+                "qsa select",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn attention(&self, layer: &Layer, t: usize, spans: &[Span], sparse: bool) -> Result<()> {
         let a = layer.attn.as_ref().unwrap();
         let (cfg, w, s, m) = (&self.cfg, &self.work, &self.stream, &self.meta);
         let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, cfg.attn.head_dim);
@@ -1365,6 +1507,45 @@ impl Model {
             heads: kvh as c_int,
             dim: hd as c_int,
         };
+        let sparse = sparse && self.cfg.qsa.is_some();
+        if self.cfg.qsa.is_some() {
+            self.qsa_index(layer, t, spans, sparse)?;
+        }
+        if sparse {
+            // every row attends to its selected slots: the selection table is a KV table of one-row "sequences"
+            let (table, counts, rows) = (w.qsa_table.as_ref().unwrap(), w.qsa_counts.as_ref().unwrap(), w.qsa_rows.as_ref().unwrap());
+            let splits = (4 * self.num_sms / (t * kvh)).clamp(1, 16);
+            check(
+                unsafe {
+                    sys::blz_nvfp4_mha_decode(
+                        w.q.ptr::<u16>().cast(),
+                        (heads * hd) as i64,
+                        hd as i64,
+                        heads as c_int,
+                        view,
+                        table.ptr(),
+                        QSA_TABLE_STRIDE as i64,
+                        sys::blz_index_ptr { ptr: rows.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
+                        sys::blz_index_ptr { ptr: counts.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
+                        t as c_int,
+                        1,
+                        splits as c_int,
+                        1.0 / (hd as f32).sqrt(),
+                        w.partial_o.ptr(),
+                        w.partial_ml.ptr(),
+                        sys::BLZ_BF16,
+                        w.attn.ptr::<u16>().cast(),
+                        (heads * hd) as i64,
+                        hd as i64,
+                        s.0,
+                    )
+                },
+                "qsa mha",
+            )?;
+            check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
+            a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
+            return self.prefetch_mlp(layer, t);
+        }
         // Decode spans (len 1, first) in one call; every prefill span on its own (its own q_len).
         let n_decode = spans.iter().take_while(|sp| sp.len == 1).count();
         let mut calls: Vec<(usize, usize, usize, usize)> = Vec::new(); // (first span, spans, q_len, token offset)
