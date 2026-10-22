@@ -29,13 +29,22 @@ struct EngineArgs {
     /// CPU threads serving experts kept in RAM
     #[arg(long, default_value_t = 12)]
     expert_threads: usize,
+    /// CPU cores of the expert threads ("3-4,9-17"; default: any)
+    #[arg(long, default_value = "")]
+    expert_cores: String,
+    /// GiB of expert slots on the second GPU (0: none)
+    #[arg(long, default_value_t = 0.0)]
+    expert_gpu1_gib: f64,
+    /// GiB of pinned RAM for experts; -1: every expert not in VRAM, else the rarest are read from the SSD
+    #[arg(long, default_value_t = -1.0, allow_hyphen_values = true)]
+    expert_ram_gib: f64,
     /// routing profile of the experts (initial VRAM placement, saved while running); default
     /// ~/.cache/blaze/heat-<model directory name>.bin, "none" to disable
     #[arg(long)]
     expert_heat: Option<String>,
     /// expert deferral in decode: CPU experts whose routes all rank >= N are added one layer later (approximate;
     /// -1 off)
-    #[arg(long, default_value_t = -1)]
+    #[arg(long, default_value_t = -1, allow_hyphen_values = true)]
     expert_defer: i32,
     /// extra options of the expert engine ("key=value,...")
     #[arg(long, default_value = "host_reserve_gib=2")]
@@ -82,6 +91,9 @@ impl EngineArgs {
                 moe_heat: heat,
                 moe_options: options,
                 reserve_gib: self.vram_reserve,
+                moe_gpu1_gib: self.expert_gpu1_gib,
+                moe_ram_gib: self.expert_ram_gib,
+                moe_cores: self.expert_cores.clone(),
                 l2_prefetch_mib: self.l2_prefetch_mib,
                 full_logits,
                 capture_layers: Vec::new(),

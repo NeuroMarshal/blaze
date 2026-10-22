@@ -40,6 +40,16 @@ fn part(total: usize, rank: usize, world: usize) -> Range<usize> {
     rank * n..(rank + 1) * n
 }
 
+fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
+    let inject = format!("{prefix}block_inject_weight.weight");
+    Ok(HcBlock {
+        norm: load_vec(ckpt, &format!("{prefix}hc_norm.weight"))?,
+        down: load_vec(ckpt, &format!("{prefix}input_mix_weight_down.weight"))?,
+        up: load_vec(ckpt, &format!("{prefix}input_mix_weight_up.weight"))?,
+        inject: if ckpt.get(&inject).is_some() { Some(load_vec(ckpt, &inject)?) } else { None },
+    })
+}
+
 fn load_vec(ckpt: &Checkpoint, name: &str) -> Result<DevBuf> {
     load_rows(ckpt, name, None)
 }
@@ -85,10 +95,55 @@ pub enum Mlp {
     Dense { gu: Linear, down: Linear },
 }
 
+/// Low-rank gated hyper-connection of one block (Qwen4-Exp GatedResidual): per-stream norm, mix down to one input,
+/// gated injection of the block's output back into every stream.
+pub struct HcBlock {
+    norm: DevBuf,
+    down: DevBuf,
+    up: DevBuf,
+    inject: Option<DevBuf>,
+}
+
+/// How a layer reads and updates the residual stream.
+pub enum Mixing {
+    /// Pre-norm residual: RMSNorm before each block, residual add after.
+    Norm { input: DevBuf, post: DevBuf },
+    /// Hyper-connection streams.
+    Hyper { attn: HcBlock, mlp: HcBlock },
+}
+
+pub enum FinalMix {
+    Norm(DevBuf),
+    Hyper(HcBlock),
+}
+
+/// Per-layer n-gram embedding (Qwen4-Exp PLE) of one layer.
+pub struct Ple {
+    key: Linear,
+    value: Linear,
+    norm_key: DevBuf,
+    norm_query: DevBuf,
+    norm_conv: DevBuf,
+    conv_w: DevBuf,
+    mult: DevBuf,
+    sizes: DevBuf,
+    offsets: DevBuf,
+}
+
+pub struct PleTable(*mut sys::blz_ple);
+
+unsafe impl Send for PleTable {}
+
+impl Drop for PleTable {
+    fn drop(&mut self) {
+        unsafe { sys::blz_ple_destroy(self.0) };
+    }
+}
+
 pub struct Layer {
     kind: LayerKind,
-    input_norm: DevBuf,
-    post_norm: DevBuf,
+    mix: Mixing,
+    ple: Option<Ple>,
     attn: Option<Attn>,
     gdn: Option<Gdn>,
     mlp: Mlp,
@@ -116,6 +171,11 @@ pub struct Options {
     pub moe_options: String,
     /// VRAM kept free after the experts' slots (activations of cuBLAS, the allocator, the display).
     pub reserve_gib: f64,
+    /// Expert slots on the second GPU (GiB; 0: none), pinned RAM for experts (GiB; < 0: every expert not in VRAM,
+    /// else the rarest go to the SSD), CPU cores of the expert workers ("3-4,9-17"; empty: any).
+    pub moe_gpu1_gib: f64,
+    pub moe_ram_gib: f64,
+    pub moe_cores: String,
     /// Decode: stream the next linear layer's weights into L2 on a side stream while the main stream waits on the
     /// all-reduce or runs the small attention / GDN kernels (MiB per window, 0: off).
     pub l2_prefetch_mib: usize,
@@ -198,6 +258,20 @@ struct Work {
     gx: DevBuf,
     gres: DevBuf,
     gnormed: DevBuf,
+    // hyper-connection streams [t, hc * hidden], their norm, mix workspace; head rows of the streams
+    streams: Option<DevBuf>,
+    hnorm: Option<DevBuf>,
+    hc_t: Option<DevBuf>,
+    hc_ws: Option<DevBuf>,
+    gstreams: Option<DevBuf>,
+    ghnorm: Option<DevBuf>,
+    // PLE: n-gram row ids [t, heads], embeddings [t, embed], key / gated / gated-normed [t, hc * hidden], value
+    ple_ids: Option<DevBuf>,
+    ple_emb: Option<DevBuf>,
+    ple_key: Option<DevBuf>,
+    ple_value: Option<DevBuf>,
+    ple_gated: Option<DevBuf>,
+    ple_gatedn: Option<DevBuf>,
     pairs: DevBuf,
     logits: DevBuf,
     next: DevBuf,
@@ -209,8 +283,11 @@ pub struct Model {
     pub dims: Dims,
     pub tp: Tp,
     layers: Vec<Layer>,
-    final_norm: DevBuf,
+    final_mix: FinalMix,
     lm_head: Linear,
+    ple_table: Option<PleTable>,
+    /// PLE short-conv state [seqs, hc * hidden, 9] bf16 and n-gram history [seqs, 2] int64.
+    ple_state: Option<(DevBuf, DevBuf)>,
     embed: Arc<HostMapped>,
     moe: Option<MoeEngine>,
     lin: LinCtx,
@@ -415,17 +492,53 @@ impl Model {
                     }
                 }
             };
+            let mix = if cfg.hc.is_some() {
+                Mixing::Hyper {
+                    attn: load_hc(&ckpt, &format!("{l}attn_hyper_connection."))?,
+                    mlp: load_hc(&ckpt, &format!("{l}mlp_hyper_connection."))?,
+                }
+            } else {
+                Mixing::Norm {
+                    input: load_vec(&ckpt, &format!("{l}input_layernorm.weight"))?,
+                    post: load_vec(&ckpt, &format!("{l}post_attention_layernorm.weight"))?,
+                }
+            };
+            let ple = match &cfg.ple {
+                Some(pc) if pc.layers.contains(&i) => {
+                    let q = format!("{l}ple.");
+                    let e = format!("{q}ple_embedding.");
+                    Some(Ple {
+                        key: Linear::load(&ckpt, &quant, &[all(format!("{q}key_proj"))], s)?,
+                        value: Linear::load(&ckpt, &quant, &[all(format!("{q}value_proj"))], s)?,
+                        norm_key: load_vec(&ckpt, &format!("{q}norm_key.weight"))?,
+                        norm_query: load_vec(&ckpt, &format!("{q}norm_query.weight"))?,
+                        norm_conv: load_vec(&ckpt, &format!("{q}norm_conv.weight"))?,
+                        conv_w: load_vec(&ckpt, &format!("{q}conv1d.weight"))?,
+                        mult: DevBuf::from_slice(ckpt.bytes(&format!("{e}layer_multipliers"))?)?,
+                        sizes: DevBuf::from_slice(ckpt.bytes(&format!("{e}ngram_heads_vocab_sizes"))?)?,
+                        offsets: DevBuf::from_slice(ckpt.bytes(&format!("{e}ngram_heads_offsets"))?)?,
+                    })
+                }
+                _ => None,
+            };
             layers.push(Layer {
                 kind: *kind,
-                input_norm: load_vec(&ckpt, &format!("{l}input_layernorm.weight"))?,
-                post_norm: load_vec(&ckpt, &format!("{l}post_attention_layernorm.weight"))?,
+                mix,
+                ple,
                 attn,
                 gdn,
                 mlp,
                 slot,
             });
         }
-        let final_norm = load_vec(&ckpt, &format!("{p}norm.weight"))?;
+        let final_mix = if cfg.hc.is_some() {
+            FinalMix::Hyper(load_hc(&ckpt, &format!("{p}hyper_connection_mixer."))?)
+        } else {
+            FinalMix::Norm(load_vec(&ckpt, &format!("{p}norm.weight"))?)
+        };
+        if cfg.hc.is_some() && w > 1 {
+            bail!("tensor parallelism of hyper-connection models is not supported yet");
+        }
         let lm_name = if cfg.tie_embeddings { format!("{p}embed_tokens") } else { "lm_head".into() };
         let lm_head = Linear::load(&ckpt, &quant, &[rows(lm_name, vec![part(cfg.vocab, r, w)])], s)?;
 
@@ -462,6 +575,35 @@ impl Model {
             }
         }
         let commit_meta = DevBuf::zeroed(16, s)?;
+        // PLE: the n-gram table stays in its safetensors file, rows read on demand by CPU threads.
+        let (mut ple_table, mut ple_state) = (None, None);
+        if let (Some(pc), Some(hc)) = (&cfg.ple, &cfg.hc) {
+            if pc.layers.len() != 1 {
+                bail!("PLE on {} layers (one supported)", pc.layers.len());
+            }
+            let shard0 = format!("{p}layers.{}.ple.ple_embedding.ngram_embedding.shard_0.weight", pc.layers[0]);
+            let path = &ckpt.files[ckpt.info(&shard0)?.file];
+            let cpath = CString::new(path.to_string_lossy().as_bytes())?;
+            let max_ids = opts.max_chunk.max(opts.max_seqs).max(opts.max_verify) * 2 * pc.heads_per_ngram;
+            let mut table = null_mut();
+            let mut err = vec![0i8; 512];
+            if unsafe { sys::blz_ple_create(cpath.as_ptr(), max_ids as c_int, 8, &mut table, err.as_mut_ptr().cast(), err.len()) } != 0 {
+                let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr().cast()) }.to_string_lossy().into_owned();
+                bail!("PLE table: {msg}");
+            }
+            let table = PleTable(table);
+            let row_dim = unsafe { sys::blz_ple_row_dim(table.0) } as usize;
+            if row_dim * 2 * pc.heads_per_ngram != pc.embed_dim {
+                bail!("PLE rows of {row_dim} values for a {}-wide embedding", pc.embed_dim);
+            }
+            let channels = hc.count * cfg.hidden;
+            let state_len = (pc.conv_kernel - 1) * pc.ngram_size;
+            let conv = DevBuf::zeroed(opts.max_seqs * channels * state_len * 2, s)?;
+            let eos = cfg.eos.ok_or_else(|| anyhow!("PLE needs eos_token_id"))?;
+            let hist = DevBuf::from_slice(&vec![eos; opts.max_seqs * 2])?;
+            ple_table = Some(table);
+            ple_state = Some((conv, hist));
+        }
         let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs).max(opts.max_verify), opts.max_seqs);
         let aux = if opts.capture_layers.is_empty() {
             None
@@ -478,6 +620,9 @@ impl Model {
             }
             if let Some(g) = &l.gdn {
                 lins.extend([&g.in_proj, &g.out]);
+            }
+            if let Some(pl) = &l.ple {
+                lins.extend([&pl.key, &pl.value]);
             }
             match &l.mlp {
                 Mlp::Moe { gate, shared_gu, shared_down, .. } => lins.extend([gate, shared_gu, shared_down]),
@@ -507,8 +652,10 @@ impl Model {
             dims,
             tp,
             layers,
-            final_norm,
+            final_mix,
             lm_head,
+            ple_table,
+            ple_state,
             embed,
             moe: None,
             lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems },
@@ -546,16 +693,17 @@ impl Model {
         let model_dir = CString::new(dir.to_string_lossy().as_bytes())?;
         let heat = self.opts.moe_heat.as_ref().map(|h| CString::new(h.as_bytes())).transpose()?;
         let options = CString::new(self.opts.moe_options.as_bytes())?;
+        let cores = CString::new(self.opts.moe_cores.as_bytes())?;
         let cfg = sys::blz_moe_engine_config {
             model_dir: model_dir.as_ptr(),
             topk: top_k as c_int,
             gpu0: 0,
-            gpu1: -1,
+            gpu1: if self.opts.moe_gpu1_gib > 0.0 { 1 } else { -1 },
             gpu0_gib: gib,
-            gpu1_gib: 0.0,
-            ram_gib: -1.0,
+            gpu1_gib: self.opts.moe_gpu1_gib,
+            ram_gib: self.opts.moe_ram_gib,
             cpu_threads: self.opts.moe_threads as c_int,
-            cpu_cores: null(),
+            cpu_cores: if self.opts.moe_cores.is_empty() { null() } else { cores.as_ptr() },
             heat_path: heat.as_ref().map_or(null(), |h| h.as_ptr()),
             swap_options: null(),
             options: options.as_ptr(),
@@ -566,7 +714,12 @@ impl Model {
             let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr().cast()) }.to_string_lossy().into_owned();
             return Err(anyhow!("MoE engine: {msg}"));
         }
-        eprintln!("blaze: MoE engine with {:.2} GiB of expert slots in VRAM, the rest in pinned RAM", gib);
+        eprintln!(
+            "blaze: MoE engine: {:.2} GiB of expert slots on GPU0, {:.2} GiB on GPU1, the rest in pinned RAM{}",
+            gib,
+            self.opts.moe_gpu1_gib.max(0.0),
+            if self.opts.moe_ram_gib >= 0.0 { " and on the SSD" } else { "" }
+        );
         Ok(MoeEngine(engine))
     }
 
@@ -602,6 +755,8 @@ impl Model {
         let _ = proj_cols;
         // rows the head may take in one step: one per sequence, or every row of a verify
         let head_rows = opts.max_seqs.max(opts.max_verify);
+        let hcw = cfg.hc.as_ref().map(|hc| hc.count * h);
+        let ple_c = cfg.ple.as_ref().and(hcw);
         let b = |n: usize| DevBuf::zeroed(n, s);
         Ok(Work {
             residual: b(t * h * 2)?,
@@ -627,6 +782,26 @@ impl Model {
             gx: b(head_rows * h * 2)?,
             gres: b(head_rows * h * 2)?,
             gnormed: b(head_rows * h * 2)?,
+            streams: hcw.map(|c| b(t * c * 2)).transpose()?,
+            hnorm: hcw.map(|c| b(t * c * 2)).transpose()?,
+            hc_t: cfg.hc.as_ref().map(|hc| b(t.max(head_rows) * hc.lowrank * 2)).transpose()?,
+            hc_ws: cfg
+                .hc
+                .as_ref()
+                .map(|hc| {
+                    let rows = t.max(head_rows) as c_int;
+                    let bytes = unsafe { sys::blz_hc_mix_workspace_bytes(rows, hc.count as c_int, h as c_int, hc.lowrank as c_int) };
+                    b(bytes.max(16))
+                })
+                .transpose()?,
+            gstreams: hcw.map(|c| b(head_rows * c * 2)).transpose()?,
+            ghnorm: hcw.map(|c| b(head_rows * c * 2)).transpose()?,
+            ple_ids: cfg.ple.as_ref().map(|p| b(t * 2 * p.heads_per_ngram * 8)).transpose()?,
+            ple_emb: cfg.ple.as_ref().map(|p| b(t * p.embed_dim * 2)).transpose()?,
+            ple_key: ple_c.map(|c| b(t * c * 2)).transpose()?,
+            ple_value: cfg.ple.as_ref().map(|_| b(t * h * 2)).transpose()?,
+            ple_gated: ple_c.map(|c| b(t * c * 2)).transpose()?,
+            ple_gatedn: ple_c.map(|c| b(t * c * 2)).transpose()?,
             pairs: b((head_rows * 8 * 8).next_multiple_of(16))?,
             logits: b(head_rows * cfg.vocab * 2)?,
             next: b(head_rows * 4)?,
@@ -660,7 +835,96 @@ impl Model {
                 check(unsafe { sys::cudaMemsetAsync(r.at::<u8>(slot * rec_bytes).cast(), 0, rec_bytes, s.0) }, "memset")?;
             }
         }
+        if let (Some((conv, hist)), Some(pc), Some(hc)) = (&self.ple_state, &self.cfg.ple, &self.cfg.hc) {
+            let bytes = hc.count * self.cfg.hidden * (pc.conv_kernel - 1) * pc.ngram_size * 2;
+            check(unsafe { sys::cudaMemsetAsync(conv.at::<u8>(slot * bytes).cast(), 0, bytes, s.0) }, "memset")?;
+            let eos = self.cfg.eos.unwrap();
+            s.sync()?;
+            hist.upload_at(slot * 16, &[eos, eos])?;
+        }
         Ok(())
+    }
+
+    /// The streams' input to a block: per-stream norm, then the gated low-rank mix into `normed`.
+    fn hc_enter(&self, hc: &HcBlock, rows: usize, streams: *const u16, hnorm: *mut u16, out: *mut u16) -> Result<()> {
+        let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
+        let c = self.cfg.hc.as_ref().unwrap();
+        check(
+            unsafe { sys::blz_grouped_rmsnorm(streams, hc.norm.ptr(), self.cfg.rms_eps, rows as c_int, c.count as c_int, h as c_int, hnorm, s.0) },
+            "hc norm",
+        )?;
+        check(
+            unsafe {
+                sys::blz_hc_mix(hnorm, hc.down.ptr(), hc.up.ptr(), w.hc_t.as_ref().unwrap().ptr(), out, rows as c_int, c.count as c_int,
+                                h as c_int, c.lowrank as c_int, w.hc_ws.as_ref().unwrap().ptr(), s.0)
+            },
+            "hc mix",
+        )
+    }
+
+    /// The block's output x back into the streams (gated injection, gates from the streams' norm).
+    fn hc_exit(&self, hc: &HcBlock, rows: usize) -> Result<()> {
+        let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
+        let c = self.cfg.hc.as_ref().unwrap();
+        check(
+            unsafe {
+                sys::blz_hc_combine(w.streams.as_ref().unwrap().ptr(), w.hnorm.as_ref().unwrap().ptr(), hc.inject.as_ref().unwrap().ptr(),
+                                    w.x.ptr(), h as i64, rows as c_int, c.count as c_int, h as c_int, s.0)
+            },
+            "hc combine",
+        )
+    }
+
+    /// n-gram row ids of the step's tokens and the table request (the CPU reads them while the first layers run).
+    fn ple_request(&self, t: usize, seqs: usize, verify: bool) -> Result<()> {
+        let (Some(table), Some((_, hist)), Some(pc)) = (&self.ple_table, &self.ple_state, &self.cfg.ple) else { return Ok(()) };
+        let ple = self.layers[pc.layers[0]].ple.as_ref().unwrap();
+        let (w, s, m) = (&self.work, &self.stream, &self.meta);
+        let ids = w.ple_ids.as_ref().unwrap();
+        check(
+            unsafe {
+                sys::blz_ngram_hash(self.meta_ptr(m.tokens), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
+                                    t as c_int, hist.ptr(), (!verify) as c_int, ple.mult.ptr(), ple.sizes.ptr(), ple.offsets.ptr(),
+                                    pc.heads_per_ngram as c_int, self.cfg.eos.unwrap(), ids.ptr(), s.0)
+            },
+            "n-gram hash",
+        )?;
+        check(unsafe { sys::blz_ple_request(table.0, ids.ptr(), (t * 2 * pc.heads_per_ngram) as c_int, s.0) }, "PLE request")
+    }
+
+    /// PLE of `layer`: the embedding rows, key / value projections, the gate against the streams, the dilated short
+    /// conv; the result is added to the streams.
+    fn ple_apply(&self, ple: &Ple, t: usize, seqs: usize, verify: bool) -> Result<()> {
+        let (w, s, h, m) = (&self.work, &self.stream, self.cfg.hidden, &self.meta);
+        let (pc, hc) = (self.cfg.ple.as_ref().unwrap(), self.cfg.hc.as_ref().unwrap());
+        let (table, (conv, _)) = (self.ple_table.as_ref().unwrap(), self.ple_state.as_ref().unwrap());
+        let ch = hc.count * h;
+        let (emb, key, value) = (w.ple_emb.as_ref().unwrap(), w.ple_key.as_ref().unwrap(), w.ple_value.as_ref().unwrap());
+        let (gated, gatedn) = (w.ple_gated.as_ref().unwrap(), w.ple_gatedn.as_ref().unwrap());
+        let (streams, query_n) = (w.streams.as_ref().unwrap(), w.hnorm.as_ref().unwrap());
+        let eps = self.cfg.rms_eps;
+        check(unsafe { sys::blz_ple_fetch(table.0, emb.ptr(), (t * 2 * pc.heads_per_ngram) as c_int, s.0) }, "PLE fetch")?;
+        ple.key.run(&self.lin, emb.ptr(), pc.embed_dim, t, key.ptr(), ch, s)?;
+        ple.value.run(&self.lin, emb.ptr(), pc.embed_dim, t, value.ptr(), h, s)?;
+        let g = hc.count as c_int;
+        check(unsafe { sys::blz_grouped_rmsnorm(key.ptr(), ple.norm_key.ptr(), eps, t as c_int, g, h as c_int, key.ptr(), s.0) }, "PLE key norm")?;
+        check(
+            unsafe { sys::blz_grouped_rmsnorm(streams.ptr(), ple.norm_query.ptr(), eps, t as c_int, g, h as c_int, query_n.ptr(), s.0) },
+            "PLE query norm",
+        )?;
+        check(unsafe { sys::blz_ple_gate(key.ptr(), query_n.ptr(), value.ptr(), t as c_int, g, h as c_int, gated.ptr(), s.0) }, "PLE gate")?;
+        check(
+            unsafe { sys::blz_grouped_rmsnorm(gated.ptr(), ple.norm_conv.ptr(), eps, t as c_int, g, h as c_int, gatedn.ptr(), s.0) },
+            "PLE conv norm",
+        )?;
+        check(
+            unsafe {
+                sys::blz_ple_conv(gatedn.ptr(), gated.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
+                                  ch as c_int, pc.conv_kernel as c_int, pc.ngram_size as c_int, ple.conv_w.ptr(), conv.ptr(),
+                                  (!verify) as c_int, streams.ptr(), s.0)
+            },
+            "PLE conv",
+        )
     }
 
     /// Enqueue the forward of a step whose metadata is already in the device buffer (MetaLayout). `spans`: decode
@@ -695,11 +959,27 @@ impl Model {
             "embed",
         )?;
         let eps = cfg.rms_eps;
+        self.ple_request(t, n, verify)?;
         for (li, layer) in self.layers.iter().enumerate() {
-            if li == 0 {
-                check(unsafe { sys::blz_rmsnorm(w.residual.ptr(), null_mut(), layer.input_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
-            } else {
-                self.reduce_norm(&layer.input_norm, t)?;
+            match &layer.mix {
+                Mixing::Norm { input, .. } => {
+                    if li == 0 {
+                        check(unsafe { sys::blz_rmsnorm(w.residual.ptr(), null_mut(), input.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
+                    } else {
+                        self.reduce_norm(input, t)?;
+                    }
+                }
+                Mixing::Hyper { attn, .. } => {
+                    let streams = w.streams.as_ref().unwrap();
+                    if li == 0 {
+                        let c = cfg.hc.as_ref().unwrap().count;
+                        check(unsafe { sys::blz_hc_widen(w.residual.ptr(), t as c_int, c as c_int, h as c_int, streams.ptr(), s.0) }, "hc widen")?;
+                    }
+                    if let Some(ple) = &layer.ple {
+                        self.ple_apply(ple, t, n, verify)?;
+                    }
+                    self.hc_enter(attn, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?;
+                }
             }
             if let Some(ci) = self.opts.capture_layers.iter().position(|&c| c == li) {
                 let aux = self.aux.as_ref().unwrap();
@@ -716,8 +996,18 @@ impl Model {
                 LayerKind::Full => self.attention(layer, t, spans)?,
                 LayerKind::Linear => self.gdn(layer, t, n, verify)?,
             }
-            self.reduce_norm(&layer.post_norm, t)?;
+            match &layer.mix {
+                Mixing::Norm { post, .. } => self.reduce_norm(post, t)?,
+                Mixing::Hyper { attn, mlp } => {
+                    self.hc_exit(attn, t)?;
+                    let streams = w.streams.as_ref().unwrap();
+                    self.hc_enter(mlp, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?;
+                }
+            }
             self.mlp(li, layer, t)?;
+            if let Mixing::Hyper { mlp, .. } = &layer.mix {
+                self.hc_exit(mlp, t)?;
+            }
         }
         self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
@@ -725,9 +1015,20 @@ impl Model {
             // h = x + residual of the listed rows, normed, through the head, greedy pick.
             let n = n_logits;
             let rows: *const i32 = self.meta_ptr(m.logit_rows);
-            check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
-            check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;
-            check(unsafe { sys::blz_rmsnorm(w.gx.ptr(), w.gres.ptr(), self.final_norm.ptr(), eps, n as c_int, h as c_int, 1, w.gnormed.ptr(), s.0) }, "final norm")?;
+            match &self.final_mix {
+                FinalMix::Norm(norm) => {
+                    check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
+                    check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;
+                    check(unsafe { sys::blz_rmsnorm(w.gx.ptr(), w.gres.ptr(), norm.ptr(), eps, n as c_int, h as c_int, 1, w.gnormed.ptr(), s.0) }, "final norm")?;
+                }
+                FinalMix::Hyper(mixer) => {
+                    let width = cfg.hc.as_ref().unwrap().count * h;
+                    let (gs, gh) = (w.gstreams.as_ref().unwrap(), w.ghnorm.as_ref().unwrap());
+                    let streams = w.streams.as_ref().unwrap();
+                    check(unsafe { sys::blz_gather_rows(streams.ptr(), width as i64, rows, n as c_int, width as c_int, gs.ptr(), s.0) }, "gather")?;
+                    self.hc_enter(mixer, n, gs.ptr(), gh.ptr(), w.gnormed.ptr())?;
+                }
+            }
             if self.tp.world > 1 && !self.opts.full_logits {
                 return self.greedy_sharded(w.gnormed.ptr(), n);
             }
@@ -845,7 +1146,16 @@ impl Model {
         }
         let (w, s) = (&self.work, &self.stream);
         let out = self.score_logits.as_ref().unwrap();
-        check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), self.final_norm.ptr(), self.cfg.rms_eps, t as c_int, self.cfg.hidden as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
+        match &self.final_mix {
+            FinalMix::Norm(norm) => check(
+                unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), norm.ptr(), self.cfg.rms_eps, t as c_int, self.cfg.hidden as c_int, 1, w.normed.ptr(), s.0) },
+                "final norm",
+            )?,
+            FinalMix::Hyper(mixer) => {
+                let streams = w.streams.as_ref().unwrap();
+                self.hc_enter(mixer, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?
+            }
+        }
         // in blocks of rows the all-reduce buffer holds
         let block = if self.tp.world == 1 { t } else { (self.tp.ar_bytes / (v * 2)).max(1) };
         let mut r0 = 0;
