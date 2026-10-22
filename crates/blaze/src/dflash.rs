@@ -338,7 +338,12 @@ impl DFlash {
             self.meta.upload_at(m * 8, &loc)?;
             let posp: *const i64 = self.meta.ptr();
             let locp: *const i64 = self.meta.at::<u8>(m * 8).cast();
-            self.fc.run(lin, aux.at::<u16>((it.aux_row + r0) * feats), feats, m, self.ctx_h.ptr(), h, s)?;
+            // fc in pieces the NVFP4 GEMV takes directly (its BF16 widening would need more scratch than the
+            // target's layers provide)
+            for j in (0..m).step_by(sys::BLZ_NVFP4_MMA_MAX_ROWS) {
+                let mj = (m - j).min(sys::BLZ_NVFP4_MMA_MAX_ROWS);
+                self.fc.run(lin, aux.at::<u16>((it.aux_row + r0 + j) * feats), feats, mj, self.ctx_h.at::<u16>(j * h), h, s)?;
+            }
             check(
                 unsafe { sys::blz_rmsnorm(self.ctx_h.ptr(), std::ptr::null_mut(), self.hidden_norm.ptr(), c.eps, m as c_int, h as c_int, 0, self.ctx_n.ptr(), s.0) },
                 "DFlash hidden norm",
