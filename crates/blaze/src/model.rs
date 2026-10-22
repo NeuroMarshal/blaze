@@ -194,7 +194,8 @@ pub struct Options {
     /// Layers whose input hidden state (the residual stream entering the layer) every forward copies out, in order
     /// (a speculative drafter's features).
     pub capture_layers: Vec<usize>,
-    /// Most rows of a speculative verify (GDN inputs are recorded for the replay of the accepted rows); 0: none.
+    /// Most rows of a speculative verify per sequence (GDN inputs are recorded for the replay of the accepted rows;
+    /// every live sequence may verify in the same step); 0: none.
     pub max_verify: usize,
     pub kv_dtype: KvDtype,
 }
@@ -210,6 +211,13 @@ pub enum KvDtype {
     /// FP8 E4M3, per-layer scale 1
     Fp8,
     Bf16,
+}
+
+impl Options {
+    /// Rows of the largest verify step: max_verify rows for every live sequence.
+    pub fn verify_rows(&self) -> usize {
+        self.max_verify * self.max_seqs.max(1)
+    }
 }
 
 impl std::str::FromStr for KvDtype {
@@ -276,7 +284,8 @@ pub struct MetaLayout {
 }
 
 impl MetaLayout {
-    pub fn new(max_tokens: usize, max_seqs: usize, vocab: usize) -> Self {
+    /// `head_rows`: most logit rows of a step (a verify step: every row of every sequence).
+    pub fn new(max_tokens: usize, max_seqs: usize, head_rows: usize, vocab: usize) -> Self {
         let mut o = 0;
         let mut take = |n: usize| {
             let at = o;
@@ -294,7 +303,9 @@ impl MetaLayout {
         let logit_rows = take(max_tokens * 4);
         let tok_row = take(max_tokens * 4);
         let tok_kv_len = take(max_tokens * 4);
-        let max_pen = (max_seqs * 16384).clamp(1 << 16, 1 << 18);
+        // a sampled row's edits: its penalized tokens (the output's distinct tokens, the prompt's with a repetition
+        // penalty), bans, biases
+        let max_pen = (head_rows * 32768).clamp(1 << 16, 1 << 21);
         let pen_off = take((max_tokens + 1) * 4);
         let mask_row = take(max_tokens * 4);
         let base_bytes = take(0);
@@ -423,18 +434,21 @@ pub struct Model {
     /// [max_seqs, ratio, 128]
     qsa_comp: Vec<DevBuf>,
     qsa_ring: Vec<DevBuf>,
-    // verify records: PLE conv inputs [max_verify, channels], raw index keys per QSA layer [max_verify, 128], the
-    // ring rows before the verify, the n-gram history before it
+    // verify records (rows of the step, every verifying sequence's at its offset): PLE conv inputs [verify_rows,
+    // channels], raw index keys per QSA layer [verify_rows, 128]; and per verify slot (the sequence's index in the
+    // verify step): the ring rows before the verify [max_seqs, ratio, 128], the n-gram history before it
     ple_record: Option<DevBuf>,
     qsa_record: Vec<DevBuf>,
     qsa_ring_save: Vec<DevBuf>,
-    hist_save: std::cell::Cell<[i64; 2]>,
+    hist_save: std::cell::RefCell<Vec<[i64; 2]>>,
     req_to_token: DevBuf,
     // GDN states: conv [seqs, channels, kernel - 1] bf16, recurrent [seqs, v_heads, dk, dv] f32
     conv_state: Vec<DevBuf>,
     rec_state: Vec<DevBuf>,
-    // Verify records per GDN layer: pre-conv qkv [max_verify, channels] bf16, g and beta [max_verify, v_heads] f32
+    // Verify records per GDN layer: pre-conv qkv [verify_rows, channels] bf16, g and beta [verify_rows, v_heads] f32
     records: Vec<[DevBuf; 3]>,
+    /// commit metadata per verify slot ([0, accepted, row, pad] i32): the uploads are synchronous copies that do not
+    /// wait for the model stream, so the commits of one step must not share it
     commit_meta: DevBuf,
     /// Captured hidden states [max_tokens, capture_layers, hidden] bf16.
     pub aux: Option<DevBuf>,
@@ -713,13 +727,13 @@ impl Model {
                 qsa_comp.push(DevBuf::zeroed((opts.max_tokens / q.compress_ratio + 1) * q.head_dim * 2, s)?);
                 qsa_ring.push(DevBuf::zeroed(opts.max_seqs * q.compress_ratio * q.head_dim * 2, s)?);
                 if opts.max_verify > 0 {
-                    qsa_record.push(DevBuf::zeroed(opts.max_verify * q.head_dim * 2, s)?);
-                    qsa_ring_save.push(DevBuf::zeroed(q.compress_ratio * q.head_dim * 2, s)?);
+                    qsa_record.push(DevBuf::zeroed(opts.verify_rows() * q.head_dim * 2, s)?);
+                    qsa_ring_save.push(DevBuf::zeroed(opts.max_seqs * q.compress_ratio * q.head_dim * 2, s)?);
                 }
             }
         }
         let ple_record = match (&cfg.ple, &cfg.hc, opts.max_verify > 0) {
-            (Some(_), Some(hc), true) => Some(DevBuf::zeroed(opts.max_verify * hc.count * cfg.hidden * 2, s)?),
+            (Some(_), Some(hc), true) => Some(DevBuf::zeroed(opts.verify_rows() * hc.count * cfg.hidden * 2, s)?),
             _ => None,
         };
         let req_to_token = DevBuf::zeroed(opts.max_seqs * cfg.max_positions.min(opts.max_tokens) * 4, s)?;
@@ -738,13 +752,13 @@ impl Model {
             let channels = 2 * dims.k_heads * g.k_dim + dims.v_heads * g.v_dim;
             for _ in 0..n_gdn {
                 records.push([
-                    DevBuf::zeroed(opts.max_verify * channels * 2, s)?,
-                    DevBuf::zeroed(opts.max_verify * dims.v_heads * 4, s)?,
-                    DevBuf::zeroed(opts.max_verify * dims.v_heads * 4, s)?,
+                    DevBuf::zeroed(opts.verify_rows() * channels * 2, s)?,
+                    DevBuf::zeroed(opts.verify_rows() * dims.v_heads * 4, s)?,
+                    DevBuf::zeroed(opts.verify_rows() * dims.v_heads * 4, s)?,
                 ]);
             }
         }
-        let commit_meta = DevBuf::zeroed(16, s)?;
+        let commit_meta = DevBuf::zeroed(opts.max_seqs.max(1) * 16, s)?;
         // PLE: the n-gram table stays in its safetensors file, rows read on demand by CPU threads.
         let (mut ple_table, mut ple_state) = (None, None);
         if let (Some(pc), Some(hc)) = (&cfg.ple, &cfg.hc) {
@@ -754,7 +768,7 @@ impl Model {
             let shard0 = format!("{p}layers.{}.ple.ple_embedding.ngram_embedding.shard_0.weight", pc.layers[0]);
             let path = &ckpt.files[ckpt.info(&shard0)?.file];
             let cpath = CString::new(path.to_string_lossy().as_bytes())?;
-            let max_ids = opts.max_chunk.max(opts.max_seqs).max(opts.max_verify) * 2 * pc.heads_per_ngram;
+            let max_ids = opts.max_chunk.max(opts.max_seqs).max(opts.verify_rows()) * 2 * pc.heads_per_ngram;
             let mut table = null_mut();
             let mut err = vec![0i8; 512];
             if unsafe { sys::blz_ple_create(cpath.as_ptr(), max_ids as c_int, opts.ple_threads as c_int, opts.ple_cache_gib, &mut table, err.as_mut_ptr().cast(), err.len()) } != 0 {
@@ -774,7 +788,12 @@ impl Model {
             ple_table = Some(table);
             ple_state = Some((conv, hist));
         }
-        let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs).max(opts.max_verify), opts.max_seqs, cfg.vocab);
+        let meta = MetaLayout::new(
+            opts.max_chunk.max(opts.max_seqs).max(opts.verify_rows()),
+            opts.max_seqs,
+            opts.max_seqs.max(opts.verify_rows()),
+            cfg.vocab,
+        );
         let aux = if opts.capture_layers.is_empty() {
             None
         } else {
@@ -839,7 +858,7 @@ impl Model {
             ple_record,
             qsa_record,
             qsa_ring_save,
-            hist_save: std::cell::Cell::new([0, 0]),
+            hist_save: std::cell::RefCell::new(vec![[0, 0]; opts.max_seqs]),
             req_to_token,
             conv_state,
             rec_state,
@@ -931,11 +950,11 @@ impl Model {
         if cfg.qsa.is_some() {
             // sparse attention: every row a one-token sequence, rows x splits <= max(rows, 4 x SMs / kv heads)
             let per_split = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, 1, 1) } as usize;
-            partial_rows = partial_rows.max(t.max(opts.max_seqs).max(opts.max_verify).max(1024) * per_split);
+            partial_rows = partial_rows.max(t.max(opts.max_seqs).max(opts.verify_rows()).max(1024) * per_split);
         }
         let _ = proj_cols;
         // rows the head may take in one step: one per sequence, or every row of a verify
-        let head_rows = opts.max_seqs.max(opts.max_verify);
+        let head_rows = opts.max_seqs.max(opts.verify_rows());
         let ctx = cfg.max_positions.min(opts.max_tokens);
         let hcw = cfg.hc.as_ref().map(|hc| hc.count * h);
         let ple_c = cfg.ple.as_ref().and(hcw);
@@ -1209,8 +1228,8 @@ impl Model {
         if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
             bail!("step of {t} tokens in {n} sequences exceeds the buffers");
         }
-        if verify && (n != 1 || t > self.opts.max_verify) {
-            bail!("verify of {t} rows in {n} sequences (one sequence of at most {} rows)", self.opts.max_verify);
+        if verify && spans.iter().any(|sp| sp.len > self.opts.max_verify) {
+            bail!("verify of more than {} rows in a sequence", self.opts.max_verify);
         }
         let s = &self.stream;
         let cfg = &self.cfg;
@@ -1766,29 +1785,33 @@ impl Model {
         }
     }
 
-    /// Before a verify of row `row`: keep what the verify overwrites and the commit restores (QSA rings, the n-gram
-    /// history).
-    pub fn pre_verify(&self, row: usize) -> Result<()> {
+    /// Before a verify of row `row` (verify slot `k`: the sequence's index among the step's verifying sequences): keep
+    /// what the verify overwrites and the commit restores (QSA rings, the n-gram history).
+    pub fn pre_verify(&self, row: usize, k: usize) -> Result<()> {
         let s = &self.stream;
         if let Some(q) = &self.cfg.qsa {
             let bytes = q.compress_ratio * q.head_dim * 2;
             for (ring, save) in self.qsa_ring.iter().zip(&self.qsa_ring_save) {
-                check(unsafe { sys::cudaMemcpyAsync(save.ptr(), ring.at::<u8>(row * bytes).cast(), bytes, sys::MEMCPY_D2D, s.0) }, "ring save")?;
+                check(
+                    unsafe { sys::cudaMemcpyAsync(save.at::<u8>(k * bytes).cast(), ring.at::<u8>(row * bytes).cast(), bytes, sys::MEMCPY_D2D, s.0) },
+                    "ring save",
+                )?;
             }
         }
         if let Some((_, hist)) = &self.ple_state {
             s.sync()?;
             let mut h = [0i64; 2];
             check(unsafe { sys::cudaMemcpy(h.as_mut_ptr().cast(), hist.at::<u8>(row * 16).cast(), 16, sys::MEMCPY_D2H) }, "hist")?;
-            self.hist_save.set(h);
+            self.hist_save.borrow_mut()[k] = h;
         }
         Ok(())
     }
 
-    /// Replay the first `accepted` rows of the last verify (row `row`'s sequence, which started at position `start`
-    /// with `tokens`) into the recurrent states: GDN conv and recurrent state, the PLE conv state and n-gram history,
-    /// the QSA ring of the trailing block, as if the rows had been decoded one by one.
-    pub fn commit(&self, row: usize, accepted: usize, start: usize, tokens: &[i64]) -> Result<()> {
+    /// Replay the first `accepted` rows of the last verify (row `row`'s sequence, verify slot `k`, its rows at `offset`
+    /// in the step, which started at position `start` with `tokens`) into the recurrent states: GDN conv and recurrent
+    /// state, the PLE conv state and n-gram history, the QSA ring of the trailing block, as if the rows had been
+    /// decoded one by one.
+    pub fn commit(&self, row: usize, accepted: usize, start: usize, tokens: &[i64], k: usize, offset: usize) -> Result<()> {
         if accepted == 0 {
             return Ok(());
         }
@@ -1800,12 +1823,12 @@ impl Model {
             let end = start + accepted;
             for ((ring, save), rec) in self.qsa_ring.iter().zip(&self.qsa_ring_save).zip(&self.qsa_record) {
                 let r: *mut u8 = ring.at::<u8>(row * bytes);
-                check(unsafe { sys::cudaMemcpyAsync(r.cast(), save.ptr::<u8>().cast(), bytes, sys::MEMCPY_D2D, s.0) }, "ring restore")?;
+                check(unsafe { sys::cudaMemcpyAsync(r.cast(), save.at::<u8>(k * bytes).cast(), bytes, sys::MEMCPY_D2D, s.0) }, "ring restore")?;
                 for p in (end / ratio * ratio).max(start)..end {
                     check(
                         unsafe {
-                            sys::cudaMemcpyAsync(r.add((p % ratio) * dim * 2).cast(), rec.at::<u16>((p - start) * dim).cast(), dim * 2,
-                                                 sys::MEMCPY_D2D, s.0)
+                            sys::cudaMemcpyAsync(r.add((p % ratio) * dim * 2).cast(), rec.at::<u16>((offset + p - start) * dim).cast(),
+                                                 dim * 2, sys::MEMCPY_D2D, s.0)
                         },
                         "ring fix",
                     )?;
@@ -1815,16 +1838,16 @@ impl Model {
         if let (Some((conv, hist)), Some(rec), Some(pc), Some(hc)) = (&self.ple_state, &self.ple_record, &self.cfg.ple, &self.cfg.hc) {
             let ple = self.layers[pc.layers[0]].ple.as_ref().unwrap();
             let ch = hc.count * self.cfg.hidden;
-            self.commit_meta.upload(&[0i32, accepted as i32, row as i32])?;
+            self.commit_meta.upload_at(k * 16, &[0i32, accepted as i32, row as i32])?;
             let dummy = self.work.ple_key.as_ref().unwrap();
             check(
                 unsafe {
-                    sys::blz_ple_conv(rec.ptr(), rec.ptr(), self.commit_meta.ptr(), self.commit_meta.at(2), 1, ch as c_int,
+                    sys::blz_ple_conv(rec.at::<u16>(offset * ch), rec.at::<u16>(offset * ch), self.commit_meta.at(k * 4), self.commit_meta.at(k * 4 + 2), 1, ch as c_int,
                                       pc.conv_kernel as c_int, pc.ngram_size as c_int, ple.conv_w.ptr(), conv.ptr(), 1, dummy.ptr(), s.0)
                 },
                 "commit ple conv",
             )?;
-            let mut all: Vec<i64> = self.hist_save.get().to_vec();
+            let mut all: Vec<i64> = self.hist_save.borrow()[k].to_vec();
             all.extend_from_slice(&tokens[..accepted]);
             s.sync()?;
             hist.upload_at(row * 16, &all[all.len() - 2..])?;
@@ -1833,22 +1856,23 @@ impl Model {
         let (w, s) = (&self.work, &self.stream);
         let (kh, vh) = (self.dims.k_heads, self.dims.v_heads);
         let channels = 2 * kh * gc.k_dim + vh * gc.v_dim;
-        self.commit_meta.upload(&[0i32, accepted as i32, row as i32])?;
-        let seq_start: *const i32 = self.commit_meta.ptr();
-        let slots: *const i32 = self.commit_meta.at(2);
+        self.commit_meta.upload_at(k * 16, &[0i32, accepted as i32, row as i32])?;
+        let seq_start: *const i32 = self.commit_meta.at(k * 4);
+        let slots: *const i32 = self.commit_meta.at(k * 4 + 2);
         for layer in &self.layers {
             let Some(g) = &layer.gdn else { continue };
             let [qkv, gg, beta] = &self.records[layer.slot];
             check(
                 unsafe {
-                    sys::blz_gdn_conv_ex(qkv.ptr(), channels as i64, seq_start, slots, 1, channels as c_int, gc.conv_kernel as c_int,
+                    sys::blz_gdn_conv_ex(qkv.at::<u16>(offset * channels), channels as i64, seq_start, slots, 1, channels as c_int, gc.conv_kernel as c_int,
                                          g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), 1, s.0)
                 },
                 "commit conv",
             )?;
             check(
                 unsafe {
-                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), gg.ptr(), beta.ptr(), seq_start, slots, 1, accepted as c_int, kh as c_int,
+                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), gg.at::<f32>(offset * vh), beta.at::<f32>(offset * vh), seq_start, slots, 1,
+                                              accepted as c_int, kh as c_int,
                                               vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int, self.rec_state[layer.slot].ptr(),
                                               w.core.ptr(), 1, s.0)
                 },

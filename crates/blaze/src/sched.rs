@@ -127,48 +127,60 @@ impl Acceptance {
 /// and a plain step runs instead when it is faster.
 #[derive(Default)]
 struct SpecCost {
-    decode: f64,
+    /// seconds of a plain decode step, by batch size
+    decode: Vec<f64>,
+    /// seconds of a verify round (verify + commit), by rows in the step
     verify: Vec<f64>,
 }
 
 impl SpecCost {
-    fn note(x: &mut f64, t: f64) {
+    fn note(table: &mut Vec<f64>, n: usize, t: f64) {
+        if table.len() <= n {
+            table.resize(n + 1, 0.0);
+        }
+        let x = &mut table[n];
         *x = if *x == 0.0 { t } else { 0.8 * *x + 0.2 * t };
     }
 
-    /// Verify seconds of n rows: measured, else interpolated from the nearest measured sizes, else a little above a
-    /// decode step (so that every length is tried once).
-    fn verify_time(&self, n: usize) -> f64 {
-        if let Some(&t) = self.verify.get(n).filter(|&&t| t > 0.0) {
-            return t;
+    /// Measured value at n, else interpolated between the nearest measured sizes (constant beyond them).
+    fn lookup(table: &[f64], n: usize) -> Option<f64> {
+        if let Some(&t) = table.get(n).filter(|&&t| t > 0.0) {
+            return Some(t);
         }
-        let known: Vec<(usize, f64)> = self.verify.iter().enumerate().filter(|&(_, &t)| t > 0.0).map(|(i, &t)| (i, t)).collect();
-        match known.as_slice() {
-            [] => self.decode * (1.0 + 0.05 * n as f64),
-            [(_, t)] => *t,
-            _ => {
-                let lo = known.iter().rev().find(|k| k.0 < n).or(known.first()).unwrap();
-                let hi = known.iter().find(|k| k.0 > n).or(known.last()).unwrap();
-                if hi.0 == lo.0 { lo.1 } else { lo.1 + (hi.1 - lo.1) * (n as f64 - lo.0 as f64) / (hi.0 as f64 - lo.0 as f64) }
-            }
-        }
+        let known: Vec<(usize, f64)> = table.iter().enumerate().filter(|&(_, &t)| t > 0.0).map(|(i, &t)| (i, t)).collect();
+        let lo = known.iter().rev().find(|k| k.0 < n).or(known.first())?;
+        let hi = known.iter().find(|k| k.0 > n).or(known.last())?;
+        Some(if hi.0 == lo.0 { lo.1 } else { lo.1 + (hi.1 - lo.1) * (n as f64 - lo.0 as f64) / (hi.0 as f64 - lo.0 as f64) })
     }
 
-    /// Draft length to verify (0: a plain step) for drafts of up to `max_d` tokens.
-    fn best(&self, max_d: usize, acc: &Acceptance) -> usize {
-        if self.decode == 0.0 {
-            return max_d;
-        }
-        let (mut best, mut rate) = (0, 1.0 / self.decode);
-        let (mut e, mut p) = (1.0, 1.0);
-        let mut c = 0.5;
-        for d in 1..=max_d {
-            c = acc.conditional(d, c);
-            p *= c;
-            e += p;
-            let r = e / self.verify_time(d + 1);
+    /// Verify seconds of `rows` rows in a batch of `n`: measured or interpolated, else a little above a decode step
+    /// (so that every size is tried once).
+    fn verify_time(&self, n: usize, rows: usize, decode: f64) -> f64 {
+        Self::lookup(&self.verify, rows).unwrap_or(decode * (1.0 + 0.05 * (rows - n) as f64))
+    }
+
+    /// Draft lengths of a batch (requests with drafts of up to `max[i]` tokens, acceptance `acc[i]`); all zero: a
+    /// plain step. Draft tokens go one at a time to the request whose next token adds the most expected tokens; the
+    /// prefix of that order with the most tokens per second wins.
+    fn choose(&self, max: &[usize], acc: &[&Acceptance]) -> Vec<usize> {
+        let n = max.len();
+        let Some(decode) = Self::lookup(&self.decode, n) else { return max.to_vec() };
+        let (mut d, mut p, mut c) = (vec![0usize; n], vec![1.0f64; n], vec![0.5f64; n]);
+        let mut tokens = n as f64;
+        let (mut best, mut rate) = (d.clone(), n as f64 / decode);
+        loop {
+            let next = (0..n)
+                .filter(|&i| d[i] < max[i])
+                .map(|i| (i, p[i] * acc[i].conditional(d[i] + 1, c[i])))
+                .max_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((i, gain)) = next else { break };
+            c[i] = acc[i].conditional(d[i] + 1, c[i]);
+            p[i] = gain;
+            d[i] += 1;
+            tokens += gain;
+            let r = tokens / self.verify_time(n, n + d.iter().sum::<usize>(), decode);
             if r > rate {
-                (best, rate) = (d, r);
+                (best, rate) = (d.clone(), r);
             }
         }
         best
@@ -534,98 +546,165 @@ impl Loop {
     /// Speculative decoding of a lone decoding request from n-gram matches in its own context (vLLM's prompt-lookup
     /// proposer): the draft rides on one verify step; tokens are drawn row by row from the target's distribution and
     /// kept while they equal the draft (exact for sampling too). False when there is no draft.
-    fn spec_step(&mut self) -> Result<bool> {
+    /// Draft for active request `i` (empty: it only decodes its pending token in a verify step).
+    fn draft_for(&mut self, i: usize) -> Vec<i64> {
+        let a = &self.active[i];
         let k = self.cfg.spec_tokens;
-        let a = &self.active[0];
-        let Some(pending) = a.pending else { return Ok(false) };
-        if a.req.constraint.is_some() {
-            return Ok(false);
+        if a.pending.is_none() || a.req.constraint.is_some() {
+            return Vec::new();
         }
-        if a.req.think.is_some() && (a.in_think || !a.forced.is_empty()) && a.req.think.as_ref().unwrap().budget < usize::MAX {
-            // budgeted thinking may replace tokens: keep it simple
-            if a.think_count + k >= a.req.think.as_ref().unwrap().budget {
-                return Ok(false);
-            }
+        // budgeted thinking may replace tokens: no drafts near the budget
+        if let Some(tb) = a.req.think.as_ref()
+            && tb.budget < usize::MAX
+            && (a.in_think || !a.forced.is_empty())
+            && a.think_count + k >= tb.budget
+        {
+            return Vec::new();
         }
         let room = (a.req.max_tokens - a.generated.len()).min(self.engine.info.ctx_stride - a.seq.len() - 1);
         let k = k.min(room.saturating_sub(1));
         if k == 0 {
-            return Ok(false);
+            return Vec::new();
         }
-        let mut draft = match self.cfg.spec_method {
+        match self.cfg.spec_method {
             SpecMethod::Ngram => {
                 let ctx: Vec<i64> = a.req.tokens.iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
                 propose(&ctx, 4, 1, k)
             }
-            SpecMethod::Suffix => self.suffix_draft(k),
-        };
-        let a = &self.active[0];
-        if draft.is_empty() {
+            SpecMethod::Suffix => self.suffix_draft(i, k),
+        }
+    }
+
+    /// Speculative step of every active request (all decoding): drafts verified in one step, each request keeps its
+    /// matched drafts and one more token. False: no request has a draft worth verifying (a plain step runs).
+    fn spec_step(&mut self) -> Result<bool> {
+        let n = self.active.len();
+        let mut drafts: Vec<Vec<i64>> = (0..n).map(|i| self.draft_for(i)).collect();
+        if drafts.iter().all(|d| d.is_empty()) {
             return Ok(false);
         }
+        // requests whose draft was dropped: their first draft token is scored against the step's output
+        let mut shadow: Vec<Option<i64>> = vec![None; n];
         if self.cfg.spec_adaptive {
-            let d = self.spec_cost.best(draft.len(), &a.acc);
-            if d == 0 {
-                self.active[0].shadow = Some(draft[0]);
+            let max: Vec<usize> = drafts.iter().map(Vec::len).collect();
+            let acc: Vec<&Acceptance> = self.active.iter().map(|a| &a.acc).collect();
+            let lens = self.spec_cost.choose(&max, &acc);
+            for (i, d) in drafts.iter_mut().enumerate() {
+                if lens[i] == 0 && !d.is_empty() {
+                    shadow[i] = Some(d[0]);
+                }
+                d.truncate(lens[i]);
+            }
+            if drafts.iter().all(|d| d.is_empty()) {
+                for (a, s) in self.active.iter_mut().zip(shadow) {
+                    a.shadow = s;
+                }
                 return Ok(false);
             }
-            draft.truncate(d);
         }
         let t0 = Instant::now();
-        let mut rows = vec![pending as i64];
-        rows.extend(&draft);
-        let plain = !a.req.params.needs_candidates();
-        let (picks, lps): (Vec<i32>, Vec<Option<TokenLogprob>>) = if plain {
-            let a = &mut self.active[0];
-            let p = self.engine.verify(&mut a.seq, &rows)?;
-            let n = p.len();
-            (p, vec![None; n])
+        // decode-only rows first (the engine attends to leading one-row spans in one call)
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| drafts[i].len());
+        let rows: Vec<Vec<i64>> = order
+            .iter()
+            .map(|&i| std::iter::once(self.active[i].pending.unwrap() as i64).chain(drafts[i].iter().copied()).collect())
+            .collect();
+        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some());
+        let words = self.engine.info.vocab.div_ceil(32);
+        let mut pens: Vec<Penalty> = Vec::new();
+        if sampled {
+            for &i in &order {
+                for j in 0..=drafts[i].len() {
+                    let mut p = self.edits_for(i, &drafts[i][..j]);
+                    // grammar requests never draft: their one row gets the mask
+                    let a = &mut self.active[i];
+                    if let Some(c) = a.req.constraint.as_mut() {
+                        p.mask = c.mask(words).unwrap_or_else(|e| {
+                            eprintln!("blaze: grammar dropped: {e}");
+                            a.req.constraint = None;
+                            None
+                        });
+                    }
+                    pens.push(p);
+                }
+            }
+        }
+        let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
+        // SAFETY: `order` holds distinct indices, so the pointers are distinct and live for these calls.
+        let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
+        let row_refs: Vec<&[i64]> = rows.iter().map(Vec::as_slice).collect();
+        // per request: picks (row by row while the draft holds) and their logprobs
+        let picks: Vec<(Vec<i32>, Vec<Option<TokenLogprob>>)> = if sampled {
+            let cands = self.engine.verify_many_sampled(&mut seqs, &row_refs, &pens)?;
+            drop(seqs);
+            order
+                .iter()
+                .zip(cands)
+                .map(|(&i, cs)| {
+                    let a = &mut self.active[i];
+                    let (mut out, mut lps) = (Vec::new(), Vec::new());
+                    for (j, c) in cs.iter().enumerate() {
+                        let x = sample(&c.top, &a.req.params, &mut a.rng);
+                        out.push(x);
+                        lps.push(logprob_of(c, x, a.req.params.logprobs));
+                        if j < drafts[i].len() && x as i64 != drafts[i][j] {
+                            break;
+                        }
+                    }
+                    (out, lps)
+                })
+                .collect()
         } else {
-            let pens: Vec<Penalty> = (0..rows.len()).map(|j| self.edits_for(0, &draft[..j])).collect();
-            let a = &mut self.active[0];
-            let cands = self.engine.verify_sampled(&mut a.seq, &rows, &pens)?;
-            // draw row by row; later rows only matter while the draft holds
-            let (mut out, mut lps) = (Vec::new(), Vec::new());
-            for (j, c) in cands.iter().enumerate() {
-                let x = sample(&c.top, &a.req.params, &mut a.rng);
-                out.push(x);
-                lps.push(logprob_of(c, x, a.req.params.logprobs));
-                if j < draft.len() && x as i64 != draft[j] {
+            let p = self.engine.verify_many(&mut seqs, &row_refs)?;
+            drop(seqs);
+            p.into_iter().map(|p| { let m = p.len(); (p, vec![None; m]) }).collect()
+        };
+        // emitted tokens: x_1 .. while x_j equals draft_j, plus the first mismatch (or the bonus token)
+        let mut accepted = Vec::with_capacity(n);
+        let mut finished = Vec::new();
+        for (&i, (p, lps)) in order.iter().zip(picks) {
+            let draft = &drafts[i];
+            let mut emitted = 0;
+            let mut finish = None;
+            for (j, (&x, lp)) in p.iter().zip(lps).enumerate() {
+                let (tok, f) = self.emit(i, x, lp);
+                emitted += 1;
+                if f.is_some() {
+                    finish = f;
+                    break;
+                }
+                if j >= draft.len() || tok as i64 != draft[j] {
                     break;
                 }
             }
-            (out, lps)
-        };
-        // emitted tokens: x_1 .. while x_j equals draft_j, plus the first mismatch (or the bonus token)
-        let mut emitted = 0;
-        let mut finish = None;
-        for (j, (&x, lp)) in picks.iter().zip(lps).enumerate() {
-            let (tok, f) = self.emit(0, x, lp);
-            emitted += 1;
-            if f.is_some() {
-                finish = f;
-                break;
+            let a = &mut self.active[i];
+            if !draft.is_empty() {
+                // matched drafts out of the compared ones (a finish cuts the round short)
+                let matched = emitted - 1;
+                let tried = if finish.is_some() { matched } else { (matched + 1).min(draft.len()) };
+                a.acc.note(matched, tried);
+            } else if let Some(d) = shadow[i] {
+                a.acc.note((a.generated.last().map(|&t| t as i64) == Some(d)) as usize, 1);
             }
-            if j >= draft.len() || tok as i64 != draft[j] {
-                break;
+            self.spec_stats.0 += 1;
+            self.spec_stats.1 += emitted;
+            accepted.push(emitted);
+            if let Some(f) = finish {
+                finished.push((i, f));
             }
         }
-        self.spec_stats.0 += 1;
-        self.spec_stats.1 += emitted;
         // keep the rows whose inputs were accepted: the pending token and the matched drafts
-        let a = &mut self.active[0];
-        self.engine.commit(&mut a.seq, rows.len(), emitted)?;
-        let n = rows.len();
-        if self.spec_cost.verify.len() <= n {
-            self.spec_cost.verify.resize(n + 1, 0.0);
-        }
-        SpecCost::note(&mut self.spec_cost.verify[n], t0.elapsed().as_secs_f64());
-        // matched drafts out of the tried ones (a finish cuts the round short: count only what was compared)
-        let matched = emitted - 1;
-        let tried = if finish.is_some() { matched } else { (matched + 1).min(draft.len()) };
-        a.acc.note(matched, tried);
-        if let Some(reason) = finish {
-            let a = self.active.swap_remove(0);
+        let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
+        // SAFETY: as above.
+        let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
+        self.engine.commit_many(&mut seqs, &accepted)?;
+        drop(seqs);
+        let total: usize = rows.iter().map(Vec::len).sum();
+        SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
+        finished.sort_by(|a, b| b.0.cmp(&a.0));
+        for (i, reason) in finished {
+            let a = self.active.swap_remove(i);
             if reason != Finish::Cancelled {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
@@ -638,11 +717,11 @@ impl Loop {
         Ok(true)
     }
 
-    /// Suffix decoding draft of up to `k` tokens for active request 0: the better of its own prompt and output and the
-    /// earlier outputs.
-    fn suffix_draft(&mut self, k: usize) -> Vec<i64> {
+    /// Suffix decoding draft of up to `k` tokens for active request `i`: the better of its own prompt and output and
+    /// the earlier outputs.
+    fn suffix_draft(&mut self, i: usize, k: usize) -> Vec<i64> {
         let cfg = self.suffix_cfg;
-        let a = &mut self.active[0];
+        let a = &mut self.active[i];
         let ix = a.suffix.get_or_insert_with(|| {
             let mut ix = SuffixIndex::default();
             ix.extend(a.req.tokens.iter().map(|&t| t as i32));
@@ -669,7 +748,12 @@ impl Loop {
     }
 
     fn step(&mut self) -> Result<()> {
-        if self.cfg.spec_tokens > 0 && self.active.len() == 1 && self.waiting.is_empty() && self.active[0].pending.is_some() && self.spec_step()? {
+        if self.cfg.spec_tokens > 0
+            && self.waiting.is_empty()
+            && !self.active.is_empty()
+            && self.active.iter().all(|a| a.pending.is_some())
+            && self.spec_step()?
+        {
             return Ok(());
         }
         let t0 = Instant::now();
@@ -756,8 +840,8 @@ impl Loop {
             let n = p.len();
             (p, vec![None; n])
         };
-        if order.len() == 1 && chunk_len == 0 {
-            SpecCost::note(&mut self.spec_cost.decode, t0.elapsed().as_secs_f64());
+        if chunk_len == 0 {
+            SpecCost::note(&mut self.spec_cost.decode, order.len(), t0.elapsed().as_secs_f64());
         }
         // apply
         let mut finished = Vec::new();

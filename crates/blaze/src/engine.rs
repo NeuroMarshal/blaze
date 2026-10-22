@@ -65,8 +65,10 @@ enum Cmd {
     /// PLE read-ahead: previous tokens, upcoming tokens
     PleWarm(Arc<(Vec<i64>, Vec<i64>)>),
     /// sequence row, accepted rows of the last verify, its first position, its tokens
-    Commit(usize, usize, usize, Arc<Vec<i64>>),
-    PreVerify(usize),
+    /// ... and its verify slot and row offset in the verify step
+    Commit(usize, usize, usize, Arc<Vec<i64>>, usize, usize),
+    /// sequence row, verify slot
+    PreVerify(usize, usize),
     Reset(usize),
     Logits(usize),
     AllLogits(usize),
@@ -203,12 +205,12 @@ impl Runner {
                 self.model.set_kv_row(row, &slots)?;
                 Reply::Done
             }
-            Cmd::Commit(row, accepted, start, tokens) => {
-                self.model.commit(row, accepted, start, &tokens)?;
+            Cmd::Commit(row, accepted, start, tokens, k, offset) => {
+                self.model.commit(row, accepted, start, &tokens, k, offset)?;
                 Reply::Done
             }
-            Cmd::PreVerify(row) => {
-                self.model.pre_verify(row)?;
+            Cmd::PreVerify(row, k) => {
+                self.model.pre_verify(row, k)?;
                 Reply::Done
             }
             Cmd::Reset(row) => {
@@ -279,7 +281,8 @@ pub struct Cands {
 pub struct Engine {
     workers: Vec<Worker>,
     /// the last verify: its first position and tokens (for the commit)
-    last_verify: Option<(usize, Arc<Vec<i64>>)>,
+    /// the last verify, per sequence: row, first position, tokens, row offset in the step
+    last_verify: Vec<(usize, usize, Arc<Vec<i64>>, usize)>,
     /// free KV pages and the references of every page (live sequences and snapshots)
     free_pages: Vec<u32>,
     page_refs: Vec<u32>,
@@ -402,7 +405,7 @@ impl Engine {
         let info = info.unwrap();
         Ok(Self {
             workers,
-            last_verify: None,
+            last_verify: Vec::new(),
             free_pages: (0..(info.max_tokens / info.page) as u32).rev().collect(),
             page_refs: vec![0; info.max_tokens / info.page],
             free_rows: (0..info.max_seqs).rev().collect(),
@@ -606,24 +609,24 @@ impl Engine {
         }
     }
 
-    /// Speculative verify: `tokens` (the pending token, then the draft) appended to `seq` with the GDN state left
-    /// as it was; returns the greedy pick after every row. Follow with `commit`.
-    pub fn verify(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<Vec<i32>> {
-        self.broadcast(|| Cmd::PreVerify(seq.row))?;
-        self.last_verify = Some((seq.len(), Arc::new(tokens.to_vec())));
-        let meta = Arc::new(self.plan(&mut [seq], &[tokens], true)?);
-        match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
-            Reply::Tokens(t) => Ok(t),
+    /// Speculative verify of several sequences in one step: `tokens[i]` (the pending token and the drafts) go into
+    /// `seqs[i]` without touching their recurrent states (the inputs are recorded); returns the greedy pick after every
+    /// row, per sequence. `commit_many` keeps the accepted rows.
+    pub fn verify_many(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]]) -> Result<Vec<Vec<i32>>> {
+        self.pre_verify(seqs, tokens)?;
+        let meta = Arc::new(self.plan(seqs, tokens, true)?);
+        let picks = match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
+            Reply::Tokens(t) => t,
             _ => unreachable!(),
-        }
+        };
+        Ok(split_rows(picks, tokens))
     }
 
-    /// Sampled speculative verify: like `verify`, but every row gets its sampling candidates (with row i's penalties
-    /// `pens[i]`, which count the draft tokens before it).
-    pub fn verify_sampled(&mut self, seq: &mut Seq, tokens: &[i64], pens: &[Penalty]) -> Result<Vec<Cands>> {
-        self.broadcast(|| Cmd::PreVerify(seq.row))?;
-        self.last_verify = Some((seq.len(), Arc::new(tokens.to_vec())));
-        let mut m = self.plan(&mut [seq], &[tokens], true)?;
+    /// Sampled speculative verify: like `verify_many`, but every row gets its sampling candidates (with row r's
+    /// penalties `pens[r]`, rows of all sequences in order, which count the draft tokens before it).
+    pub fn verify_many_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Vec<Cands>>> {
+        self.pre_verify(seqs, tokens)?;
+        let mut m = self.plan(seqs, tokens, true)?;
         m.sample = true;
         fill_edits(&mut m, pens);
         let n = m.logit_rows.len();
@@ -632,7 +635,28 @@ impl Engine {
             Reply::Cands(p) => p,
             _ => unreachable!(),
         };
-        Ok(self.merge_candidates(&pairs, n))
+        Ok(split_rows(self.merge_candidates(&pairs, n), tokens))
+    }
+
+    pub fn verify(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<Vec<i32>> {
+        Ok(self.verify_many(&mut [seq], &[tokens])?.remove(0))
+    }
+
+    pub fn verify_sampled(&mut self, seq: &mut Seq, tokens: &[i64], pens: &[Penalty]) -> Result<Vec<Cands>> {
+        Ok(self.verify_many_sampled(&mut [seq], &[tokens], pens)?.remove(0))
+    }
+
+    /// Save what the verify overwrites (per verify slot) and remember its rows for the commit.
+    fn pre_verify(&mut self, seqs: &[&mut Seq], tokens: &[&[i64]]) -> Result<()> {
+        self.last_verify.clear();
+        let mut offset = 0;
+        for (k, (seq, t)) in seqs.iter().zip(tokens).enumerate() {
+            let row = seq.row;
+            self.broadcast(|| Cmd::PreVerify(row, k))?;
+            self.last_verify.push((row, seq.len(), Arc::new(t.to_vec()), offset));
+            offset += t.len();
+        }
+        Ok(())
     }
 
     fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Cands> {
@@ -665,21 +689,32 @@ impl Engine {
             .collect()
     }
 
-    /// Keep the first `accepted` of the last verify's `rows` rows: the rest give back their KV slots, the GDN states
-    /// advance over the kept rows.
-    pub fn commit(&mut self, seq: &mut Seq, rows: usize, accepted: usize) -> Result<()> {
-        let keep = seq.len() - (rows - accepted);
+    /// After `verify_many`: keep the first `accepted[i]` rows of every verified sequence (the pending token and the
+    /// matched drafts), drop the rest of their KV and replay the kept rows into the recurrent states.
+    pub fn commit_many(&mut self, seqs: &mut [&mut Seq], accepted: &[usize]) -> Result<()> {
         let page = self.info.page;
-        // whole pages past the kept positions go back; a partly kept page stays with the sequence
-        let first_free = keep.div_ceil(page) * page;
-        let dropped: Vec<u32> = (first_free..seq.len()).step_by(page).map(|i| seq.slots[i] / page as u32).collect();
-        seq.slots.truncate(keep);
-        for pg in dropped.into_iter().rev() {
-            self.unref(pg);
+        for (seq, &acc) in seqs.iter_mut().zip(accepted) {
+            let k = self.last_verify.iter().position(|v| v.0 == seq.row).ok_or_else(|| anyhow!("commit without a verify"))?;
+            let (row, start, toks, offset) = self.last_verify[k].clone();
+            let keep = start + acc;
+            // whole pages past the kept positions go back; a partly kept page stays with the sequence
+            let first_free = keep.div_ceil(page) * page;
+            let dropped: Vec<u32> = (first_free..seq.len()).step_by(page).map(|i| seq.slots[i] / page as u32).collect();
+            seq.slots.truncate(keep);
+            for pg in dropped.into_iter().rev() {
+                self.unref(pg);
+            }
+            self.broadcast(|| Cmd::Commit(row, acc, start, toks.clone(), k, offset))?;
         }
-        let (start, toks) = self.last_verify.take().ok_or_else(|| anyhow!("commit without a verify"))?;
-        self.broadcast(|| Cmd::Commit(seq.row, accepted, start, toks.clone()))?;
+        self.last_verify.clear();
         Ok(())
+    }
+
+    /// Single-sequence `commit_many` (`rows`: the verified rows, `accepted`: the kept ones).
+    pub fn commit(&mut self, seq: &mut Seq, rows: usize, accepted: usize) -> Result<()> {
+        debug_assert!(self.last_verify.iter().any(|v| v.0 == seq.row && v.2.len() == rows));
+        let _ = rows;
+        self.commit_many(&mut [seq], &[accepted])
     }
 
     /// Read ahead the PLE rows of `tokens` (after `prev`) on rank 0 (the table is read by the host of every rank).
@@ -713,6 +748,12 @@ impl Drop for Engine {
             }
         }
     }
+}
+
+/// Per-row results of a verify step split by sequence (`tokens[i].len()` rows each).
+fn split_rows<T>(rows: Vec<T>, tokens: &[&[i64]]) -> Vec<Vec<T>> {
+    let mut it = rows.into_iter();
+    tokens.iter().map(|t| it.by_ref().take(t.len()).collect()).collect()
 }
 
 fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
