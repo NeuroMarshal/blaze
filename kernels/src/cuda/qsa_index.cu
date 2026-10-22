@@ -173,6 +173,112 @@ __global__ void __launch_bounds__(kScoreThreads) scores_kernel(const uint16_t* _
   }
 }
 
+// Tensor-core scores of a prefill span (one sequence): S = Q K^T with Q [rows * heads, 128] (the heads of a row
+// consecutive) and K the span's compressed keys [blocks, 128]; per CTA 32 rows x 4 heads (8 m16 tiles) against 64
+// blocks (8 n8 tiles), Q and K in shared memory, ldmatrix + mma.m16n8k16 bf16 -> f32; relu and the sum over the four
+// heads in the fragments (the heads of a row sit in four consecutive fragment rows: lanes 4 and 8 apart).
+constexpr int kTcRows = 32, kTcBlocks = 64, kTcHeads = 4, kTcStride = 128 + 8;  // bf16 per smem row (padding)
+
+__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const uint16_t* p) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(a));
+}
+
+__device__ __forceinline__ void ldsm_x2(uint32_t (&r)[2], const uint16_t* p) {
+  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n" : "=r"(r[0]), "=r"(r[1]) : "r"(a));
+}
+
+__device__ __forceinline__ void mma_bf16(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+      "{%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// grid: (block tiles, row tiles), block: 128 (4 warps; warp w: m tiles 2w, 2w + 1, all 8 n tiles)
+__global__ void __launch_bounds__(128) scores_tc_kernel(const uint16_t* __restrict__ q,
+                                                        const int64_t* __restrict__ positions,
+                                                        const int32_t* __restrict__ tok_row, int row0, int rows,
+                                                        int ratio, const int32_t* __restrict__ rt, int64_t rt_stride,
+                                                        const uint16_t* __restrict__ comp, int max_blocks,
+                                                        float* __restrict__ scores, int64_t ld) {
+  extern __shared__ __align__(16) uint16_t tc_smem[];  // Q [32 * 4][136], K [64][136]
+  uint16_t* sq = tc_smem;
+  uint16_t* sk = tc_smem + kTcRows * kTcHeads * kTcStride;
+  const int r0 = blockIdx.y * kTcRows, b0 = blockIdx.x * kTcBlocks;
+  const int nr = min(kTcRows, rows - r0);
+  const int seq = tok_row[row0];
+  // the last row of the tile sees the most blocks (one sequence, ascending positions)
+  const int64_t vis_last = (positions[row0 + r0 + nr - 1] + 1) / ratio;
+  const float scale = rsqrtf(128.0f);
+  if (b0 >= vis_last) {
+    for (int i = threadIdx.x; i < nr * kTcBlocks; i += blockDim.x) {
+      const int r = i / kTcBlocks, b = b0 + i % kTcBlocks;
+      if (b < max_blocks) scores[int64_t(r0 + r) * ld + b] = -FLT_MAX;
+    }
+    return;
+  }
+  // Q rows (row, head) and K rows (block), 16 bytes per thread step
+  for (int i = threadIdx.x; i < kTcRows * kTcHeads * 16; i += blockDim.x) {
+    const int m = i / 16, c = i % 16;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (m / kTcHeads < nr) v = *reinterpret_cast<const uint4*>(q + (int64_t(row0 + r0) * kTcHeads + m) * 128 + c * 8);
+    *reinterpret_cast<uint4*>(sq + m * kTcStride + c * 8) = v;
+  }
+  for (int i = threadIdx.x; i < kTcBlocks * 16; i += blockDim.x) {
+    const int n = i / 16, c = i % 16, b = b0 + n;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (b < vis_last && b < max_blocks)
+      v = *reinterpret_cast<const uint4*>(comp + int64_t(rt[int64_t(seq) * rt_stride + int64_t(b) * ratio] / ratio) * 128 + c * 8);
+    *reinterpret_cast<uint4*>(sk + n * kTcStride + c * 8) = v;
+  }
+  __syncthreads();
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  float acc[2][8][4] = {};
+#pragma unroll
+  for (int ks = 0; ks < 8; ++ks) {
+    uint32_t a[2][4];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+      const int m = (2 * warp + mt) * 16 + (lane & 15);
+      ldsm_x4(a[mt], sq + m * kTcStride + ks * 16 + (lane >> 4) * 8);
+    }
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+      uint32_t bb[2];
+      const int n = nt * 8 + (lane & 7);
+      ldsm_x2(bb, sk + n * kTcStride + ks * 16 + ((lane >> 3) & 1) * 8);
+#pragma unroll
+      for (int mt = 0; mt < 2; ++mt) mma_bf16(acc[mt][nt], a[mt], bb);
+    }
+  }
+  // fragment: lane = 4 gr + c holds rows gr, gr + 8 (m = 4 row + head) and columns 2c, 2c + 1
+  const int gr = lane / 4, c = lane % 4;
+#pragma unroll
+  for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        float v = fmaxf(acc[mt][nt][e], 0.0f);
+        v += __shfl_xor_sync(0xffffffffu, v, 4);
+        v += __shfl_xor_sync(0xffffffffu, v, 8);
+        if ((gr & 3) == 0) {
+          // m = 16 (2 warp + mt) + gr + 8 (e >> 1): tile row m / 4
+          const int r = (16 * (2 * warp + mt) + gr + 8 * (e >> 1)) / 4;
+          const int b = b0 + nt * 8 + 2 * c + (e & 1);
+          if (r < nr && b < max_blocks) {
+            const int64_t vis = (positions[row0 + r0 + r] + 1) / ratio;
+            scores[int64_t(r0 + r) * ld + b] = b < vis ? v * scale : -FLT_MAX;
+          }
+        }
+      }
+}
+
 constexpr int kSelThreads = 1024;
 
 __device__ __forceinline__ uint32_t fkey(float f) {
@@ -322,6 +428,18 @@ extern "C" cudaError_t blz_qsa_scores(const uint16_t* q, int heads, int dim, con
                                       int max_blocks, float* scores, int64_t ld_scores, cudaStream_t stream) {
   if (rows == 0 || max_blocks == 0) return cudaSuccess;
   if (dim != 128 || heads > 8) return cudaErrorInvalidValue;
+  if (same_seq && heads == kTcHeads && rows >= 16) {
+    const dim3 grid(unsigned((max_blocks + kTcBlocks - 1) / kTcBlocks), unsigned((rows + kTcRows - 1) / kTcRows));
+    const size_t smem = size_t(kTcRows * kTcHeads + kTcBlocks) * kTcStride * 2;
+    static bool attr = false;
+    if (!attr) {
+      cudaFuncSetAttribute(scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+      attr = true;
+    }
+    scores_tc_kernel<<<grid, 128, smem, stream>>>(q, positions, tok_row, row0, rows, ratio, req_to_token, rt_stride,
+                                                  comp, max_blocks, scores, ld_scores);
+    return cudaGetLastError();
+  }
   // rows of one sequence (a prefill span) share key loads in groups of 16; decode rows (different sequences) go one by one
   const int group = same_seq ? kMaxGroupRows : 1;
   const dim3 grid(unsigned((max_blocks + kScoreThreads - 1) / kScoreThreads), unsigned((rows + group - 1) / group));
