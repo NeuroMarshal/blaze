@@ -250,7 +250,7 @@ fn main() -> Result<()> {
             // greedy reference with the top-2 logit gap of every token (a near tie may flip under other batch shapes)
             let mut reference = vec![e.prefill(&mut seq, &ids)? as i64];
             let mut gaps = vec![f32::INFINITY];
-            let none = [blaze::engine::Penalty { edits: Vec::new() }];
+            let none = [blaze::engine::Penalty::default()];
             while reference.len() < max_tokens {
                 let last = [*reference.last().unwrap()];
                 let c = e.step_sampled(&mut [&mut seq], &[&last], &none)?.remove(0);
@@ -316,6 +316,7 @@ fn main() -> Result<()> {
             let text = blaze::text::Text::load(&engine.model)?;
             let e = engine.load(None, false)?;
             let max_context = e.info.ctx_stride;
+            let vocab = e.info.vocab;
             let sched = blaze::sched::Scheduler::start(
                 e,
                 blaze::sched::SchedConfig {
@@ -347,7 +348,7 @@ fn main() -> Result<()> {
                 thinking_budget,
             };
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
-            rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context))
+            rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab))
         }
         Command::Generate { engine, prompt, prompt_file, max_tokens, logits } => {
             let prompt = match prompt_file {

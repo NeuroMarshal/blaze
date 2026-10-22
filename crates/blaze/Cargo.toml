@@ -22,3 +22,5 @@ futures.workspace = true
 async-stream.workspace = true
 uuid.workspace = true
 minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
+llguidance = { version = "1.9.1", default-features = false, features = ["lark", "referencing", "ahash"] }
+toktrie_hf_tokenizers = "1.9.1"

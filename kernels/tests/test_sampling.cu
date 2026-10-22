@@ -91,6 +91,44 @@ int main() {
   }
   std::printf("top-%d of %d rows x %d: %d mismatches\n", k, rows, vocab, bad);
 
+  // token mask: shard of ncols columns at col0 of a vocabulary of `full` tokens; mask rows 2 (row 0), none (row 1), 0
+  // (row 2); the masks cover full - 40 tokens (the rest forbidden)
+  {
+    const int full = 248320, ncols = 124160, mcol0 = 124160, words = (full - 40 + 31) / 32;
+    std::vector<uint32_t> masks(size_t(3) * words);
+    for (auto& w : masks) w = uint32_t(rng());
+    for (int m = 0; m < 3; ++m) masks[size_t(m) * words + words - 1] &= (1u << ((full - 40) % 32)) - 1;
+    const std::vector<int32_t> mrow = {2, -1, 0};
+    std::vector<uint16_t> lg(size_t(rows) * ncols);
+    for (auto& v : lg) v = bf(d(rng));
+    uint16_t* dlg;
+    uint32_t* dm;
+    int32_t* dmr;
+    check(cudaMalloc(&dlg, lg.size() * 2), "malloc");
+    check(cudaMalloc(&dm, masks.size() * 4), "malloc");
+    check(cudaMalloc(&dmr, 12), "malloc");
+    check(cudaMemcpy(dlg, lg.data(), lg.size() * 2, cudaMemcpyHostToDevice), "copy");
+    check(cudaMemcpy(dm, masks.data(), masks.size() * 4, cudaMemcpyHostToDevice), "copy");
+    check(cudaMemcpy(dmr, mrow.data(), 12, cudaMemcpyHostToDevice), "copy");
+    check(blz_token_mask(dlg, ncols, rows, mcol0, ncols, words, dm, dmr, 0), "mask");
+    std::vector<uint16_t> out(lg.size());
+    check(cudaMemcpy(out.data(), dlg, out.size() * 2, cudaMemcpyDeviceToHost), "copy back");
+    int mbad = 0;
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < ncols; ++c) {
+        const int t = mcol0 + c;
+        bool ok = true;
+        if (mrow[r] >= 0) ok = t < words * 32 && (masks[size_t(mrow[r]) * words + t / 32] >> (t % 32)) & 1u;
+        const uint16_t want = ok ? lg[size_t(r) * ncols + c] : uint16_t(0xFF80u);
+        if (out[size_t(r) * ncols + c] != want) ++mbad;
+      }
+    std::printf("token mask: %d mismatches\n", mbad);
+    bad += mbad;
+    cudaFree(dlg);
+    cudaFree(dm);
+    cudaFree(dmr);
+  }
+
   cudaEvent_t a, b;
   cudaEventCreate(&a);
   cudaEventCreate(&b);

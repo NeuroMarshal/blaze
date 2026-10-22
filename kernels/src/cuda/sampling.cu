@@ -193,6 +193,24 @@ __global__ void edits_kernel(uint16_t* __restrict__ logits, int64_t ld, int col0
   }
 }
 
+// grid (column blocks, rows): 8 columns per thread; rows without a mask leave at once
+__global__ void mask_kernel(uint16_t* __restrict__ logits, int64_t ld, int col0, int ncols, int words,
+                            const uint32_t* __restrict__ mask, const int32_t* __restrict__ mask_row) {
+  const int row = blockIdx.y;
+  const int mr = mask_row[row];
+  if (mr < 0) return;
+  const uint32_t* m = mask + int64_t(mr) * words;
+  uint16_t* p = logits + int64_t(row) * ld;
+  const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+  for (int j = 0; j < 8; ++j) {
+    const int c = c0 + j;
+    if (c >= ncols) return;
+    const int t = col0 + c;
+    const bool ok = t < words * 32 && (m[t >> 5] >> (t & 31)) & 1u;
+    if (!ok) p[c] = 0xFF80u;  // bf16 -inf
+  }
+}
+
 __global__ void __launch_bounds__(1024) lse_kernel(const uint16_t* __restrict__ logits, int64_t ld, int ncols,
                                                     float* __restrict__ lse) {
   __shared__ float red[32];
@@ -223,6 +241,14 @@ extern "C" cudaError_t blz_logit_edits(uint16_t* logits, int64_t ld, int rows, i
                                        const float* coef, const int32_t* off, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
   edits_kernel<<<rows, 256, 0, stream>>>(logits, ld, col0, ncols, ids, coef, off);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_token_mask(uint16_t* logits, int64_t ld, int rows, int col0, int ncols, int words,
+                                      const uint32_t* mask, const int32_t* mask_row, cudaStream_t stream) {
+  if (rows == 0 || ncols == 0) return cudaSuccess;
+  const dim3 grid{unsigned((ncols + 2047) / 2048), unsigned(rows)};
+  mask_kernel<<<grid, 256, 0, stream>>>(logits, ld, col0, ncols, words, mask, mask_row);
   return cudaGetLastError();
 }
 

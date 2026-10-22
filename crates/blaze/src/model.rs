@@ -215,16 +215,22 @@ pub struct MetaLayout {
     /// per token: its sequence's KV-table row and length after the step (QSA)
     pub tok_row: usize,
     pub tok_kv_len: usize,
-    // sampling: logit edits of the sampled rows (ids, (a, b, c) per entry, offsets [rows + 1])
+    // sampling: logit edits of the sampled rows (ids, (a, b, c) per entry, offsets [rows + 1]); grammar masks
+    // ([max_seqs][mask_words]) and the mask row of each logit row (-1: none)
     pub max_pen: usize,
+    pub pen_off: usize,
+    pub mask_row: usize,
+    /// bytes copied every step; the lists below go up as far as filled
+    pub base_bytes: usize,
     pub pen_ids: usize,
     pub pen_coef: usize,
-    pub pen_off: usize,
+    pub mask_words: usize,
+    pub mask: usize,
     pub bytes: usize,
 }
 
 impl MetaLayout {
-    pub fn new(max_tokens: usize, max_seqs: usize) -> Self {
+    pub fn new(max_tokens: usize, max_seqs: usize, vocab: usize) -> Self {
         let mut o = 0;
         let mut take = |n: usize| {
             let at = o;
@@ -243,9 +249,13 @@ impl MetaLayout {
         let tok_row = take(max_tokens * 4);
         let tok_kv_len = take(max_tokens * 4);
         let max_pen = (max_seqs * 16384).clamp(1 << 16, 1 << 18);
+        let pen_off = take((max_tokens + 1) * 4);
+        let mask_row = take(max_tokens * 4);
+        let base_bytes = take(0);
         let pen_ids = take(max_pen * 4);
         let pen_coef = take(max_pen * 12);
-        let pen_off = take((max_tokens + 1) * 4);
+        let mask_words = vocab.div_ceil(32);
+        let mask = take(max_seqs * mask_words * 4);
         Self {
             max_tokens,
             max_seqs,
@@ -261,9 +271,13 @@ impl MetaLayout {
             tok_row,
             tok_kv_len,
             max_pen,
+            pen_off,
+            mask_row,
+            base_bytes,
             pen_ids,
             pen_coef,
-            pen_off,
+            mask_words,
+            mask,
             bytes: o,
         }
     }
@@ -713,7 +727,7 @@ impl Model {
             ple_table = Some(table);
             ple_state = Some((conv, hist));
         }
-        let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs).max(opts.max_verify), opts.max_seqs);
+        let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs).max(opts.max_verify), opts.max_seqs, cfg.vocab);
         let aux = if opts.capture_layers.is_empty() {
             None
         } else {
@@ -1365,6 +1379,13 @@ impl Model {
                                      self.meta_ptr(m.pen_coef), self.meta_ptr(m.pen_off), s.0)
             },
             "logit edits",
+        )?;
+        check(
+            unsafe {
+                sys::blz_token_mask(w.logits.ptr(), v as i64, rows as c_int, (rank * v) as c_int, v as c_int, m.mask_words as c_int,
+                                    self.meta_ptr(m.mask), self.meta_ptr(m.mask_row), s.0)
+            },
+            "token mask",
         )?;
         check(unsafe { sys::blz_row_lse(w.logits.ptr(), v as i64, rows as c_int, v as c_int, w.cand_lse.ptr(), s.0) }, "lse")?;
         check(

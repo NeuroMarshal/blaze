@@ -11,5 +11,6 @@ pub mod quant;
 pub mod sampler;
 pub mod sched;
 pub mod server;
+pub mod structured;
 pub mod text;
 pub mod weights;

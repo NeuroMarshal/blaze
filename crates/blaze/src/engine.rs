@@ -50,6 +50,9 @@ struct StepMeta {
     pen_ids: Vec<i32>,
     pen_coef: Vec<f32>,
     pen_off: Vec<i32>,
+    /// grammar masks of the sampled rows and the mask row of each logit row (-1: none)
+    mask: Vec<u32>,
+    mask_row: Vec<i32>,
 }
 
 enum Cmd {
@@ -123,19 +126,31 @@ impl Runner {
         self.put(m.logit_rows, &meta.logit_rows);
         self.put(m.tok_row, &meta.tok_row);
         self.put(m.tok_kv_len, &meta.tok_kv_len);
+        let mut tail = Vec::new();
         if meta.sample {
             if meta.pen_ids.len() > m.max_pen {
                 bail!("{} penalty entries (max {})", meta.pen_ids.len(), m.max_pen);
             }
+            if meta.mask.len() > m.max_seqs * m.mask_words {
+                bail!("{} grammar mask rows (max {})", meta.mask.len() / m.mask_words, m.max_seqs);
+            }
+            self.put(m.pen_off, &meta.pen_off);
+            self.put(m.mask_row, &meta.mask_row);
             self.put(m.pen_ids, &meta.pen_ids);
             self.put(m.pen_coef, &meta.pen_coef);
-            self.put(m.pen_off, &meta.pen_off);
+            self.put(m.mask, &meta.mask);
+            tail = vec![(m.pen_ids, meta.pen_ids.len() * 4), (m.pen_coef, meta.pen_coef.len() * 4), (m.mask, meta.mask.len() * 4)];
         }
         let s = self.model.stream.0;
-        check(
-            unsafe { sys::cudaMemcpyAsync(self.model.meta_buffer().ptr(), self.staging.host_ptr(), m.bytes, sys::MEMCPY_H2D, s) },
-            "meta copy",
-        )?;
+        let dev = self.model.meta_buffer().ptr::<u8>();
+        let host = self.staging.host_ptr().cast::<u8>();
+        for (at, bytes) in std::iter::once((0, m.base_bytes)).chain(tail).filter(|&(_, b)| b > 0) {
+            // SAFETY: offsets and sizes lie within the staging and device metadata buffers (checked above).
+            check(
+                unsafe { sys::cudaMemcpyAsync(dev.add(at).cast(), host.add(at).cast(), bytes, sys::MEMCPY_H2D, s) },
+                "meta copy",
+            )?;
+        }
         let n = meta.logit_rows.len();
         if allow_graph && self.use_graphs && !verify && meta.spans.iter().all(|sp| sp.len == 1) {
             self.run_graph(n, meta.sample, meta.sparse, &meta.spans)?;
@@ -250,6 +265,8 @@ impl Snapshot {
 #[derive(Clone, Default)]
 pub struct Penalty {
     pub edits: Vec<(i32, f32, f32, f32)>,
+    /// structured outputs: the tokens the grammar allows (bit t of word t / 32), as many words as the vocabulary needs
+    pub mask: Option<Vec<u32>>,
 }
 
 /// Sampling candidates of one row: (logit, token) sorted descending, and the log-sum-exp of the whole (edited) row.
@@ -706,5 +723,12 @@ fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
             m.pen_coef.extend([a, b, c]);
         }
         m.pen_off.push(m.pen_ids.len() as i32);
+        match &p.mask {
+            Some(words) => {
+                m.mask_row.push(m.mask_row.iter().filter(|&&r| r >= 0).count() as i32);
+                m.mask.extend_from_slice(words);
+            }
+            None => m.mask_row.push(-1),
+        }
     }
 }

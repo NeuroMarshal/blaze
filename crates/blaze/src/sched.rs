@@ -44,6 +44,8 @@ pub struct GenRequest {
     /// Thinking budget (vLLM's thinking_token_budget): after this many tokens inside a thinking section the tokens of
     /// `think.force` are emitted instead of samples (they end the section).
     pub think: Option<ThinkBudget>,
+    /// structured outputs: the grammar the output follows
+    pub constraint: Option<crate::structured::Constraint>,
     pub events: UnboundedSender<GenEvent>,
     /// set by the client side (stop string seen, connection closed)
     pub cancel: Arc<AtomicBool>,
@@ -418,7 +420,7 @@ impl Loop {
                 }
             }
         }
-        Penalty { edits: e.into_iter().map(|(t, (a, b, c))| (t, a, b, c)).collect() }
+        Penalty { edits: e.into_iter().map(|(t, (a, b, c))| (t, a, b, c)).collect(), mask: None }
     }
 
     /// One generated token of active request `i`: thinking budget, counts, the event, stop conditions; the token
@@ -448,6 +450,12 @@ impl Loop {
         *a.counts.entry(pick).or_insert(0) += 1;
         let _ = a.req.events.send(GenEvent::Token(pick, lp));
         let stop = a.req.stop_ids.contains(&pick);
+        if let Some(c) = a.req.constraint.as_mut()
+            && let Err(e) = c.advance(pick, stop)
+        {
+            eprintln!("blaze: grammar dropped: {e}");
+            a.req.constraint = None;
+        }
         let cancel = a.req.cancel.load(Ordering::Relaxed) || a.req.events.is_closed();
         let full = a.seq.len() + 1 >= self.engine.info.ctx_stride;
         if stop || cancel || a.generated.len() >= a.req.max_tokens || full {
@@ -477,6 +485,9 @@ impl Loop {
         let k = self.cfg.spec_tokens;
         let a = &self.active[0];
         let Some(pending) = a.pending else { return Ok(false) };
+        if a.req.constraint.is_some() {
+            return Ok(false);
+        }
         if a.req.think.is_some() && (a.in_think || !a.forced.is_empty()) && a.req.think.as_ref().unwrap().budget < usize::MAX {
             // budgeted thinking may replace tokens: keep it simple
             if a.think_count + k >= a.req.think.as_ref().unwrap().budget {
@@ -615,14 +626,32 @@ impl Loop {
                 }
             })
             .collect();
-        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates());
+        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some());
+        // grammar masks (a prefill chunk's pick before the prompt's end is thrown away: no mask)
+        let words = self.engine.info.vocab.div_ceil(32);
+        let masks: Vec<Option<Vec<u32>>> = order
+            .iter()
+            .map(|&i| {
+                let a = &mut self.active[i];
+                let last_chunk = a.pending.is_some() || a.fed + chunk_len >= a.req.tokens.len();
+                let c = a.req.constraint.as_mut().filter(|_| last_chunk)?;
+                c.mask(words).unwrap_or_else(|e| {
+                    eprintln!("blaze: grammar dropped: {e}");
+                    a.req.constraint = None;
+                    None
+                })
+            })
+            .collect();
         // split borrows: collect &mut Seq in step order
         let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
         // SAFETY: `order` holds distinct indices, so the pointers are distinct and live for this call.
         let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
         let tok_refs: Vec<&[i64]> = toks.iter().map(|t| t.as_slice()).collect();
         let (picks, lps): (Vec<i32>, Vec<Option<TokenLogprob>>) = if sampled {
-            let pens: Vec<Penalty> = order.iter().map(|&i| self.edits_for(i, &[])).collect();
+            let mut pens: Vec<Penalty> = order.iter().map(|&i| self.edits_for(i, &[])).collect();
+            for (p, m) in pens.iter_mut().zip(masks) {
+                p.mask = m;
+            }
             let cands = self.engine.step_sampled(&mut seqs, &tok_refs, &pens)?;
             order
                 .iter()

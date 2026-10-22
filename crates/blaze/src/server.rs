@@ -4,6 +4,7 @@
 
 use crate::sampler::SamplingParams;
 use crate::sched::{Finish, GenEvent, GenRequest, Scheduler, ThinkBudget, TokenLogprob};
+use crate::structured::{Constraint, Grammars, grammar_of};
 use crate::text::Text;
 use anyhow::{Result, anyhow};
 use axum::extract::State;
@@ -42,6 +43,8 @@ struct AppState {
     formatter: Option<ChatFormatter>,
     cfg: ServeConfig,
     max_context: usize,
+    /// structured outputs (None: the tokenizer could not be read for grammars)
+    grammars: Option<Grammars>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -65,7 +68,8 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cfg: ServeConfig, max_context: usize) -> Result<()> {
+pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cfg: ServeConfig, max_context: usize,
+                   vocab: usize) -> Result<()> {
     let template = model_dir.join("chat_template.jinja");
     let config = model_dir.join("tokenizer_config.json");
     let formatter = blaze_chat::load_chat_formatter(
@@ -76,8 +80,15 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
     )
     .map_err(|e| eprintln!("blaze: chat completions disabled: {e}"))
     .ok();
+    let t0 = std::time::Instant::now();
+    let grammars = Grammars::load(&model_dir.join("tokenizer.json"), &text.eos, vocab)
+        .map_err(|e| eprintln!("blaze: structured outputs disabled: {e}"))
+        .ok();
+    if grammars.is_some() {
+        eprintln!("blaze: grammar compiler ready in {:.2} s", t0.elapsed().as_secs_f64());
+    }
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    let state = Arc::new(AppState { sched, text: Arc::new(text), formatter, cfg, max_context });
+    let state = Arc::new(AppState { sched, text: Arc::new(text), formatter, cfg, max_context, grammars });
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/models", get(models))
@@ -279,13 +290,22 @@ fn think_budget(st: &AppState, body: &Value, starts_inside: bool) -> Option<Thin
     Some(ThinkBudget { budget, start_id, end_id, starts_inside, force })
 }
 
-fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
-          stop_ids: Vec<i32>) -> Result<Gen> {
-    submit_ex(st, tokens, params, max_tokens, stops, stop_ids, None)
+/// The request's grammar as a scheduler constraint (applied after `after` when the output opens with reasoning).
+fn constraint_of(st: &AppState, body: &Value, after: Option<i32>) -> std::result::Result<Option<Constraint>, String> {
+    let Some(g) = grammar_of(body).map_err(|e| e.to_string())? else { return Ok(None) };
+    let gr = st.grammars.as_ref().ok_or("structured outputs are unavailable for this tokenizer")?;
+    let matcher = gr.matcher(g).map_err(|e| e.to_string())?;
+    Ok(Some(Constraint { matcher, after }))
 }
 
+fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
+          stop_ids: Vec<i32>, constraint: Option<Constraint>) -> Result<Gen> {
+    submit_ex(st, tokens, params, max_tokens, stops, stop_ids, None, constraint)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
-             stop_ids: Vec<i32>, think: Option<ThinkBudget>) -> Result<Gen> {
+             stop_ids: Vec<i32>, think: Option<ThinkBudget>, constraint: Option<Constraint>) -> Result<Gen> {
     let (tx, rx) = unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
     // Prompt-cache point before the last turn header: the next turn of a chat repeats everything up to it.
@@ -297,7 +317,7 @@ fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens
         .into_iter()
         .collect();
     st.sched
-        .submit(GenRequest { tokens, params, max_tokens, stop_ids, cache_points, think, events: tx, cancel: cancel.clone() })
+        .submit(GenRequest { tokens, params, max_tokens, stop_ids, cache_points, think, constraint, events: tx, cancel: cancel.clone() })
         .map_err(|_| anyhow!("scheduler stopped"))?;
     Ok(Gen {
         logprobs: Vec::new(),
@@ -338,7 +358,11 @@ async fn completions(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -
     let params = sampling_of(&body, &st.cfg.defaults, &st.text);
     let max_tokens = body.get("max_tokens").and_then(Value::as_u64).map(|x| x as usize).unwrap_or(16);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut g = match submit(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text)) {
+    let constraint = match constraint_of(&st, &body, None) {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let mut g = match submit(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text), constraint) {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     };
@@ -490,7 +514,14 @@ async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Respo
     let starts_in_reasoning = matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"))
         && prompt.trim_end_matches('\n').ends_with("<think>");
     let think = think_budget(&st, &body, starts_in_reasoning);
-    let mut g = match submit_ex(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text), think) {
+    // with reasoning first, the grammar applies to the answer after </think>
+    let after = starts_in_reasoning.then(|| st.text.token_id("</think>")).flatten().map(|t| t as i32);
+    let constraint = match constraint_of(&st, &body, after) {
+        Ok(c) => c,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let mut g = match submit_ex(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text), think,
+                                constraint) {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     };

@@ -20,6 +20,12 @@ extern "C" {
 cudaError_t blz_logit_edits(uint16_t* logits, int64_t ld, int rows, int col0, int ncols, const int32_t* ids,
                             const float* coef, const int32_t* off, cudaStream_t stream);
 
+/// \brief Structured outputs: tokens a grammar forbids get -inf. Row r uses mask row mask_row[r] (< 0: no mask) of
+/// `words` 32-bit words, bit t of the mask allowing global token t (tokens past words * 32 are forbidden); the shard
+/// holds tokens col0 .. col0 + ncols.
+cudaError_t blz_token_mask(uint16_t* logits, int64_t ld, int rows, int col0, int ncols, int words, const uint32_t* mask,
+                           const int32_t* mask_row, cudaStream_t stream);
+
 /// \brief log(sum(exp(logits))) of each row of a shard (the softmax normalizer, for logprobs): lse[r].
 cudaError_t blz_row_lse(const uint16_t* logits, int64_t ld, int rows, int ncols, float* lse, cudaStream_t stream);
 

@@ -176,6 +176,8 @@ unsafe extern "C" {
                          s: cudaStream_t) -> cudaError_t;
     pub fn blz_logit_edits(logits: *mut bf16, ld: i64, rows: c_int, col0: c_int, ncols: c_int, ids: *const i32,
                            coef: *const f32, off: *const i32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_token_mask(logits: *mut bf16, ld: i64, rows: c_int, col0: c_int, ncols: c_int, words: c_int, mask: *const u32,
+                          mask_row: *const i32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_row_lse(logits: *const bf16, ld: i64, rows: c_int, ncols: c_int, lse: *mut f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_fp8_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, block_scale: *const f32, block_n: c_int,
                             alpha: *const f32, y: *mut bf16, ldy: i64, rows: c_int, n: c_int, k: c_int,
