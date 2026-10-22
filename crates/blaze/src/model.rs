@@ -198,6 +198,8 @@ pub struct Options {
     /// every live sequence may verify in the same step); 0: none.
     pub max_verify: usize,
     pub kv_dtype: KvDtype,
+    /// EAGLE-4 drafter checkpoint (run on rank 0; the layers it reads are captured)
+    pub draft: Option<std::path::PathBuf>,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
@@ -1041,6 +1043,20 @@ impl Model {
 
     pub fn meta_ptr<T>(&self, offset: usize) -> *mut T {
         self.work.meta.at::<u8>(offset).cast()
+    }
+
+    /// The linear-layer context (cuBLAS, scratch) of this rank, for a drafter running next to the model.
+    pub fn lin_ctx(&self) -> &LinCtx {
+        &self.lin
+    }
+
+    /// The pinned token embedding table [vocab, hidden] bf16.
+    pub fn embed_table(&self) -> &HostMapped {
+        &self.embed
+    }
+
+    pub fn sms(&self) -> usize {
+        self.num_sms
     }
 
     pub fn meta_buffer(&self) -> &DevBuf {

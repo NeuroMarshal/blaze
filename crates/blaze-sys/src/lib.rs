@@ -160,6 +160,21 @@ unsafe extern "C" {
                                 out: *mut c_void, out_stride_tok: i64, out_stride_head: i64,
                                 s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_mha_parts(q_heads: c_int, kv_heads: c_int, q_len: c_int, splits: c_int) -> c_int;
+    pub fn blz_mha_decode_window(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
+                                 pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64,
+                                 req_indices: blz_index_ptr, kv_lens: blz_index_ptr, batch: c_int, q_len: c_int,
+                                 splits: c_int, scale: f32, window: c_int, partial_o: *mut f32, partial_ml: *mut f32,
+                                 dtype: c_int, out: *mut c_void, out_stride_tok: i64, out_stride_head: i64,
+                                 s: cudaStream_t) -> cudaError_t;
+    // EAGLE-4 draft (blaze/eagle.h)
+    pub fn blz_rmsnorm_ld(x: *const bf16, ldx: i64, w: *const bf16, eps: f32, rows: c_int, dim: c_int, out: *mut bf16,
+                          ldo: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_rope_neox(x: *mut bf16, ld: i64, tokens: c_int, heads: c_int, head_dim: c_int, positions: *const i64,
+                         inv_freq: *const f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_candidate_logits(hidden: *const bf16, ld_hidden: i64, rows: c_int, dim: c_int, table: *const bf16,
+                                ids: *const i32, c: c_int, out: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_candidate_pick(logits: *const f32, ids: *const i32, rows: c_int, c: c_int, token: *mut i64,
+                              record: *mut i64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_embed_gather(ids: *const i64, n: i64, table: *const u8, rows: i64, row_bytes: i64, out: *mut u8,
                             s: cudaStream_t) -> cudaError_t;
 }
@@ -170,6 +185,8 @@ pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
 pub const BLZ_FP8_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_TOPK_MAX: usize = 64;
+/// largest k of blz_topk
+pub const BLZ_TOPK_LIMIT: usize = 128;
 
 unsafe extern "C" {
     pub fn blz_nvfp4_gemv(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,

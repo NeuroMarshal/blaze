@@ -71,6 +71,9 @@ struct EngineArgs {
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
     tp: usize,
+    /// EAGLE-4 drafter checkpoint (speculative decoding with --spec-method eagle)
+    #[arg(long)]
+    draft_model: Option<PathBuf>,
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
@@ -117,6 +120,7 @@ impl EngineArgs {
                 ple_cache_gib: self.ple_cache_gib,
                 max_verify: self.max_verify,
                 kv_dtype: self.kv_cache_dtype,
+                draft: self.draft_model.clone(),
             },
             self.tp,
             !self.no_graphs,
@@ -154,6 +158,24 @@ enum Command {
         max_tokens: usize,
         /// draft tokens per round
         #[arg(long, default_value_t = 7)]
+        draft: usize,
+    },
+    /// EAGLE-4 test (needs --draft-model): greedy reference decode, then the same prompt through draft + verify
+    /// rounds; prints the accepted tokens per round, the speed of both and where the outputs part (bf16 ties).
+    EagleTest {
+        #[command(flatten)]
+        engine: EngineArgs,
+        #[arg(long, default_value = "")]
+        prompt: String,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// wrap the prompt in the chat template (one user turn, no thinking)
+        #[arg(long)]
+        chat: bool,
+        #[arg(long, default_value_t = 200)]
+        max_tokens: usize,
+        /// draft tokens per round
+        #[arg(long, default_value_t = 6)]
         draft: usize,
     },
     /// OpenAI-compatible server (chat completions with reasoning and tool calls, completions).
@@ -242,6 +264,89 @@ fn main() -> Result<()> {
                 }
                 pos += c.len();
             }
+            Ok(())
+        }
+        Command::EagleTest { engine, prompt, prompt_file, chat, max_tokens, draft } => {
+            let mut prompt = match prompt_file {
+                Some(f) => prompt + &std::fs::read_to_string(f)?,
+                None => prompt,
+            };
+            if chat {
+                prompt = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+            }
+            let text = blaze::text::Text::load(&engine.model)?;
+            let mut e = engine.load(None, false)?;
+            let window = e.info.draft_window;
+            if window == 0 {
+                anyhow::bail!("eagle-test needs --draft-model");
+            }
+            let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
+            let n = ids.len();
+            // reference
+            let mut seq = e.open()?;
+            let mut reference = vec![e.prefill(&mut seq, &ids)? as i64];
+            let t0 = Instant::now();
+            while reference.len() < max_tokens {
+                let last = [*reference.last().unwrap()];
+                reference.push(e.step(&mut [&mut seq], &[&last])?[0] as i64);
+            }
+            let plain = (max_tokens - 1) as f64 / t0.elapsed().as_secs_f64();
+            e.close(seq);
+            // prefill chunk by chunk, the drafter extended over the prompt's last `window` positions
+            let mut seq = e.open()?;
+            let chunk = e.info.max_chunk;
+            let mut first = 0;
+            let mut drafts = Vec::new();
+            for c0 in (0..n).step_by(chunk) {
+                let c1 = (c0 + chunk).min(n);
+                first = e.step(&mut [&mut seq], &[&ids[c0..c1]])?[0] as i64;
+                let lo = c0.max(n.saturating_sub(window));
+                if lo < c1 {
+                    let tokens: Vec<i64> = (lo..c1).map(|p| if p + 1 < n { ids[p + 1] } else { first }).collect();
+                    let item = blaze::eagle::DraftItem { row: seq.row, aux_row: lo - c0, tokens, pos0: lo };
+                    let k = if c1 == n { draft } else { 0 };
+                    drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k })?.remove(0);
+                }
+            }
+            let mut out = vec![first];
+            let (mut rounds, mut drafted, mut accepted_total) = (0usize, 0usize, 0usize);
+            let t1 = Instant::now();
+            while out.len() < max_tokens {
+                let k = draft.min(max_tokens - out.len());
+                let d = &drafts[..k.min(drafts.len())];
+                let start = seq.len();
+                let mut rows = vec![*out.last().unwrap()];
+                rows.extend_from_slice(d);
+                let picks = e.verify(&mut seq, &rows)?;
+                let mut m = 0;
+                while m < d.len() && picks[m] as i64 == d[m] {
+                    m += 1;
+                }
+                let emitted: Vec<i64> = picks[..=m].iter().map(|&p| p as i64).collect();
+                out.extend_from_slice(&emitted);
+                e.commit(&mut seq, rows.len(), m + 1)?;
+                rounds += 1;
+                drafted += d.len();
+                accepted_total += m;
+                let item = blaze::eagle::DraftItem { row: seq.row, aux_row: 0, tokens: emitted, pos0: start };
+                drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k: draft })?.remove(0);
+            }
+            let spec = (out.len() - 1) as f64 / t1.elapsed().as_secs_f64();
+            out.truncate(max_tokens);
+            let same = out.iter().zip(&reference).take_while(|(a, b)| a == b).count();
+            println!(
+                "prompt {n} tokens; plain {plain:.1} tok/s; EAGLE-4 {spec:.1} tok/s ({:.2}x): {rounds} rounds, {:.2} tokens per round, \
+                 {accepted_total}/{drafted} drafts accepted ({:.0}%); {same}/{max_tokens} tokens match the reference",
+                spec / plain,
+                (out.len() - 1) as f64 / rounds.max(1) as f64,
+                100.0 * accepted_total as f64 / drafted.max(1) as f64
+            );
+            if same < max_tokens {
+                let r: Vec<u32> = reference.iter().map(|&t| t as u32).collect();
+                let o: Vec<u32> = out.iter().map(|&t| t as u32).collect();
+                println!("reference: {:?}\neagle:     {:?}", text.decode(&r)?, text.decode(&o)?);
+            }
+            e.close(seq);
             Ok(())
         }
         Command::SelfSpec { engine, prompt, prompt_file, max_tokens, draft } => {

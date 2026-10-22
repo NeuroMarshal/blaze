@@ -69,6 +69,8 @@ enum Cmd {
     Commit(usize, usize, usize, Arc<Vec<i64>>, usize, usize),
     /// sequence row, verify slot
     PreVerify(usize, usize),
+    /// EAGLE-4 drafter (rank 0): extend over the last step's rows, then draft
+    Draft(Arc<crate::eagle::DraftPlan>),
     Reset(usize),
     Logits(usize),
     AllLogits(usize),
@@ -81,6 +83,7 @@ enum Reply {
     Cands(Vec<f32>),
     Logits(Vec<f32>),
     AllLogits(Vec<Vec<f32>>),
+    Drafts(Vec<Vec<i64>>),
     Done,
 }
 
@@ -101,6 +104,7 @@ impl Drop for Graph {
 /// One rank: its model shard and the per-step machinery.
 struct Runner {
     model: Model,
+    draft: Option<crate::eagle::Draft>,
     staging: HostMapped,
     graphs: HashMap<(usize, bool, bool), Graph>,
     warmed: HashSet<(usize, bool, bool)>,
@@ -201,6 +205,10 @@ impl Runner {
                 self.model.ple_warm(&w.0, &w.1);
                 Reply::Done
             }
+            Cmd::Draft(plan) => {
+                let d = self.draft.as_mut().ok_or_else(|| anyhow!("no drafter loaded"))?;
+                Reply::Drafts(d.run(&self.model, &plan)?)
+            }
             Cmd::SetKvRow(row, slots) => {
                 self.model.set_kv_row(row, &slots)?;
                 Reply::Done
@@ -243,6 +251,8 @@ pub struct Info {
     pub page: usize,
     /// context above which the step selects (QSA); usize::MAX: never
     pub qsa_budget: usize,
+    /// attention window of the EAGLE-4 drafter (0: none loaded)
+    pub draft_window: usize,
 }
 
 /// A cached prefix: the recurrent state after its tokens (state row `row`, outside the live rows) and the KV slots of
@@ -326,9 +336,18 @@ fn worker_main(
             }
             check(err, "host all-reduce buffer")?;
         }
+        let draft_dir = opts.draft.clone();
         let model = Model::load(&dir, opts, Tp { rank, world, ar, ar_bytes }, embed)?;
         let staging = HostMapped::new(model.meta.bytes)?;
-        Ok(Runner { model, staging, graphs: HashMap::new(), warmed: HashSet::new(), use_graphs })
+        let draft = match (rank, draft_dir) {
+            (0, Some(d)) => {
+                let dr = crate::eagle::Draft::load(&d, &model, model.opts.max_seqs, model.ctx_stride())?;
+                eprintln!("blaze: {}", dr.describe());
+                Some(dr)
+            }
+            _ => None,
+        };
+        Ok(Runner { model, draft, staging, graphs: HashMap::new(), warmed: HashSet::new(), use_graphs })
     };
     let mut runner = match start() {
         Ok(r) => {
@@ -341,10 +360,12 @@ fn worker_main(
                 cache_rows: r.model.opts.cache_rows,
                 page: r.model.page_size(),
                 qsa_budget: r.model.qsa_budget(),
+                draft_window: r.draft.as_ref().map_or(0, |d| d.cfg.window),
             };
             let _ = tx.send(Ok(Reply::Logits(vec![info.max_tokens as f32, info.max_seqs as f32, info.max_chunk as f32,
                                                    info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32,
-                                                   info.page as f32, info.qsa_budget.min(1 << 24) as f32])));
+                                                   info.page as f32, info.qsa_budget.min(1 << 24) as f32,
+                                                   info.draft_window as f32])));
             r
         }
         Err(e) => {
@@ -363,8 +384,12 @@ fn worker_main(
 
 impl Engine {
     /// Load `dir` on GPUs 0..world (tensor parallel when world > 1).
-    pub fn new(dir: &Path, opts: Options, world: usize, use_graphs: bool) -> Result<Self> {
+    pub fn new(dir: &Path, mut opts: Options, world: usize, use_graphs: bool) -> Result<Self> {
         gpu::set_device(0)?;
+        if let Some(d) = &opts.draft {
+            // the drafter reads the target's hidden states after its aux layers
+            opts.capture_layers = crate::eagle::DraftConfig::load(d)?.capture_layers();
+        }
         let embed = Arc::new(Model::load_embedding(dir)?);
         let barrier = Arc::new(Barrier::new(world));
         let mut workers = Vec::with_capacity(world);
@@ -391,6 +416,7 @@ impl Engine {
                         cache_rows: v[5] as usize,
                         page: v[6] as usize,
                         qsa_budget: if v[7] as usize >= 1 << 24 { usize::MAX } else { v[7] as usize },
+                        draft_window: v[8] as usize,
                     });
                 }
                 Ok(_) => unreachable!(),
@@ -715,6 +741,16 @@ impl Engine {
         debug_assert!(self.last_verify.iter().any(|v| v.0 == seq.row && v.2.len() == rows));
         let _ = rows;
         self.commit_many(&mut [seq], &[accepted])
+    }
+
+    /// EAGLE-4: extend the drafter over rows of the last step and draft `plan.k` tokens after each item (rank 0).
+    pub fn draft(&self, plan: crate::eagle::DraftPlan) -> Result<Vec<Vec<i64>>> {
+        self.workers[0].tx.send(Cmd::Draft(Arc::new(plan))).map_err(|_| anyhow!("rank exited"))?;
+        match self.workers[0].rx.recv().map_err(|_| anyhow!("rank exited"))? {
+            Ok(Reply::Drafts(d)) => Ok(d),
+            Ok(_) => unreachable!(),
+            Err(e) => Err(e),
+        }
     }
 
     /// Read ahead the PLE rows of `tokens` (after `prev`) on rank 0 (the table is read by the host of every rank).
