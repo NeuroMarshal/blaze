@@ -316,6 +316,8 @@ struct Work {
     hc_t: Option<DevBuf>,
     hc_ws: Option<DevBuf>,
     gstreams: Option<DevBuf>,
+    /// gate partial sums of the split combine (decode rows)
+    hc_partial: Option<DevBuf>,
     ghnorm: Option<DevBuf>,
     // PLE: n-gram row ids [t, heads], embeddings [t, embed], key / gated / gated-normed [t, hc * hidden], value
     ple_ids: Option<DevBuf>,
@@ -898,6 +900,7 @@ impl Model {
                 })
                 .transpose()?,
             gstreams: hcw.map(|c| b(head_rows * c * 2)).transpose()?,
+            hc_partial: hcw.map(|c| b(16usize.max(head_rows) * c.div_ceil(1024) * 8 * 4)).transpose()?,
             ghnorm: hcw.map(|c| b(head_rows * c * 2)).transpose()?,
             ple_ids: cfg.ple.as_ref().map(|p| b(t * 2 * p.heads_per_ngram * 8)).transpose()?,
             ple_emb: cfg.ple.as_ref().map(|p| b(t * p.embed_dim * 2)).transpose()?,
@@ -1014,10 +1017,21 @@ impl Model {
     fn hc_exit(&self, hc: &HcBlock, rows: usize) -> Result<()> {
         let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
         let c = self.cfg.hc.as_ref().unwrap();
+        let (streams, hnorm, inject) = (w.streams.as_ref().unwrap(), w.hnorm.as_ref().unwrap(), hc.inject.as_ref().unwrap());
+        if rows <= 16 {
+            // few rows: gate dot products over many blocks
+            return check(
+                unsafe {
+                    sys::blz_hc_combine_split(streams.ptr(), hnorm.ptr(), inject.ptr(), w.x.ptr(), h as i64, rows as c_int, c.count as c_int,
+                                              h as c_int, w.hc_partial.as_ref().unwrap().ptr(), s.0)
+                },
+                "hc combine",
+            );
+        }
         check(
             unsafe {
-                sys::blz_hc_combine(w.streams.as_ref().unwrap().ptr(), w.hnorm.as_ref().unwrap().ptr(), hc.inject.as_ref().unwrap().ptr(),
-                                    w.x.ptr(), h as i64, rows as c_int, c.count as c_int, h as c_int, s.0)
+                sys::blz_hc_combine(streams.ptr(), hnorm.ptr(), inject.ptr(), w.x.ptr(), h as i64, rows as c_int, c.count as c_int, h as c_int,
+                                    s.0)
             },
             "hc combine",
         )

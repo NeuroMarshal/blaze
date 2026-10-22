@@ -21,6 +21,11 @@ cudaError_t blz_grouped_rmsnorm(const uint16_t* x, const uint16_t* w, float eps,
 cudaError_t blz_hc_combine(uint16_t* streams, const uint16_t* normed, const uint16_t* inject, const uint16_t* y,
                            int64_t ld_y, int rows, int hc, int dim, cudaStream_t stream);
 
+/// \brief The same combine for few rows (decode): the gate dot products split over column chunks of 1024 (partials in
+/// `partial`, [rows, ceil(hc * dim / 1024), hc] floats), summed in a fixed order by every block of the update.
+cudaError_t blz_hc_combine_split(uint16_t* streams, const uint16_t* normed, const uint16_t* inject, const uint16_t* y,
+                                 int64_t ld_y, int rows, int hc, int dim, float* partial, cudaStream_t stream);
+
 /// \brief streams[m, c * dim + i] = x[m, i] for every stream c (the layer stack's input).
 cudaError_t blz_hc_widen(const uint16_t* x, int rows, int hc, int dim, uint16_t* streams, cudaStream_t stream);
 

@@ -247,6 +247,8 @@ unsafe extern "C" {
                                out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_hc_combine(streams: *mut bf16, normed: *const bf16, inject: *const bf16, y: *const bf16, ld_y: i64,
                           rows: c_int, hc: c_int, dim: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_hc_combine_split(streams: *mut bf16, normed: *const bf16, inject: *const bf16, y: *const bf16, ld_y: i64,
+                                rows: c_int, hc: c_int, dim: c_int, partial: *mut f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_hc_widen(x: *const bf16, rows: c_int, hc: c_int, dim: c_int, streams: *mut bf16, s: cudaStream_t)
                         -> cudaError_t;
     pub fn blz_hc_mix_supported(rows: c_int, hc: c_int, hs: c_int, lowrank: c_int) -> c_int;

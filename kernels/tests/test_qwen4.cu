@@ -104,6 +104,11 @@ int main() {
     uint16_t *ds = dev(st), *dn = dev(nm), *di = dev(inj), *dy = dev(y);
     check(blz_hc_combine(ds, dn, di, dy, H, rows, HC, H, 0), "hc combine");
     ok &= report("hc combine", max_err(host(ds, st.size()), ref), 8e-3);
+    uint16_t* ds2 = dev(st);
+    float* part;
+    check(cudaMalloc(&part, size_t(rows) * 64 * HC * 4), "malloc");
+    check(blz_hc_combine_split(ds2, dn, di, dy, H, rows, HC, H, part, 0), "hc combine split");
+    ok &= report("hc combine split", max_err(host(ds2, st.size()), ref), 8e-3);
   }
 
   // n-gram hash: two sequences, EOS inside, history carried over

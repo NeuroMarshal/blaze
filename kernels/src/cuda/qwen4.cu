@@ -79,6 +79,51 @@ __global__ void __launch_bounds__(kThreads) hc_combine_kernel(uint16_t* __restri
   }
 }
 
+// Split combine for few rows (decode): partial gate dot products over kGateChunk columns per block, then every
+// block of the apply sums the partials (fixed order, deterministic) and updates its columns.
+constexpr int kGateChunk = 1024;
+
+template <int HC>
+__global__ void __launch_bounds__(kThreads) hc_gate_partial_kernel(const uint16_t* __restrict__ normed,
+                                                                   const uint16_t* __restrict__ inject, int width,
+                                                                   float* __restrict__ partial) {
+  __shared__ float red[HC][kThreads / 32];
+  const int row = blockIdx.y, chunk = blockIdx.x;
+  const uint16_t* nr = normed + int64_t(row) * width;
+  float acc[HC];
+#pragma unroll
+  for (int c = 0; c < HC; ++c) acc[c] = 0.0f;
+  const int i0 = chunk * kGateChunk, i1 = min(width, i0 + kGateChunk);
+  for (int i = i0 + threadIdx.x; i < i1; i += kThreads) {
+    const float v = bf(nr[i]);
+#pragma unroll
+    for (int c = 0; c < HC; ++c) acc[c] = fmaf(v, bf(inject[int64_t(c) * width + i]), acc[c]);
+  }
+  block_sum(acc, red);
+  if (threadIdx.x < HC) partial[(int64_t(row) * gridDim.x + chunk) * HC + threadIdx.x] = acc[threadIdx.x];
+}
+
+template <int HC>
+__global__ void __launch_bounds__(kThreads) hc_apply_kernel(uint16_t* __restrict__ streams,
+                                                            const float* __restrict__ partial, int chunks,
+                                                            const uint16_t* __restrict__ y, int64_t ld_y, int dim) {
+  __shared__ float a[HC];
+  const int row = blockIdx.y;
+  if (threadIdx.x < HC) {
+    float t = 0.0f;
+    for (int k = 0; k < chunks; ++k) t += partial[(int64_t(row) * chunks + k) * HC + threadIdx.x];
+    a[threadIdx.x] = 2.0f / (1.0f + __expf(-t / float(HC)));
+  }
+  __syncthreads();
+  const int width = HC * dim;
+  uint16_t* sr = streams + int64_t(row) * width;
+  const uint16_t* yr = y + int64_t(row) * ld_y;
+  for (int i = blockIdx.x * kThreads + threadIdx.x; i < width; i += gridDim.x * kThreads) {
+    const int c = i / dim;
+    sr[i] = to_bf(bf(sr[i]) + a[c] * bf(yr[i - c * dim]));
+  }
+}
+
 __global__ void hc_widen_kernel(const uint16_t* __restrict__ x, int rows, int hc, int dim,
                                 uint16_t* __restrict__ streams) {
   const int64_t total = int64_t(rows) * hc * dim;
@@ -195,6 +240,27 @@ extern "C" cudaError_t blz_grouped_rmsnorm(const uint16_t* x, const uint16_t* w,
                                            int dim, uint16_t* out, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
   grouped_rmsnorm_kernel<<<rows * groups, kThreads, 0, stream>>>(x, w, eps, groups, dim, out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_hc_combine_split(uint16_t* streams, const uint16_t* normed, const uint16_t* inject,
+                                            const uint16_t* y, int64_t ld_y, int rows, int hc, int dim, float* partial,
+                                            cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  const int width = hc * dim, chunks = (width + kGateChunk - 1) / kGateChunk;
+  const dim3 g1{unsigned(chunks), unsigned(rows)}, g2{unsigned((width + 4 * kThreads - 1) / (4 * kThreads)), unsigned(rows)};
+  switch (hc) {
+    case 4:
+      hc_gate_partial_kernel<4><<<g1, kThreads, 0, stream>>>(normed, inject, width, partial);
+      hc_apply_kernel<4><<<g2, kThreads, 0, stream>>>(streams, partial, chunks, y, ld_y, dim);
+      break;
+    case 2:
+      hc_gate_partial_kernel<2><<<g1, kThreads, 0, stream>>>(normed, inject, width, partial);
+      hc_apply_kernel<2><<<g2, kThreads, 0, stream>>>(streams, partial, chunks, y, ld_y, dim);
+      break;
+    default:
+      return blz_hc_combine(streams, normed, inject, y, ld_y, rows, hc, dim, stream);
+  }
   return cudaGetLastError();
 }
 
