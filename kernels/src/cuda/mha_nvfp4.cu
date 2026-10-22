@@ -1,4 +1,4 @@
-// Dense attention straight from an NVFP4 KV pool (see blaze/mha.h).
+// Dense attention straight from an NVFP4, FP8 or BF16 KV pool (see blaze/mha.h).
 //
 // Decode / verify, FlashAttention-2 style with the dequantization in registers. One warp = one 16-row MMA tile of
 // query rows (the request's query tokens x the KV head's q heads, GQA 6: 2 tokens x 6 heads, each row with its own
@@ -13,12 +13,19 @@
 // issued before the softmax and P V of the current one, its V loads before its Q K^T. The global scales go into q (K)
 // and the output (V). Each warp leaves its unnormalized output, running max (log2 units) and sum; a second kernel
 // merges the parts.
+//
+// FP8 and BF16 pools go through the same kernel (the format a template parameter): FP8 E4M3 pairs convert to f16x2
+// exactly (cvt.rn.f16x2.e4m3x2), BF16 pairs through FP32 (exact in FP16 for |x| in [2^-14, 65504], the range of
+// normed keys and values). FP8 chunks are prefetched like NVFP4 ones (twice the registers); BF16 rows are read where
+// they are used (prefetching 64 registers per side would not fit next to O).
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp4.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
+#include <type_traits>
 
 #include "nvfp4_attn.cuh"
 #include "blaze/mha.h"
@@ -51,6 +58,17 @@ __device__ __forceinline__ __half2 e2m1x2_to_f16x2(uint32_t byte) {
   const uint32_t bits = ((byte & 0x8u) << 12) | ((byte & 0x7u) << 9) | ((byte & 0x80u) << 24) | ((byte & 0x70u) << 21);
   return __hmul2(*reinterpret_cast<const __half2*>(&bits), __half2half2(__float2half_rn(16384.0f)));
 #endif
+}
+
+// Two E4M3 values (low byte first) as f16x2, exactly.
+__device__ __forceinline__ __half2 e4m3x2_to_f16x2(uint32_t two) {
+  const __half2_raw r = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(two & 0xffffu), __NV_E4M3);
+  return *reinterpret_cast<const __half2*>(&r);
+}
+
+// Two bf16 values (low half first) as f16x2.
+__device__ __forceinline__ __half2 bf16x2_to_f16x2(uint32_t two) {
+  return __float22half2_rn(__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&two)));
 }
 
 __device__ __forceinline__ int64_t load_index(blz_index_ptr p, int64_t i) {
@@ -126,8 +144,61 @@ __device__ __forceinline__ uint32_t word_of(const uint4& u, int w) {
   return w == 0 ? u.x : w == 1 ? u.y : w == 2 ? u.z : u.w;
 }
 
+// FP8 chunks: K bytes [64c, 64c + 64) of positions gr and 8 + gr; V bytes [32 gr, 32 gr + 32) of positions 2c, 2c + 1,
+// 2c + 8, 2c + 9 (the same dims as the NVFP4 shares, one byte per value).
+struct ChunkK8 {
+  uint4 c[2][4];
+};
+struct ChunkV8 {
+  uint4 c[4][2];
+};
+struct NoChunk {};
+
+template <int F>
+struct Chunks {
+  using K = NoChunk;
+  using V = NoChunk;
+};
+template <>
+struct Chunks<BLZ_KV_NVFP4> {
+  using K = ChunkK;
+  using V = ChunkV;
+};
+template <>
+struct Chunks<BLZ_KV_FP8> {
+  using K = ChunkK8;
+  using V = ChunkV8;
+};
+
+template <int F, typename CK>
+__device__ __forceinline__ void load_k_any(const blz_nvfp4_pool& pool, int64_t row, int c, int n, CK& k) {
+  if constexpr (F == BLZ_KV_NVFP4) {
+    load_k(pool, row, c, n, k);
+  } else if constexpr (F == BLZ_KV_FP8) {
+    const uint4* src = reinterpret_cast<const uint4*>(pool.k_data + row * kDim + 64 * c);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) k.c[n][j] = row < 0 ? make_uint4(0, 0, 0, 0) : __ldg(src + j);
+  }
+}
+
+template <int F, typename CV>
+__device__ __forceinline__ void load_v_any(const blz_nvfp4_pool& pool, int64_t row, int gr, int i, CV& v) {
+  if constexpr (F == BLZ_KV_NVFP4) {
+    load_v(pool, row, gr, i, v);
+  } else if constexpr (F == BLZ_KV_FP8) {
+    const uint4* src = reinterpret_cast<const uint4*>(pool.v_data + row * kDim + 32 * gr);
+#pragma unroll
+    for (int j = 0; j < 2; ++j) v.c[i][j] = row < 0 ? make_uint4(0, 0, 0, 0) : __ldg(src + j);
+  }
+}
+
+// BF16 pools: 8 values (16 bytes) of a row from `d`, zeros for a row past the part.
+__device__ __forceinline__ uint4 load_bf16x8(const uint8_t* data, int64_t row, int d) {
+  return row < 0 ? make_uint4(0, 0, 0, 0) : __ldg(reinterpret_cast<const uint4*>(data + (row * kDim + d) * 2));
+}
+
 // grid: (batch * tiles, kv_heads, splits), block: 32 * MT * KW, dynamic shared memory: MT * 16 * kQStride f16
-template <int MT, int KW>
+template <int F, int MT, int KW>
 __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t sq_tok, int64_t sq_head, int group, int tokens_per_tile, int tiles,
     int q_heads, blz_nvfp4_pool pool, const int32_t* __restrict__ req_to_token, int64_t req_stride,
@@ -184,35 +255,59 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const int64_t t = tc + (lane & 15);
     return t < t1 ? int32_t(__ldg(r2t + t) * head_rows + g) : -1;
   };
-  ChunkK kc;
-  ChunkV vc;
+  typename Chunks<F>::K kc;
+  typename Chunks<F>::V vc;
   int64_t tc = t0 + int64_t(kw) * kChunk;
   int32_t slot = tc < t1 ? slots_of(tc) : -1;
   if (tc < t1) {
 #pragma unroll
-    for (int n = 0; n < 2; ++n) load_k(pool, chunk_row(slot, 8 * n + gr), c, n, kc);
+    for (int n = 0; n < 2; ++n) load_k_any<F>(pool, chunk_row(slot, 8 * n + gr), c, n, kc);
 #pragma unroll
-    for (int i = 0; i < 4; ++i) load_v(pool, chunk_row(slot, 2 * c + (i & 1) + 8 * (i >> 1)), gr, i, vc);
+    for (int i = 0; i < 4; ++i) load_v_any<F>(pool, chunk_row(slot, 2 * c + (i & 1) + 8 * (i >> 1)), gr, i, vc);
   }
   for (; tc < t1; tc += int64_t(kChunk) * KW) {
     // S = Q K^T over the chunk's 16 positions (two n8 tiles), two accumulation chains per tile.
     float sacc[2][2][4] = {};
     {
       __half2 ks[2][4];
+      if constexpr (F == BLZ_KV_NVFP4) {
 #pragma unroll
-      for (int n = 0; n < 2; ++n)
+        for (int n = 0; n < 2; ++n)
 #pragma unroll
-        for (int j = 0; j < 4; ++j) ks[n][j] = scale_h2(kc.sc[n] >> (8 * j));
+          for (int j = 0; j < 4; ++j) ks[n][j] = scale_h2(kc.sc[n] >> (8 * j));
+      }
+      int64_t krow[2] = {-1, -1};
+      if constexpr (F == BLZ_KV_BF16) {
+#pragma unroll
+        for (int n = 0; n < 2; ++n) krow[n] = chunk_row(slot, 8 * n + gr);
+      }
       const int arow = lane & 15, acol = (lane >> 4) * 8;
+      uint4 kb[2];  // BF16: dims 64c + 4 ks_ .. + 7 of both positions, for k-steps ks_ and ks_ + 1
 #pragma unroll
       for (int ks_ = 0; ks_ < kDim / 16; ++ks_) {
         uint32_t qa[4];
         ldsm_x4(qa, &sq[(16 * mt + arow) * kQStride + 16 * ks_ + acol]);
+        if constexpr (F == BLZ_KV_BF16) {
+          if ((ks_ & 1) == 0) {
+#pragma unroll
+            for (int n = 0; n < 2; ++n) kb[n] = load_bf16x8(pool.k_data, krow[n], 64 * c + 4 * ks_);
+          }
+        }
 #pragma unroll
         for (int n = 0; n < 2; ++n) {
-          const uint32_t w = word_of(kc.c[n][ks_ / 8], (ks_ / 2) % 4) >> (16 * (ks_ & 1));
-          const uint32_t b0 = h2_bits(__hmul2(e2m1x2_to_f16x2(w), ks[n][ks_ / 4]));
-          const uint32_t b1 = h2_bits(__hmul2(e2m1x2_to_f16x2(w >> 8), ks[n][ks_ / 4]));
+          uint32_t b0, b1;
+          if constexpr (F == BLZ_KV_NVFP4) {
+            const uint32_t w = word_of(kc.c[n][ks_ / 8], (ks_ / 2) % 4) >> (16 * (ks_ & 1));
+            b0 = h2_bits(__hmul2(e2m1x2_to_f16x2(w), ks[n][ks_ / 4]));
+            b1 = h2_bits(__hmul2(e2m1x2_to_f16x2(w >> 8), ks[n][ks_ / 4]));
+          } else if constexpr (F == BLZ_KV_FP8) {
+            const uint32_t w = word_of(kc.c[n][ks_ / 4], ks_ % 4);
+            b0 = h2_bits(e4m3x2_to_f16x2(w));
+            b1 = h2_bits(e4m3x2_to_f16x2(w >> 16));
+          } else {
+            b0 = h2_bits(bf16x2_to_f16x2(word_of(kb[n], 2 * (ks_ & 1))));
+            b1 = h2_bits(bf16x2_to_f16x2(word_of(kb[n], 2 * (ks_ & 1) + 1)));
+          }
           mma_f16(sacc[ks_ & 1][n], qa, b0, b1);
         }
       }
@@ -222,7 +317,7 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const int32_t slot_next = tn < t1 ? slots_of(tn) : -1;
     if (tn < t1) {
 #pragma unroll
-      for (int n = 0; n < 2; ++n) load_k(pool, chunk_row(slot_next, 8 * n + gr), c, n, kc);
+      for (int n = 0; n < 2; ++n) load_k_any<F>(pool, chunk_row(slot_next, 8 * n + gr), c, n, kc);
     }
 
     // Online softmax; rows gr (h = 0) and gr + 8 (h = 1); this thread's positions 8n + 2c, + 1.
@@ -278,17 +373,38 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
 
     // O += P V: B rows (positions) 2c, 2c + 1 / 2c + 8, 2c + 9; byte j of V row bytes [16 gr, +16) holds dims
     // 32 gr + 2j, + 1 of output tiles 2j, 2j + 1.
+    int64_t vrow[4] = {-1, -1, -1, -1};
+    if constexpr (F == BLZ_KV_BF16) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) vrow[i] = chunk_row(slot, 2 * c + (i & 1) + 8 * (i >> 1));
+    }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
       __half2 vs[4];
+      if constexpr (F == BLZ_KV_NVFP4) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) vs[i] = scale_h2(vc.sc[i] >> (8 * half));
+        for (int i = 0; i < 4; ++i) vs[i] = scale_h2(vc.sc[i] >> (8 * half));
+      }
+      uint4 vb[4];  // BF16: dims 32 gr + 2j .. + 7 (pairs j .. j + 3) of the four positions
 #pragma unroll
       for (int jj = 0; jj < 8; ++jj) {
         const int j = 8 * half + jj;
+        if constexpr (F == BLZ_KV_BF16) {
+          if (j % 4 == 0) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) vb[i] = load_bf16x8(pool.v_data, vrow[i], 32 * gr + 2 * j);
+          }
+        }
         __half2 f[4];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) f[i] = __hmul2(e2m1x2_to_f16x2(word_of(vc.c[i], j / 4) >> (8 * (j % 4))), vs[i]);
+        for (int i = 0; i < 4; ++i) {
+          if constexpr (F == BLZ_KV_NVFP4)
+            f[i] = __hmul2(e2m1x2_to_f16x2(word_of(vc.c[i], j / 4) >> (8 * (j % 4))), vs[i]);
+          else if constexpr (F == BLZ_KV_FP8)
+            f[i] = e4m3x2_to_f16x2(word_of(vc.c[i][j / 8], (j / 2) % 4) >> (16 * (j & 1)));
+          else
+            f[i] = bf16x2_to_f16x2(word_of(vb[i], j % 4));
+        }
         mma_f16(o[2 * j], pa, h2_bits(__lows2half2(f[0], f[1])), h2_bits(__lows2half2(f[2], f[3])));
         mma_f16(o[2 * j + 1], pa, h2_bits(__highs2half2(f[0], f[1])), h2_bits(__highs2half2(f[2], f[3])));
       }
@@ -296,7 +412,7 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     // The next chunk's V, in flight during its Q K^T.
     if (tn < t1) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) load_v(pool, chunk_row(slot_next, 2 * c + (i & 1) + 8 * (i >> 1)), gr, i, vc);
+      for (int i = 0; i < 4; ++i) load_v_any<F>(pool, chunk_row(slot_next, 2 * c + (i & 1) + 8 * (i >> 1)), gr, i, vc);
     }
     slot = slot_next;
   }
@@ -394,7 +510,8 @@ extern "C" cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok,
                                             blz_half_t dtype, void* out, int64_t out_stride_tok,
                                             int64_t out_stride_head, cudaStream_t stream) {
   if (dtype != BLZ_BF16 || pool.dim != blaze::attn::kDim || pool.heads <= 0 || q_heads % pool.heads != 0 ||
-      q_heads / pool.heads > 16 || q_len < 1 || splits < 1 || splits > 64)
+      q_heads / pool.heads > 16 || q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 ||
+      pool.format > BLZ_KV_BF16)
     return cudaErrorNotSupported;
   if (batch == 0) return cudaSuccess;
   const int group = q_heads / pool.heads;
@@ -410,12 +527,21 @@ extern "C" cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok,
         static_cast<const __nv_bfloat16*>(q), q_stride_tok, q_stride_head, group, per_tile, tiles, q_heads, pool,
         req_to_token, req_stride, req_indices, kv_lens, q_len, splits, scale, partial_o, partial_ml);
   };
-  if (mt == 1)
-    launch(blaze::mha_decode_kernel<1, blaze::parts_per_cta(1)>, blaze::parts_per_cta(1));
-  else if (mt == 2)
-    launch(blaze::mha_decode_kernel<2, blaze::parts_per_cta(2)>, 2 * blaze::parts_per_cta(2));
+  auto by_tiles = [&](auto fmt) {
+    constexpr int F = decltype(fmt)::value;
+    if (mt == 1)
+      launch(blaze::mha_decode_kernel<F, 1, blaze::parts_per_cta(1)>, blaze::parts_per_cta(1));
+    else if (mt == 2)
+      launch(blaze::mha_decode_kernel<F, 2, blaze::parts_per_cta(2)>, 2 * blaze::parts_per_cta(2));
+    else
+      launch(blaze::mha_decode_kernel<F, 3, blaze::parts_per_cta(3)>, 3 * blaze::parts_per_cta(3));
+  };
+  if (pool.format == BLZ_KV_FP8)
+    by_tiles(std::integral_constant<int, BLZ_KV_FP8>{});
+  else if (pool.format == BLZ_KV_BF16)
+    by_tiles(std::integral_constant<int, BLZ_KV_BF16>{});
   else
-    launch(blaze::mha_decode_kernel<3, blaze::parts_per_cta(3)>, 3 * blaze::parts_per_cta(3));
+    by_tiles(std::integral_constant<int, BLZ_KV_NVFP4>{});
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return err;
   const dim3 cgrid(static_cast<unsigned>(batch * q_len), static_cast<unsigned>(q_heads));
@@ -427,7 +553,7 @@ extern "C" cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok,
 
 extern "C" cudaError_t blz_nvfp4_dequant_rows(blz_nvfp4_pool pool, blz_index_ptr slots, int64_t n, blz_half_t dtype,
                                               void* out_k, void* out_v, cudaStream_t stream) {
-  if (pool.dim % 16 != 0 || pool.heads <= 0) return cudaErrorNotSupported;
+  if (pool.dim % 16 != 0 || pool.heads <= 0 || pool.format != BLZ_KV_NVFP4) return cudaErrorNotSupported;
   if (n == 0) return cudaSuccess;
   const int64_t threads = n * pool.heads * (pool.dim / blaze::kNvfp4Block);
   const int block = 256;

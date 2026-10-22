@@ -179,6 +179,77 @@ extern "C" cudaError_t blz_nvfp4_kv_store(const void* k, const void* v, int64_t 
                                       k_scale, v_scale, k_g, v_g, four_over_six != 0, stream);
 }
 
+namespace blaze {
+namespace {
+
+// FP8 / BF16 rows: one thread = 8 consecutive values of K (first half of the threads) or V
+template <typename IdxT, bool kFp8>
+__global__ void __launch_bounds__(512) kv_store_dense_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v, int64_t k_stride, int64_t v_stride,
+    const IdxT* __restrict__ loc, uint8_t* __restrict__ k_data, uint8_t* __restrict__ v_data,
+    const float* __restrict__ k_g, const float* __restrict__ v_g, int heads, int dim) {
+  const int64_t token = blockIdx.x;
+  const int64_t slot = static_cast<int64_t>(loc[token]);
+  const int per_side = heads * dim / kPerThread;
+  const int tid = blockIdx.y * blockDim.x + threadIdx.x;
+  if (slot < 0 || tid >= 2 * per_side) return;
+  const bool is_v = tid >= per_side;
+  const int e = (is_v ? tid - per_side : tid) * kPerThread;
+  const uint4 raw = __ldg(reinterpret_cast<const uint4*>((is_v ? v + token * v_stride : k + token * k_stride) + e));
+  const int64_t off = slot * heads * dim + e;
+  uint8_t* dst = is_v ? v_data : k_data;
+  if constexpr (kFp8) {
+    const float inv = 1.0f / __ldg(is_v ? v_g : k_g);
+    const __nv_bfloat16* x = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    uint32_t w[2] = {0, 0};
+#pragma unroll
+    for (int i = 0; i < kPerThread; ++i) {
+      const __nv_fp8_e4m3 q(__bfloat162float(x[i]) * inv);  // round to nearest, saturated
+      w[i / 4] |= uint32_t(reinterpret_cast<const uint8_t&>(q)) << (8 * (i % 4));
+    }
+    *reinterpret_cast<uint2*>(dst + off) = make_uint2(w[0], w[1]);
+  } else {
+    *reinterpret_cast<uint4*>(dst + 2 * off) = raw;
+  }
+}
+
+template <typename IdxT>
+cudaError_t store_dense(const void* k, const void* v, int64_t k_stride, int64_t v_stride, const void* loc,
+                        int64_t tokens, int heads, int dim, bool fp8, uint8_t* k_data, uint8_t* v_data,
+                        const float* k_g, const float* v_g, cudaStream_t stream) {
+  const int threads = 2 * heads * dim / kPerThread, block = threads < 512 ? threads : 512;
+  const dim3 grid{unsigned(tokens), unsigned((threads + block - 1) / block)};
+  auto kk = static_cast<const __nv_bfloat16*>(k);
+  auto vv = static_cast<const __nv_bfloat16*>(v);
+  auto ll = static_cast<const IdxT*>(loc);
+  if (fp8)
+    kv_store_dense_kernel<IdxT, true><<<grid, block, 0, stream>>>(kk, vv, k_stride, v_stride, ll, k_data, v_data, k_g,
+                                                                  v_g, heads, dim);
+  else
+    kv_store_dense_kernel<IdxT, false><<<grid, block, 0, stream>>>(kk, vv, k_stride, v_stride, ll, k_data, v_data,
+                                                                   k_g, v_g, heads, dim);
+  return cudaGetLastError();
+}
+
+}  // namespace
+}  // namespace blaze
+
+extern "C" cudaError_t blz_kv_store_dense(const void* k, const void* v, int64_t k_stride, int64_t v_stride,
+                                          const void* loc, blz_index_t loc_type, int64_t tokens, int heads, int dim,
+                                          blz_kv_format_t format, uint8_t* k_data, uint8_t* v_data, const float* k_g,
+                                          const float* v_g, cudaStream_t stream) {
+  if (dim % blaze::kPerThread != 0 || k_stride % 8 != 0 || v_stride % 8 != 0 || heads <= 0 ||
+      (format != BLZ_KV_FP8 && format != BLZ_KV_BF16))
+    return cudaErrorInvalidValue;
+  if (tokens == 0) return cudaSuccess;
+  const bool fp8 = format == BLZ_KV_FP8;
+  return loc_type == BLZ_I64
+             ? blaze::store_dense<int64_t>(k, v, k_stride, v_stride, loc, tokens, heads, dim, fp8, k_data, v_data, k_g,
+                                           v_g, stream)
+             : blaze::store_dense<int32_t>(k, v, k_stride, v_stride, loc, tokens, heads, dim, fp8, k_data, v_data, k_g,
+                                           v_g, stream);
+}
+
 extern "C" cudaError_t blz_nvfp4_dequant(const uint8_t* data, const uint8_t* scale, const float* g, int64_t rows,
                                          int dim, blz_half_t out_dtype, void* out, cudaStream_t stream) {
   if (dim % blaze::kNvfp4Block != 0) return cudaErrorInvalidValue;

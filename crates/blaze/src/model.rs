@@ -196,6 +196,52 @@ pub struct Options {
     pub capture_layers: Vec<usize>,
     /// Most rows of a speculative verify (GDN inputs are recorded for the replay of the accepted rows); 0: none.
     pub max_verify: usize,
+    pub kv_dtype: KvDtype,
+}
+
+/// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum KvDtype {
+    /// NVFP4 with the block scale searched per block (max/6, max/4 and E4M3 steps around: four over six)
+    #[default]
+    Nvfp4FourOverSix,
+    /// NVFP4 with the block maximum mapped to 6
+    Nvfp4,
+    /// FP8 E4M3, per-layer scale 1
+    Fp8,
+    Bf16,
+}
+
+impl std::str::FromStr for KvDtype {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(match s {
+            "nvfp4_4over6" | "nvfp4-4over6" => Self::Nvfp4FourOverSix,
+            "nvfp4" => Self::Nvfp4,
+            "fp8" | "fp8_e4m3" => Self::Fp8,
+            "bf16" | "auto" | "bfloat16" => Self::Bf16,
+            _ => bail!("unknown KV cache dtype {s} (nvfp4_4over6, nvfp4, fp8, bf16)"),
+        })
+    }
+}
+
+impl KvDtype {
+    fn format(self) -> c_int {
+        match self {
+            Self::Nvfp4FourOverSix | Self::Nvfp4 => sys::BLZ_KV_NVFP4,
+            Self::Fp8 => sys::BLZ_KV_FP8,
+            Self::Bf16 => sys::BLZ_KV_BF16,
+        }
+    }
+
+    /// Bytes of codes and of block scales per value.
+    fn bytes(self) -> (f64, f64) {
+        match self {
+            Self::Nvfp4FourOverSix | Self::Nvfp4 => (0.5, 1.0 / 16.0),
+            Self::Fp8 => (1.0, 0.0),
+            Self::Bf16 => (2.0, 0.0),
+        }
+    }
 }
 
 /// Byte offsets of the step metadata in one device buffer (filled by one host-to-device copy per step).
@@ -651,11 +697,12 @@ impl Model {
         let (freqs, rope_scale) = inv_freq(&cfg);
         let inv_freq = DevBuf::from_slice(&freqs)?;
 
-        // KV pools (NVFP4) for every softmax layer, GDN states for every linear layer, this rank's heads.
+        // KV pools for every softmax layer, GDN states for every linear layer, this rank's heads.
         let mut kv = Vec::new();
+        let (code_bytes, scale_bytes) = opts.kv_dtype.bytes();
         for _ in 0..n_full {
-            let codes = opts.max_tokens * dims.kv_heads * hd / 2;
-            let scales = opts.max_tokens * dims.kv_heads * hd / 16;
+            let values = (opts.max_tokens * dims.kv_heads * hd) as f64;
+            let (codes, scales) = ((values * code_bytes) as usize, ((values * scale_bytes) as usize).max(16));
             kv.push([DevBuf::zeroed(codes, s)?, DevBuf::zeroed(codes, s)?, DevBuf::zeroed(scales, s)?, DevBuf::zeroed(scales, s)?]);
         }
         let kv_global = DevBuf::from_slice(&[1.0f32])?;
@@ -1602,11 +1649,19 @@ impl Model {
             "attn_prep",
         )?;
         let pool = &self.kv[layer.slot];
+        let kvd = self.opts.kv_dtype;
         check(
             unsafe {
-                sys::blz_nvfp4_kv_store(k.cast(), v.cast(), ld as i64, ld as i64, sys::BLZ_BF16, self.meta_ptr::<i64>(m.locs).cast(),
-                                        sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, pool[0].ptr(), pool[1].ptr(),
-                                        pool[2].ptr(), pool[3].ptr(), self.kv_global.ptr(), self.kv_global.ptr(), 1, s.0)
+                match kvd {
+                    KvDtype::Nvfp4FourOverSix | KvDtype::Nvfp4 => sys::blz_nvfp4_kv_store(
+                        k.cast(), v.cast(), ld as i64, ld as i64, sys::BLZ_BF16, self.meta_ptr::<i64>(m.locs).cast(),
+                        sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, pool[0].ptr(), pool[1].ptr(), pool[2].ptr(),
+                        pool[3].ptr(), self.kv_global.ptr(), self.kv_global.ptr(),
+                        (kvd == KvDtype::Nvfp4FourOverSix) as c_int, s.0),
+                    _ => sys::blz_kv_store_dense(k.cast(), v.cast(), ld as i64, ld as i64, self.meta_ptr::<i64>(m.locs).cast(),
+                                                 sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, kvd.format(), pool[0].ptr(),
+                                                 pool[1].ptr(), self.kv_global.ptr(), self.kv_global.ptr(), s.0),
+                }
             },
             "kv_store",
         )?;
@@ -1619,6 +1674,7 @@ impl Model {
             v_g: self.kv_global.ptr(),
             heads: kvh as c_int,
             dim: hd as c_int,
+            format: kvd.format(),
         };
         let sparse = sparse && self.cfg.qsa.is_some();
         if self.cfg.qsa.is_some() {

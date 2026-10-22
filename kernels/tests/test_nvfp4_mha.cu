@@ -1,15 +1,19 @@
-// Dense attention straight from an NVFP4 pool (blaze/mha.h) against a double-precision reference on the dequantized
-// cache (decode and causal verify, GQA 6 and 8, several context splits), the row dequantization, and the decode time
-// of a long context.
+// Dense attention straight from an NVFP4, FP8 or BF16 pool (blaze/mha.h) against a double-precision reference on the
+// dequantized cache (decode and causal verify, GQA 6 and 8, several context splits), the FP8 / BF16 store, the row
+// dequantization, and the decode time of a long context per format.
 #include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
+#include <cuda_fp8.h>
+
+#include "blaze/kv.h"
 #include "blaze/mha.h"
 #include "blaze/nvfp4.h"
 
@@ -43,21 +47,52 @@ struct Dev {
   }
 };
 
+float e4m3_value(uint8_t b) { return blaze::e4m3_to_float(b); }
+
 struct Pool {
-  int slots, heads;
+  int slots, heads, format = BLZ_KV_NVFP4;
   std::vector<uint8_t> kd, vd, ks, vs;
   float kg = 1.0f, vg = 0.5f;
   float value(bool v, int64_t slot, int head, int d) const {  // bf16-rounded, as the kernels store it
     const int64_t row = slot * heads + head;
-    const int code = ((v ? vd : kd)[row * (kDim / 2) + d / 2] >> (4 * (d & 1))) & 15;
-    const float x = blaze::e2m1_value(code) * blaze::e4m3_to_float((v ? vs : ks)[row * (kDim / 16) + d / 16]) * (v ? vg : kg);
+    const auto& data = v ? vd : kd;
+    const float g = v ? vg : kg;
+    float x;
+    if (format == BLZ_KV_FP8) {
+      x = e4m3_value(data[row * kDim + d]) * g;
+    } else if (format == BLZ_KV_BF16) {
+      uint16_t b;
+      std::memcpy(&b, &data[(row * kDim + d) * 2], 2);
+      x = __bfloat162float(__ushort_as_bfloat16(b)) * g;
+    } else {
+      const int code = (data[row * (kDim / 2) + d / 2] >> (4 * (d & 1))) & 15;
+      x = blaze::e2m1_value(code) * blaze::e4m3_to_float((v ? vs : ks)[row * (kDim / 16) + d / 16]) * g;
+    }
     return __bfloat162float(__float2bfloat16(x));
   }
 };
 
-Pool make_pool(int slots, int heads, std::mt19937& rng) {
-  Pool p{slots, heads};
+Pool make_pool(int slots, int heads, std::mt19937& rng, int format = BLZ_KV_NVFP4) {
+  Pool p{slots, heads, format};
   std::normal_distribution<float> n01;
+  if (format != BLZ_KV_NVFP4) {
+    const size_t n = size_t(slots) * heads * kDim;
+    p.kd.resize(n * (format == BLZ_KV_BF16 ? 2 : 1)), p.vd.resize(p.kd.size());
+    p.ks.resize(1), p.vs.resize(1);
+    for (int side = 0; side < 2; ++side)
+      for (size_t i = 0; i < n; ++i) {
+        const float x = n01(rng) * 2.0f / (side ? p.vg : p.kg);
+        auto& data = side ? p.vd : p.kd;
+        if (format == BLZ_KV_FP8) {
+          const __nv_fp8_e4m3 q(x);
+          data[i] = reinterpret_cast<const uint8_t&>(q);
+        } else {
+          const uint16_t b = __bfloat16_as_ushort(__float2bfloat16(x));
+          std::memcpy(&data[2 * i], &b, 2);
+        }
+      }
+    return p;
+  }
   p.kd.resize(size_t(slots) * heads * kDim / 2), p.vd.resize(p.kd.size());
   p.ks.resize(size_t(slots) * heads * kDim / 16), p.vs.resize(p.ks.size());
   std::vector<float> row(kDim);
@@ -76,15 +111,59 @@ struct DevPool {
   blz_nvfp4_pool pool;
   explicit DevPool(const Pool& p)
       : kd(p.kd), vd(p.vd), ks(p.ks), vs(p.vs), kg(std::vector<float>{p.kg}), vg(std::vector<float>{p.vg}) {
-    pool = {kd.ptr, vd.ptr, ks.ptr, vs.ptr, kg.ptr, vg.ptr, p.heads, kDim};
+    pool = {kd.ptr, vd.ptr, ks.ptr, vs.ptr, kg.ptr, vg.ptr, p.heads, kDim, p.format};
   }
 };
 
+const char* format_name(int f) { return f == BLZ_KV_FP8 ? "fp8" : f == BLZ_KV_BF16 ? "bf16" : "nvfp4"; }
+
+// FP8 / BF16 store: bf16 rows (strided, some slots skipped) against a CPU conversion.
+void test_store_dense(int format, std::mt19937& rng) {
+  const int heads = 2, tokens = 37, slots = 100, stride = heads * kDim + 64;
+  std::normal_distribution<float> n01;
+  std::vector<__nv_bfloat16> k(size_t(tokens) * stride), v(k.size());
+  for (auto& x : k) x = __float2bfloat16(n01(rng) * 3.0f);
+  for (auto& x : v) x = __float2bfloat16(n01(rng) * 900.0f);  // FP8: some values saturate at 448 * g
+  std::vector<int32_t> loc(tokens);
+  for (int t = 0; t < tokens; ++t) loc[t] = t % 7 == 3 ? -1 : (t * 13) % slots;
+  const float g = 2.0f;
+  const int bytes = format == BLZ_KV_BF16 ? 2 : 1;
+  Dev<__nv_bfloat16> dk(k), dv(v);
+  Dev<int32_t> dl(loc);
+  Dev<uint8_t> kd(size_t(slots) * heads * kDim * bytes), vd(kd.n);
+  CHECK_CUDA(cudaMemset(kd.ptr, 0, kd.n));
+  CHECK_CUDA(cudaMemset(vd.ptr, 0, vd.n));
+  Dev<float> dg(std::vector<float>{g});
+  CHECK_CUDA(blz_kv_store_dense(dk.ptr, dv.ptr, stride, stride, dl.ptr, BLZ_I32, tokens, heads, kDim,
+                                blz_kv_format_t(format), kd.ptr, vd.ptr, dg.ptr, dg.ptr, nullptr));
+  const auto hk = kd.get(), hv = vd.get();
+  size_t bad = 0;
+  for (int t = 0; t < tokens; ++t) {
+    if (loc[t] < 0) continue;
+    for (int side = 0; side < 2; ++side)
+      for (int e = 0; e < heads * kDim; ++e) {
+        const float x = __bfloat162float((side ? v : k)[size_t(t) * stride + e]);
+        const size_t o = size_t(loc[t]) * heads * kDim + e;
+        const auto& h = side ? hv : hk;
+        if (format == BLZ_KV_FP8) {
+          const __nv_fp8_e4m3 q(x / g);
+          bad += h[o] != reinterpret_cast<const uint8_t&>(q);
+        } else {
+          uint16_t b;
+          std::memcpy(&b, &h[2 * o], 2);
+          bad += b != __bfloat16_as_ushort(__float2bfloat16(x));
+        }
+      }
+  }
+  std::printf("store %s: %zu mismatches %s\n", format_name(format), bad, bad ? "FAIL" : "ok");
+  g_failures += bad != 0;
+}
+
 void test_case(const char* what, int kv_heads, int group, int q_len, std::vector<int> kv_lens, int splits,
-               std::mt19937& rng) {
+               std::mt19937& rng, int format = BLZ_KV_NVFP4) {
   const int batch = int(kv_lens.size()), q_heads = kv_heads * group, slots = 8192;
   const int max_len = *std::max_element(kv_lens.begin(), kv_lens.end());
-  Pool p = make_pool(slots, kv_heads, rng);
+  Pool p = make_pool(slots, kv_heads, rng, format);
   DevPool dp(p);
   const int reqs = batch + 2, stride = max_len + 8;
   std::vector<int32_t> r2t(size_t(reqs) * stride);
@@ -134,7 +213,8 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
       }
   const double rel = worst / std::max(peak, 1e-30);
   const bool ok = rel < 1.5e-2;
-  std::printf("%-44s splits %2d: max error / max |out| %.2e %s\n", what, splits, rel, ok ? "ok" : "FAIL");
+  std::printf("%-5s %-44s splits %2d: max error / max |out| %.2e %s\n", format_name(format), what, splits, rel,
+              ok ? "ok" : "FAIL");
   g_failures += !ok;
 }
 
@@ -160,14 +240,15 @@ void test_dequant_rows(std::mt19937& rng) {
   g_failures += bad != 0;
 }
 
-void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng) {
+void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int format = BLZ_KV_NVFP4) {
   const int kv_heads = 2, group = 6, q_heads = 12, slots = ctx + 64;
-  // Random codes are enough for timing.
-  std::vector<uint8_t> kd(size_t(slots) * kv_heads * kDim / 2), ks(size_t(slots) * kv_heads * kDim / 16, 0x38);
-  for (auto& c : kd) c = uint8_t(rng());
+  // Random codes are enough for timing (BF16: small values from random low bytes and a fixed high byte).
+  const size_t row_bytes = format == BLZ_KV_NVFP4 ? kDim / 2 : format == BLZ_KV_FP8 ? kDim : 2 * kDim;
+  std::vector<uint8_t> kd(size_t(slots) * kv_heads * row_bytes), ks(size_t(slots) * kv_heads * kDim / 16, 0x38);
+  for (size_t i = 0; i < kd.size(); ++i) kd[i] = format == BLZ_KV_BF16 && i % 2 ? 0x3f : uint8_t(rng() & 0x77);
   Dev<uint8_t> dkd(kd), dvd(kd), dks(ks), dvs(ks);
   Dev<float> g(std::vector<float>{1.0f});
-  blz_nvfp4_pool pool{dkd.ptr, dvd.ptr, dks.ptr, dvs.ptr, g.ptr, g.ptr, kv_heads, kDim};
+  blz_nvfp4_pool pool{dkd.ptr, dvd.ptr, dks.ptr, dvs.ptr, g.ptr, g.ptr, kv_heads, kDim, format};
   std::vector<int32_t> r2t(size_t(batch) * (ctx + 8));
   for (size_t i = 0; i < r2t.size(); ++i) r2t[i] = int32_t(i % size_t(ctx));
   std::vector<int32_t> lens(batch, ctx);
@@ -196,8 +277,9 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng) {
   float ms = 0;
   cudaEventElapsedTime(&ms, a, e);
   const double us = 1000.0 * ms / iters;
-  const double bytes = double(batch) * ctx * kv_heads * (kDim + kDim / 8);  // K and V codes + scales
-  std::printf("bench %d x %d tokens over %dk context, %d splits: %.1f us per layer (%.0f GB/s of KV)\n", batch, q_len,
+  const double bytes = double(batch) * ctx * kv_heads * 2 * (row_bytes + (format == BLZ_KV_NVFP4 ? kDim / 16 : 0));
+  std::printf("bench %-5s %d x %d tokens over %dk context, %d splits: %.1f us per layer (%.0f GB/s of KV)\n",
+              format_name(format), batch, q_len,
               ctx / 1000, splits, us, bytes / us / 1e3);
 }
 
@@ -210,7 +292,18 @@ int main() {
   test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
   test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
   test_case("decode, GQA 16, length 777", 1, 16, 1, {777}, 3, rng);
+  for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
+    test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 16, rng, f);
+    test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng, f);
+    test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng, f);
+    test_case("decode, GQA 16, length 777", 1, 16, 1, {777}, 3, rng, f);
+    test_store_dense(f, rng);
+  }
   test_dequant_rows(rng);
+  for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
+    bench(122000, 1, 1, 64, rng, f);
+    bench(122000, 1, 8, 64, rng, f);
+  }
   bench(122000, 1, 1, 64, rng);
   bench(122000, 4, 1, 32, rng);
   bench(122000, 1, 8, 32, rng);

@@ -18,7 +18,9 @@ typedef struct {
   blz_index_t type;
 } blz_index_ptr;
 
-/// \brief NVFP4 pool of one layer: data [slots, heads, dim/2], scale [slots, heads, dim/16], global scales.
+/// \brief KV pool of one layer: data [slots, heads, dim/2], scale [slots, heads, dim/16], global scales; with format
+/// BLZ_KV_FP8 / BLZ_KV_BF16 (blaze/kv.h; only blz_nvfp4_mha_decode reads those) data rows [slots, heads, dim] of 1 / 2
+/// bytes per value and no scales. Zero-initialized: NVFP4.
 typedef struct {
   const uint8_t* k_data;
   const uint8_t* v_data;
@@ -28,6 +30,7 @@ typedef struct {
   const float* v_g;
   int heads;
   int dim;
+  int format;
 } blz_nvfp4_pool;
 
 /// \brief Device cache of pool rows for a pool kept in host memory (--blaze-kv-host): decode gathers read cached rows

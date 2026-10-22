@@ -137,13 +137,22 @@ pub struct blz_nvfp4_pool {
     pub v_g: *const f32,
     pub heads: c_int,
     pub dim: c_int,
+    /// BLZ_KV_NVFP4 / BLZ_KV_FP8 / BLZ_KV_BF16
+    pub format: c_int,
 }
+
+pub const BLZ_KV_NVFP4: c_int = 0;
+pub const BLZ_KV_FP8: c_int = 1;
+pub const BLZ_KV_BF16: c_int = 2;
 
 unsafe extern "C" {
     pub fn blz_nvfp4_kv_store(k: *const c_void, v: *const c_void, k_stride: i64, v_stride: i64, dtype: c_int,
                               loc: *const c_void, loc_type: c_int, tokens: i64, heads: c_int, dim: c_int,
                               k_data: *mut u8, v_data: *mut u8, k_scale: *mut u8, v_scale: *mut u8, k_g: *const f32,
                               v_g: *const f32, four_over_six: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_kv_store_dense(k: *const c_void, v: *const c_void, k_stride: i64, v_stride: i64, loc: *const c_void,
+                              loc_type: c_int, tokens: i64, heads: c_int, dim: c_int, format: c_int, k_data: *mut u8,
+                              v_data: *mut u8, k_g: *const f32, v_g: *const f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_mha_decode(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
                                 pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64,
                                 req_indices: blz_index_ptr, kv_lens: blz_index_ptr, batch: c_int, q_len: c_int,

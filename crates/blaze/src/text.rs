@@ -11,7 +11,10 @@ pub struct Text {
 
 impl Text {
     pub fn load(dir: &Path) -> Result<Self> {
-        let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer.json: {e}"))?;
+        let mut tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer.json: {e}"))?;
+        // some checkpoints ship a training-time truncation (e.g. max_length 2048) that would cut long prompts
+        tok.with_truncation(None).map_err(|e| anyhow!("tokenizer.json: {e}"))?;
+        tok.with_padding(None);
         let mut eos = Vec::new();
         // generation_config.json: eos_token_id (int or list); tokenizer_config.json: eos_token (string).
         if let Ok(s) = std::fs::read_to_string(dir.join("generation_config.json")) {

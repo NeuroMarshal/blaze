@@ -10,6 +10,9 @@ extern "C" {
 
 typedef enum { BLZ_BF16 = 0, BLZ_FP16 = 1 } blz_half_t;
 typedef enum { BLZ_I32 = 0, BLZ_I64 = 1 } blz_index_t;
+/// KV pool formats: NVFP4 (codes [slots, heads, dim/2] + E4M3 block scales [.., dim/16]); FP8 E4M3 and BF16 rows
+/// [slots, heads, dim] (no block scales). The per-layer global scales k_g / v_g apply to every format.
+typedef enum { BLZ_KV_NVFP4 = 0, BLZ_KV_FP8 = 1, BLZ_KV_BF16 = 2 } blz_kv_format_t;
 
 /// \brief Quantize K and V rows to NVFP4 and scatter them into a paged pool.
 /// \param k,v          [tokens, heads, dim] 16-bit rows; the inner [heads, dim] block is contiguous
@@ -26,6 +29,13 @@ cudaError_t blz_nvfp4_kv_store(const void* k, const void* v, int64_t k_stride, i
                                blz_half_t dtype, const void* loc, blz_index_t loc_type, int64_t tokens,
                                int heads, int dim, uint8_t* k_data, uint8_t* v_data, uint8_t* k_scale,
                                uint8_t* v_scale, const float* k_g, const float* v_g, int four_over_six,
+                               cudaStream_t stream);
+
+/// \brief Store bf16 K and V rows into an FP8 (value / g, E4M3 round to nearest, saturated) or BF16 (copied) pool
+/// [slots, heads, dim]; arguments as blz_nvfp4_kv_store.
+cudaError_t blz_kv_store_dense(const void* k, const void* v, int64_t k_stride, int64_t v_stride, const void* loc,
+                               blz_index_t loc_type, int64_t tokens, int heads, int dim, blz_kv_format_t format,
+                               uint8_t* k_data, uint8_t* v_data, const float* k_g, const float* v_g,
                                cudaStream_t stream);
 
 /// \brief Dequantize `rows` contiguous NVFP4 rows of `dim` values into 16-bit output [rows, dim].

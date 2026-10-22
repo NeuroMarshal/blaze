@@ -71,6 +71,9 @@ struct EngineArgs {
     /// GPUs (tensor-parallel ranks)
     #[arg(long, default_value_t = 1)]
     tp: usize,
+    /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
+    #[arg(long, default_value = "nvfp4_4over6")]
+    kv_cache_dtype: blaze::model::KvDtype,
     /// eager decode steps instead of CUDA graphs
     #[arg(long)]
     no_graphs: bool,
@@ -113,6 +116,7 @@ impl EngineArgs {
                 ple_threads: self.ple_threads,
                 ple_cache_gib: self.ple_cache_gib,
                 max_verify: self.max_verify,
+                kv_dtype: self.kv_cache_dtype,
             },
             self.tp,
             !self.no_graphs,
@@ -186,8 +190,8 @@ enum Command {
         /// always verify the whole n-gram draft (by default drafts are cut or skipped by the measured verify cost)
         #[arg(long)]
         spec_fixed: bool,
-        /// draft source: ngram (prompt lookup) or suffix (suffix decoding over the request and earlier outputs)
-        #[arg(long, default_value = "ngram")]
+        /// draft source: suffix (suffix decoding over the request and earlier outputs) or ngram (prompt lookup)
+        #[arg(long, default_value = "suffix")]
         spec_method: String,
         #[arg(long, default_value = "qwen3_coder")]
         tool_call_parser: String,
