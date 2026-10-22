@@ -418,6 +418,63 @@ struct Work {
     meta: DevBuf,
 }
 
+impl Work {
+    /// Every buffer's bytes (the VRAM log at load).
+    fn sizes(&self) -> Vec<(&'static str, usize)> {
+        vec![
+            ("residual", self.residual.bytes()),
+            ("normed", self.normed.bytes()),
+            ("x", self.x.bytes()),
+            ("proj", self.proj.bytes()),
+            ("conv", self.conv.bytes()),
+            ("g", self.g.bytes()),
+            ("beta", self.beta.bytes()),
+            ("core", self.core.bytes()),
+            ("core_normed", self.core_normed.bytes()),
+            ("q", self.q.bytes()),
+            ("gate", self.gate.bytes()),
+            ("attn", self.attn.bytes()),
+            ("ids", self.ids.bytes()),
+            ("weights", self.weights.bytes()),
+            ("moe_out", self.moe_out.bytes()),
+            ("shared", self.shared.bytes()),
+            ("shared_act", self.shared_act.bytes()),
+            ("gu", self.gu.bytes()),
+            ("partial_o", self.partial_o.bytes()),
+            ("partial_ml", self.partial_ml.bytes()),
+            ("gx", self.gx.bytes()),
+            ("gres", self.gres.bytes()),
+            ("gnormed", self.gnormed.bytes()),
+            ("streams", self.streams.as_ref().map_or(0, |b| b.bytes())),
+            ("hnorm", self.hnorm.as_ref().map_or(0, |b| b.bytes())),
+            ("hc_t", self.hc_t.as_ref().map_or(0, |b| b.bytes())),
+            ("hc_ws", self.hc_ws.as_ref().map_or(0, |b| b.bytes())),
+            ("gstreams", self.gstreams.as_ref().map_or(0, |b| b.bytes())),
+            ("hc_partial", self.hc_partial.as_ref().map_or(0, |b| b.bytes())),
+            ("ghnorm", self.ghnorm.as_ref().map_or(0, |b| b.bytes())),
+            ("ple_ids", self.ple_ids.as_ref().map_or(0, |b| b.bytes())),
+            ("ple_emb", self.ple_emb.as_ref().map_or(0, |b| b.bytes())),
+            ("ple_key", self.ple_key.as_ref().map_or(0, |b| b.bytes())),
+            ("ple_value", self.ple_value.as_ref().map_or(0, |b| b.bytes())),
+            ("ple_gated", self.ple_gated.as_ref().map_or(0, |b| b.bytes())),
+            ("ple_gatedn", self.ple_gatedn.as_ref().map_or(0, |b| b.bytes())),
+            ("pairs", self.pairs.bytes()),
+            ("cand_vals", self.cand_vals.bytes()),
+            ("cand_ids", self.cand_ids.bytes()),
+            ("cand_lse", self.cand_lse.bytes()),
+            ("cand_pairs", self.cand_pairs.bytes()),
+            ("qsa_q", self.qsa_q.as_ref().map_or(0, |b| b.bytes())),
+            ("qsa_scores", self.qsa_scores.as_ref().map_or(0, |b| b.bytes())),
+            ("qsa_table", self.qsa_table.as_ref().map_or(0, |b| b.bytes())),
+            ("qsa_counts", self.qsa_counts.as_ref().map_or(0, |b| b.bytes())),
+            ("qsa_rows", self.qsa_rows.as_ref().map_or(0, |b| b.bytes())),
+            ("logits", self.logits.bytes()),
+            ("next", self.next.bytes()),
+            ("meta", self.meta.bytes()),
+        ]
+    }
+}
+
 pub struct Model {
     pub cfg: ModelConfig,
     pub dims: Dims,
@@ -528,6 +585,16 @@ impl Model {
         let s = &stream;
         let p = ckpt.text_prefix();
         let (r, w) = (tp.rank, tp.world);
+        // VRAM taken by each part of the load (free memory before and after), printed at the end
+        let mut vram: Vec<(&str, f64)> = Vec::new();
+        let mut free_at = crate::gpu::mem_info()?.0;
+        let mut mark = |what: &'static str, s: &Stream| -> Result<()> {
+            s.sync()?;
+            let f = crate::gpu::mem_info()?.0;
+            vram.push((what, free_at.saturating_sub(f) as f64 / (1u64 << 30) as f64));
+            free_at = f;
+            Ok(())
+        };
         let inter = match cfg.mlp {
             MlpConfig::Dense { intermediate } => intermediate,
             MlpConfig::Moe { shared_intermediate, .. } => shared_intermediate,
@@ -724,6 +791,7 @@ impl Model {
 
         let (freqs, rope_scale) = inv_freq(&cfg);
         let inv_freq = DevBuf::from_slice(&freqs)?;
+        mark("weights (no routed experts)", s)?;
 
         // KV pools for every softmax layer, GDN states for every linear layer, this rank's heads.
         let mut kv = Vec::new();
@@ -746,6 +814,7 @@ impl Model {
                 }
             }
         }
+        mark("KV pools + QSA keys", s)?;
         let ple_record = match (&cfg.ple, &cfg.hc, opts.max_verify > 0) {
             (Some(_), Some(hc), true) => Some(DevBuf::zeroed(opts.verify_rows() * hc.count * cfg.hidden * 2, s)?),
             _ => None,
@@ -773,6 +842,7 @@ impl Model {
             }
         }
         let commit_meta = DevBuf::zeroed(opts.max_seqs.max(1) * 16, s)?;
+        mark("KV table, GDN states, verify records", s)?;
         // PLE: the n-gram table stays in its safetensors file, rows read on demand by CPU threads.
         let (mut ple_table, mut ple_state) = (None, None);
         if let (Some(pc), Some(hc)) = (&cfg.ple, &cfg.hc) {
@@ -808,12 +878,21 @@ impl Model {
             opts.max_seqs.max(opts.verify_rows()),
             cfg.vocab,
         );
+        mark("PLE", s)?;
         let aux = if opts.capture_layers.is_empty() {
             None
         } else {
             Some(DevBuf::zeroed(meta.max_tokens * opts.capture_layers.len() * cfg.hidden * 2, s)?)
         };
+        mark("captured hidden states", s)?;
         let work = Self::alloc_work(&cfg, &dims, w, &layers, &opts, &meta, s)?;
+        mark("activations (chunk + head rows)", s)?;
+        if tp.rank == 0 {
+            let mut big = work.sizes();
+            big.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = big.iter().take(10).map(|(k, b)| format!("{k} {:.0}", *b as f64 / (1u64 << 20) as f64)).collect();
+            eprintln!("blaze: largest activation buffers (MiB): {}", top.join(", "));
+        }
         // Scratch NVFP4 weights are widened into for prefill GEMMs.
         let mut scratch_elems = lm_head.scratch_elems();
         for l in &layers {
@@ -839,6 +918,11 @@ impl Model {
             bail!("cuBLAS init failed");
         }
         s.sync()?;
+        mark("widening scratch + cuBLAS", s)?;
+        if tp.rank == 0 {
+            let parts: Vec<String> = vram.iter().filter(|v| v.1 >= 0.005).map(|(k, g)| format!("{k} {g:.2}")).collect();
+            eprintln!("blaze: VRAM (GiB) on GPU{}: {}; free {:.2}", tp.rank, parts.join(", "), free_at as f64 / (1u64 << 30) as f64);
+        }
 
         let mut num_sms: c_int = 0;
         let mut dev: c_int = 0;
@@ -919,10 +1003,17 @@ impl Model {
         };
         let mut engine = null_mut();
         let mut err = vec![0i8; 1024];
+        let free_before = free;
         if unsafe { sys::blz_moe_engine_create(&cfg, &mut engine, err.as_mut_ptr().cast(), err.len()) } != 0 {
             let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr().cast()) }.to_string_lossy().into_owned();
             return Err(anyhow!("MoE engine: {msg}"));
         }
+        let free_after = crate::gpu::mem_info()?.0;
+        eprintln!(
+            "blaze: VRAM (GiB) on GPU0: MoE engine {:.2} (budget {gib:.2}); free {:.2}",
+            free_before.saturating_sub(free_after) as f64 / (1u64 << 30) as f64,
+            free_after as f64 / (1u64 << 30) as f64
+        );
         eprintln!(
             "blaze: MoE engine: {:.2} GiB of expert slots on GPU0, {:.2} GiB on GPU1, the rest in pinned RAM{}",
             gib,
