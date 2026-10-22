@@ -30,7 +30,7 @@ __global__ void __launch_bounds__(128) gdn_recurrent_kernel(const uint16_t* __re
                                                             const int32_t* __restrict__ seq_start,
                                                             const int32_t* __restrict__ slots, int k_heads,
                                                             int v_heads, int dv, float* __restrict__ state,
-                                                            uint16_t* __restrict__ out) {
+                                                            uint16_t* __restrict__ out, int write_state) {
   __shared__ float sq[4 * kPad], sk[4 * kPad], sv[kSlice], sgb[2];
   const int s = blockIdx.x, vh = blockIdx.y, slice = blockIdx.z;
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -90,22 +90,31 @@ __global__ void __launch_bounds__(128) gdn_recurrent_kernel(const uint16_t* __re
     o += __shfl_xor_sync(0xffffffffu, o, 16);
     if (rg == 0) out[(int64_t(t) * v_heads + vh) * dv + j] = to_bf(o * inv_q);
   }
+  if (write_state)
 #pragma unroll
-  for (int r = 0; r < kRows; ++r) st[int64_t(rg * kRows + r) * dv + j] = S[r];
+    for (int r = 0; r < kRows; ++r) st[int64_t(rg * kRows + r) * dv + j] = S[r];
 }
 
 }  // namespace
 }  // namespace blaze
 
-extern "C" cudaError_t blz_gdn_recurrent(const uint16_t* qkv, const float* g, const float* beta,
-                                         const int32_t* seq_start, const int32_t* slots, int seqs, int tokens,
-                                         int k_heads, int v_heads, int dk, int dv, float* state, uint16_t* out,
-                                         cudaStream_t stream) {
+extern "C" cudaError_t blz_gdn_recurrent_ex(const uint16_t* qkv, const float* g, const float* beta,
+                                            const int32_t* seq_start, const int32_t* slots, int seqs, int tokens,
+                                            int k_heads, int v_heads, int dk, int dv, float* state, uint16_t* out,
+                                            int write_state, cudaStream_t stream) {
   (void)tokens;
   if (seqs == 0) return cudaSuccess;
   if (dk != blaze::kDk || dv % blaze::kSlice || v_heads % k_heads) return cudaErrorInvalidValue;
   const dim3 grid(unsigned(seqs), unsigned(v_heads), unsigned(dv / blaze::kSlice));
   blaze::gdn_recurrent_kernel<<<grid, 128, 0, stream>>>(qkv, g, beta, seq_start, slots, k_heads, v_heads, dv, state,
-                                                        out);
+                                                        out, write_state);
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_gdn_recurrent(const uint16_t* qkv, const float* g, const float* beta,
+                                         const int32_t* seq_start, const int32_t* slots, int seqs, int tokens,
+                                         int k_heads, int v_heads, int dk, int dv, float* state, uint16_t* out,
+                                         cudaStream_t stream) {
+  return blz_gdn_recurrent_ex(qkv, g, beta, seq_start, slots, seqs, tokens, k_heads, v_heads, dk, dv, state, out, 1,
+                              stream);
 }

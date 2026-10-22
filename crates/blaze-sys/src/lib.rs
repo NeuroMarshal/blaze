@@ -30,6 +30,8 @@ unsafe extern "C" {
     pub fn cudaHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: u32) -> cudaError_t;
     pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int) -> cudaError_t;
     pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn cudaMemcpy2DAsync(dst: *mut c_void, dpitch: usize, src: *const c_void, spitch: usize, width: usize,
+                             height: usize, kind: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn cudaMemsetAsync(dst: *mut c_void, value: c_int, bytes: usize, s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamCreateWithFlags(s: *mut cudaStream_t, flags: u32) -> cudaError_t;
     pub fn cudaStreamDestroy(s: cudaStream_t) -> cudaError_t;
@@ -86,6 +88,13 @@ unsafe extern "C" {
     pub fn blz_gdn_recurrent(qkv: *const bf16, g: *const f32, beta: *const f32, seq_start: *const i32,
                              slots: *const i32, seqs: c_int, tokens: c_int, k_heads: c_int, v_heads: c_int, dk: c_int,
                              dv: c_int, state: *mut f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gdn_conv_ex(x: *const bf16, ldx: i64, seq_start: *const i32, slots: *const i32, seqs: c_int,
+                           channels: c_int, kernel: c_int, weight: *const bf16, state: *mut bf16, out: *mut bf16,
+                           write_state: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gdn_recurrent_ex(qkv: *const bf16, g: *const f32, beta: *const f32, seq_start: *const i32,
+                                slots: *const i32, seqs: c_int, tokens: c_int, k_heads: c_int, v_heads: c_int, dk: c_int,
+                                dv: c_int, state: *mut f32, out: *mut bf16, write_state: c_int, s: cudaStream_t)
+                                -> cudaError_t;
     pub fn blz_argmax_bf16(logits: *const bf16, rows: c_int, vocab: c_int, ld: i64, out: *mut i32,
                            s: cudaStream_t) -> cudaError_t;
     pub fn blz_argmax_part(logits: *const bf16, rows: c_int, vocab: c_int, ld: i64, col0: c_int, pairs: *mut f32,

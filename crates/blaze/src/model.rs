@@ -121,6 +121,11 @@ pub struct Options {
     pub l2_prefetch_mib: usize,
     /// Keep the full logits of every step (tensor parallelism otherwise exchanges only each shard's best token).
     pub full_logits: bool,
+    /// Layers whose input hidden state (the residual stream entering the layer) every forward copies out, in order
+    /// (a speculative drafter's features).
+    pub capture_layers: Vec<usize>,
+    /// Most rows of a speculative verify (GDN inputs are recorded for the replay of the accepted rows); 0: none.
+    pub max_verify: usize,
 }
 
 /// Byte offsets of the step metadata in one device buffer (filled by one host-to-device copy per step).
@@ -219,6 +224,11 @@ pub struct Model {
     // GDN states: conv [seqs, channels, kernel - 1] bf16, recurrent [seqs, v_heads, dk, dv] f32
     conv_state: Vec<DevBuf>,
     rec_state: Vec<DevBuf>,
+    // Verify records per GDN layer: pre-conv qkv [max_verify, channels] bf16, g and beta [max_verify, v_heads] f32
+    records: Vec<[DevBuf; 3]>,
+    commit_meta: DevBuf,
+    /// Captured hidden states [max_tokens, capture_layers, hidden] bf16.
+    pub aux: Option<DevBuf>,
     work: Work,
     pub meta: MetaLayout,
     score_logits: Option<DevBuf>,
@@ -440,7 +450,24 @@ impl Model {
             }
         }
 
-        let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs), opts.max_seqs);
+        let mut records = Vec::new();
+        if let (Some(g), true) = (&cfg.gdn, opts.max_verify > 0) {
+            let channels = 2 * dims.k_heads * g.k_dim + dims.v_heads * g.v_dim;
+            for _ in 0..n_gdn {
+                records.push([
+                    DevBuf::zeroed(opts.max_verify * channels * 2, s)?,
+                    DevBuf::zeroed(opts.max_verify * dims.v_heads * 4, s)?,
+                    DevBuf::zeroed(opts.max_verify * dims.v_heads * 4, s)?,
+                ]);
+            }
+        }
+        let commit_meta = DevBuf::zeroed(16, s)?;
+        let meta = MetaLayout::new(opts.max_chunk.max(opts.max_seqs).max(opts.max_verify), opts.max_seqs);
+        let aux = if opts.capture_layers.is_empty() {
+            None
+        } else {
+            Some(DevBuf::zeroed(meta.max_tokens * opts.capture_layers.len() * cfg.hidden * 2, s)?)
+        };
         let work = Self::alloc_work(&cfg, &dims, &layers, &opts, &meta, s)?;
         // Scratch NVFP4 weights are widened into for prefill GEMMs.
         let mut scratch_elems = lm_head.scratch_elems();
@@ -493,6 +520,9 @@ impl Model {
             req_to_token,
             conv_state,
             rec_state,
+            records,
+            commit_meta,
+            aux,
             work,
             meta,
             score_logits: None,
@@ -570,6 +600,8 @@ impl Model {
         let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, d.kv_heads as c_int, 1, 64) } as usize;
         let partial_rows = (t * parts_prefill).max(opts.max_seqs * parts_decode);
         let _ = proj_cols;
+        // rows the head may take in one step: one per sequence, or every row of a verify
+        let head_rows = opts.max_seqs.max(opts.max_verify);
         let b = |n: usize| DevBuf::zeroed(n, s);
         Ok(Work {
             residual: b(t * h * 2)?,
@@ -592,12 +624,12 @@ impl Model {
             gu: b(t * 2 * inter * 2)?,
             partial_o: b(partial_rows * heads * hd * 4)?,
             partial_ml: b(partial_rows * heads * 2 * 4)?,
-            gx: b(opts.max_seqs * h * 2)?,
-            gres: b(opts.max_seqs * h * 2)?,
-            gnormed: b(opts.max_seqs * h * 2)?,
-            pairs: b((opts.max_seqs * 8 * 8).next_multiple_of(16))?,
-            logits: b(opts.max_seqs * cfg.vocab * 2)?,
-            next: b(opts.max_seqs * 4)?,
+            gx: b(head_rows * h * 2)?,
+            gres: b(head_rows * h * 2)?,
+            gnormed: b(head_rows * h * 2)?,
+            pairs: b((head_rows * 8 * 8).next_multiple_of(16))?,
+            logits: b(head_rows * cfg.vocab * 2)?,
+            next: b(head_rows * 4)?,
             meta: b(meta.bytes)?,
         })
     }
@@ -632,13 +664,17 @@ impl Model {
     }
 
     /// Enqueue the forward of a step whose metadata is already in the device buffer (MetaLayout). `spans`: decode
-    /// sequences (len 1) first, then prefill chunks. With `logits` the head runs on the last token of every span and
-    /// leaves greedy picks in `next`; capturable into a CUDA graph (no host synchronization).
-    pub fn forward(&self, spans: &[Span], logits: bool) -> Result<()> {
+    /// sequences (len 1) first, then prefill chunks. The head runs on the first `n_logits` rows listed in
+    /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
+    /// (its inputs are recorded for commit). Capturable into a CUDA graph (no host synchronization).
+    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool) -> Result<()> {
         let t: usize = spans.iter().map(|s| s.len).sum();
         let n = spans.len();
-        if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs {
+        if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
             bail!("step of {t} tokens in {n} sequences exceeds the buffers");
+        }
+        if verify && (n != 1 || t > self.opts.max_verify) {
+            bail!("verify of {t} rows in {n} sequences (one sequence of at most {} rows)", self.opts.max_verify);
         }
         let s = &self.stream;
         let cfg = &self.cfg;
@@ -665,17 +701,29 @@ impl Model {
             } else {
                 self.reduce_norm(&layer.input_norm, t)?;
             }
+            if let Some(ci) = self.opts.capture_layers.iter().position(|&c| c == li) {
+                let aux = self.aux.as_ref().unwrap();
+                let ncap = self.opts.capture_layers.len();
+                check(
+                    unsafe {
+                        sys::cudaMemcpy2DAsync(aux.at::<u16>(ci * h).cast(), ncap * h * 2, w.residual.ptr::<u16>().cast(), h * 2, h * 2,
+                                               t, sys::MEMCPY_D2D, s.0)
+                    },
+                    "capture",
+                )?;
+            }
             match layer.kind {
                 LayerKind::Full => self.attention(layer, t, spans)?,
-                LayerKind::Linear => self.gdn(layer, t, n)?,
+                LayerKind::Linear => self.gdn(layer, t, n, verify)?,
             }
             self.reduce_norm(&layer.post_norm, t)?;
             self.mlp(li, layer, t)?;
         }
         self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
-        if logits {
-            // h = x + residual of the last token of every span, normed, through the head, greedy pick.
+        if n_logits > 0 {
+            // h = x + residual of the listed rows, normed, through the head, greedy pick.
+            let n = n_logits;
             let rows: *const i32 = self.meta_ptr(m.logit_rows);
             check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
             check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;
@@ -906,7 +954,42 @@ impl Model {
         }
     }
 
-    fn gdn(&self, layer: &Layer, t: usize, seqs: usize) -> Result<()> {
+    /// Replay the first `accepted` rows of the last verify (row `row`'s sequence) into the GDN states: the conv and
+    /// recurrent state then stand after those rows, as if they had been decoded one by one.
+    pub fn commit(&self, row: usize, accepted: usize) -> Result<()> {
+        let Some(gc) = self.cfg.gdn.as_ref() else { return Ok(()) };
+        if accepted == 0 {
+            return Ok(());
+        }
+        let (w, s) = (&self.work, &self.stream);
+        let (kh, vh) = (self.dims.k_heads, self.dims.v_heads);
+        let channels = 2 * kh * gc.k_dim + vh * gc.v_dim;
+        self.commit_meta.upload(&[0i32, accepted as i32, row as i32])?;
+        let seq_start: *const i32 = self.commit_meta.ptr();
+        let slots: *const i32 = self.commit_meta.at(2);
+        for layer in &self.layers {
+            let Some(g) = &layer.gdn else { continue };
+            let [qkv, gg, beta] = &self.records[layer.slot];
+            check(
+                unsafe {
+                    sys::blz_gdn_conv_ex(qkv.ptr(), channels as i64, seq_start, slots, 1, channels as c_int, gc.conv_kernel as c_int,
+                                         g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), 1, s.0)
+                },
+                "commit conv",
+            )?;
+            check(
+                unsafe {
+                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), gg.ptr(), beta.ptr(), seq_start, slots, 1, accepted as c_int, kh as c_int,
+                                              vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int, self.rec_state[layer.slot].ptr(),
+                                              w.core.ptr(), 1, s.0)
+                },
+                "commit recurrent",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn gdn(&self, layer: &Layer, t: usize, seqs: usize, verify: bool) -> Result<()> {
         let g = layer.gdn.as_ref().unwrap();
         let gc = self.cfg.gdn.as_ref().unwrap();
         let (cfg, w, s) = (&self.cfg, &self.work, &self.stream);
@@ -920,10 +1003,21 @@ impl Model {
         let b: *const u16 = w.proj.at(channels + vh * gc.v_dim);
         let a: *const u16 = w.proj.at(channels + vh * gc.v_dim + vh);
         let m = &self.meta;
+        let write = (!verify) as c_int;
+        if verify {
+            let rec = &self.records[layer.slot][0];
+            check(
+                unsafe {
+                    sys::cudaMemcpy2DAsync(rec.ptr(), channels * 2, w.proj.ptr::<u16>().cast(), ld * 2, channels * 2, t, sys::MEMCPY_D2D, s.0)
+                },
+                "record qkv",
+            )?;
+        }
         check(
             unsafe {
-                sys::blz_gdn_conv(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int, channels as c_int,
-                                  gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), s.0)
+                sys::blz_gdn_conv_ex(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
+                                     channels as c_int, gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(),
+                                     w.conv.ptr(), write, s.0)
             },
             "gdn_conv",
         )?;
@@ -934,11 +1028,16 @@ impl Model {
             },
             "gdn_gate",
         )?;
+        if verify {
+            let [_, rg, rb] = &self.records[layer.slot];
+            check(unsafe { sys::cudaMemcpyAsync(rg.ptr(), w.g.ptr::<f32>().cast(), t * vh * 4, sys::MEMCPY_D2D, s.0) }, "record g")?;
+            check(unsafe { sys::cudaMemcpyAsync(rb.ptr(), w.beta.ptr::<f32>().cast(), t * vh * 4, sys::MEMCPY_D2D, s.0) }, "record beta")?;
+        }
         check(
             unsafe {
-                sys::blz_gdn_recurrent(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int, t as c_int,
-                                       kh as c_int, vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
-                                       self.rec_state[layer.slot].ptr(), w.core.ptr(), s.0)
+                sys::blz_gdn_recurrent_ex(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots),
+                                          seqs as c_int, t as c_int, kh as c_int, vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
+                                          self.rec_state[layer.slot].ptr(), w.core.ptr(), write, s.0)
             },
             "gdn_recurrent",
         )?;

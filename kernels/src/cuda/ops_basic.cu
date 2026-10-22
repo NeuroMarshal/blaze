@@ -309,7 +309,7 @@ constexpr int kMaxKernel = 8;
 __global__ void gdn_conv_kernel(const uint16_t* __restrict__ x, int64_t ldx, const int32_t* __restrict__ seq_start,
                                 const int32_t* __restrict__ slots, int channels, int kernel,
                                 const uint16_t* __restrict__ weight, uint16_t* __restrict__ state,
-                                uint16_t* __restrict__ out) {
+                                uint16_t* __restrict__ out, int write_state) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int s = blockIdx.y;
   if (c >= channels) return;
@@ -327,7 +327,8 @@ __global__ void gdn_conv_kernel(const uint16_t* __restrict__ x, int64_t ldx, con
     for (int j = 0; j < kernel - 2; ++j) hist[j] = hist[j + 1];
     hist[kernel - 2] = xt;
   }
-  for (int j = 0; j < kernel - 1; ++j) st[j] = to_bf(hist[j]);
+  if (write_state)
+    for (int j = 0; j < kernel - 1; ++j) st[j] = to_bf(hist[j]);
 }
 
 __global__ void gather_rows_kernel(const uint16_t* __restrict__ src, int64_t ld_src, const int32_t* __restrict__ rows,
@@ -473,13 +474,13 @@ extern "C" cudaError_t blz_gdn_gate(const uint16_t* a, int64_t ld_a, const uint1
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_gdn_conv(const uint16_t* x, int64_t ldx, const int32_t* seq_start, const int32_t* slots,
-                                    int seqs, int channels, int kernel, const uint16_t* weight, uint16_t* state,
-                                    uint16_t* out, cudaStream_t stream) {
+extern "C" cudaError_t blz_gdn_conv_ex(const uint16_t* x, int64_t ldx, const int32_t* seq_start,
+                                       const int32_t* slots, int seqs, int channels, int kernel, const uint16_t* weight,
+                                       uint16_t* state, uint16_t* out, int write_state, cudaStream_t stream) {
   if (seqs == 0) return cudaSuccess;
   if (kernel < 2 || kernel > kMaxKernel) return cudaErrorInvalidValue;
   const dim3 grid(unsigned((channels + 127) / 128), unsigned(seqs));
-  gdn_conv_kernel<<<grid, 128, 0, stream>>>(x, ldx, seq_start, slots, channels, kernel, weight, state, out);
+  gdn_conv_kernel<<<grid, 128, 0, stream>>>(x, ldx, seq_start, slots, channels, kernel, weight, state, out, write_state);
   return cudaGetLastError();
 }
 
@@ -522,4 +523,10 @@ extern "C" cudaError_t blz_argmax_merge(const float* pairs, int world, int rows,
   if (rows == 0) return cudaSuccess;
   argmax_merge_kernel<<<(rows + 127) / 128, 128, 0, stream>>>(pairs, world, rows, out);
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_gdn_conv(const uint16_t* x, int64_t ldx, const int32_t* seq_start, const int32_t* slots,
+                                    int seqs, int channels, int kernel, const uint16_t* weight, uint16_t* state,
+                                    uint16_t* out, cudaStream_t stream) {
+  return blz_gdn_conv_ex(x, ldx, seq_start, slots, seqs, channels, kernel, weight, state, out, 1, stream);
 }
