@@ -1,0 +1,10 @@
+[package]
+name = "blaze-sys"
+description = "C ABI of the blaze CUDA/C++ kernels (kernels/), built by CMake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "blaze_kernels"
+
+[build-dependencies]
+cmake = "0.1"
