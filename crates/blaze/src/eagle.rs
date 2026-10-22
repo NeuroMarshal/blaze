@@ -171,6 +171,7 @@ pub struct Draft {
     staging: HostMapped,
     meta: DevBuf,
     graphs: std::collections::HashMap<DraftKey, DraftGraph>,
+    dumped: bool,
     warmed: std::collections::HashSet<DraftKey>,
 }
 
@@ -310,6 +311,7 @@ impl Draft {
             staging: HostMapped::new(meta_bytes)?,
             meta: b(meta_bytes)?,
             graphs: Default::default(),
+            dumped: false,
             warmed: Default::default(),
             cfg,
         })
@@ -448,7 +450,33 @@ impl Draft {
         }
         s.sync()?;
         let rec: Vec<i64> = self.record.download(plan.k * n_items)?;
-        Ok((0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect())
+        let drafts: Vec<Vec<i64>> = (0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect();
+        if model.tp.rank == 0 && !self.dumped {
+            if let Some(dir) = std::env::var_os("BLAZE_DRAFT_DUMP") {
+                self.dumped = true;
+                self.dump(model, &plan.items[0], &drafts[0], Path::new(&dir))?;
+            }
+        }
+        Ok(drafts)
+    }
+
+    /// BLAZE_DRAFT_DUMP=dir: the first drafting call's first item (its captured target features, tokens, positions)
+    /// and drafts, and the extend's last normed hidden, for a reference implementation (scripts/ref_eagle4.py).
+    fn dump(&self, model: &Model, it: &DraftItem, drafts: &[i64], dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let h = self.cfg.hidden;
+        let aux = model.aux.as_ref().ok_or_else(|| anyhow!("no captured hidden states"))?;
+        let rows = it.tokens.len();
+        let all: Vec<u16> = aux.download((it.aux_row + rows) * 3 * h)?;
+        let feats = &all[it.aux_row * 3 * h..];
+        let bytes: Vec<u8> = feats.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join("features.bin"), bytes)?;
+        let last: Vec<u16> = self.last_normed.download(h)?;
+        std::fs::write(dir.join("first_normed.bin"), last.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+        let meta = serde_json::json!({"tokens": it.tokens, "pos0": it.pos0, "drafts": drafts, "hidden": h});
+        std::fs::write(dir.join("meta.json"), meta.to_string())?;
+        eprintln!("blaze: draft dump of {rows} rows and {} drafts in {}", drafts.len(), dir.display());
+        Ok(())
     }
 
     /// The extend forwards: the target's features of the items' rows (normed per layer, through fc) and their next
