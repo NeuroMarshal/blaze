@@ -161,11 +161,9 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
   }
   thread_ = std::thread([this] { run(); });
   file_bytes_ = table_bytes_;
-  if (cache_sets_) {
-    fd_direct_ = open(path.c_str(), O_RDONLY | O_DIRECT);
-    if (fd_direct_ >= 0)
-      for (int t = 0; t < threads_; ++t) warm_pool_.emplace_back([this] { warm_reader(); });
-  }
+  fd_direct_ = open(path.c_str(), O_RDONLY | O_DIRECT);
+  if (cache_sets_ && fd_direct_ >= 0)
+    for (int t = 0; t < threads_; ++t) warm_pool_.emplace_back([this] { warm_reader(); });
   warm_thread_ = std::thread([this] {
     std::vector<int64_t> ids;
     for (;;) {
@@ -206,6 +204,20 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
       ids.clear();
     }
   });
+}
+
+// A row read with O_DIRECT into this thread's aligned block buffer (no page-cache insertion: shorter reads on the
+// decode path than a page fault on the mapping); false without a direct descriptor or on a failed read.
+bool PleService::read_direct(const uint8_t* src, uint16_t* dst) {
+  if (fd_direct_ < 0) return false;
+  constexpr size_t blk = 4096;
+  thread_local uint8_t* buf = nullptr;
+  if (!buf && posix_memalign(reinterpret_cast<void**>(&buf), blk, 2 * blk) != 0) return false;
+  const size_t row_bytes = size_t(row_dim_) * 2, off = size_t(src - table_);
+  const size_t a = off & ~(blk - 1), len = ((off + row_bytes + blk - 1) & ~(blk - 1)) - a;
+  if (a + len > file_bytes_ || pread(fd_direct_, buf, len, off_t(a)) != ssize_t(len)) return false;
+  std::memcpy(dst, buf + (off - a), row_bytes);
+  return true;
 }
 
 // One O_DIRECT reader: takes ids of the current job in batches, reads each row's 4 KiB block(s) into an aligned
@@ -329,8 +341,8 @@ void PleService::gather(uint32_t gen, int n) {
         continue;
       }
       misses_.fetch_add(1, std::memory_order_relaxed);
-      std::memcpy(dst, shard_[size_t(uint64_t(id) / shard_rows_)] + size_t(uint64_t(id) % shard_rows_) * dim * 2,
-                  size_t(dim) * 2);
+      const uint8_t* src = shard_[size_t(uint64_t(id) / shard_rows_)] + size_t(uint64_t(id) % shard_rows_) * dim * 2;
+      if (!read_direct(src, dst)) std::memcpy(dst, src, size_t(dim) * 2);
       cache_put(id, dst);
     }
     work_done_.fetch_add(1, std::memory_order_acq_rel);
@@ -342,6 +354,7 @@ void PleService::gather(uint32_t gen, int n) {
 void PleService::run() {
   auto* hdr = reinterpret_cast<PleMailHeader*>(mail_);
   uint32_t last = uint32_t(__atomic_load_n(&hdr->req, __ATOMIC_ACQUIRE) >> 32);
+  auto served_at = std::chrono::steady_clock::now();
   while (!stop_.load(std::memory_order_acquire)) {
     const uint64_t req = __atomic_load_n(&hdr->req, __ATOMIC_ACQUIRE);
     const uint32_t seq = uint32_t(req >> 32);
@@ -350,8 +363,11 @@ void PleService::run() {
       gather(0, int(req & 0xFFFFFFFFu));
       __atomic_store_n(&hdr->done, seq, __ATOMIC_RELEASE);
       served_.fetch_add(1, std::memory_order_relaxed);
+      served_at = std::chrono::steady_clock::now();
+    } else if (std::chrono::steady_clock::now() - served_at < std::chrono::milliseconds(50)) {
+      // decoding: the next request comes within a step; spin on it (a timer sleep would add up to ~60 us)
+      _mm_pause();
     } else {
-      // Poll, not spin: a request is served within one timer slice (~60 us) of the prefetch, well before its use.
       std::this_thread::sleep_for(std::chrono::microseconds(20));
     }
   }

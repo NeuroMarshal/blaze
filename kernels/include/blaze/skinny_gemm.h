@@ -22,6 +22,21 @@ extern "C" {
 cudaError_t blz_skinny_gemm(const void* x, int64_t x_stride, const void* w, void* y, int rows, int n, int k,
                             blz_half_t dtype, cudaStream_t stream);
 
+/// Most rows and largest k of blz_gemv_wide.
+#define BLZ_GEMV_WIDE_MAX_ROWS 4
+#define BLZ_GEMV_WIDE_MAX_K 16384
+/// Shared memory blz_gemv_wide may take for x (rows * k * 2 bytes).
+#define BLZ_GEMV_WIDE_MAX_SMEM (96 * 1024)
+
+/// \brief BF16 y = x . w^T for a few rows and a large n (an LM head: 248k x 2048): one warp per output column, x in
+/// shared memory, every lane with all its 16-byte weight loads in flight at once; FP32 sums, one rounding.
+/// \param x  [rows, k] bf16, row stride x_stride; rows <= BLZ_GEMV_WIDE_MAX_ROWS, k <= BLZ_GEMV_WIDE_MAX_K, k % 256 == 0,
+///           rows * k * 2 <= BLZ_GEMV_WIDE_MAX_SMEM
+/// \param w  [n, k] bf16 contiguous, 16-byte aligned
+/// \param y  [rows, n] bf16, row stride y_stride
+cudaError_t blz_gemv_wide(const void* x, int64_t x_stride, const void* w, void* y, int64_t y_stride, int rows, int n,
+                          int k, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -390,7 +390,21 @@ impl Linear {
                     }
                 }
                 Store::Bf16(w) => {
-                    if m == 1 && p.n <= 4096 && k % 8 == 0 {
+                    let wide = m <= sys::BLZ_GEMV_WIDE_MAX_ROWS
+                        && p.n > 4096
+                        && k % 256 == 0
+                        && k <= sys::BLZ_GEMV_WIDE_MAX_K
+                        && m * k * 2 <= sys::BLZ_GEMV_WIDE_MAX_SMEM
+                        && ldx % 8 == 0;
+                    if wide {
+                        check(
+                            unsafe {
+                                sys::blz_gemv_wide(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), ldo as i64, m as c_int,
+                                                   p.n as c_int, k as c_int, s.0)
+                            },
+                            "blz_gemv_wide",
+                        )?;
+                    } else if m == 1 && p.n <= 4096 && k % 8 == 0 {
                         check(
                             unsafe {
                                 sys::blz_skinny_gemm(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), 1, p.n as c_int, k as c_int,

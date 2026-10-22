@@ -167,6 +167,8 @@ unsafe extern "C" {
                                  dtype: c_int, out: *mut c_void, out_stride_tok: i64, out_stride_head: i64,
                                  s: cudaStream_t) -> cudaError_t;
     // EAGLE-4 draft (blaze/eagle.h)
+    pub fn blz_gemv_wide(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
+                         n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rmsnorm_ld(x: *const bf16, ldx: i64, w: *const bf16, eps: f32, rows: c_int, dim: c_int, out: *mut bf16,
                           ldo: i64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rope_neox(x: *mut bf16, ld: i64, tokens: c_int, heads: c_int, head_dim: c_int, positions: *const i64,
@@ -187,6 +189,9 @@ pub const BLZ_FP8_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_TOPK_MAX: usize = 64;
 /// largest k of blz_topk
 pub const BLZ_TOPK_LIMIT: usize = 128;
+pub const BLZ_GEMV_WIDE_MAX_ROWS: usize = 4;
+pub const BLZ_GEMV_WIDE_MAX_K: usize = 16384;
+pub const BLZ_GEMV_WIDE_MAX_SMEM: usize = 96 * 1024;
 
 unsafe extern "C" {
     pub fn blz_nvfp4_gemv(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,

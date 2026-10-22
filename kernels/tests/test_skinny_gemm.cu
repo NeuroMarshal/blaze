@@ -96,6 +96,45 @@ int main() {
     std::printf("48 x 5120 bf16, %2d rows: %.2f us per call\n", rows, 1000 * ms / iters);
     cudaFree(dx), cudaFree(dw), cudaFree(dy);
   }
+  // gemv_wide: LM-head shapes against a double reference on a sample of columns, and the bandwidth
+  for (int rows : {1, 2, 4}) {
+    const int n = 248320, k = 2048;
+    std::normal_distribution<float> d(0.0f, 1.0f);
+    std::vector<__nv_bfloat16> x(size_t(rows) * k), w(size_t(n) * k), y(size_t(rows) * n);
+    for (auto& v : x) v = from_f<__nv_bfloat16>(d(rng));
+    for (auto& v : w) v = from_f<__nv_bfloat16>(d(rng) * 0.05f);
+    __nv_bfloat16 *dx, *dw, *dy;
+    check(cudaMalloc(&dx, x.size() * 2), "malloc");
+    check(cudaMalloc(&dw, w.size() * 2), "malloc");
+    check(cudaMalloc(&dy, y.size() * 2), "malloc");
+    check(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "upload");
+    check(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice), "upload");
+    check(blz_gemv_wide(dx, k, dw, dy, n, rows, n, k, nullptr), "gemv_wide");
+    check(cudaMemcpy(y.data(), dy, y.size() * 2, cudaMemcpyDeviceToHost), "download");
+    double worst = 0, peak = 0;
+    for (int r = 0; r < rows; ++r)
+      for (int c = 0; c < n; c += 97) {
+        double ref = 0;
+        for (int i = 0; i < k; ++i) ref += double(to_f(x[size_t(r) * k + i])) * to_f(w[size_t(c) * k + i]);
+        worst = std::max(worst, std::fabs(double(to_f(y[size_t(r) * n + c])) - ref));
+        peak = std::max(peak, std::fabs(ref));
+      }
+    const double e = worst / std::max(peak, 1e-30);
+    cudaEvent_t a, b;
+    cudaEventCreate(&a), cudaEventCreate(&b);
+    for (int i = 0; i < 3; ++i) blz_gemv_wide(dx, k, dw, dy, n, rows, n, k, nullptr);
+    cudaEventRecord(a);
+    for (int i = 0; i < 20; ++i) blz_gemv_wide(dx, k, dw, dy, n, rows, n, k, nullptr);
+    cudaEventRecord(b);
+    check(cudaEventSynchronize(b), "time");
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a, b);
+    const double us = 1000.0 * ms / 20;
+    std::printf("gemv_wide %d rows, %d x %d: error %.2e %s, %.0f us (%.0f GB/s)\n", rows, n, k, e, e < 8e-3 ? "ok" : "FAIL",
+                us, double(n) * k * 2 / us / 1e3);
+    fails += e >= 8e-3;
+    cudaFree(dx), cudaFree(dw), cudaFree(dy);
+  }
   std::printf("%s\n", fails ? "FAILED" : "all passed");
   return fails ? 1 : 0;
 }
