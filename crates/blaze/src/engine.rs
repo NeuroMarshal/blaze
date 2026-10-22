@@ -101,13 +101,19 @@ impl Drop for Graph {
     }
 }
 
+/// A captured step: the rows of every sequence (decode: all 1), sampled head, sparse attention, speculative verify.
+type GraphKey = (Vec<usize>, bool, bool, bool);
+
+/// Most verify graphs kept (their span shapes vary with the draft lengths); beyond them verify steps run eagerly.
+const MAX_VERIFY_GRAPHS: usize = 48;
+
 /// One rank: its model shard and the per-step machinery.
 struct Runner {
     model: Model,
     draft: Option<crate::eagle::Draft>,
     staging: HostMapped,
-    graphs: HashMap<(usize, bool, bool), Graph>,
-    warmed: HashSet<(usize, bool, bool)>,
+    graphs: HashMap<GraphKey, Graph>,
+    warmed: HashSet<GraphKey>,
     use_graphs: bool,
 }
 
@@ -158,8 +164,16 @@ impl Runner {
             )?;
         }
         let n = meta.logit_rows.len();
-        if allow_graph && self.use_graphs && !verify && meta.spans.iter().all(|sp| sp.len == 1) {
-            self.run_graph(n, meta.sample, meta.sparse, &meta.spans)?;
+        let lens: Vec<usize> = meta.spans.iter().map(|sp| sp.len).collect();
+        let key: GraphKey = (lens, meta.sample, meta.sparse, verify);
+        let graphable = if verify {
+            // verify shapes repeat (the draft lengths), each captured on its second sight
+            self.graphs.contains_key(&key) || self.graphs.keys().filter(|k| k.3).count() < MAX_VERIFY_GRAPHS
+        } else {
+            meta.spans.iter().all(|sp| sp.len == 1)
+        };
+        if allow_graph && self.use_graphs && graphable {
+            self.run_graph(key, n, &meta.spans)?;
         } else {
             self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse)?;
         }
@@ -169,19 +183,19 @@ impl Runner {
     /// Decode step of `n` sequences through its CUDA graph (one per batch size and head mode): one eager run to load
     /// every kernel, then the capture, then replays. Every rank takes the same path for the same key, so their
     /// all-reduces stay paired.
-    fn run_graph(&mut self, n: usize, sample: bool, sparse: bool, spans: &[Span]) -> Result<()> {
-        let key = (n, sample, sparse);
+    fn run_graph(&mut self, key: GraphKey, n: usize, spans: &[Span]) -> Result<()> {
+        let (sample, sparse, verify) = (key.1, key.2, key.3);
         if let Some(g) = self.graphs.get(&key) {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
-        if self.warmed.insert(key) {
-            return self.model.forward(spans, n, false, sample, sparse);
+        if self.warmed.insert(key.clone()) {
+            return self.model.forward(spans, n, verify, sample, sparse);
         }
         // The step's own metadata copy is already enqueued; capture after it completes.
         self.model.stream.sync()?;
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, false, sample, sparse);
+        let captured = self.model.forward(spans, n, verify, sample, sparse);
         let mut graph = null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
         captured?;
@@ -646,7 +660,7 @@ impl Engine {
     pub fn verify_many(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]]) -> Result<Vec<Vec<i32>>> {
         self.pre_verify(seqs, tokens)?;
         let meta = Arc::new(self.plan(seqs, tokens, true)?);
-        let picks = match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
+        let picks = match self.broadcast(|| Cmd::Step(meta.clone(), true, true))? {
             Reply::Tokens(t) => t,
             _ => unreachable!(),
         };
@@ -662,7 +676,7 @@ impl Engine {
         fill_edits(&mut m, pens);
         let n = m.logit_rows.len();
         let meta = Arc::new(m);
-        let pairs = match self.broadcast(|| Cmd::Step(meta.clone(), false, true))? {
+        let pairs = match self.broadcast(|| Cmd::Step(meta.clone(), true, true))? {
             Reply::Cands(p) => p,
             _ => unreachable!(),
         };
