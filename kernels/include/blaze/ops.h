@@ -18,18 +18,20 @@ extern "C" {
 cudaError_t blz_rmsnorm(const uint16_t* x, uint16_t* residual, const uint16_t* w, float eps, int rows, int dim,
                         int zero_centered, uint16_t* out, cudaStream_t stream);
 
-/// \brief Gated RMSNorm of linear attention: out = (w * bf16(x / rms(x))) * silu(z), rows of `dim` values.
-cudaError_t blz_gated_rmsnorm(const uint16_t* x, const uint16_t* z, const uint16_t* w, float eps, int rows, int dim,
-                              uint16_t* out, cudaStream_t stream);
+/// \brief Gated RMSNorm of linear attention, per (token, head) row of `dim` values: out = (w * bf16(x / rms(x))) *
+/// silu(z). Head h of token t is at x + t * ld_x + h * dim (likewise z); out is dense [tokens, heads * dim].
+cudaError_t blz_gated_rmsnorm(const uint16_t* x, int64_t ld_x, const uint16_t* z, int64_t ld_z, const uint16_t* w,
+                              float eps, int tokens, int heads, int dim, uint16_t* out, cudaStream_t stream);
 
 // attention
 
 /// \brief Inputs of gated softmax attention: per-head RMSNorm of q and k, rotary embedding of the first `rotary_dim`
 /// dims (halves rotated, cos / sin of position * inv_freq[i] times `rope_scale`), split of the output gate.
-/// qg [tokens, heads, 2 * head_dim] (per head: query then gate); k [tokens, kv_heads, head_dim], rotated in place;
-/// positions [tokens] int64; inv_freq [rotary_dim / 2]. q_out [tokens, heads, head_dim], gate [tokens, heads *
-/// head_dim].
-cudaError_t blz_attn_prep(const uint16_t* qg, uint16_t* k, const int64_t* positions, const uint16_t* q_norm,
+/// qg [tokens, heads, 2 * head_dim] (per head: query then gate), token rows `ld_qg` apart; k [tokens, kv_heads,
+/// head_dim], token rows `ld_k` apart, rotated in place; positions [tokens] int64; inv_freq [rotary_dim / 2].
+/// q_out [tokens, heads, head_dim], gate [tokens, heads * head_dim].
+cudaError_t blz_attn_prep(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_t ld_k, const int64_t* positions,
+                          const uint16_t* q_norm,
                           const uint16_t* k_norm, float eps, int zero_centered, int tokens, int heads, int kv_heads,
                           int head_dim, int rotary_dim, const float* inv_freq, float rope_scale, uint16_t* q_out,
                           uint16_t* gate, cudaStream_t stream);
@@ -43,14 +45,15 @@ cudaError_t blz_mul_sigmoid(uint16_t* x, const uint16_t* gate, int64_t n, cudaSt
 cudaError_t blz_silu_mul(const uint16_t* gate, int64_t ld_gate, const uint16_t* up, int64_t ld_up, int rows, int n,
                          uint16_t* out, cudaStream_t stream);
 
-/// \brief out[r, :] = a[r, :] + sigmoid(gate_logit[r]) * b[r, :] (shared expert added to the routed experts).
-cudaError_t blz_add_sigmoid_scaled(const uint16_t* a, const uint16_t* b, const uint16_t* gate_logit, int rows,
-                                   int dim, uint16_t* out, cudaStream_t stream);
+/// \brief out[r, :] = a[r, :] + sigmoid(gate_logit[r * ld_gate]) * b[r, :] (shared expert added to the routed
+/// experts).
+cudaError_t blz_add_sigmoid_scaled(const uint16_t* a, const uint16_t* b, const uint16_t* gate_logit, int64_t ld_gate,
+                                   int rows, int dim, uint16_t* out, cudaStream_t stream);
 
 /// \brief Softmax router: probabilities over `experts` logits, the `k` largest (ties: lower index), renormalized to
-/// sum 1 when `renorm`. ids [tokens, k] int32, w [tokens, k] float.
-cudaError_t blz_router_topk(const uint16_t* logits, int tokens, int experts, int k, int renorm, int32_t* ids,
-                            float* w, cudaStream_t stream);
+/// sum 1 when `renorm`. Logit rows `ld` apart; ids [tokens, k] int32, w [tokens, k] float.
+cudaError_t blz_router_topk(const uint16_t* logits, int64_t ld, int tokens, int experts, int k, int renorm,
+                            int32_t* ids, float* w, cudaStream_t stream);
 
 /// \brief out[i] = a[i] + b[i] (bf16).
 cudaError_t blz_add(const uint16_t* a, const uint16_t* b, int64_t n, uint16_t* out, cudaStream_t stream);

@@ -64,23 +64,30 @@ __global__ void __launch_bounds__(kNormThreads) rmsnorm_kernel(const uint16_t* _
   }
 }
 
-__global__ void __launch_bounds__(kNormThreads) gated_rmsnorm_kernel(const uint16_t* __restrict__ x,
-                                                                     const uint16_t* __restrict__ z,
-                                                                     const uint16_t* __restrict__ w, float eps, int dim,
-                                                                     uint16_t* __restrict__ out) {
-  __shared__ float red[kNormThreads / 32];
-  const int64_t row = blockIdx.x;
+// One warp per (token, head) row.
+__global__ void gated_rmsnorm_kernel(const uint16_t* __restrict__ x, int64_t ld_x, const uint16_t* __restrict__ z,
+                                     int64_t ld_z, const uint16_t* __restrict__ w, float eps, int tokens, int heads,
+                                     int dim, uint16_t* __restrict__ out) {
+  const int64_t row = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  const int lane = threadIdx.x % 32;
+  if (row >= int64_t(tokens) * heads) return;
+  const int64_t t = row / heads;
+  const int h = int(row % heads);
+  const uint16_t* xr = x + t * ld_x + int64_t(h) * dim;
+  const uint16_t* zr = z + t * ld_z + int64_t(h) * dim;
   float ss = 0.0f;
-  for (int i = threadIdx.x; i < dim; i += kNormThreads) {
-    const float v = bf(x[row * dim + i]);
+  for (int i = lane; i < dim; i += 32) {
+    const float v = bf(xr[i]);
     ss += v * v;
   }
-  const float inv = rsqrtf(block_sum<kNormThreads>(ss, red) / float(dim) + eps);
-  for (int i = threadIdx.x; i < dim; i += kNormThreads) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const float inv = rsqrtf(ss / float(dim) + eps);
+  for (int i = lane; i < dim; i += 32) {
     // Reference: weight * bf16(normalized) in bf16, then times silu(z) in fp32, one final rounding.
-    const float normed = bf(to_bf(bf(x[row * dim + i]) * inv));
+    const float normed = bf(to_bf(bf(xr[i]) * inv));
     const float scaled = bf(to_bf(bf(w[i]) * normed));
-    out[row * dim + i] = to_bf(scaled * siluf(bf(z[row * dim + i])));
+    out[row * dim + i] = to_bf(scaled * siluf(bf(zr[i])));
   }
 }
 
@@ -88,7 +95,8 @@ __global__ void __launch_bounds__(kNormThreads) gated_rmsnorm_kernel(const uint1
 constexpr int kPrepWarps = 4;
 
 __global__ void __launch_bounds__(32 * kPrepWarps) attn_prep_kernel(
-    const uint16_t* __restrict__ qg, uint16_t* __restrict__ k, const int64_t* __restrict__ positions,
+    const uint16_t* __restrict__ qg, int64_t ld_qg, uint16_t* __restrict__ k, int64_t ld_k,
+    const int64_t* __restrict__ positions,
     const uint16_t* __restrict__ q_norm, const uint16_t* __restrict__ k_norm, float eps, int zero_centered, int tokens,
     int heads, int kv_heads, int head_dim, int rotary_dim, const float* __restrict__ inv_freq, float rope_scale,
     uint16_t* __restrict__ q_out, uint16_t* __restrict__ gate) {
@@ -101,7 +109,7 @@ __global__ void __launch_bounds__(32 * kPrepWarps) attn_prep_kernel(
   const int64_t t = item / per_token;
   const int h = int(item % per_token);
   const bool is_q = h < heads;
-  const uint16_t* src = is_q ? qg + (t * heads + h) * 2 * head_dim : k + (t * kv_heads + (h - heads)) * head_dim;
+  const uint16_t* src = is_q ? qg + t * ld_qg + int64_t(h) * 2 * head_dim : k + t * ld_k + int64_t(h - heads) * head_dim;
   const uint16_t* nw = is_q ? q_norm : k_norm;
   float ss = 0.0f;
   for (int i = lane; i < head_dim; i += 32) {
@@ -120,7 +128,7 @@ __global__ void __launch_bounds__(32 * kPrepWarps) attn_prep_kernel(
   __syncwarp();
   const float pos = float(positions[t]);
   const int half = rotary_dim / 2;
-  uint16_t* dst = is_q ? q_out + (t * heads + h) * head_dim : k + (t * kv_heads + (h - heads)) * head_dim;
+  uint16_t* dst = is_q ? q_out + (t * heads + h) * head_dim : k + t * ld_k + int64_t(h - heads) * head_dim;
   for (int i = lane; i < head_dim; i += 32) {
     float v = r[i];
     if (i < rotary_dim) {
@@ -153,13 +161,13 @@ __global__ void silu_mul_kernel(const uint16_t* __restrict__ gate, int64_t ld_ga
 }
 
 __global__ void add_sigmoid_scaled_kernel(const uint16_t* __restrict__ a, const uint16_t* __restrict__ b,
-                                          const uint16_t* __restrict__ gate_logit, int rows, int dim,
+                                          const uint16_t* __restrict__ gate_logit, int64_t ld_gate, int rows, int dim,
                                           uint16_t* __restrict__ out) {
   const int64_t total = int64_t(rows) * dim;
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += int64_t(gridDim.x) * blockDim.x) {
     const int64_t r = i / dim;
     // Reference: sigmoid(gate) * shared in bf16, then the bf16 sum.
-    const float shared = bf(to_bf(sigmoidf(bf(gate_logit[r])) * bf(b[i])));
+    const float shared = bf(to_bf(sigmoidf(bf(gate_logit[r * ld_gate])) * bf(b[i])));
     out[i] = to_bf(bf(a[i]) + shared);
   }
 }
@@ -173,8 +181,8 @@ __global__ void add_kernel(const uint16_t* __restrict__ a, const uint16_t* __res
 // One warp per token; experts <= 32 * kMaxPerLane, k <= 32.
 constexpr int kMaxPerLane = 16;
 
-__global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int tokens, int experts, int k, int renorm,
-                                   int32_t* __restrict__ ids, float* __restrict__ w) {
+__global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int64_t ld, int tokens, int experts, int k,
+                                   int renorm, int32_t* __restrict__ ids, float* __restrict__ w) {
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const int64_t t = int64_t(blockIdx.x) * (blockDim.x / 32) + warp;
   if (t >= tokens) return;
@@ -183,7 +191,7 @@ __global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int toke
 #pragma unroll
   for (int j = 0; j < kMaxPerLane; ++j) {
     const int e = lane + 32 * j;
-    p[j] = e < experts ? bf(logits[t * experts + e]) : -FLT_MAX;
+    p[j] = e < experts ? bf(logits[t * ld + e]) : -FLT_MAX;
     mx = fmaxf(mx, p[j]);
   }
 #pragma unroll
@@ -334,14 +342,17 @@ extern "C" cudaError_t blz_rmsnorm(const uint16_t* x, uint16_t* residual, const 
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_gated_rmsnorm(const uint16_t* x, const uint16_t* z, const uint16_t* w, float eps, int rows,
-                                         int dim, uint16_t* out, cudaStream_t stream) {
+extern "C" cudaError_t blz_gated_rmsnorm(const uint16_t* x, int64_t ld_x, const uint16_t* z, int64_t ld_z,
+                                         const uint16_t* w, float eps, int tokens, int heads, int dim, uint16_t* out,
+                                         cudaStream_t stream) {
+  const int64_t rows = int64_t(tokens) * heads;
   if (rows == 0) return cudaSuccess;
-  gated_rmsnorm_kernel<<<rows, kNormThreads, 0, stream>>>(x, z, w, eps, dim, out);
+  gated_rmsnorm_kernel<<<unsigned((rows + 3) / 4), 128, 0, stream>>>(x, ld_x, z, ld_z, w, eps, tokens, heads, dim, out);
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_attn_prep(const uint16_t* qg, uint16_t* k, const int64_t* positions, const uint16_t* q_norm,
+extern "C" cudaError_t blz_attn_prep(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_t ld_k,
+                                     const int64_t* positions, const uint16_t* q_norm,
                                      const uint16_t* k_norm, float eps, int zero_centered, int tokens, int heads,
                                      int kv_heads, int head_dim, int rotary_dim, const float* inv_freq,
                                      float rope_scale, uint16_t* q_out, uint16_t* gate, cudaStream_t stream) {
@@ -350,7 +361,7 @@ extern "C" cudaError_t blz_attn_prep(const uint16_t* qg, uint16_t* k, const int6
   const int64_t items = int64_t(tokens) * (heads + kv_heads);
   const unsigned grid = unsigned((items + kPrepWarps - 1) / kPrepWarps);
   attn_prep_kernel<<<grid, 32 * kPrepWarps, size_t(kPrepWarps) * head_dim * sizeof(float), stream>>>(
-      qg, k, positions, q_norm, k_norm, eps, zero_centered, tokens, heads, kv_heads, head_dim, rotary_dim, inv_freq,
+      qg, ld_qg, k, ld_k, positions, q_norm, k_norm, eps, zero_centered, tokens, heads, kv_heads, head_dim, rotary_dim, inv_freq,
       rope_scale, q_out, gate);
   return cudaGetLastError();
 }
@@ -369,9 +380,10 @@ extern "C" cudaError_t blz_silu_mul(const uint16_t* gate, int64_t ld_gate, const
 }
 
 extern "C" cudaError_t blz_add_sigmoid_scaled(const uint16_t* a, const uint16_t* b, const uint16_t* gate_logit,
-                                              int rows, int dim, uint16_t* out, cudaStream_t stream) {
+                                              int64_t ld_gate, int rows, int dim, uint16_t* out, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
-  add_sigmoid_scaled_kernel<<<grid_for(int64_t(rows) * dim, 256), 256, 0, stream>>>(a, b, gate_logit, rows, dim, out);
+  add_sigmoid_scaled_kernel<<<grid_for(int64_t(rows) * dim, 256), 256, 0, stream>>>(a, b, gate_logit, ld_gate, rows,
+                                                                                   dim, out);
   return cudaGetLastError();
 }
 
@@ -381,11 +393,11 @@ extern "C" cudaError_t blz_add(const uint16_t* a, const uint16_t* b, int64_t n, 
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_router_topk(const uint16_t* logits, int tokens, int experts, int k, int renorm,
-                                       int32_t* ids, float* w, cudaStream_t stream) {
+extern "C" cudaError_t blz_router_topk(const uint16_t* logits, int64_t ld, int tokens, int experts, int k,
+                                       int renorm, int32_t* ids, float* w, cudaStream_t stream) {
   if (tokens == 0) return cudaSuccess;
   if (experts > 32 * kMaxPerLane || k > 32 || k > experts) return cudaErrorInvalidValue;
-  router_topk_kernel<<<(tokens + 3) / 4, 128, 0, stream>>>(logits, tokens, experts, k, renorm, ids, w);
+  router_topk_kernel<<<(tokens + 3) / 4, 128, 0, stream>>>(logits, ld, tokens, experts, k, renorm, ids, w);
   return cudaGetLastError();
 }
 

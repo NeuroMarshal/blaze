@@ -107,7 +107,7 @@ static void test_attn_prep() {
   Dev<uint16_t> dqg(qg), dk(k), dqn(qn), dkn(kn), dq(T * H * D), dg(T * H * D);
   Dev<int64_t> dpos(pos);
   Dev<float> dinv(inv);
-  CHECK_CUDA(blz_attn_prep(dqg.p, dk.p, dpos.p, dqn.p, dkn.p, 1e-6f, 1, T, H, KVH, D, RD, dinv.p, 1.0f, dq.p, dg.p, 0));
+  CHECK_CUDA(blz_attn_prep(dqg.p, int64_t(H) * 2 * D, dk.p, int64_t(KVH) * D, dpos.p, dqn.p, dkn.p, 1e-6f, 1, T, H, KVH, D, RD, dinv.p, 1.0f, dq.p, dg.p, 0));
   auto ref_row = [&](const uint16_t* src, const std::vector<uint16_t>& nw, int64_t p, std::vector<float>& out) {
     double ss = 0;
     for (int i = 0; i < D; ++i) ss += double(bf(src[i])) * bf(src[i]);
@@ -148,7 +148,7 @@ static void test_router() {
   Dev<uint16_t> dl(logits);
   Dev<int32_t> dids(T * K);
   Dev<float> dw(T * K);
-  CHECK_CUDA(blz_router_topk(dl.p, T, E, K, 1, dids.p, dw.p, 0));
+  CHECK_CUDA(blz_router_topk(dl.p, E, T, E, K, 1, dids.p, dw.p, 0));
   const auto ids = dids.down();
   const auto w = dw.down();
   int bad = 0;
