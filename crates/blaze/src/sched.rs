@@ -91,8 +91,10 @@ struct Active {
     acc: Acceptance,
     /// suffix decoding: the request's prompt and output
     suffix: Option<SuffixIndex>,
-    /// EAGLE-4: the drafter's tokens after the request's last output
+    /// EAGLE-4: the drafter's tokens after the request's last output, and how many to draft (the cost model's last
+    /// choice plus one, so that a longer draft is still tried)
     eagle: Vec<i64>,
+    eagle_k: usize,
     /// first draft token proposed while a plain step ran instead (scored against the step's output)
     shadow: Option<i64>,
 }
@@ -445,6 +447,7 @@ impl Loop {
                 suffix: None,
                 shadow: None,
                 eagle: Vec::new(),
+                eagle_k: usize::MAX,
             });
         }
     }
@@ -586,7 +589,7 @@ impl Loop {
         if items.is_empty() {
             return Ok(());
         }
-        let k = self.cfg.spec_tokens.min(crate::eagle::MAX_CHAIN);
+        let k = idx_k(&items, &self.active).min(self.cfg.spec_tokens).min(crate::eagle::MAX_CHAIN).max(1);
         let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
         let drafts = self.engine.draft(crate::eagle::DraftPlan { items, k })?;
         for (i, d) in idx.into_iter().zip(drafts) {
@@ -616,6 +619,9 @@ impl Loop {
             for (i, d) in drafts.iter_mut().enumerate() {
                 if lens[i] == 0 && !d.is_empty() {
                     shadow[i] = Some(d[0]);
+                }
+                if !d.is_empty() {
+                    self.active[i].eagle_k = lens[i] + 1;
                 }
                 d.truncate(lens[i]);
             }
@@ -957,6 +963,11 @@ impl Loop {
         }
         Ok(())
     }
+}
+
+/// Chain length of an EAGLE-4 call: the longest any of its requests wants.
+fn idx_k(items: &[(usize, crate::eagle::DraftItem)], active: &[Active]) -> usize {
+    items.iter().map(|(i, _)| active[*i].eagle_k).max().unwrap_or(1)
 }
 
 /// Prompt-lookup draft: the longest suffix of `ctx` of max_n .. min_n tokens that occurred earlier (most recent
