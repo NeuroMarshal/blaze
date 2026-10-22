@@ -212,6 +212,7 @@ pub struct Model {
     conv_state: Vec<DevBuf>,
     rec_state: Vec<DevBuf>,
     work: Work,
+    score_logits: Option<DevBuf>,
     pub stream: Stream,
     pub opts: Options,
     num_sms: usize,
@@ -387,6 +388,7 @@ impl Model {
             conv_state,
             rec_state,
             work,
+            score_logits: None,
             stream,
             opts,
             num_sms: num_sms.max(1) as usize,
@@ -501,6 +503,22 @@ impl Model {
     /// Forward of `tokens` (one sequence, positions start..start + len) with KV request row `req` and GDN state slot
     /// `seq_slot`; returns the greedy next token. A new sequence (start == 0) resets its GDN state.
     pub fn forward_seq(&mut self, tokens: &[i64], start: usize, req: usize, seq_slot: usize) -> Result<i32> {
+        self.forward_inner(tokens, start, req, seq_slot, false)?;
+        Ok(self.work.next.download::<i32>(1)?[0])
+    }
+
+    /// Like forward_seq, but the logits of every position (row i: the distribution after token i), as f32.
+    pub fn forward_all_logits(&mut self, tokens: &[i64], start: usize, req: usize, seq_slot: usize) -> Result<Vec<Vec<f32>>> {
+        self.forward_inner(tokens, start, req, seq_slot, true)?;
+        let v = self.cfg.vocab;
+        let raw = self.score_logits.as_ref().unwrap().download::<u16>(tokens.len() * v)?;
+        Ok(raw.chunks(v).map(|r| r.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()).collect())
+    }
+
+    fn forward_inner(&mut self, tokens: &[i64], start: usize, req: usize, seq_slot: usize, all_logits: bool) -> Result<()> {
+        if all_logits && self.score_logits.as_ref().is_none_or(|b| b.bytes() < tokens.len() * self.cfg.vocab * 2) {
+            self.score_logits = Some(DevBuf::new(tokens.len() * self.cfg.vocab * 2)?);
+        }
         let t = tokens.len();
         if t == 0 || t > self.opts.max_chunk {
             bail!("forward of {t} tokens (max chunk {})", self.opts.max_chunk);
@@ -570,14 +588,21 @@ impl Model {
             check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), layer.post_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
             self.mlp(li, layer, t)?;
         }
+        if all_logits {
+            let out = self.score_logits.as_ref().unwrap();
+            check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), self.final_norm.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
+            self.lm_head.run(self.gemm, w.normed.ptr(), h, t, out.ptr(), cfg.vocab, s)?;
+            s.sync()?;
+            return Ok(());
+        }
         // Final norm of the last token only, then the head and the greedy pick.
-        let last_x: *const u16 = w.x.at(( t - 1) * h);
+        let last_x: *const u16 = w.x.at((t - 1) * h);
         let last_res: *mut u16 = w.residual.at((t - 1) * h);
         check(unsafe { sys::blz_rmsnorm(last_x, last_res, self.final_norm.ptr(), eps, 1, h as c_int, 1, w.normed.ptr(), s.0) }, "final norm")?;
         self.lm_head.run(self.gemm, w.normed.ptr(), h, 1, w.logits.ptr(), cfg.vocab, s)?;
         check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), 1, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         s.sync()?;
-        Ok(w.next.download::<i32>(1)?[0])
+        Ok(())
     }
 
     pub fn last_logits(&self) -> Result<Vec<f32>> {

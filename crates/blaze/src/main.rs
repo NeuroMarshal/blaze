@@ -15,6 +15,20 @@ struct Cli {
 enum Command {
     /// Describe a checkpoint: architecture, layers, weight formats per module.
     Inspect { model: PathBuf },
+    /// Teacher-forced scoring of a text file: per position the log-probability of the next token and the argmax,
+    /// as JSON lines (for comparisons against a reference engine).
+    Score {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        text_file: PathBuf,
+        #[arg(long, default_value_t = 512)]
+        chunk: usize,
+        #[arg(long, default_value_t = 12)]
+        moe_threads: usize,
+        #[arg(long, default_value_t = 0.8)]
+        reserve_gib: f64,
+    },
     /// Greedy generation from a raw text prompt (no chat template), for testing.
     Generate {
         #[arg(long)]
@@ -44,9 +58,42 @@ enum Command {
     },
 }
 
+fn load(model: &std::path::Path, kv: usize, chunk: usize, moe_threads: usize, reserve_gib: f64, moe_options: String) -> Result<blaze::model::Model> {
+    blaze::gpu::set_device(0)?;
+    let t0 = Instant::now();
+    let m = blaze::model::Model::load(
+        model,
+        blaze::model::Options { max_tokens: kv, max_chunk: chunk, max_seqs: 1, moe_threads, moe_heat: None, moe_options, reserve_gib },
+    )?;
+    eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());
+    Ok(m)
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { model } => blaze::inspect::run(&model),
+        Command::Score { model, text_file, chunk, moe_threads, reserve_gib } => {
+            let text = blaze::text::Text::load(&model)?;
+            let ids: Vec<i64> = text.encode(&std::fs::read_to_string(&text_file)?)?.into_iter().map(i64::from).collect();
+            let mut m = load(&model, 65536, chunk, moe_threads, reserve_gib, "host_reserve_gib=2".into())?;
+            let mut pos = 0;
+            for c in ids.chunks(chunk) {
+                let logits = m.forward_all_logits(c, pos, 0, 0)?;
+                for (i, row) in logits.iter().enumerate() {
+                    let p = pos + i;
+                    if p + 1 >= ids.len() {
+                        break;
+                    }
+                    let mx = row.iter().cloned().fold(f32::MIN, f32::max);
+                    let lse = mx + row.iter().map(|&x| (x - mx).exp()).sum::<f32>().ln();
+                    let argmax = row.iter().enumerate().fold((0, f32::MIN), |b, (j, &x)| if x > b.1 { (j, x) } else { b }).0;
+                    let target = ids[p + 1] as usize;
+                    println!("{{\"pos\": {p}, \"target\": {target}, \"logprob\": {:.5}, \"argmax\": {argmax}}}", row[target] - lse);
+                }
+                pos += c.len();
+            }
+            Ok(())
+        }
         Command::Generate { model, prompt, max_tokens, max_tokens_kv, chunk, moe_threads, reserve_gib, moe_options, logits } => {
             blaze::gpu::set_device(0)?;
             let text = blaze::text::Text::load(&model)?;
