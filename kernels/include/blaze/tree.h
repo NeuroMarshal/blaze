@@ -54,6 +54,18 @@ cudaError_t blz_move_rows(const blz_row_buf* bufs, int nbuf, const int32_t* pair
 cudaError_t blz_candidate_topk(const float* logits, const int32_t* ids, int rows, int c, int k, float* probs,
                                int64_t* tokens, cudaStream_t stream);
 
+/// \brief A vocabulary shard's candidates of every row as pairs for the merge: pairs [world][rows][c][2] floats (logit,
+/// id + id_offset; ids < 0 empty), this rank's part written, the others zeroed (an all-reduce sums the ranks' pairs).
+cudaError_t blz_cand_pack(const float* logits, const int32_t* ids, int id_offset, int rows, int c, int rank, int world,
+                          float* pairs, cudaStream_t stream);
+
+/// \brief Merge the ranks' candidates of every row (eagle_harness merge_candidates): the best c of the world * c pairs
+/// by logit (ties: lower id) are the row's candidates; the first k of them with their softmax probabilities over the c
+/// (probs [rows][k], may be null) and ids (tokens [rows][k]); `record` (may be null) gets the first id per row.
+/// world * c <= 1024, k <= 32.
+cudaError_t blz_cand_merge_topk(const float* pairs, int world, int rows, int c, int k, float* probs, int64_t* tokens,
+                                int64_t* record, cudaStream_t stream);
+
 /// \brief The draft tree of `items` items, K = top_k frontier rows each, depths 1 .. max_depth. Node n of an item: depth
 /// 1 at [0, K), the children of depth d's frontier at K + (d - 1) * K * K (row-major by frontier lane, then candidate).
 typedef struct {

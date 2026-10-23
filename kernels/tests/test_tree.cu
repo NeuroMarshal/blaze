@@ -312,6 +312,49 @@ void test_draft_tree(std::mt19937& rng) {
   expect(ok, "draft tree bookkeeping");
 }
 
+// Sharded candidates: pack per rank, sum (the all-reduce), merge to the top c, softmax, top k.
+void test_cand_merge(std::mt19937& rng) {
+  const int world = 2, rows = 5, c = 128, k = 8, vocab_shard = 1000;
+  std::normal_distribution<float> d;
+  std::vector<float> sum(size_t(world) * rows * c * 2, 0.0f);
+  std::vector<std::vector<float>> logits(world, std::vector<float>(rows * c));
+  std::vector<std::vector<int32_t>> ids(world, std::vector<int32_t>(rows * c));
+  for (int w = 0; w < world; ++w) {
+    for (int i = 0; i < rows * c; ++i) logits[w][i] = d(rng) * 3.0f, ids[w][i] = (i * 37 + w) % vocab_shard;
+    ids[w][3] = -1;  // an empty candidate
+    if (w == 1) logits[w][9] = logits[0][9];  // a cross-rank tie
+    Dev<float> dl(logits[w]), dp(sum.size());
+    Dev<int32_t> di(ids[w]);
+    CHECK_CUDA(blz_cand_pack(dl.ptr, di.ptr, w * vocab_shard, rows, c, w, world, dp.ptr, 0));
+    const auto part = dp.get();
+    for (size_t i = 0; i < sum.size(); ++i) sum[i] += part[i];
+  }
+  Dev<float> dsum(sum), dprobs(rows * k);
+  Dev<int64_t> dtok(rows * k), drec(rows);
+  CHECK_CUDA(blz_cand_merge_topk(dsum.ptr, world, rows, c, k, dprobs.ptr, dtok.ptr, drec.ptr, 0));
+  const auto probs = dprobs.get();
+  const auto tok = dtok.get();
+  const auto rec = drec.get();
+  bool ok = true;
+  double err = 0;
+  for (int r = 0; r < rows; ++r) {
+    std::vector<std::pair<float, int>> all;
+    for (int w = 0; w < world; ++w)
+      for (int j = 0; j < c; ++j)
+        if (ids[w][r * c + j] >= 0) all.push_back({logits[w][r * c + j], ids[w][r * c + j] + w * vocab_shard});
+    std::sort(all.begin(), all.end(), [](auto& a, auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); });
+    double z = 0;
+    for (int j = 0; j < c; ++j) z += std::exp(double(all[j].first - all[0].first));
+    for (int j = 0; j < k; ++j) {
+      ok &= tok[r * k + j] == all[j].second;
+      err = std::max(err, std::fabs(probs[r * k + j] - std::exp(double(all[j].first - all[0].first)) / z));
+    }
+    ok &= rec[r] == all[0].second;
+  }
+  std::printf("candidate merge over %d ranks: ids %s, prob max |err| %.2e\n", world, ok ? "ok" : "MISMATCH", err);
+  expect(ok && err < 1e-5, "candidate merge");
+}
+
 // Tree verify attention: row i of the tree against a plain decode of its path; tail rows against an explicit table.
 void test_mha_tree(std::mt19937& rng) {
   const int dim = 256, kvh = 2, q_heads = 12, prefix = 300, W = 11, slots = 512;
@@ -406,6 +449,7 @@ int main() {
   test_gdn_tree(rng);
   test_move_rows(rng);
   test_candidate_topk(rng);
+  test_cand_merge(rng);
   test_draft_tree(rng);
   test_mha_tree(rng);
   CHECK_CUDA(cudaDeviceSynchronize());

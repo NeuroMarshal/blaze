@@ -150,8 +150,14 @@ pub struct Draft {
     gu: Linear,
     down: Linear,
     lr_down: Linear,
+    /// the low-rank head's and the LM head's rows of this rank's vocabulary shard [vocab_off, vocab_off + shard): the
+    /// candidates of a shard, merged over the ranks (eagle_harness shard_candidates / merge_candidates)
     lr_head: Linear,
     lm_head: Arc<HostMapped>,
+    lm_shard: Option<DevBuf>,
+    vocab_off: usize,
+    shard: usize,
+    pairs: DevBuf,
     /// this rank's heads, KV heads and MLP rows
     heads: usize,
     kv_heads: usize,
@@ -279,9 +285,10 @@ impl Draft {
         let lin = |mods: &[(&str, Cut)]| Linear::load(&ckpt, &quant, &mods.iter().map(|(n, c)| (n.to_string(), c.clone())).collect::<Vec<_>>(), s);
         let fc_norm = if cfg.fc_norm { (0..3).map(|i| vec(&format!("fc_norm.{i}.weight"))).collect::<Result<_>>()? } else { Vec::new() };
         let (r, world) = (model.tp.rank, model.tp.world);
-        if cfg.heads % world != 0 || cfg.kv_heads % world != 0 || cfg.inter % world != 0 {
-            bail!("draft: heads / KV heads / MLP rows do not split {world} ways");
+        if cfg.heads % world != 0 || cfg.kv_heads % world != 0 || cfg.inter % world != 0 || cfg.vocab % world != 0 {
+            bail!("draft: heads / KV heads / MLP rows / vocabulary do not split {world} ways");
         }
+        let shard = cfg.vocab / world;
         let (heads, kv_heads, inter) = (cfg.heads / world, cfg.kv_heads / world, cfg.inter / world);
         let part = |n: usize| Cut::Rows(vec![r * n..(r + 1) * n]);
         let (qr, kr) = (heads * hd, kv_heads * hd);
@@ -339,7 +346,28 @@ impl Draft {
             gu: lin(&[("layers.0.mlp.gate_proj", part(inter)), ("layers.0.mlp.up_proj", part(inter))])?,
             down: lin(&[("layers.0.mlp.down_proj", Cut::Cols(r * inter..(r + 1) * inter))])?,
             lr_down: lin(&[("efficient_lm_head_down_proj", Cut::All)])?,
-            lr_head: lin(&[("efficient_lm_head", Cut::All)])?,
+            lr_head: lin(&[("efficient_lm_head", part(shard))])?,
+            lm_shard: {
+                let bytes = shard * h * 2;
+                let (mut free, mut total) = (0usize, 0usize);
+                check(unsafe { sys::cudaMemGetInfo(&mut free, &mut total) }, "cudaMemGetInfo")?;
+                let vram = model.opts.draft_head_vram.unwrap_or(free > bytes + (3usize << 29));
+                if vram {
+                    let b = DevBuf::zeroed(bytes, s)?;
+                    check(
+                        unsafe {
+                            sys::cudaMemcpy(b.ptr(), lm_head.host_ptr().cast::<u8>().add(r * bytes).cast(), bytes, sys::MEMCPY_H2D)
+                        },
+                        "draft LM head shard",
+                    )?;
+                    Some(b)
+                } else {
+                    None
+                }
+            },
+            vocab_off: r * shard,
+            shard,
+            pairs: b(world * max_items * tk.max(1) * c * 8)?,
             lm_head,
             heads,
             kv_heads,
@@ -393,12 +421,13 @@ impl Draft {
             (0, _) => "chains".to_string(),
             (k, d) => format!("trees of width {k}, depth {d}"),
         };
+        let gib = (self.shard * self.cfg.hidden * 2) as f64 / (1u64 << 30) as f64;
+        let head = if self.lm_shard.is_some() { format!("LM head shard {gib:.1} GiB in VRAM") } else { format!("LM head shard {gib:.1} GiB in pinned RAM") };
         format!(
-            "EAGLE-4 draft: window {}, {} candidates, {tree}, KV {:.0} MiB, LM head {:.1} GiB in pinned RAM",
+            "EAGLE-4 draft: window {}, {} candidates, {tree}, KV {:.0} MiB, {head}",
             self.cfg.window,
             self.cfg.candidates,
             (self.k_pool.bytes() * 2) as f64 / (1u64 << 20) as f64,
-            (self.cfg.vocab * self.cfg.hidden * 2) as f64 / (1u64 << 30) as f64
         )
     }
 
@@ -652,27 +681,54 @@ impl Draft {
     /// Candidate head on `rows` rows of `input`: the top `k` of each row's softmax over its candidates (probs f32,
     /// tokens i64, [rows][k]).
     fn head_topk(&self, model: &Model, input: *const u16, rows: usize, k: usize, probs: *mut f32, tokens: *mut i64) -> Result<()> {
+        self.head_merged(model, input, rows, k, probs, tokens, std::ptr::null_mut())
+    }
+
+    /// The candidate head (eagle_harness candidate_head): rank-r scores of this rank's vocabulary shard, its top C,
+    /// their exact logits from the shard's LM head rows, every rank's candidates merged (the best C by logit), softmax
+    /// over them; the first k per row (probs may be null; `record`, may be null, gets the first token).
+    fn head_merged(&self, model: &Model, input: *const u16, rows: usize, k: usize, probs: *mut f32, tokens: *mut i64,
+                   record: *mut i64) -> Result<()> {
         let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
         let (h, nc, rank) = (c.hidden, c.candidates, self.lr_down.n);
+        let (shard, world) = (self.shard, model.tp.world);
         self.lr_down.run(lin, input, h, rows, self.lr.ptr(), rank, s)?;
-        self.lr_head.run(lin, self.lr.ptr(), rank, rows, self.scores.ptr(), c.vocab, s)?;
+        self.lr_head.run(lin, self.lr.ptr(), rank, rows, self.scores.ptr(), shard, s)?;
         check(
             unsafe {
-                sys::blz_topk(self.scores.ptr(), c.vocab as i64, rows as c_int, c.vocab as c_int, 0, nc as c_int, self.cand_vals.ptr(),
+                sys::blz_topk(self.scores.ptr(), shard as i64, rows as c_int, shard as c_int, 0, nc as c_int, self.cand_vals.ptr(),
                               self.cand_ids.ptr(), std::ptr::null_mut(), s.0)
             },
             "draft candidates",
         )?;
+        let table: *const u16 = match &self.lm_shard {
+            Some(b) => b.ptr(),
+            None => unsafe { self.lm_head.dev_ptr::<u16>().add(self.vocab_off * h) },
+        };
         check(
             unsafe {
-                sys::blz_candidate_logits(input, h as i64, rows as c_int, h as c_int, self.lm_head.dev_ptr(), self.cand_ids.ptr(),
-                                          nc as c_int, self.cand_logits.ptr(), s.0)
+                sys::blz_candidate_logits(input, h as i64, rows as c_int, h as c_int, table.cast(), self.cand_ids.ptr(), nc as c_int,
+                                          self.cand_logits.ptr(), s.0)
             },
             "draft candidate logits",
         )?;
         check(
-            unsafe { sys::blz_candidate_topk(self.cand_logits.ptr(), self.cand_ids.ptr(), rows as c_int, nc as c_int, k as c_int, probs, tokens, s.0) },
-            "draft candidate top-k",
+            unsafe {
+                sys::blz_cand_pack(self.cand_logits.ptr(), self.cand_ids.ptr(), self.vocab_off as c_int, rows as c_int, nc as c_int,
+                                   model.tp.rank as c_int, world as c_int, self.pairs.ptr(), s.0)
+            },
+            "draft candidate pack",
+        )?;
+        if !self.ar.is_null() {
+            let bytes = (world * rows * nc * 8) as i64;
+            check(unsafe { sys::blz_host_ar_all_reduce(self.ar, self.pairs.ptr(), bytes, sys::BLZ_AR_FP32, s.0) }, "draft candidate all-reduce")?;
+        }
+        check(
+            unsafe {
+                sys::blz_cand_merge_topk(self.pairs.ptr(), world as c_int, rows as c_int, nc as c_int, k as c_int, probs, tokens, record,
+                                         s.0)
+            },
+            "draft candidate merge",
         )
     }
 
@@ -977,6 +1033,11 @@ impl Draft {
 
     /// Candidate head on `last_normed`: draft token of chain step `step` for every item, in `tok` and the record.
     fn head(&self, model: &Model, items: usize, step: usize) -> Result<()> {
+        self.head_merged(model, self.last_normed.ptr(), items, 1, std::ptr::null_mut(), self.tok.ptr(), self.record.at::<i64>(step * items))
+    }
+
+    #[allow(dead_code)]
+    fn head_replicated(&self, model: &Model, items: usize, step: usize) -> Result<()> {
         let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
         let (h, nc, rank) = (c.hidden, c.candidates, self.lr_down.n);
         self.lr_down.run(lin, self.last_normed.ptr(), h, items, self.lr.ptr(), rank, s)?;

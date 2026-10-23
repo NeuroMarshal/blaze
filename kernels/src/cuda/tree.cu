@@ -188,6 +188,75 @@ __global__ void __launch_bounds__(32 * kTopkWarps) candidate_topk_kernel(const f
   }
 }
 
+// grid: rows; this rank's (logit, global id) pairs of the row, the other ranks' zero (summed by an all-reduce)
+__global__ void cand_pack_kernel(const float* __restrict__ logits, const int32_t* __restrict__ ids, int id_offset, int rows,
+                                 int c, int rank, int world, float* __restrict__ pairs) {
+  const int r = blockIdx.x;
+  for (int i = threadIdx.x; i < world * c; i += blockDim.x) {
+    const int w = i / c, j = i % c;
+    float* p = pairs + ((int64_t(w) * rows + r) * c + j) * 2;
+    if (w == rank) {
+      const int id = ids[int64_t(r) * c + j];
+      p[0] = id < 0 ? -FLT_MAX : logits[int64_t(r) * c + j];
+      p[1] = id < 0 ? -1.0f : float(id + id_offset);
+    } else {
+      p[0] = p[1] = 0.0f;
+    }
+  }
+}
+
+constexpr int kMergeMax = 1024;
+
+// grid: rows, block: n (the pairs of all ranks, padded to a power of two): bitonic sort by logit (descending, ties: the
+// lower id), the top c are the candidates, softmax over them, the first k out
+__global__ void cand_merge_topk_kernel(const float* __restrict__ pairs, int world, int rows, int c, int k,
+                                       float* __restrict__ probs, int64_t* __restrict__ tokens, int64_t* __restrict__ record) {
+  __shared__ float sv[kMergeMax];
+  __shared__ int si[kMergeMax];
+  __shared__ float red[32];
+  const int r = blockIdx.x, n = blockDim.x, t = threadIdx.x;
+  const int total = world * c;
+  {
+    float v = -INFINITY;
+    int id = 0x7fffffff;
+    if (t < total) {
+      const int w = t / c, j = t % c;
+      const float* p = pairs + ((int64_t(w) * rows + r) * c + j) * 2;
+      if (p[1] >= 0.0f) v = p[0], id = int(p[1]);
+    }
+    sv[t] = v, si[t] = id;
+  }
+  __syncthreads();
+  for (int size = 2; size <= n; size <<= 1)
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      const int o = t ^ stride;
+      if (o > t) {
+        const bool desc = (t & size) == 0;
+        const bool after = sv[o] > sv[t] || (sv[o] == sv[t] && si[o] < si[t]);  // o belongs before t
+        if (after == desc) {
+          const float tv = sv[t];
+          const int ti = si[t];
+          sv[t] = sv[o], si[t] = si[o];
+          sv[o] = tv, si[o] = ti;
+        }
+      }
+      __syncthreads();
+    }
+  const float mx = sv[0];
+  float e = t < c && sv[t] > -INFINITY ? __expf(sv[t] - mx) : 0.0f;
+  for (int o = 16; o > 0; o >>= 1) e += __shfl_xor_sync(0xffffffffu, e, o);
+  if ((t & 31) == 0) red[t >> 5] = e;
+  __syncthreads();
+  float sum = 0.0f;
+  for (int i = 0; i < n / 32; ++i) sum += red[i];
+  if (t < k) {
+    const bool ok = sv[t] > -INFINITY;
+    if (probs) probs[int64_t(r) * k + t] = ok ? __expf(sv[t] - mx) / sum : 0.0f;
+    tokens[int64_t(r) * k + t] = ok ? si[t] : 0;
+    if (record && t == 0) record[r] = ok ? si[0] : 0;
+  }
+}
+
 __device__ __forceinline__ int tree_slot(const blz_draft_tree& t, int item, int depth, int lane) {
   return t.slot_base + (item * t.max_depth + depth - 1) * t.top_k + lane;
 }
@@ -332,5 +401,22 @@ extern "C" cudaError_t blz_tree_step(blz_draft_tree t, int items, int step, cons
   if (t.top_k < 1 || t.top_k > blaze::kMaxTopK || step < 1 || step >= t.max_depth || t.max_depth > blaze::kMaxDepth)
     return cudaErrorInvalidValue;
   blaze::tree_step_kernel<<<items, 256, 0, stream>>>(t, step, probs, tokens, hidden, dim, front_hidden);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_cand_pack(const float* logits, const int32_t* ids, int id_offset, int rows, int c, int rank,
+                                     int world, float* pairs, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  blaze::cand_pack_kernel<<<rows, 256, 0, stream>>>(logits, ids, id_offset, rows, c, rank, world, pairs);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_cand_merge_topk(const float* pairs, int world, int rows, int c, int k, float* probs,
+                                           int64_t* tokens, int64_t* record, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  int n = 32;
+  while (n < world * c) n <<= 1;
+  if (n > blaze::kMergeMax || k < 1 || k > c || k > 32) return cudaErrorInvalidValue;
+  blaze::cand_merge_topk_kernel<<<rows, n, 0, stream>>>(pairs, world, rows, c, k, probs, tokens, record);
   return cudaGetLastError();
 }

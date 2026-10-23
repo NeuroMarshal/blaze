@@ -210,6 +210,9 @@ pub struct Options {
     pub tree_levels: usize,
     /// EAGLE-4 draft trees: frontier rows per item (top-k children per node; 0: chains); their depth is tree_levels
     pub tree_width: usize,
+    /// EAGLE-4: this rank's vocabulary shard of the drafter's LM head in VRAM (Some(true)), in the pinned host table
+    /// (Some(false)), or in VRAM when it fits with room to spare (None)
+    pub draft_head_vram: Option<bool>,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).

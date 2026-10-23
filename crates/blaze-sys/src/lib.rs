@@ -215,6 +215,10 @@ unsafe extern "C" {
     pub fn blz_move_rows(bufs: *const blz_row_buf, nbuf: c_int, pairs: *const i32, n: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_candidate_topk(logits: *const f32, ids: *const i32, rows: c_int, c: c_int, k: c_int, probs: *mut f32,
                               tokens: *mut i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_cand_pack(logits: *const f32, ids: *const i32, id_offset: c_int, rows: c_int, c: c_int, rank: c_int,
+                         world: c_int, pairs: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_cand_merge_topk(pairs: *const f32, world: c_int, rows: c_int, c: c_int, k: c_int, probs: *mut f32,
+                               tokens: *mut i64, record: *mut i64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_tree_begin(t: blz_draft_tree, items: c_int, probs: *const f32, tokens: *const i64, root_hidden: *const bf16,
                           dim: c_int, front_hidden: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_tree_step(t: blz_draft_tree, items: c_int, step: c_int, probs: *const f32, tokens: *const i64,

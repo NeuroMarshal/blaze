@@ -89,6 +89,10 @@ struct EngineArgs {
     /// EAGLE-4 draft trees: depth
     #[arg(long, default_value_t = 6)]
     draft_tree_depth: usize,
+    /// EAGLE-4: this rank's shard of the drafter's LM head in VRAM (on), in pinned RAM read over PCIe (off), or in VRAM
+    /// when it fits with 1.5 GiB to spare (auto)
+    #[arg(long, default_value = "auto")]
+    draft_head_vram: String,
 }
 
 impl EngineArgs {
@@ -134,6 +138,12 @@ impl EngineArgs {
                 yarn_factor: self.yarn_factor,
                 tree_levels: if self.draft_tree_width > 1 { self.draft_tree_depth } else { 0 },
                 tree_width: if self.draft_tree_width > 1 { self.draft_tree_width } else { 0 },
+                draft_head_vram: match self.draft_head_vram.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    "auto" => None,
+                    v => anyhow::bail!("--draft-head-vram {v} (on, off, auto)"),
+                },
             },
             self.tp,
             !self.no_graphs,
