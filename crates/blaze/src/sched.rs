@@ -196,6 +196,49 @@ impl SpecCost {
     }
 }
 
+/// Sums of the tree rounds since the last log line (BLAZE_SPEC_LOG).
+#[derive(Default)]
+struct SpecLog {
+    every: Option<usize>,
+    rounds: usize,
+    seqs: usize,
+    rows: usize,
+    kept: usize,
+    verify: f64,
+    commit: f64,
+    draft: f64,
+}
+
+impl SpecLog {
+    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64) {
+        let every = *self.every.get_or_insert_with(|| std::env::var("BLAZE_SPEC_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        if every == 0 {
+            return;
+        }
+        self.rounds += 1;
+        self.seqs += seqs;
+        self.rows += rows;
+        self.kept += kept;
+        self.verify += verify;
+        self.commit += commit;
+        self.draft += draft;
+        if self.rounds == every {
+            let r = self.rounds as f64;
+            eprintln!(
+                "blaze: {} tree rounds: {:.2} seqs, {:.1} rows, {:.2} kept per round; verify {:.2} ms, commit {:.2} ms, draft {:.2} ms",
+                self.rounds,
+                self.seqs as f64 / r,
+                self.rows as f64 / r,
+                self.kept as f64 / r,
+                1e3 * self.verify / r,
+                1e3 * self.commit / r,
+                1e3 * self.draft / r
+            );
+            *self = SpecLog { every: self.every, ..Default::default() };
+        }
+    }
+}
+
 impl SpecCost {
     /// Draft-tree nodes per request of a batch: `gains[i]` the expected accepted tokens each further node of request i
     /// adds, best first. Nodes go one at a time to the request whose next node adds the most; the prefix of that order
@@ -267,6 +310,7 @@ impl Scheduler {
                     cache: Vec::new(),
                     clock: 0,
                     spec_stats: (0, 0),
+                    spec_log: SpecLog::default(),
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
@@ -292,6 +336,8 @@ struct Loop {
     clock: u64,
     /// speculative verifies and the tokens they emitted
     spec_stats: (usize, usize),
+    /// BLAZE_SPEC_LOG=n: every n tree rounds, their mean rows, kept rows and times on stderr
+    spec_log: SpecLog,
     spec_cost: SpecCost,
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
@@ -906,6 +952,7 @@ impl Loop {
             Greedy(Vec<i32>),
             Sampled(Vec<crate::engine::Cands>),
         }
+        let tv = Instant::now();
         let picks: Vec<Picks> = if sampled {
             let c = self.engine.verify_many_tree_sampled(&mut seqs, &tok_rows, Some(&parent_rows), &pens)?;
             c.into_iter().map(Picks::Sampled).collect()
@@ -914,6 +961,7 @@ impl Loop {
             p.into_iter().map(Picks::Greedy).collect()
         };
         drop(seqs);
+        let t_verify = tv.elapsed().as_secs_f64();
         let mut paths = Vec::with_capacity(n);
         let mut finished = Vec::new();
         for (&i, pk) in order.iter().zip(picks) {
@@ -949,8 +997,10 @@ impl Loop {
         let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
         // SAFETY: as above.
         let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
+        let tc = Instant::now();
         self.engine.commit_many_tree(&mut seqs, &paths)?;
         drop(seqs);
+        let t_commit = tc.elapsed().as_secs_f64();
         // the drafter over every request's kept rows (moved to the front of its verify rows), in verify-row order
         let mut items = Vec::new();
         let mut aux_row = 0;
@@ -963,8 +1013,11 @@ impl Loop {
             }
             aux_row += rows[i].len();
         }
+        let td = Instant::now();
         self.eagle_extend(items)?;
         let total: usize = rows.iter().map(|r| r.len()).sum();
+        let kept: usize = paths.iter().map(Vec::len).sum();
+        self.spec_log.note(n, total, kept, t_verify, t_commit, td.elapsed().as_secs_f64());
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
