@@ -31,10 +31,19 @@ def load_vision(model_dir, dtype):
     model = Qwen3_5VisionModel(cfg).to(dtype).eval()
     prefix = "model.visual."
     sd = {}
-    with safe_open(os.path.join(model_dir, "model.safetensors"), "pt") as f:
-        for k in f.keys():
-            if k.startswith(prefix):
-                sd[k[len(prefix):]] = f.get_tensor(k).to(dtype)
+    # single model.safetensors or shards listed by model.safetensors.index.json
+    index = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index):
+        import json
+        weight_map = json.load(open(index))["weight_map"]
+        files = sorted({f for k, f in weight_map.items() if k.startswith(prefix)})
+    else:
+        files = ["model.safetensors"]
+    for name in files:
+        with safe_open(os.path.join(model_dir, name), "pt") as f:
+            for k in f.keys():
+                if k.startswith(prefix):
+                    sd[k[len(prefix):]] = f.get_tensor(k).to(dtype)
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not missing and not unexpected, (missing, unexpected)
     return model
