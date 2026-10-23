@@ -102,7 +102,10 @@ bool decode_case(int nvis, int max_blocks) {
   for (auto& x : q) x = bf(nd(rng));
   std::vector<int32_t> rt(stride, 0);
   for (int64_t i = 0; i <= pos; ++i) rt[i] = int32_t(i);  // page = block
-  uint16_t* dcomp = dev(comp);
+  // copies of the keys, one per layer in turn, so that the scores read them from DRAM as they do in the model
+  const int copies = 4;
+  uint16_t* dcomps[copies];
+  for (auto& c : dcomps) c = dev(comp);
   uint16_t* dq = dev(q);
   int32_t* drt = dev(rt);
   std::vector<int64_t> hp = {pos};
@@ -116,8 +119,10 @@ bool decode_case(int nvis, int max_blocks) {
   check(cudaMalloc(&counts, 4), "malloc");
   cudaStream_t st;
   cudaStreamCreate(&st);
+  int turn = 0;
   auto run_scores = [&] {
-    check(blz_qsa_scores(dq, HEADS, D, dp, dtr, 0, 1, 0, RATIO, drt, stride, dcomp, max_blocks, scores, max_blocks, st), "scores");
+    check(blz_qsa_scores(dq, HEADS, D, dp, dtr, 0, 1, 0, RATIO, drt, stride, dcomps[turn++ % copies], max_blocks, scores, max_blocks, st),
+          "scores");
   };
   auto run_select = [&] {
     check(blz_qsa_select(scores, max_blocks, dp, dtr, 0, 1, RATIO, TOPK_BLOCKS, drt, stride, table, 2056, counts, st), "select");
@@ -154,7 +159,8 @@ bool decode_case(int nvis, int max_blocks) {
   const float t_sc = time_us(run_scores), t_sel = time_us(run_select), t_both = time_us([&] { run_scores(); run_select(); });
   std::printf("decode row, %d blocks (scores laid out for %d): %s; scores %.1f us, select %.1f us, both %.1f us\n", nvis,
               max_blocks, same ? "exact in order" : "MISMATCH", t_sc, t_sel, t_both);
-  cudaFree(dcomp), cudaFree(dq), cudaFree(drt), cudaFree(dp), cudaFree(dtr), cudaFree(scores), cudaFree(table), cudaFree(counts);
+  for (auto c : dcomps) cudaFree(c);
+  cudaFree(dq), cudaFree(drt), cudaFree(dp), cudaFree(dtr), cudaFree(scores), cudaFree(table), cudaFree(counts);
   cudaStreamDestroy(st);
   return same;
 }

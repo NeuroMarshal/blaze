@@ -298,7 +298,9 @@ __device__ __forceinline__ uint32_t fkey(float f) {
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-// Exclusive scan of one int per thread over the block; returns the thread's offset and sets *total.
+// Exclusive scan of one int per thread over the block; returns the thread's offset and sets *total. One barrier: every
+// warp scans the warp sums itself; `Slot` gives each call site its own sums, so that no barrier is needed between two.
+template <int Slot>
 __device__ int block_scan(int v, int* total) {
   __shared__ int warp_sums[kSelThreads / 32];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -310,36 +312,57 @@ __device__ int block_scan(int v, int* total) {
   }
   if (lane == 31) warp_sums[warp] = x;
   __syncthreads();
-  if (warp == 0) {
-    int s = lane < kSelThreads / 32 ? warp_sums[lane] : 0;
+  int s = warp_sums[lane];  // kSelThreads / 32 == 32
 #pragma unroll
-    for (int o = 1; o < 32; o <<= 1) {
-      const int y = __shfl_up_sync(0xffffffffu, s, o);
-      if (lane >= o) s += y;
-    }
-    if (lane < kSelThreads / 32) warp_sums[lane] = s;
+  for (int o = 1; o < 32; o <<= 1) {
+    const int y = __shfl_up_sync(0xffffffffu, s, o);
+    if (lane >= o) s += y;
   }
-  __syncthreads();
-  const int before = (warp > 0 ? warp_sums[warp - 1] : 0) + x - v;
-  *total = warp_sums[kSelThreads / 32 - 1];
-  __syncthreads();
-  return before;
+  *total = __shfl_sync(0xffffffffu, s, 31);
+  return __shfl_sync(0xffffffffu, s, (warp + 31) & 31) * (warp > 0) + x - v;
 }
 
 // The largest bin b of hist[0, NB) with at least `need` elements in the bins >= b; *above = elements in the bins > b,
-// *in_bin = elements in b. Two bins per thread, scanned from the top.
+// *in_bin = elements in b. Warp 0 scans it: lane l owns the bins NB - (l + 1) * NB / 32 .. NB - l * NB / 32 - 1. The
+// lanes sum their bins starting at different vectors (rotated), which keeps the 16-byte loads free of bank conflicts;
+// the lane holding the answer walks its bins from the top.
 template <int NB>
 __device__ int find_bin(const int* hist, int need, int* above, int* in_bin) {
+  constexpr int vecs = NB / 32 / 4;
   __shared__ int found[3];
-  const int b0 = NB - 1 - 2 * threadIdx.x;
-  const bool mine = b0 >= 1;
-  const int h0 = mine ? hist[b0] : 0, h1 = mine ? hist[b0 - 1] : 0;
-  if (threadIdx.x == 0) found[0] = found[1] = found[2] = 0;
-  int total;
-  const int before = block_scan(h0 + h1, &total);
-  if (mine) {
-    if (before < need && before + h0 >= need) found[0] = b0, found[1] = before, found[2] = h0;
-    else if (before + h0 < need && before + h0 + h1 >= need) found[0] = b0 - 1, found[1] = before + h0, found[2] = h1;
+  if (threadIdx.x < 32) {
+    const int lane = threadIdx.x;
+    const int4* mine = reinterpret_cast<const int4*>(hist + NB - (lane + 1) * (NB / 32));
+    int sum = 0;
+#pragma unroll
+    for (int j = 0; j < vecs; ++j) {
+      const int4 q = mine[(j + lane) % vecs];
+      sum += q.x + q.y + q.z + q.w;
+    }
+    int x = sum;  // inclusive scan from lane 0 (the top bins) down
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+      const int y = __shfl_up_sync(0xffffffffu, x, o);
+      if (lane >= o) x += y;
+    }
+    const int before = x - sum;
+    if (before < need && x >= need) {
+      int4 q[vecs];
+#pragma unroll
+      for (int j = 0; j < vecs; ++j) q[j] = mine[j];
+      int c = before;
+#pragma unroll
+      for (int j = vecs - 1; j >= 0; --j) {
+        const int hh[4] = {q[j].w, q[j].z, q[j].y, q[j].x};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+          if (c < need && c + hh[e] >= need) {
+            found[0] = NB - (lane + 1) * (NB / 32) + 4 * j + 3 - e, found[1] = c, found[2] = hh[e];
+          }
+          c += hh[e];
+        }
+      }
+    }
   }
   __syncthreads();
   const int bin = found[0];
@@ -347,6 +370,30 @@ __device__ int find_bin(const int* hist, int need, int* above, int* in_bin) {
   *in_bin = found[2];
   __syncthreads();
   return bin;
+}
+
+// Bitmap of the blocks with fkey(score) >= t1: word w holds blocks 32 w .. 32 w + 31, the ballot of one warp's loads.
+// Non-negative t1 > 0x80000000 only needs the float bits compared as signed integers (a negative float is below any).
+template <bool NonNeg>
+__device__ void mark_ge(const float* __restrict__ sc, int nvis, uint32_t t1, uint32_t* bm) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = (nvis + 31) >> 5;
+  const int ti = int(t1 ^ 0x80000000u);
+  auto ge = [&](float v) { return NonNeg ? int(__float_as_uint(v)) >= ti : fkey(v) >= t1; };
+  const int full = nvis / (kSelThreads * kUnroll) * (kSelThreads * kUnroll);
+  for (int base = 0; base < full; base += kSelThreads * kUnroll) {
+    float v[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) v[u] = sc[base + u * kSelThreads + tid];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const uint32_t m = __ballot_sync(0xffffffffu, ge(v[u]));
+      if (lane == 0) bm[(base >> 5) + u * 32 + warp] = m;
+    }
+  }
+  for (int i = full + tid; i < ((nvis + kSelThreads - 1) / kSelThreads) * kSelThreads; i += kSelThreads) {
+    const uint32_t m = __ballot_sync(0xffffffffu, i < nvis && ge(sc[i]));
+    if (lane == 0 && (i >> 5) < nw) bm[i >> 5] = m;
+  }
 }
 
 // One block per row: the best block_topk visible blocks (largest score; the lowest blocks among equal scores), taken in
@@ -379,16 +426,16 @@ __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __rest
   } else {
     for (int i = tid; i < kBins; i += kSelThreads) hist[i] = 0;
     __syncthreads();
-    for (int base = 0; base < nvis; base += kSelThreads * kUnroll) {
-      float v[kUnroll];
+    {
+      const int full = nvis / (kSelThreads * kUnroll) * (kSelThreads * kUnroll);
+      for (int base = 0; base < full; base += kSelThreads * kUnroll) {
+        float v[kUnroll];
 #pragma unroll
-      for (int u = 0; u < kUnroll; ++u) {
-        const int i = base + u * kSelThreads + tid;
-        v[u] = i < nvis ? sc[i] : 0.0f;
+        for (int u = 0; u < kUnroll; ++u) v[u] = sc[base + u * kSelThreads + tid];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) atomicAdd(&hist[fkey(v[u]) >> 21], 1);
       }
-#pragma unroll
-      for (int u = 0; u < kUnroll; ++u)
-        if (base + u * kSelThreads + tid < nvis) atomicAdd(&hist[fkey(v[u]) >> 21], 1);
+      for (int i = full + tid; i < nvis; i += kSelThreads) atomicAdd(&hist[fkey(sc[i]) >> 21], 1);
     }
     __syncthreads();
     int above1, in_bin1;
@@ -396,22 +443,9 @@ __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __rest
     if (above1 + in_bin1 <= kCand && nvis <= kBitWords * 32) {
       // blocks with a key in bin b1 or above: the bitmap word of 32 blocks is the warp's ballot
       const uint32_t t1 = uint32_t(b1) << 21;
-      const int nw = (nvis + 31) >> 5, lane = tid & 31, warp = tid >> 5;
-      for (int base = 0; base < nvis; base += kSelThreads * kUnroll) {
-        float v[kUnroll];
-#pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-          const int i = base + u * kSelThreads + tid;
-          v[u] = i < nvis ? sc[i] : 0.0f;
-        }
-#pragma unroll
-        for (int u = 0; u < kUnroll; ++u) {
-          const bool p = base + u * kSelThreads + tid < nvis && fkey(v[u]) >= t1;
-          const uint32_t m = __ballot_sync(0xffffffffu, p);
-          const int w = (base >> 5) + u * 32 + warp;
-          if (lane == 0 && w < nw) bm[w] = m;
-        }
-      }
+      const int nw = (nvis + 31) >> 5;
+      if (t1 >= 0x80000000u) mark_ge<true>(sc, nvis, t1, bm);
+      else mark_ge<false>(sc, nvis, t1, bm);
       for (int i = tid; i < kBins + kBins / 2; i += kSelThreads) lh[i] = 0;
       __syncthreads();
       // candidates in block order: thread t lists the set bits of its words
@@ -420,7 +454,7 @@ __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __rest
       int cnt = 0;
       for (int w = w0; w < w1; ++w) cnt += __popc(bm[w]);
       int n;
-      int o = block_scan(cnt, &n);
+      int o = block_scan<0>(cnt, &n);
       for (int w = w0; w < w1; ++w) {
         uint32_t m = bm[w];
         while (m) {
@@ -461,7 +495,7 @@ __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __rest
         v += (e < n && k2[j] > thr) + ((e < n && k2[j] == thr) << 16);
       }
       int tot;
-      const int off = block_scan(v, &tot);
+      const int off = block_scan<1>(v, &tot);
       const int n_gt = tot & 0xffff, ties = K - n_gt;
       int og = off & 0xffff, oe = off >> 16;
 #pragma unroll
@@ -505,8 +539,8 @@ __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __rest
         eq += k == thr;
       }
       int n_gt = 0, n_eq = 0;
-      const int off_gt = block_scan(gt, &n_gt);
-      const int off_eq = block_scan(eq, &n_eq);
+      const int off_gt = block_scan<2>(gt, &n_gt);
+      const int off_eq = block_scan<3>(eq, &n_eq);
       int og = off_gt, oe = off_eq;
       for (int i = a; i < b; ++i) {
         const uint32_t k = fkey(sc[i]);
