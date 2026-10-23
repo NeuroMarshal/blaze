@@ -334,7 +334,23 @@ fn main() -> Result<()> {
             let (mut rounds, mut drafted, mut accepted_total) = (0usize, 0usize, 0usize);
             let (mut t_verify, mut t_commit, mut t_draft) = (0.0f64, 0.0f64, 0.0f64);
             let t1 = Instant::now();
+            // BLAZE_PROFILE_ROUNDS=a,b: profile rounds a..b (nsys --capture-range=cudaProfilerApi)
+            let prof: Option<(usize, usize)> = std::env::var("BLAZE_PROFILE_ROUNDS").ok().and_then(|v| {
+                let (a, b) = v.split_once(',')?;
+                Some((a.parse().ok()?, b.parse().ok()?))
+            });
+            let mark = |rounds: usize| -> anyhow::Result<()> {
+                if let Some((a, b)) = prof {
+                    if rounds == a {
+                        blaze::gpu::profiler(true)?;
+                    } else if rounds == b {
+                        blaze::gpu::profiler(false)?;
+                    }
+                }
+                Ok(())
+            };
             while out.len() < max_tokens && tree.is_some() {
+                mark(rounds)?;
                 let t = tree.as_ref().unwrap();
                 let room = max_tokens - out.len();
                 let nodes: Vec<usize> = blaze::tree::ranked(t, room.saturating_sub(1)).into_iter().take(draft).map(|x| x.1).collect();
@@ -358,6 +374,7 @@ fn main() -> Result<()> {
                 t_draft += td.elapsed().as_secs_f64();
             }
             while out.len() < max_tokens {
+                mark(rounds)?;
                 let k = draft.min(max_tokens - out.len());
                 let d = &drafts[..k.min(drafts.len())];
                 let start = seq.len();
