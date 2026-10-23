@@ -207,10 +207,13 @@ struct SpecLog {
     verify: f64,
     commit: f64,
     draft: f64,
+    round: f64,
+    depth: usize,
 }
 
 impl SpecLog {
-    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64, round: f64, depth: usize) {
         let every = *self.every.get_or_insert_with(|| std::env::var("BLAZE_SPEC_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         if every == 0 {
             return;
@@ -222,17 +225,22 @@ impl SpecLog {
         self.verify += verify;
         self.commit += commit;
         self.draft += draft;
+        self.round += round;
+        self.depth += depth;
         if self.rounds == every {
             let r = self.rounds as f64;
             eprintln!(
-                "blaze: {} tree rounds: {:.2} seqs, {:.1} rows, {:.2} kept per round; verify {:.2} ms, commit {:.2} ms, draft {:.2} ms",
+                "blaze: {} tree rounds: {:.2} seqs, {:.1} rows, {:.2} kept per round, depth {:.1}; verify {:.2} ms, commit {:.2} ms, \
+                 draft {:.2} ms, round {:.2} ms",
                 self.rounds,
                 self.seqs as f64 / r,
                 self.rows as f64 / r,
                 self.kept as f64 / r,
+                self.depth as f64 / r,
                 1e3 * self.verify / r,
                 1e3 * self.commit / r,
-                1e3 * self.draft / r
+                1e3 * self.draft / r,
+                1e3 * self.round / r
             );
             *self = SpecLog { every: self.every, ..Default::default() };
         }
@@ -316,6 +324,9 @@ impl Scheduler {
                     spec_stats: (0, 0),
                     spec_log: SpecLog::default(),
                     tree_depth: 0,
+                    tree_level_s: 0.0,
+                    tree_tokens: 0.0,
+                    tree_round_s: 0.0,
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
@@ -343,9 +354,12 @@ struct Loop {
     spec_stats: (usize, usize),
     /// BLAZE_SPEC_LOG=n: every n tree rounds, their mean rows, kept rows and times on stderr
     spec_log: SpecLog,
-    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth): one deeper after a round that
-    /// verified a node of the deepest level, one shallower after a round that left two levels unused
+    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth), and the decayed means the depth
+    /// rule weighs: seconds of a drafting call per level, tokens kept per round, seconds per round
     tree_depth: usize,
+    tree_level_s: f64,
+    tree_tokens: f64,
+    tree_round_s: f64,
     spec_cost: SpecCost,
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
@@ -1027,17 +1041,33 @@ impl Loop {
             }
             aux_row += rows[i].len();
         }
-        // the depth of the next trees from the deepest node this round verified
-        let deepest = rows.iter().flat_map(|r| r.depth.iter().copied()).max().unwrap_or(0);
-        if deepest > 0 {
-            let (cur, max) = (self.tree_depth.max(2), self.engine.info.tree_levels);
-            self.tree_depth = if deepest >= cur { (cur + 1).min(max) } else if deepest + 2 <= cur { (cur - 1).max(2) } else { cur };
-        }
+        // The depth of the next trees (eagle_harness grows a level while its work delta pays for the draft step): the
+        // deepest level earns its draft step when the tokens expected from its verified nodes g exceed the step's time
+        // at this batch's token rate, g > step * tokens / round. One level deeper when it earns that with margin (the next
+        // level holds less), one shallower when it does not.
+        let cur = self.tree_depth.max(2);
+        let gain: f64 = order
+            .iter()
+            .map(|&i| {
+                let a = &self.active[i];
+                let cal = (a.tree_hit + 1.0) / (a.tree_pred + 1.0);
+                rows[i].scores.iter().zip(&rows[i].depth).filter(|(_, &d)| d == cur).map(|(&s, _)| s as f64 * cal).sum::<f64>()
+            })
+            .sum();
         let td = Instant::now();
         self.eagle_extend(items)?;
+        let t_draft = td.elapsed().as_secs_f64();
         let total: usize = rows.iter().map(|r| r.len()).sum();
         let kept: usize = paths.iter().map(Vec::len).sum();
-        self.spec_log.note(n, total, kept, t_verify, t_commit, td.elapsed().as_secs_f64());
+        let t_round = t0.elapsed().as_secs_f64();
+        let ema = |x: &mut f64, v: f64| *x = if *x == 0.0 { v } else { 0.9 * *x + 0.1 * v };
+        ema(&mut self.tree_level_s, t_draft / cur as f64);
+        ema(&mut self.tree_tokens, kept as f64);
+        ema(&mut self.tree_round_s, t_round);
+        let pay = self.tree_level_s * self.tree_tokens / self.tree_round_s;
+        let max = self.engine.info.tree_levels;
+        self.tree_depth = if 0.6 * gain > pay { (cur + 1).min(max) } else if gain < pay { (cur - 1).max(2) } else { cur };
+        self.spec_log.note(n, total, kept, t_verify, t_commit, t_draft, t_round, cur);
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
