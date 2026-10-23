@@ -1,0 +1,213 @@
+//! Launch configurations of the tensor-core GEMV kernels (NVFP4, MXFP8), measured on this GPU for the model's own
+//! weight shapes and kept per device in ~/.cache/blaze, instead of constants tuned by hand on one GPU.
+//!
+//! An entry is the fastest (warps along K, weight tiles per block) for a weight shape [n, k] and a bucket of input
+//! rows. It is measured over every layer of that shape in turn, so that the weights come from DRAM as in a forward
+//! pass, not from L2. Missing shapes are measured at load (a fraction of a second each); BLAZE_TUNE=0 keeps the
+//! kernels' built-in defaults.
+
+use crate::gpu::{DevBuf, Stream, Timer};
+use anyhow::Result;
+use blaze_sys as sys;
+use std::collections::HashMap;
+use std::ffi::c_int;
+use std::path::PathBuf;
+use std::sync::RwLock;
+
+/// Representative rows of the buckets (a call of m rows takes the first bucket >= m).
+pub const BUCKETS: [usize; 10] = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64];
+/// Bump when kernel variants change: older cache files are ignored.
+const VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kernel {
+    Nvfp4,
+    Mxfp8,
+}
+
+impl Kernel {
+    fn name(self) -> &'static str {
+        match self {
+            Kernel::Nvfp4 => "nvfp4",
+            Kernel::Mxfp8 => "mxfp8",
+        }
+    }
+}
+
+/// A weight of one shape to measure: its device buffers (codes, scales, NVFP4 alpha).
+#[derive(Clone, Copy)]
+pub struct Weight {
+    pub kernel: Kernel,
+    pub n: usize,
+    pub k: usize,
+    pub codes: *const u8,
+    pub scales: *const u8,
+    pub alpha: *const f32,
+}
+
+fn bucket(m: usize) -> usize {
+    BUCKETS.iter().position(|&b| b >= m).unwrap_or(BUCKETS.len() - 1)
+}
+
+fn launch(w: &Weight, x: *const u16, y: *mut u16, rows: usize, split: c_int, tiles: c_int, s: &Stream) -> c_int {
+    unsafe {
+        match w.kernel {
+            Kernel::Nvfp4 => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int,
+                                                        w.n as c_int, w.k as c_int, split, tiles, s.0),
+            Kernel::Mxfp8 => sys::blz_mxfp8_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, y, w.n as i64, rows as c_int, w.n as c_int,
+                                                        w.k as c_int, split, tiles, s.0),
+        }
+    }
+}
+
+fn valid(kernel: Kernel, rows: usize, split: c_int, tiles: c_int) -> bool {
+    unsafe {
+        match kernel {
+            Kernel::Nvfp4 => sys::blz_nvfp4_mma_cfg_valid(rows as c_int, split, tiles) != 0,
+            Kernel::Mxfp8 => sys::blz_mxfp8_mma_cfg_valid(rows as c_int, split, tiles) != 0,
+        }
+    }
+}
+
+type Key = (Kernel, usize, usize, usize);
+
+pub struct Tuning {
+    table: RwLock<HashMap<Key, (c_int, c_int)>>,
+    path: Option<PathBuf>,
+    enabled: bool,
+}
+
+impl Tuning {
+    /// The cache of this device (`rank`: one file per rank, the ranks tune in parallel).
+    pub fn open(rank: usize) -> Self {
+        let enabled = std::env::var("BLAZE_TUNE").map(|v| v != "0").unwrap_or(true);
+        let (mut major, mut minor, mut sms, mut dev) = (0, 0, 0, 0);
+        unsafe {
+            unsafe extern "C" {
+                fn cudaGetDevice(device: *mut c_int) -> c_int;
+            }
+            cudaGetDevice(&mut dev);
+            sys::cudaDeviceGetAttribute(&mut major, sys::ATTR_COMPUTE_CAPABILITY_MAJOR, dev);
+            sys::cudaDeviceGetAttribute(&mut minor, sys::ATTR_COMPUTE_CAPABILITY_MINOR, dev);
+            sys::cudaDeviceGetAttribute(&mut sms, sys::ATTR_MULTIPROCESSOR_COUNT, dev);
+        }
+        let path = std::env::var_os("HOME").map(|h| {
+            PathBuf::from(h).join(".cache/blaze").join(format!("tune-sm{major}{minor}-{sms}sm-r{rank}.json"))
+        });
+        let mut table = HashMap::new();
+        if let Some(p) = &path
+            && let Ok(text) = std::fs::read_to_string(p)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && v["version"].as_u64() == Some(VERSION as u64)
+            && let Some(entries) = v["entries"].as_object()
+        {
+            for (key, val) in entries {
+                let parts: Vec<&str> = key.split(':').collect();
+                let kernel = match parts.first() {
+                    Some(&"nvfp4") => Kernel::Nvfp4,
+                    Some(&"mxfp8") => Kernel::Mxfp8,
+                    _ => continue,
+                };
+                let (Some(n), Some(k), Some(b)) = (parts.get(1).and_then(|x| x.parse().ok()), parts.get(2).and_then(|x| x.parse().ok()),
+                                                   parts.get(3).and_then(|x| x.parse::<usize>().ok()))
+                else {
+                    continue;
+                };
+                let (Some(split), Some(tiles)) = (val[0].as_i64(), val[1].as_i64()) else { continue };
+                table.insert((kernel, n, k, b), (split as c_int, tiles as c_int));
+            }
+        }
+        Self { table: RwLock::new(table), path, enabled }
+    }
+
+    /// The configuration of a call (0, 0: the kernel's default).
+    pub fn get(&self, kernel: Kernel, n: usize, k: usize, m: usize) -> (c_int, c_int) {
+        if !self.enabled {
+            return (0, 0);
+        }
+        self.table.read().unwrap().get(&(kernel, n, k, bucket(m))).copied().unwrap_or((0, 0))
+    }
+
+    /// Measure the shapes of `weights` not in the table (every bucket, every valid configuration; each timed over all
+    /// weights of the shape in turn) and save the table. Returns the shapes measured.
+    pub fn tune(&self, weights: &[Weight], s: &Stream) -> Result<usize> {
+        if !self.enabled {
+            return Ok(0);
+        }
+        let mut shapes: HashMap<(Kernel, usize, usize), Vec<Weight>> = HashMap::new();
+        for w in weights {
+            if w.k % 128 == 0 {
+                shapes.entry((w.kernel, w.n, w.k)).or_default().push(*w);
+            }
+        }
+        let missing: Vec<_> = {
+            let t = self.table.read().unwrap();
+            shapes.into_iter().filter(|(key, _)| (0..BUCKETS.len()).any(|b| !t.contains_key(&(key.0, key.1, key.2, b)))).collect()
+        };
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let max_k = missing.iter().map(|(k, _)| k.2).max().unwrap();
+        let max_n = missing.iter().map(|(k, _)| k.1).max().unwrap();
+        let rows_max = *BUCKETS.last().unwrap();
+        let x = DevBuf::zeroed(rows_max * max_k * 2, s)?;
+        let y = DevBuf::zeroed(rows_max * max_n * 2, s)?;
+        let timer = Timer::new()?;
+        let mut found = Vec::new();
+        for ((kernel, n, k), ws) in &missing {
+            // at most 16 weights in turn: enough to keep them out of L2, few enough to be quick
+            let ws = &ws[..ws.len().min(16)];
+            let rounds = (32 / ws.len()).clamp(2, 8);
+            for (b, &rows) in BUCKETS.iter().enumerate() {
+                let mut best = (f32::INFINITY, 0, 0);
+                for split in [2, 4, 8] {
+                    for tiles in [1, 2, 4] {
+                        if !valid(*kernel, rows, split, tiles) {
+                            continue;
+                        }
+                        for w in ws {
+                            launch(w, x.ptr(), y.ptr(), rows, split, tiles, s);
+                        }
+                        timer.start(s)?;
+                        for _ in 0..rounds {
+                            for w in ws {
+                                launch(w, x.ptr(), y.ptr(), rows, split, tiles, s);
+                            }
+                        }
+                        let ms = timer.stop(s)?;
+                        if ms < best.0 {
+                            best = (ms, split, tiles);
+                        }
+                    }
+                }
+                if best.1 > 0 {
+                    found.push(((*kernel, *n, *k, b), (best.1, best.2)));
+                }
+            }
+        }
+        let shapes_tuned = missing.len();
+        {
+            let mut t = self.table.write().unwrap();
+            t.extend(found);
+        }
+        self.save();
+        Ok(shapes_tuned)
+    }
+
+    fn save(&self) {
+        let Some(p) = &self.path else { return };
+        let t = self.table.read().unwrap();
+        let mut entries = serde_json::Map::new();
+        let mut keys: Vec<_> = t.keys().copied().collect();
+        keys.sort_by_key(|k| (k.0.name(), k.1, k.2, k.3));
+        for key in keys {
+            let v = t[&key];
+            entries.insert(format!("{}:{}:{}:{}", key.0.name(), key.1, key.2, key.3), serde_json::json!([v.0, v.1]));
+        }
+        let doc = serde_json::json!({"version": VERSION, "buckets": BUCKETS, "entries": entries});
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, serde_json::to_string_pretty(&doc).unwrap_or_default());
+    }
+}

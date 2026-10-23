@@ -63,7 +63,8 @@ uint16_t bf(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
 float fb(uint16_t v) { return __bfloat162float(__ushort_as_bfloat16(v)); }
 
 // Worst |y - ref| / max |ref| of `rows` rows through the GEMV (rows <= 8) or dequant + cuBLAS.
-double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm* gemm, bool mma = false) {
+double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm* gemm, bool mma = false, int split = 0,
+           int tiles = 0) {
   std::normal_distribution<float> d(0.0f, 1.0f);
   std::vector<uint16_t> x(size_t(rows) * ldx);
   for (auto& v : x) v = bf(d(rng));
@@ -72,7 +73,8 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
   check(cudaMalloc(&dy, size_t(rows) * W.n * 2), "malloc");
   check(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "copy");
   if (mma) {
-    check(blz_nvfp4_gemv_mma(dx, ldx, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, 0), "gemv_mma");
+    check(blz_nvfp4_gemv_mma_cfg(dx, ldx, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, split, tiles, 0),
+          "gemv_mma");
   } else if (rows <= BLZ_NVFP4_GEMV_MAX_ROWS) {
     check(blz_nvfp4_gemv(dx, ldx, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, 0), "gemv");
   } else {
@@ -161,11 +163,32 @@ int main(int argc, char** argv) {
     ok &= pass;
     std::printf("rows %2d (mma): max rel err %.2e %s\n", rows, e, pass ? "ok" : "FAIL");
   }
+  // every launch the tuner may pick (tune.rs): all valid (warps along K, weight tiles per block)
+  {
+    int checked = 0, bad = 0;
+    for (int rows : {1, 7, 8, 9, 16, 17, 32, 33, 48, 64})
+      for (int split : {2, 4, 8})
+        for (int tiles : {1, 2, 4}) {
+          if (!blz_nvfp4_mma_cfg_valid(rows, split, tiles)) continue;
+          const double e = run(mid, rows, 1152, rng, gemm, true, split, tiles);
+          ++checked;
+          if (!(e < 6e-3)) {
+            ++bad;
+            std::printf("rows %2d split %d tiles %d: max rel err %.2e FAIL\n", rows, split, tiles, e);
+          }
+        }
+    ok &= bad == 0;
+    std::printf("mma launches: %d checked, %d failed\n", checked, bad);
+  }
   Weights big(64, 8704, rng);
   const double e = run(big, 1, 8704, rng, gemm);
   ok &= e < 6e-3;
   std::printf("rows  1, k 8704: max rel err %.2e %s\n", e, e < 6e-3 ? "ok" : "FAIL");
 
+  if (argc > 1 && std::string(argv[1]) == "check") {  // correctness only
+    std::printf("%s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+  }
   std::printf("bandwidth:\n");
   for (int rows : {1, 2, 4, 8, 16, 24, 32, 48, 64}) {
     for (bool mma : {false, true}) {

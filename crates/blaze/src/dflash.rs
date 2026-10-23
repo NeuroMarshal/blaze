@@ -177,6 +177,23 @@ pub struct DFlash {
 unsafe impl Send for DFlash {}
 
 impl DFlash {
+    /// Window splits of the block attention: about four CTAs per SM over the call's query tiles and KV heads, within
+    /// the partial workspace (one CTA per tile walked the whole 2048-position window).
+    fn attn_splits(&self, model: &Model, items: usize, q_len: usize) -> usize {
+        let (heads, kvh, hd) = (self.heads, self.kv_heads, self.cfg.head_dim);
+        let group = heads / kvh;
+        let mt = (q_len * group).div_ceil(16).min(3);
+        let tiles = q_len.div_ceil((16 * mt / group).max(1));
+        let cap = self.partial_o.bytes() / (heads * hd * 4);
+        let mut splits = (4 * model.sms() / (items * tiles * kvh)).clamp(1, 16);
+        while splits > 1
+            && items * q_len * unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, splits as c_int) } as usize > cap
+        {
+            splits /= 2;
+        }
+        splits
+    }
+
     pub fn load(dir: &Path, model: &Model, max_items: usize, stride: usize) -> Result<Self> {
         let cfg = DFlashConfig::load(dir)?;
         let s = &model.stream;
@@ -236,7 +253,8 @@ impl DFlash {
         let ns = max_items * cfg.steps();
         let groups = h / cfg.group;
         let v_local = model.dims.vocab;
-        let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, cfg.block as c_int, 1) } as usize;
+        // the block attention splits its window up to 16 ways (attn_splits)
+        let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, cfg.block as c_int, 16) } as usize;
         let k = cfg.top_k;
         // a call's metadata: positions and slots of every context row (at most `window` per item), the blocks'
         // positions, slots, tokens, rows, lengths, anchors
@@ -504,7 +522,7 @@ impl DFlash {
                         sys::blz_index_ptr { ptr: kvlp.cast(), kind: sys::BLZ_I32 },
                         n as c_int,
                         bl as c_int,
-                        1,
+                        self.attn_splits(model, n, bl) as c_int,
                         1.0 / (hd as f32).sqrt(),
                         c.window as c_int,
                         c.causal as c_int,

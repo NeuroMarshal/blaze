@@ -45,6 +45,8 @@ unsafe extern "C" {
     pub fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> cudaError_t;
     pub fn cudaEventCreateWithFlags(e: *mut cudaEvent_t, flags: u32) -> cudaError_t;
     pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventSynchronize(e: cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventElapsedTime(ms: *mut f32, start: cudaEvent_t, end: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(e: cudaEvent_t, s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamWaitEvent(s: cudaStream_t, e: cudaEvent_t, flags: u32) -> cudaError_t;
 }
@@ -56,6 +58,8 @@ pub type cudaGraph_t = *mut c_void;
 pub type cudaGraphExec_t = *mut c_void;
 pub const CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
 pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const ATTR_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
+pub const ATTR_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
 // blaze/ops.h
 #[repr(C)]
@@ -299,6 +303,13 @@ unsafe extern "C" {
     pub fn blz_fp8_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, block_scale: *const f32, block_n: c_int,
                             alpha: *const f32, y: *mut bf16, ldy: i64, rows: c_int, n: c_int, k: c_int,
                             s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_gemv_mma_cfg(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut bf16,
+                                  ldy: i64, rows: c_int, n: c_int, k: c_int, split: c_int, tiles: c_int,
+                                  s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_mma_cfg_valid(rows: c_int, split: c_int, tiles: c_int) -> c_int;
+    pub fn blz_mxfp8_gemv_mma_cfg(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, y: *mut bf16, ldy: i64, rows: c_int,
+                                  n: c_int, k: c_int, split: c_int, tiles: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_mxfp8_mma_cfg_valid(rows: c_int, split: c_int, tiles: c_int) -> c_int;
     pub fn blz_mxfp8_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, y: *mut bf16, ldy: i64, rows: c_int,
                               n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_mxfp8_weight_dequant(w: *const u8, scale: *const u8, n: c_int, k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
@@ -327,6 +338,7 @@ unsafe extern "C" {
     pub fn blz_host_ar_rmsnorm(ar: *mut blz_host_ar, x: *const bf16, residual: *mut bf16, w: *const bf16, eps: f32,
                                rows: c_int, dim: c_int, zero_centered: c_int, out: *mut bf16, s: cudaStream_t)
                                -> cudaError_t;
+    pub fn blz_host_ar_set_dma_min(ar: *mut blz_host_ar, bytes: i64);
     pub fn blz_host_ar_all_reduce(ar: *mut blz_host_ar, data: *mut c_void, bytes: i64, dtype: c_int,
                                   s: cudaStream_t) -> cudaError_t;
 }

@@ -90,6 +90,9 @@ enum Cmd {
     Reset(usize),
     Logits(usize),
     AllLogits(usize),
+    /// time the all-reduce paths at these sizes (collective)
+    TimeAllReduce(Arc<Vec<usize>>),
+    SetDmaMin(i64),
     Quit,
 }
 
@@ -123,7 +126,7 @@ impl Drop for Graph {
 type GraphKey = (Vec<usize>, bool, bool, bool, bool);
 
 /// Most verify graphs kept (their span shapes vary with the draft lengths); beyond them verify steps run eagerly.
-const MAX_VERIFY_GRAPHS: usize = 48;
+const MAX_VERIFY_GRAPHS: usize = 128;
 
 /// One rank: its model shard and the per-step machinery.
 struct Runner {
@@ -271,6 +274,11 @@ impl Runner {
                 Reply::Done
             }
             Cmd::Logits(row) => Reply::Logits(self.model.last_logits(row)?),
+            Cmd::TimeAllReduce(sizes) => Reply::Logits(self.model.time_all_reduce(&sizes)?.into_iter().flat_map(|(a, b)| [a, b]).collect()),
+            Cmd::SetDmaMin(bytes) => {
+                self.model.set_dma_min(bytes);
+                Reply::Done
+            }
             Cmd::AllLogits(t) => Reply::AllLogits(self.model.all_logits(t)?),
             Cmd::Quit => Reply::Done,
         })
@@ -497,7 +505,7 @@ impl Engine {
             return Err(e);
         }
         let info = info.unwrap();
-        Ok(Self {
+        let mut engine = Self {
             workers,
             last_verify: Vec::new(),
             free_pages: (0..(info.max_tokens / info.page) as u32).rev().collect(),
@@ -505,7 +513,33 @@ impl Engine {
             free_rows: (0..info.max_seqs).rev().collect(),
             free_cache_rows: (info.max_seqs..info.max_seqs + info.cache_rows).rev().collect(),
             info,
-        })
+        };
+        if world > 1 {
+            engine.tune_all_reduce()?;
+        }
+        Ok(engine)
+    }
+
+    /// The all-reduce size from which the DMA path (copy engines) beats the zero-copy one, measured on this machine
+    /// (rank 0's timings decide; every rank takes the same threshold, the path must agree between them).
+    fn tune_all_reduce(&mut self) -> Result<()> {
+        let sizes: Vec<usize> = (14..=21).map(|e| 1usize << e).collect(); // 16 KiB .. 2 MiB
+        let s = Arc::new(sizes.clone());
+        let Reply::Logits(t) = self.broadcast(|| Cmd::TimeAllReduce(s.clone()))? else { unreachable!() };
+        // the smallest size from which DMA is faster at every larger size measured
+        let mut threshold = i64::MAX;
+        for i in (0..sizes.len()).rev() {
+            if t[2 * i + 1] < t[2 * i] {
+                threshold = sizes[i] as i64;
+            } else {
+                break;
+            }
+        }
+        self.broadcast(|| Cmd::SetDmaMin(threshold))?;
+        let table: Vec<String> = sizes.iter().enumerate().map(|(i, b)| format!("{} KiB {:.0}/{:.0}", b >> 10, t[2 * i], t[2 * i + 1])).collect();
+        let th = if threshold == i64::MAX { "never".to_string() } else { format!("{} KiB", threshold >> 10) };
+        eprintln!("blaze: all-reduce us zero-copy/DMA: {}; DMA from {th}", table.join(", "));
+        Ok(())
     }
 
     /// Send `cmd` to every rank (made by `make`), wait for all, return rank 0's reply.

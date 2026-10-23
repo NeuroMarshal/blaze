@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "blaze/fp8_linear.h"
@@ -133,7 +134,7 @@ void bench(int rows, int n, int k, std::mt19937& rng) {
 }
 
 // MXFP8: random codes and E8M0 scales against an FP64 reference, through the MMA (<= 64 rows) and dequant + GEMM.
-double run_mx(int n, int k, int rows, std::mt19937& rng, blz_gemm* gemm, bool dequant) {
+double run_mx(int n, int k, int rows, std::mt19937& rng, blz_gemm* gemm, bool dequant, int split = 0, int tiles = 0) {
   std::uniform_int_distribution<int> byte(0, 255), ex(117, 130);
   std::vector<uint8_t> codes(size_t(n) * k), scales(size_t(n) * (k / 32));
   for (auto& c : codes) {
@@ -154,7 +155,7 @@ double run_mx(int n, int k, int rows, std::mt19937& rng, blz_gemm* gemm, bool de
   check(cudaMemcpy(ds, scales.data(), scales.size(), cudaMemcpyHostToDevice), "copy");
   check(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "copy");
   if (!dequant) {
-    check(blz_mxfp8_gemv_mma(dx, k, dc, ds, dy, n, rows, n, k, 0), "mxfp8 mma");
+    check(blz_mxfp8_gemv_mma_cfg(dx, k, dc, ds, dy, n, rows, n, k, split, tiles, 0), "mxfp8 mma");
   } else {
     check(cudaMalloc(&dw, size_t(n) * k * 2), "malloc");
     check(blz_mxfp8_weight_dequant(dc, ds, n, k, dw, 0), "mxfp8 dequant");
@@ -209,7 +210,7 @@ void bench_mx(int rows, int n, int k) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::mt19937 rng(11);
   blz_gemm* gemm = nullptr;
   if (blz_gemm_create(&gemm) != 0) return 1;
@@ -230,9 +231,29 @@ int main() {
     std::printf("mxfp8 rows %2d (mma): max rel err %.2e %s\n", rows, e, e < 6e-3 ? "ok" : "FAIL");
   }
   {
+    int checked = 0, bad = 0;
+    for (int rows : {1, 8, 9, 16, 17, 33, 64})
+      for (int split : {2, 4, 8})
+        for (int tiles : {1, 2, 4}) {
+          if (!blz_mxfp8_mma_cfg_valid(rows, split, tiles)) continue;
+          const double e = run_mx(136, 1152, rows, rng, gemm, false, split, tiles);
+          ++checked;
+          if (!(e < 6e-3)) {
+            ++bad;
+            std::printf("mxfp8 rows %2d split %d tiles %d: max rel err %.2e FAIL\n", rows, split, tiles, e);
+          }
+        }
+    ok &= bad == 0;
+    std::printf("mxfp8 launches: %d checked, %d failed\n", checked, bad);
+  }
+  {
     const double e = run_mx(136, 1152, 80, rng, gemm, true);
     ok &= e < 6e-3;
     std::printf("mxfp8 rows 80 (dequant+gemm): max rel err %.2e %s\n", e, e < 6e-3 ? "ok" : "FAIL");
+  }
+  if (argc > 1 && std::string(argv[1]) == "check") {  // correctness only
+    std::printf("%s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
   }
   std::printf("bandwidth (cold):\n");
   // EAGLE-4 draft layer per rank (TP 2): qkv 7680 x 10240, o 5120 x 2560, gate+up 16384 x 5120, down 5120 x 8192

@@ -7,7 +7,7 @@ use crate::suffix::{SuffixConfig, SuffixIndex};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -207,10 +207,13 @@ struct SpecLog {
     verify: f64,
     commit: f64,
     draft: f64,
+    round: f64,
+    depth: usize,
 }
 
 impl SpecLog {
-    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64, round: f64, depth: usize) {
         let every = *self.every.get_or_insert_with(|| std::env::var("BLAZE_SPEC_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         if every == 0 {
             return;
@@ -222,17 +225,22 @@ impl SpecLog {
         self.verify += verify;
         self.commit += commit;
         self.draft += draft;
+        self.round += round;
+        self.depth += depth;
         if self.rounds == every {
             let r = self.rounds as f64;
             eprintln!(
-                "blaze: {} tree rounds: {:.2} seqs, {:.1} rows, {:.2} kept per round; verify {:.2} ms, commit {:.2} ms, draft {:.2} ms",
+                "blaze: {} tree rounds: {:.2} seqs, {:.1} rows, {:.2} kept per round, depth {:.1}; verify {:.2} ms, commit {:.2} ms, \
+                 draft {:.2} ms, round {:.2} ms",
                 self.rounds,
                 self.seqs as f64 / r,
                 self.rows as f64 / r,
                 self.kept as f64 / r,
+                self.depth as f64 / r,
                 1e3 * self.verify / r,
                 1e3 * self.commit / r,
-                1e3 * self.draft / r
+                1e3 * self.draft / r,
+                1e3 * self.round / r
             );
             *self = SpecLog { every: self.every, ..Default::default() };
         }
@@ -287,18 +295,35 @@ pub enum SpecMethod {
     Eagle,
 }
 
+/// Node counts a tree round verifies per sequence (rows: one more).
+const TREE_NODES: [usize; 12] = [0, 1, 3, 5, 7, 11, 15, 23, 31, 39, 47, 63];
+
 /// Tokens of earlier outputs kept for suffix decoding.
 const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
+
+/// Counters the scheduler thread publishes for the server's metrics.
+#[derive(Default)]
+pub struct SchedStats {
+    /// requests prefilling or decoding
+    pub running: AtomicUsize,
+    /// requests admitted by nobody yet
+    pub waiting: AtomicUsize,
+    /// requests dropped because their client was gone
+    pub cancelled: AtomicU64,
+}
 
 /// Handle of the scheduler thread.
 #[derive(Clone)]
 pub struct Scheduler {
     tx: Sender<GenRequest>,
+    pub stats: Arc<SchedStats>,
 }
 
 impl Scheduler {
     pub fn start(engine: Engine, cfg: SchedConfig) -> Self {
         let (tx, rx) = channel();
+        let stats = Arc::new(SchedStats::default());
+        let loop_stats = stats.clone();
         std::thread::Builder::new()
             .name("blaze-sched".into())
             .spawn(move || {
@@ -313,14 +338,18 @@ impl Scheduler {
                     spec_stats: (0, 0),
                     spec_log: SpecLog::default(),
                     tree_depth: 0,
+                    tree_level_s: 0.0,
+                    tree_tokens: 0.0,
+                    tree_round_s: 0.0,
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
+                    stats: loop_stats,
                 };
                 s.run();
             })
             .expect("scheduler thread");
-        Self { tx }
+        Self { tx, stats }
     }
 
     pub fn submit(&self, req: GenRequest) -> Result<(), GenRequest> {
@@ -340,13 +369,17 @@ struct Loop {
     spec_stats: (usize, usize),
     /// BLAZE_SPEC_LOG=n: every n tree rounds, their mean rows, kept rows and times on stderr
     spec_log: SpecLog,
-    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth): one deeper after a round that
-    /// verified a node of the deepest level, one shallower after a round that left two levels unused
+    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth), and the decayed means the depth
+    /// rule weighs: seconds of a drafting call per level, tokens kept per round, seconds per round
     tree_depth: usize,
+    tree_level_s: f64,
+    tree_tokens: f64,
+    tree_round_s: f64,
     spec_cost: SpecCost,
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
     suffix_cfg: SuffixConfig,
+    stats: Arc<SchedStats>,
 }
 
 impl Loop {
@@ -354,6 +387,7 @@ impl Loop {
         loop {
             // intake: block while idle, poll while busy
             if self.active.is_empty() && self.waiting.is_empty() {
+                self.publish_stats();
                 match self.rx.recv() {
                     Ok(r) => self.waiting.push_back(r),
                     Err(_) => return,
@@ -371,7 +405,9 @@ impl Loop {
                     }
                 }
             }
+            self.reap_cancelled();
             self.admit();
+            self.publish_stats();
             if self.active.is_empty() {
                 // nothing admissible yet (KV full): wait for a finish or a new request
                 std::thread::sleep(Duration::from_millis(2));
@@ -384,6 +420,40 @@ impl Loop {
                     self.engine.close(a.seq);
                 }
             }
+        }
+    }
+
+    fn publish_stats(&self) {
+        self.stats.running.store(self.active.len(), Ordering::Relaxed);
+        self.stats.waiting.store(self.waiting.len(), Ordering::Relaxed);
+    }
+
+    /// Requests whose client is gone (cancel flag set, event channel closed) leave at once, also while they wait or
+    /// read a long prompt; decoding requests are checked after every token in `emit`.
+    fn reap_cancelled(&mut self) {
+        let gone = |r: &GenRequest| r.cancel.load(Ordering::Relaxed) || r.events.is_closed();
+        let mut n = 0;
+        self.waiting.retain(|r| {
+            if !gone(r) {
+                return true;
+            }
+            let _ = r.events.send(GenEvent::Done(Finish::Cancelled));
+            n += 1;
+            false
+        });
+        let mut i = 0;
+        while i < self.active.len() {
+            if self.active[i].pending.is_none() && gone(&self.active[i].req) {
+                let a = self.active.swap_remove(i);
+                let _ = a.req.events.send(GenEvent::Done(Finish::Cancelled));
+                self.engine.close(a.seq);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if n > 0 {
+            self.stats.cancelled.fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -858,6 +928,9 @@ impl Loop {
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
                 self.remember(&a.seq, tokens);
             }
+            if reason == Finish::Cancelled {
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = a.req.events.send(GenEvent::Done(reason));
             self.keep_output(&a);
             self.engine.close(a.seq);
@@ -911,6 +984,9 @@ impl Loop {
         } else {
             cands.iter().map(Vec::len).collect()
         };
+        // node counts from a few sizes (verify rows 1, 2, 4, 6, 8, 12, 16, ...): the verify step's CUDA graph is keyed by
+        // the rows of every sequence, and free counts of several sequences would make too many shapes to replay
+        let counts: Vec<usize> = counts.into_iter().map(|c| TREE_NODES.iter().copied().filter(|&x| x <= c).max().unwrap_or(0)).collect();
         if counts.iter().all(|&c| c == 0) {
             return Ok(false);
         }
@@ -1021,17 +1097,33 @@ impl Loop {
             }
             aux_row += rows[i].len();
         }
-        // the depth of the next trees from the deepest node this round verified
-        let deepest = rows.iter().flat_map(|r| r.depth.iter().copied()).max().unwrap_or(0);
-        if deepest > 0 {
-            let (cur, max) = (self.tree_depth.max(2), self.engine.info.tree_levels);
-            self.tree_depth = if deepest >= cur { (cur + 1).min(max) } else if deepest + 2 <= cur { (cur - 1).max(2) } else { cur };
-        }
+        // The depth of the next trees (eagle_harness grows a level while its work delta pays for the draft step): the
+        // deepest level earns its draft step when the tokens expected from its verified nodes g exceed the step's time
+        // at this batch's token rate, g > step * tokens / round. One level deeper when it earns that with margin (the next
+        // level holds less), one shallower when it does not.
+        let cur = self.tree_depth.max(2);
+        let gain: f64 = order
+            .iter()
+            .map(|&i| {
+                let a = &self.active[i];
+                let cal = (a.tree_hit + 1.0) / (a.tree_pred + 1.0);
+                rows[i].scores.iter().zip(&rows[i].depth).filter(|(_, d)| **d == cur).map(|(s, _)| *s as f64 * cal).sum::<f64>()
+            })
+            .sum();
         let td = Instant::now();
         self.eagle_extend(items)?;
+        let t_draft = td.elapsed().as_secs_f64();
         let total: usize = rows.iter().map(|r| r.len()).sum();
         let kept: usize = paths.iter().map(Vec::len).sum();
-        self.spec_log.note(n, total, kept, t_verify, t_commit, td.elapsed().as_secs_f64());
+        let t_round = t0.elapsed().as_secs_f64();
+        let ema = |x: &mut f64, v: f64| *x = if *x == 0.0 { v } else { 0.9 * *x + 0.1 * v };
+        ema(&mut self.tree_level_s, t_draft / cur as f64);
+        ema(&mut self.tree_tokens, kept as f64);
+        ema(&mut self.tree_round_s, t_round);
+        let pay = self.tree_level_s * self.tree_tokens / self.tree_round_s;
+        let max = self.engine.info.tree_levels;
+        self.tree_depth = if 0.6 * gain > pay { (cur + 1).min(max) } else if gain < pay { (cur - 1).max(2) } else { cur };
+        self.spec_log.note(n, total, kept, t_verify, t_commit, t_draft, t_round, cur);
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
@@ -1040,6 +1132,9 @@ impl Loop {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
                 self.remember(&a.seq, tokens);
+            }
+            if reason == Finish::Cancelled {
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
             }
             let _ = a.req.events.send(GenEvent::Done(reason));
             self.keep_output(&a);
@@ -1242,6 +1337,9 @@ impl Loop {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
                 self.remember(&a.seq, tokens);
+            }
+            if reason == Finish::Cancelled {
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
             }
             let _ = a.req.events.send(GenEvent::Done(reason));
             self.keep_output(&a);

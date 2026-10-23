@@ -69,6 +69,40 @@ impl Event {
     }
 }
 
+/// A pair of timing events around work on a stream.
+pub struct Timer(sys::cudaEvent_t, sys::cudaEvent_t);
+
+impl Timer {
+    pub fn new() -> Result<Self> {
+        let (mut a, mut b) = (null_mut(), null_mut());
+        check(unsafe { sys::cudaEventCreateWithFlags(&mut a, 0) }, "cudaEventCreate")?;
+        check(unsafe { sys::cudaEventCreateWithFlags(&mut b, 0) }, "cudaEventCreate")?;
+        Ok(Self(a, b))
+    }
+
+    pub fn start(&self, s: &Stream) -> Result<()> {
+        check(unsafe { sys::cudaEventRecord(self.0, s.0) }, "cudaEventRecord")
+    }
+
+    /// Milliseconds since `start`, waiting for the work in between.
+    pub fn stop(&self, s: &Stream) -> Result<f32> {
+        check(unsafe { sys::cudaEventRecord(self.1, s.0) }, "cudaEventRecord")?;
+        check(unsafe { sys::cudaEventSynchronize(self.1) }, "cudaEventSynchronize")?;
+        let mut ms = 0.0f32;
+        check(unsafe { sys::cudaEventElapsedTime(&mut ms, self.0, self.1) }, "cudaEventElapsedTime")?;
+        Ok(ms)
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        unsafe {
+            sys::cudaEventDestroy(self.0);
+            sys::cudaEventDestroy(self.1);
+        }
+    }
+}
+
 impl Drop for Event {
     fn drop(&mut self) {
         unsafe { sys::cudaEventDestroy(self.0) };

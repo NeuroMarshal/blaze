@@ -18,4 +18,5 @@ pub mod structured;
 pub mod suffix;
 pub mod text;
 pub mod tree;
+pub mod tune;
 pub mod weights;
