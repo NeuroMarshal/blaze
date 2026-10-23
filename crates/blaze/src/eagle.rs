@@ -461,7 +461,7 @@ impl Draft {
     }
 
     /// BLAZE_DRAFT_DUMP=dir: the first drafting call's first item (its captured target features, tokens, positions)
-    /// and drafts, and the extend's last normed hidden, for a reference implementation (scripts/ref_eagle4.py).
+    /// and drafts, and the head input of the last chain step, for a reference implementation (scripts/ref_eagle4.py).
     fn dump(&self, model: &Model, it: &DraftItem, drafts: &[i64], dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let h = self.cfg.hidden;

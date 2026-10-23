@@ -2,8 +2,8 @@
 """Reference check of blaze's EAGLE-4 drafter against a plain torch implementation.
 
 blaze run with BLAZE_DRAFT_DUMP=dir writes the first drafting call: the captured target features of the extended rows
-(features.bin, [rows, 3, H] bf16), their tokens, the first position, the drafted chain (meta.json) and the extend's
-last normed hidden (first_normed.bin). This script recomputes the same call the way eagle_harness/sglang/models/
+(features.bin, [rows, 3, H] bf16), their tokens, the first position, the drafted chain (meta.json) and the last chain step's
+normed hidden (first_normed.bin). This script recomputes the same call the way eagle_harness/sglang/models/
 llama_eagle4.py defines the draft (fc_norm per aux state, fc, one Llama layer over concat(input_ln(embed),
 hidden_norm(hidden)) with a sliding window of W keys ending at the query, final norm, low-rank candidate head re-scored
 with the full LM head) and compares.
@@ -141,17 +141,16 @@ def main():
     d = Draft(a.draft, embed, dev)
     if embed is not None:
         own = d.w["embed_tokens.weight"]
-        diff = (own.float() - embed.float()).abs()
-        print(f"embedding: draft's own vs the target's: max |diff| {diff.max().item():.4g}, "
-              f"rows differing {(diff.amax(-1) > 0).sum().item()} of {own.shape[0]}")
+        mx, rows_diff = 0.0, 0
+        for r0 in range(0, own.shape[0], 8192):
+            diff = (own[r0 : r0 + 8192].float() - embed[r0 : r0 + 8192].float()).abs()
+            mx, rows_diff = max(mx, diff.max().item()), rows_diff + (diff.amax(-1) > 0).sum().item()
+        print(f"embedding: draft's own vs the target's: max |diff| {mx:.4g}, rows differing {rows_diff} of {own.shape[0]}")
     pos = torch.arange(meta["pos0"], meta["pos0"] + rows, device=dev)
     normed, nxt = d.layer(tokens, d.features(feats), pos)
-    last = normed[-1]
-    cos = torch.nn.functional.cosine_similarity(last.float(), first.float(), 0).item()
-    print(f"extend of {rows} rows at {meta['pos0']}: last normed vs blaze: cos {cos:.6f}, "
-          f"max |diff| {(last.float() - first.float()).abs().max().item():.4g}")
+    print(f"extend of {rows} rows at {meta['pos0']}")
     drafts, full = [], []
-    tok, hid, p = None, nxt[-1:], pos[-1:] + 1
+    n, hid, p = normed, nxt[-1:], pos[-1:] + 1
     t, f = d.head(normed[-1:])
     drafts.append(t.item()), full.append(f.item())
     for _ in range(len(meta["drafts"]) - 1):
@@ -159,6 +158,9 @@ def main():
         t, f = d.head(n)
         drafts.append(t.item()), full.append(f.item())
         p = p + 1
+    # first_normed.bin is the head input of blaze's last chain step (the dump runs after the chain)
+    cos = torch.nn.functional.cosine_similarity(n[-1].float() if len(meta["drafts"]) > 1 else normed[-1].float(), first.float(), 0).item()
+    print(f"last chain step's normed hidden vs blaze: cos {cos:.6f}")
     print("blaze drafts:     ", meta["drafts"])
     print("reference drafts: ", drafts)
     print("full-head argmax: ", full)
