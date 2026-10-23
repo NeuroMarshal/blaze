@@ -206,7 +206,10 @@ unsafe extern "C" {
     // draft trees (blaze/tree.h)
     pub fn blz_gdn_conv_tree(x: *const bf16, ldx: i64, parent: *const i32, seq_start: *const i32, slots: *const i32,
                              seqs: c_int, channels: c_int, kernel: c_int, weight: *const bf16, state: *const bf16,
-                             out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+                             out: *mut bf16, record: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gdn_conv_rec(x: *const bf16, ldx: i64, seq_start: *const i32, slots: *const i32, seqs: c_int, channels: c_int,
+                            kernel: c_int, weight: *const bf16, state: *mut bf16, out: *mut bf16, write_state: c_int,
+                            record: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_gdn_recurrent_tree(qkv: *const bf16, g: *const f32, beta: *const f32, prog: *const i32,
                                   seq_start: *const i32, slots: *const i32, seqs: c_int, k_heads: c_int, v_heads: c_int,
                                   dk: c_int, dv: c_int, state: *const f32, scratch: *mut f32, levels: c_int,

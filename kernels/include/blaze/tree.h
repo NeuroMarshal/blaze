@@ -24,9 +24,10 @@ extern "C" {
 /// ancestors (parent[t], its parent, ...; parent < 0 past a sequence's root, whose earlier inputs come from the state,
 /// the newest last). parent holds absolute row indices; a chain (parent[t] = t - 1, the first row -1) gives exactly
 /// blz_gdn_conv_ex's result.
+/// `record` (may be null) gets a copy of the input rows [tokens, channels] (blz_gdn_conv_rec).
 cudaError_t blz_gdn_conv_tree(const uint16_t* x, int64_t ldx, const int32_t* parent, const int32_t* seq_start,
                               const int32_t* slots, int seqs, int channels, int kernel, const uint16_t* weight,
-                              const uint16_t* state, uint16_t* out, cudaStream_t stream);
+                              const uint16_t* state, uint16_t* out, uint16_t* record, cudaStream_t stream);
 
 /// \brief blz_gdn_recurrent_ex over tree rows, the state read only. Each sequence's rows are visited in the order of
 /// prog (int32 triples [row, load, save] in the sequence's range of seq_start, a depth-first order of its tree): load

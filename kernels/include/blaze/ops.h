@@ -88,6 +88,11 @@ cudaError_t blz_gdn_recurrent(const uint16_t* qkv, const float* g, const float* 
 cudaError_t blz_gdn_conv_ex(const uint16_t* x, int64_t ldx, const int32_t* seq_start, const int32_t* slots, int seqs,
                             int channels, int kernel, const uint16_t* weight, uint16_t* state, uint16_t* out,
                             int write_state, cudaStream_t stream);
+/// \brief blz_gdn_conv_ex that also copies its input rows into `record` ([tokens, channels], may be null): a verify's
+/// recorded inputs for the commit's replay, without a separate copy.
+cudaError_t blz_gdn_conv_rec(const uint16_t* x, int64_t ldx, const int32_t* seq_start, const int32_t* slots, int seqs,
+                             int channels, int kernel, const uint16_t* weight, uint16_t* state, uint16_t* out,
+                             int write_state, uint16_t* record, cudaStream_t stream);
 cudaError_t blz_gdn_recurrent_ex(const uint16_t* qkv, const float* g, const float* beta, const int32_t* seq_start,
                                  const int32_t* slots, int seqs, int tokens, int k_heads, int v_heads, int dk, int dv,
                                  float* state, uint16_t* out, int write_state, cudaStream_t stream);

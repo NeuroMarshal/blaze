@@ -2173,30 +2173,29 @@ impl Model {
         let a: *const u16 = w.proj.at(channels + vh * gc.v_dim + vh);
         let m = &self.meta;
         let write = (!verify) as c_int;
-        if verify {
-            let rec = &self.records[layer.slot][0];
-            check(
-                unsafe {
-                    sys::cudaMemcpy2DAsync(rec.ptr(), channels * 2, w.proj.ptr::<u16>().cast(), ld * 2, channels * 2, t, sys::MEMCPY_D2D, s.0)
-                },
-                "record qkv",
-            )?;
-        }
+        // a verify records its inputs for the commit's replay: the convolution copies its input rows, the gate writes
+        // g and beta straight into the records (the recurrence reads them there)
+        let (rec_qkv, g_out, beta_out): (*mut u16, *mut f32, *mut f32) = if verify {
+            let [rq, rg, rb] = &self.records[layer.slot];
+            (rq.ptr(), rg.ptr(), rb.ptr())
+        } else {
+            (null_mut(), w.g.ptr(), w.beta.ptr())
+        };
         if tree {
             check(
                 unsafe {
                     sys::blz_gdn_conv_tree(w.proj.ptr(), ld as i64, self.meta_ptr(m.tree_parent), self.meta_ptr(m.seq_start),
                                            self.meta_ptr(m.seq_slots), seqs as c_int, channels as c_int, gc.conv_kernel as c_int,
-                                           g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), s.0)
+                                           g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), rec_qkv, s.0)
                 },
                 "gdn_conv tree",
             )?;
         } else {
             check(
                 unsafe {
-                    sys::blz_gdn_conv_ex(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
-                                         channels as c_int, gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(),
-                                         w.conv.ptr(), write, s.0)
+                    sys::blz_gdn_conv_rec(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
+                                          channels as c_int, gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(),
+                                          w.conv.ptr(), write, rec_qkv, s.0)
                 },
                 "gdn_conv",
             )?;
@@ -2204,20 +2203,15 @@ impl Model {
         check(
             unsafe {
                 sys::blz_gdn_gate(a, ld as i64, b, ld as i64, g.a_log.ptr(), g.dt_bias.ptr(), t as c_int, vh as c_int,
-                                  w.g.ptr(), w.beta.ptr(), s.0)
+                                  g_out, beta_out, s.0)
             },
             "gdn_gate",
         )?;
-        if verify {
-            let [_, rg, rb] = &self.records[layer.slot];
-            check(unsafe { sys::cudaMemcpyAsync(rg.ptr(), w.g.ptr::<f32>().cast(), t * vh * 4, sys::MEMCPY_D2D, s.0) }, "record g")?;
-            check(unsafe { sys::cudaMemcpyAsync(rb.ptr(), w.beta.ptr::<f32>().cast(), t * vh * 4, sys::MEMCPY_D2D, s.0) }, "record beta")?;
-        }
         if tree {
             let scratch = self.tree_scratch.as_ref().unwrap();
             check(
                 unsafe {
-                    sys::blz_gdn_recurrent_tree(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.tree_prog), self.meta_ptr(m.seq_start),
+                    sys::blz_gdn_recurrent_tree(w.conv.ptr(), g_out, beta_out, self.meta_ptr(m.tree_prog), self.meta_ptr(m.seq_start),
                                                 self.meta_ptr(m.seq_slots), seqs as c_int, kh as c_int, vh as c_int, gc.k_dim as c_int,
                                                 gc.v_dim as c_int, self.rec_state[layer.slot].ptr(), scratch.ptr(),
                                                 self.opts.tree_levels as c_int, w.core.ptr(), s.0)
@@ -2227,7 +2221,7 @@ impl Model {
         } else {
             check(
                 unsafe {
-                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots),
+                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), g_out, beta_out, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots),
                                               seqs as c_int, t as c_int, kh as c_int, vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
                                               self.rec_state[layer.slot].ptr(), w.core.ptr(), write, s.0)
                 },

@@ -308,7 +308,7 @@ constexpr int kMaxKernel = 8;
 __global__ void gdn_conv_kernel(const uint16_t* __restrict__ x, int64_t ldx, const int32_t* __restrict__ seq_start,
                                 const int32_t* __restrict__ slots, int channels, int kernel,
                                 const uint16_t* __restrict__ weight, uint16_t* __restrict__ state,
-                                uint16_t* __restrict__ out, int write_state) {
+                                uint16_t* __restrict__ out, int write_state, uint16_t* __restrict__ record) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int s = blockIdx.y;
   if (c >= channels) return;
@@ -318,7 +318,9 @@ __global__ void gdn_conv_kernel(const uint16_t* __restrict__ x, int64_t ldx, con
   for (int j = 0; j < kernel - 1; ++j) hist[j] = bf(st[j]);
   for (int j = 0; j < kernel; ++j) wt[j] = bf(weight[int64_t(c) * kernel + j]);
   for (int t = t0; t < t1; ++t) {
-    const float xt = bf(x[int64_t(t) * ldx + c]);
+    const uint16_t xb = x[int64_t(t) * ldx + c];
+    if (record) record[int64_t(t) * channels + c] = xb;
+    const float xt = bf(xb);
     float acc = wt[kernel - 1] * xt;
     for (int j = 0; j < kernel - 1; ++j) acc += wt[j] * hist[j];
     // The reference convolves in bf16 (fp32 accumulation) and applies SiLU to the bf16 result.
@@ -474,14 +476,23 @@ extern "C" cudaError_t blz_gdn_gate(const uint16_t* a, int64_t ld_a, const uint1
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_gdn_conv_ex(const uint16_t* x, int64_t ldx, const int32_t* seq_start,
-                                       const int32_t* slots, int seqs, int channels, int kernel, const uint16_t* weight,
-                                       uint16_t* state, uint16_t* out, int write_state, cudaStream_t stream) {
+extern "C" cudaError_t blz_gdn_conv_rec(const uint16_t* x, int64_t ldx, const int32_t* seq_start,
+                                        const int32_t* slots, int seqs, int channels, int kernel,
+                                        const uint16_t* weight, uint16_t* state, uint16_t* out, int write_state,
+                                        uint16_t* record, cudaStream_t stream) {
   if (seqs == 0) return cudaSuccess;
   if (kernel < 2 || kernel > kMaxKernel) return cudaErrorInvalidValue;
   const dim3 grid(unsigned((channels + 127) / 128), unsigned(seqs));
-  gdn_conv_kernel<<<grid, 128, 0, stream>>>(x, ldx, seq_start, slots, channels, kernel, weight, state, out, write_state);
+  gdn_conv_kernel<<<grid, 128, 0, stream>>>(x, ldx, seq_start, slots, channels, kernel, weight, state, out, write_state,
+                                            record);
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_gdn_conv_ex(const uint16_t* x, int64_t ldx, const int32_t* seq_start,
+                                       const int32_t* slots, int seqs, int channels, int kernel, const uint16_t* weight,
+                                       uint16_t* state, uint16_t* out, int write_state, cudaStream_t stream) {
+  return blz_gdn_conv_rec(x, ldx, seq_start, slots, seqs, channels, kernel, weight, state, out, write_state, nullptr,
+                          stream);
 }
 
 extern "C" cudaError_t blz_gather_rows(const uint16_t* src, int64_t ld_src, const int32_t* rows, int n, int dim,

@@ -22,7 +22,8 @@ constexpr int kMaxKernel = 8;
 __global__ void gdn_conv_tree_kernel(const uint16_t* __restrict__ x, int64_t ldx, const int32_t* __restrict__ parent,
                                      const int32_t* __restrict__ seq_start, const int32_t* __restrict__ slots,
                                      int channels, int kernel, const uint16_t* __restrict__ weight,
-                                     const uint16_t* __restrict__ state, uint16_t* __restrict__ out) {
+                                     const uint16_t* __restrict__ state, uint16_t* __restrict__ out,
+                                     uint16_t* __restrict__ record) {
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   const int s = blockIdx.y;
   if (c >= channels) return;
@@ -45,7 +46,9 @@ __global__ void gdn_conv_tree_kernel(const uint16_t* __restrict__ x, int64_t ldx
         cur = -1;
       }
     }
-    const float xt = bf(x[int64_t(t) * ldx + c]);
+    const uint16_t xb = x[int64_t(t) * ldx + c];
+    if (record) record[int64_t(t) * channels + c] = xb;
+    const float xt = bf(xb);
     float acc = wt[kernel - 1] * xt;
     for (int j = 0; j < kernel - 1; ++j) acc += wt[j] * hist[j];
     out[int64_t(t) * channels + c] = to_bf(siluf(bf(to_bf(acc))));
@@ -344,12 +347,12 @@ __global__ void tree_step_kernel(blz_draft_tree t, int step, const float* __rest
 extern "C" cudaError_t blz_gdn_conv_tree(const uint16_t* x, int64_t ldx, const int32_t* parent, const int32_t* seq_start,
                                          const int32_t* slots, int seqs, int channels, int kernel,
                                          const uint16_t* weight, const uint16_t* state, uint16_t* out,
-                                         cudaStream_t stream) {
+                                         uint16_t* record, cudaStream_t stream) {
   if (seqs == 0) return cudaSuccess;
   if (kernel < 2 || kernel > blaze::kMaxKernel) return cudaErrorInvalidValue;
   const dim3 grid(unsigned((channels + 127) / 128), unsigned(seqs));
   blaze::gdn_conv_tree_kernel<<<grid, 128, 0, stream>>>(x, ldx, parent, seq_start, slots, channels, kernel, weight,
-                                                        state, out);
+                                                        state, out, record);
   return cudaGetLastError();
 }
 

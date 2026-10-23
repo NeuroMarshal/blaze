@@ -137,8 +137,10 @@ void test_gdn_tree(std::mt19937& rng) {
   }
   Dev<uint16_t> dqkv(qkv), dw(weight), dconv(conv_state), dout(size_t(T) * channels);
   Dev<int32_t> dparent(parent), dstart(seq_start), dslots(slots), dprog(prog);
+  Dev<uint16_t> dqkv_rec(size_t(T) * channels);
   CHECK_CUDA(blz_gdn_conv_tree(dqkv.ptr, channels, dparent.ptr, dstart.ptr, dslots.ptr, seqs, channels, kernel, dw.ptr,
-                               dconv.ptr, dout.ptr, 0));
+                               dconv.ptr, dout.ptr, dqkv_rec.ptr, 0));
+  expect(dqkv_rec.get() == qkv, "gdn tree conv record == input rows");
   Dev<float> dg(g), dbeta(beta), drec(rec_state);
   Dev<float> scratch(blz_gdn_tree_scratch_floats(seqs, v_heads, dv, levels));
   Dev<uint16_t> dcore(size_t(T) * v_heads * dv);
