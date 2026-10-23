@@ -312,6 +312,7 @@ impl Scheduler {
                     clock: 0,
                     spec_stats: (0, 0),
                     spec_log: SpecLog::default(),
+                    tree_depth: 0,
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
@@ -339,6 +340,9 @@ struct Loop {
     spec_stats: (usize, usize),
     /// BLAZE_SPEC_LOG=n: every n tree rounds, their mean rows, kept rows and times on stderr
     spec_log: SpecLog,
+    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth): one deeper after a round that
+    /// verified a node of the deepest level, one shallower after a round that left two levels unused
+    tree_depth: usize,
     spec_cost: SpecCost,
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
@@ -669,7 +673,10 @@ impl Loop {
             return Ok(());
         }
         if self.tree_on() {
-            let shape = (self.engine.info.tree_width, self.engine.info.tree_levels);
+            if self.tree_depth == 0 {
+                self.tree_depth = self.engine.info.tree_levels;
+            }
+            let shape = (self.engine.info.tree_width, self.tree_depth);
             let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
             let trees = self.engine.draft_tree(crate::eagle::DraftPlan { items, k: 0, tree: Some(shape) })?;
             for (i, t) in idx.into_iter().zip(trees) {
@@ -1013,6 +1020,12 @@ impl Loop {
                 items.push((i, crate::eagle::DraftItem { row: a.seq.row, aux_row, tokens, pos0: a.seq.len() - e }));
             }
             aux_row += rows[i].len();
+        }
+        // the depth of the next trees from the deepest node this round verified
+        let deepest = rows.iter().flat_map(|r| r.depth.iter().copied()).max().unwrap_or(0);
+        if deepest > 0 {
+            let (cur, max) = (self.tree_depth.max(2), self.engine.info.tree_levels);
+            self.tree_depth = if deepest >= cur { (cur + 1).min(max) } else if deepest + 2 <= cur { (cur - 1).max(2) } else { cur };
         }
         let td = Instant::now();
         self.eagle_extend(items)?;

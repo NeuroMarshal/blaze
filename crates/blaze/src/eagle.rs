@@ -496,7 +496,11 @@ impl Draft {
         if off > self.staging_len() {
             bail!("draft metadata of {off} bytes exceeds the staging buffer");
         }
-        let (tk, td) = plan.tree.unwrap_or((0, 0));
+        // tree KV slots by the buffers' depth (the kernels' layout), whatever the call's depth
+        let (tk, td) = match plan.tree {
+            Some((k, _)) => (k, self.tree_shape.1),
+            None => (0, 0),
+        };
         let slot_base = self.tree.as_ref().map_or(0, |t| t.slot_base);
         for (f, fwd) in fwds.iter().enumerate() {
             let (mut pos, mut loc, mut tok, mut req, mut kvl) = (vec![], vec![], vec![], vec![], vec![]);
@@ -595,7 +599,8 @@ impl Draft {
         if n_items == 0 {
             return Ok(Vec::new());
         }
-        if n_items > self.max_items || (k, d) != self.tree_shape {
+        // the buffers hold trees of the drafter's width and up to its depth; a call may grow fewer levels
+        if n_items > self.max_items || k != self.tree_shape.0 || d < 2 || d > self.tree_shape.1 {
             bail!("tree draft of {n_items} items, shape {:?} (buffers: {} items, shape {:?})", (k, d), self.max_items, self.tree_shape);
         }
         let (fwds, n_ext, ext_start) = self.prepare(model, plan)?;
@@ -617,15 +622,16 @@ impl Draft {
         }
         model.stream.sync()?;
         let t = self.tree.as_ref().unwrap();
-        let cap = t.cap;
+        // every item's tree at its stride in the buffers; the nodes of the d levels grown come first
+        let (cap, used) = (t.cap, k + (d - 1) * k * k);
         let scores: Vec<f32> = t.scores.download(n_items * cap)?;
         let tokens: Vec<i64> = t.tokens.download(n_items * cap)?;
         let parents: Vec<i32> = t.parents.download(n_items * cap)?;
         Ok((0..n_items)
             .map(|i| DraftTree {
-                tokens: tokens[i * cap..(i + 1) * cap].to_vec(),
-                scores: scores[i * cap..(i + 1) * cap].to_vec(),
-                parents: parents[i * cap..(i + 1) * cap].to_vec(),
+                tokens: tokens[i * cap..i * cap + used].to_vec(),
+                scores: scores[i * cap..i * cap + used].to_vec(),
+                parents: parents[i * cap..i * cap + used].to_vec(),
                 top_k: k,
                 depth: d,
             })
