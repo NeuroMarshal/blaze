@@ -91,6 +91,9 @@ fn content_text(m: &Value) -> String {
 /// call syntax around the tool's name, whatever the model writes for the arguments up to the closing tag. `single`:
 /// one call only (parallel_tool_calls false). None for parsers whose syntax is not known here (the model is then only
 /// asked). The body is "any text without the closing tag", an intersection llguidance builds as a DFA.
+/// The whitespace around the tags is bounded: the model writes "\n\n" after </think> and "\n" between calls, and a
+/// model that would rather answer in words than call (a greeting with thinking off) finds whitespace the likeliest of
+/// the allowed tokens; with `ws*` every such token leaves the grammar where it was and greedy decoding never leaves.
 fn forced_call_grammar(parser: Option<&str>, names: &[String], single: bool) -> Option<String> {
     let (open, mid, close) = match parser? {
         "qwen3_coder" => ("<tool_call>", "<function=", ">"),
@@ -101,7 +104,7 @@ fn forced_call_grammar(parser: Option<&str>, names: &[String], single: bool) -> 
     let names = names.iter().map(|n| q(n)).collect::<Vec<_>>().join(" | ");
     let more = if single { "" } else { " (ws call)*" };
     Some(format!(
-        "start: ws call{more} ws\ncall: {} ws {} name {} BODY {}\nname: {names}\nws: /[ \\t\\r\\n]*/\n\
+        "start: ws call{more} ws\ncall: {} ws {} name {} BODY {}\nname: {names}\nws: /[ \\t\\r\\n]{{0,4}}/\n\
          BODY: ~(/(?s:.*)/ {} /(?s:.*)/)\n",
         q(open), q(mid), q(close), q("</tool_call>"), q("</tool_call>")
     ))

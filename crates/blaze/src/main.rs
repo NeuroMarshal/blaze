@@ -247,6 +247,10 @@ enum Command {
         /// default thinking budget in tokens of chat requests (requests override it with thinking_token_budget)
         #[arg(long)]
         thinking_budget: Option<usize>,
+        /// longest whitespace run between JSON tokens of structured outputs, characters (0: unbounded, vLLM's default;
+        /// requests override it with whitespace_pattern or disable_any_whitespace)
+        #[arg(long, default_value_t = 64)]
+        grammar_whitespace: usize,
     },
     /// Greedy generation from a raw text prompt (no chat template), for testing.
     Generate {
@@ -506,6 +510,7 @@ fn main() -> Result<()> {
             tool_call_parser,
             reasoning_parser,
             thinking_budget,
+            grammar_whitespace,
         } => {
             let text = blaze::text::Text::load(&engine.model)?;
             let e = engine.load(None, false)?;
@@ -548,6 +553,7 @@ fn main() -> Result<()> {
                 tool_parser: (!tool_call_parser.is_empty() && tool_call_parser != "none").then_some(tool_call_parser),
                 reasoning_parser: (!reasoning_parser.is_empty() && reasoning_parser != "none").then_some(reasoning_parser),
                 thinking_budget,
+                grammar_whitespace,
             };
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
             rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab))

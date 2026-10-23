@@ -434,6 +434,19 @@ def chat_json_schema_and_object():
     check(all(set(json.loads(v)) == {"name", "age", "tags"} for v in outs.values()) and len(outs) == 2, outs)
 
 
+@test
+def chat_grammar_whitespace_is_bounded():
+    # a greeting with thinking off: the model would rather answer in words, and whitespace is its likeliest allowed
+    # token before the '{'; unbounded runs of it fill max_tokens (blaze serve --grammar-whitespace 0 shows it)
+    hello = [{"role": "user", "content": "Hello there!"}]
+    c = chat(hello, max_tokens=200, response_format={"type": "json_object"}).choices[0]
+    check(c.finish_reason == "stop" and isinstance(json.loads(c.message.content), dict), c)
+    # vLLM's disable_any_whitespace: compact JSON
+    c = chat(hello, max_tokens=200, extra_body={**NOTHINK, "structured_outputs": {"json": {"type": "object"}, "disable_any_whitespace": True}}).choices[0]
+    j = json.loads(c.message.content)
+    check(c.message.content == json.dumps(j, separators=(",", ":"), ensure_ascii=False), c.message.content)
+
+
 # tools
 
 def tool_args(tc):
