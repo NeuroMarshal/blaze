@@ -280,6 +280,18 @@ __global__ void __launch_bounds__(128) scores_tc_kernel(const uint16_t* __restri
 }
 
 constexpr int kSelThreads = 1024;
+constexpr int kBins = 2048;      // radix digits of 11 bits (the last one of 10)
+constexpr int kCand = 2048;      // candidates the fast path keeps
+constexpr int kBitWords = 8192;  // row bitmap of the fast path: rows of up to 262144 blocks
+constexpr int kUnroll = 8;       // independent loads in flight per thread
+
+struct Cand {
+  uint32_t key;
+  int idx;
+};
+
+// dynamic smem: bitmap (the first histogram lives there before it, the result after it) | candidates | level histograms
+constexpr size_t kSelSmem = size_t(kBitWords) * 4 + kCand * sizeof(Cand) + (kBins + kBins / 2) * 4;
 
 __device__ __forceinline__ uint32_t fkey(float f) {
   const uint32_t u = __float_as_uint(f);
@@ -314,75 +326,198 @@ __device__ int block_scan(int v, int* total) {
   return before;
 }
 
-// One block per row: radix select (11 + 11 + 10 bits of the ordered float key) of the best block_topk visible blocks,
-// collected in block order (above the threshold, then the lowest ties), expanded to KV slots, plus the tail.
+// The largest bin b of hist[0, NB) with at least `need` elements in the bins >= b; *above = elements in the bins > b,
+// *in_bin = elements in b. Two bins per thread, scanned from the top.
+template <int NB>
+__device__ int find_bin(const int* hist, int need, int* above, int* in_bin) {
+  __shared__ int found[3];
+  const int b0 = NB - 1 - 2 * threadIdx.x;
+  const bool mine = b0 >= 1;
+  const int h0 = mine ? hist[b0] : 0, h1 = mine ? hist[b0 - 1] : 0;
+  if (threadIdx.x == 0) found[0] = found[1] = found[2] = 0;
+  int total;
+  const int before = block_scan(h0 + h1, &total);
+  if (mine) {
+    if (before < need && before + h0 >= need) found[0] = b0, found[1] = before, found[2] = h0;
+    else if (before + h0 < need && before + h0 + h1 >= need) found[0] = b0 - 1, found[1] = before + h0, found[2] = h1;
+  }
+  __syncthreads();
+  const int bin = found[0];
+  *above = found[1];
+  *in_bin = found[2];
+  __syncthreads();
+  return bin;
+}
+
+// One block per row: the best block_topk visible blocks (largest score; the lowest blocks among equal scores), taken in
+// block order (above the threshold, then the lowest ties), expanded to KV slots, plus the tail.
+// Radix select: a histogram of the top 11 bits of the ordered float keys gives the bin of the block_topk-th key; the
+// blocks from that bin up are marked in a bitmap (a ballot per 32 blocks), listed in block order and settled in shared
+// memory with two more radix levels. When more than kCand blocks share the best bins the levels run over the row.
 __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __restrict__ scores, int64_t ld,
                                                              const int64_t* __restrict__ positions,
                                                              const int32_t* __restrict__ tok_row, int row0, int ratio,
                                                              int block_topk, const int32_t* __restrict__ rt,
                                                              int64_t rt_stride, int32_t* __restrict__ table,
                                                              int64_t table_stride, int32_t* __restrict__ counts) {
-  __shared__ int hist[2048];
-  __shared__ uint32_t s_prefix, s_mask;
-  __shared__ int s_need;
-  __shared__ int sel[2048];
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  uint32_t* bm = reinterpret_cast<uint32_t*>(smem_raw);
+  int* hist = reinterpret_cast<int*>(smem_raw);
+  int* sel = reinterpret_cast<int*>(smem_raw);
+  Cand* cand = reinterpret_cast<Cand*>(smem_raw + kBitWords * 4);
+  int* lh = reinterpret_cast<int*>(smem_raw + kBitWords * 4 + kCand * sizeof(Cand));  // kBins + kBins / 2 bins
   const int r = blockIdx.x, row = row0 + r, tid = threadIdx.x;
   const int64_t pos = positions[row];
   const int nvis = int((pos + 1) / ratio);
   const int seq = tok_row[row];
   const float* sc = scores ? scores + int64_t(r) * ld : nullptr;
+  const int K = block_topk;
   int nsel;
-  if (sc == nullptr || nvis <= block_topk) {
+  if (sc == nullptr || nvis <= K) {
     for (int i = tid; i < nvis; i += kSelThreads) sel[i] = i;
     nsel = nvis;
   } else {
-    // radix select of the block_topk-th largest key
-    if (tid == 0) s_prefix = 0, s_mask = 0, s_need = block_topk;
-    const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
-    for (int pass = 0; pass < 3; ++pass) {
-      for (int i = tid; i < 2048; i += kSelThreads) hist[i] = 0;
-      __syncthreads();
-      const uint32_t prefix = s_prefix, mask = s_mask;
-      const int sh = shifts[pass], bins = 1 << widths[pass];
-      for (int i = tid; i < nvis; i += kSelThreads) {
-        const uint32_t k = fkey(sc[i]);
-        if ((k & mask) == prefix) atomicAdd(&hist[(k >> sh) & (bins - 1)], 1);
-      }
-      __syncthreads();
-      if (tid == 0) {
-        int need = s_need, bin = bins - 1;
-        while (bin > 0 && hist[bin] < need) need -= hist[bin--];
-        s_need = need;
-        s_prefix = prefix | (uint32_t(bin) << sh);
-        s_mask = mask | (uint32_t(bins - 1) << sh);
-      }
-      __syncthreads();
-    }
-    const uint32_t thr = s_prefix;
-    const int ties_needed = s_need;  // elements equal to thr to take
-    // contiguous ranges per thread keep block order
-    const int per = (nvis + kSelThreads - 1) / kSelThreads;
-    const int a = min(nvis, tid * per), b = min(nvis, a + per);
-    int gt = 0, eq = 0;
-    for (int i = a; i < b; ++i) {
-      const uint32_t k = fkey(sc[i]);
-      gt += k > thr;
-      eq += k == thr;
-    }
-    int n_gt = 0, n_eq = 0;
-    const int off_gt = block_scan(gt, &n_gt);
-    const int off_eq = block_scan(eq, &n_eq);
-    int og = off_gt, oe = off_eq;
-    for (int i = a; i < b; ++i) {
-      const uint32_t k = fkey(sc[i]);
-      if (k > thr) sel[og++] = i;
-      else if (k == thr) {
-        if (oe < ties_needed) sel[n_gt + oe] = i;
-        ++oe;
-      }
-    }
-    nsel = n_gt + min(n_eq, ties_needed);
+    for (int i = tid; i < kBins; i += kSelThreads) hist[i] = 0;
     __syncthreads();
+    for (int base = 0; base < nvis; base += kSelThreads * kUnroll) {
+      float v[kUnroll];
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u) {
+        const int i = base + u * kSelThreads + tid;
+        v[u] = i < nvis ? sc[i] : 0.0f;
+      }
+#pragma unroll
+      for (int u = 0; u < kUnroll; ++u)
+        if (base + u * kSelThreads + tid < nvis) atomicAdd(&hist[fkey(v[u]) >> 21], 1);
+    }
+    __syncthreads();
+    int above1, in_bin1;
+    const int b1 = find_bin<kBins>(hist, K, &above1, &in_bin1);
+    if (above1 + in_bin1 <= kCand && nvis <= kBitWords * 32) {
+      // blocks with a key in bin b1 or above: the bitmap word of 32 blocks is the warp's ballot
+      const uint32_t t1 = uint32_t(b1) << 21;
+      const int nw = (nvis + 31) >> 5, lane = tid & 31, warp = tid >> 5;
+      for (int base = 0; base < nvis; base += kSelThreads * kUnroll) {
+        float v[kUnroll];
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+          const int i = base + u * kSelThreads + tid;
+          v[u] = i < nvis ? sc[i] : 0.0f;
+        }
+#pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+          const bool p = base + u * kSelThreads + tid < nvis && fkey(v[u]) >= t1;
+          const uint32_t m = __ballot_sync(0xffffffffu, p);
+          const int w = (base >> 5) + u * 32 + warp;
+          if (lane == 0 && w < nw) bm[w] = m;
+        }
+      }
+      for (int i = tid; i < kBins + kBins / 2; i += kSelThreads) lh[i] = 0;
+      __syncthreads();
+      // candidates in block order: thread t lists the set bits of its words
+      const int wp = (nw + kSelThreads - 1) / kSelThreads;
+      const int w0 = min(nw, tid * wp), w1 = min(nw, w0 + wp);
+      int cnt = 0;
+      for (int w = w0; w < w1; ++w) cnt += __popc(bm[w]);
+      int n;
+      int o = block_scan(cnt, &n);
+      for (int w = w0; w < w1; ++w) {
+        uint32_t m = bm[w];
+        while (m) {
+          cand[o++].idx = w * 32 + __ffs(m) - 1;
+          m &= m - 1;
+        }
+      }
+      __syncthreads();
+      for (int e = tid; e < n; e += kSelThreads) cand[e].key = fkey(sc[cand[e].idx]);
+      __syncthreads();
+      // two more radix levels among the candidates
+      const int need1 = K - above1;
+      for (int e = tid; e < n; e += kSelThreads) {
+        const uint32_t k = cand[e].key;
+        if ((k >> 21) == uint32_t(b1)) atomicAdd(&lh[(k >> 10) & 2047], 1);
+      }
+      __syncthreads();
+      int above2, in_bin2;
+      const int b2 = find_bin<kBins>(lh, need1, &above2, &in_bin2);
+      const uint32_t p2 = t1 | (uint32_t(b2) << 10);
+      for (int e = tid; e < n; e += kSelThreads) {
+        const uint32_t k = cand[e].key;
+        if ((k >> 10) == (p2 >> 10)) atomicAdd(&lh[kBins + (k & 1023)], 1);
+      }
+      __syncthreads();
+      int above3, in_bin3;
+      const int b3 = find_bin<kBins / 2>(lh + kBins, need1 - above2, &above3, &in_bin3);
+      const uint32_t thr = p2 | uint32_t(b3);
+      // above thr, then the lowest ties, in block order: entries 2 tid, 2 tid + 1 of the list
+      int idx2[2];
+      uint32_t k2[2];
+      int v = 0;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int e = 2 * tid + j;
+        idx2[j] = e < n ? cand[e].idx : 0;
+        k2[j] = e < n ? cand[e].key : 0;
+        v += (e < n && k2[j] > thr) + ((e < n && k2[j] == thr) << 16);
+      }
+      int tot;
+      const int off = block_scan(v, &tot);
+      const int n_gt = tot & 0xffff, ties = K - n_gt;
+      int og = off & 0xffff, oe = off >> 16;
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int e = 2 * tid + j;
+        if (e < n && k2[j] > thr) sel[og++] = idx2[j];
+        else if (e < n && k2[j] == thr) {
+          if (oe < ties) sel[n_gt + oe] = idx2[j];
+          ++oe;
+        }
+      }
+      nsel = K;
+    } else {
+      // many blocks in the best bins: the next levels over the row, then the collection
+      uint32_t prefix = uint32_t(b1) << 21, mask = 0xFFE00000u;
+      int need = K - above1;
+      for (int pass = 0; pass < 2; ++pass) {
+        const int sh = pass == 0 ? 10 : 0, bins = pass == 0 ? 2048 : 1024;
+        for (int i = tid; i < kBins; i += kSelThreads) lh[i] = 0;
+        __syncthreads();
+        for (int i = tid; i < nvis; i += kSelThreads) {
+          const uint32_t k = fkey(sc[i]);
+          if ((k & mask) == prefix) atomicAdd(&lh[(k >> sh) & (bins - 1)], 1);
+        }
+        __syncthreads();
+        int above, in_bin;
+        const int bin = pass == 0 ? find_bin<kBins>(lh, need, &above, &in_bin) : find_bin<kBins / 2>(lh, need, &above, &in_bin);
+        need -= above;
+        prefix |= uint32_t(bin) << sh;
+        mask |= uint32_t(bins - 1) << sh;
+      }
+      const uint32_t thr = prefix;
+      const int ties = need;  // elements equal to thr to take
+      // contiguous ranges per thread keep block order
+      const int per = (nvis + kSelThreads - 1) / kSelThreads;
+      const int a = min(nvis, tid * per), b = min(nvis, a + per);
+      int gt = 0, eq = 0;
+      for (int i = a; i < b; ++i) {
+        const uint32_t k = fkey(sc[i]);
+        gt += k > thr;
+        eq += k == thr;
+      }
+      int n_gt = 0, n_eq = 0;
+      const int off_gt = block_scan(gt, &n_gt);
+      const int off_eq = block_scan(eq, &n_eq);
+      int og = off_gt, oe = off_eq;
+      for (int i = a; i < b; ++i) {
+        const uint32_t k = fkey(sc[i]);
+        if (k > thr) sel[og++] = i;
+        else if (k == thr) {
+          if (oe < ties) sel[n_gt + oe] = i;
+          ++oe;
+        }
+      }
+      nsel = n_gt + min(n_eq, ties);
+    }
   }
   __syncthreads();
   int32_t* out = table + int64_t(r) * table_stride;
@@ -454,7 +589,14 @@ extern "C" cudaError_t blz_qsa_select(const float* scores, int64_t ld_scores, co
                                       int64_t table_stride, int32_t* counts, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
   if (block_topk > 2048) return cudaErrorInvalidValue;
-  select_kernel<<<rows, kSelThreads, 0, stream>>>(scores, ld_scores, positions, tok_row, row0, ratio, block_topk,
+  static bool attr[16] = {};
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (dev < 16 && !attr[dev]) {
+    cudaFuncSetAttribute(select_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSelSmem));
+    attr[dev] = true;
+  }
+  select_kernel<<<rows, kSelThreads, kSelSmem, stream>>>(scores, ld_scores, positions, tok_row, row0, ratio, block_topk,
                                                   req_to_token, rt_stride, table + int64_t(row0) * table_stride,
                                                   table_stride, counts + row0);
   return cudaGetLastError();
