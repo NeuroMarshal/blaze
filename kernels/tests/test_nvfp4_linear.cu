@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <algorithm>
 #include <random>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "blaze/nvfp4.h"
@@ -98,8 +100,10 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
 double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
   const double bytes = double(n) * k / 2 + double(n) * k / 16;
   const int copies = std::max(2, int(400e6 / bytes));
-  std::vector<Weights*> ws;
-  for (int i = 0; i < copies; ++i) ws.push_back(new Weights(n, k, rng));
+  // the copies of a shape are made once (random bytes on the host are slow) and kept for later calls
+  static std::map<std::pair<int, int>, std::vector<Weights*>> cache;
+  auto& ws = cache[{n, k}];
+  while (int(ws.size()) < copies) ws.push_back(new Weights(n, k, rng));
   uint16_t *dx, *dy;
   check(cudaMalloc(&dx, size_t(rows) * k * 2), "malloc");
   check(cudaMalloc(&dy, size_t(rows) * n * 2), "malloc");
@@ -122,7 +126,6 @@ double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
   const double us = 1000.0 * ms / iters;
   std::printf("  %s %2d x %5d x %5d: %7.1f us, %6.0f GB/s of weights\n", mma ? "mma " : "gemv", rows, n, k, us,
               bytes / us / 1000.0);
-  for (auto* w : ws) delete w;
   cudaFree(dx);
   cudaFree(dy);
   return us;
@@ -130,8 +133,16 @@ double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::mt19937 rng(7);
+  if (argc > 1 && std::string(argv[1]) == "bench") {
+    // quick: the tensor-core route over 8..64 rows on the 27B shapes
+    for (int rows : {8, 16, 24, 32, 48, 64}) {
+      bench(rows, 17408, 5120, rng, true);
+      bench(rows, 5120, 8704, rng, true);
+    }
+    return 0;
+  }
   blz_gemm* gemm = nullptr;
   if (blz_gemm_create(&gemm) != 0) return 1;
   bool ok = true;

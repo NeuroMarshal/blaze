@@ -350,26 +350,50 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
   }();
   const int split = forced ? forced : (rows <= 8 && k >= 5120 ? 8 : 2);
   const int mt = (rows + 15) / 16;
+  // More than 16 rows: several 8-row weight tiles per block, so that fewer blocks re-read the input rows (L2 traffic of
+  // the inputs: blocks x rows x k). BLZ_MMA_TILES overrides (1, 2, 4).
+  static const int forced_tiles = [] {
+    const char* e = getenv("BLZ_MMA_TILES");
+    return e ? atoi(e) : 0;
+  }();
+  const int tiles = mt == 1 ? 1 : (forced_tiles ? forced_tiles : 2);
+#define BLZ_MMA_MT(T, S)                                                                                              \
+  {                                                                                                                   \
+    const int blocks = (n + 8 * T - 1) / (8 * T);                                                                     \
+    if (mt == 4)                                                                                                      \
+      nvfp4_mma_kernel<T, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);    \
+    else if (mt == 3)                                                                                                 \
+      nvfp4_mma_kernel<T, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);    \
+    else                                                                                                              \
+      nvfp4_mma_kernel<T, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);    \
+  }
+#define BLZ_MMA_TILED(S)                                                                                             \
+  {                                                                                                                  \
+    if (tiles == 4) BLZ_MMA_MT(4, S)                                                                                 \
+    else if (tiles == 1) BLZ_MMA_MT(1, S)                                                                            \
+    else BLZ_MMA_MT(2, S)                                                                                            \
+  }
 #define BLZ_MMA_LAUNCH(S)                                                                                            \
   {                                                                                                                  \
     const int blocks = (n + 7) / 8;                                                                                  \
-    if (mt == 4)                                                                                                     \
-      nvfp4_mma_kernel<1, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
-    else if (mt == 3)                                                                                                \
-      nvfp4_mma_kernel<1, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
-    else if (mt == 2)                                                                                                \
-      nvfp4_mma_kernel<1, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
-    else if (rows > 8)                                                                                               \
+    if (rows > 8)                                                                                                    \
       nvfp4_mma_kernel<1, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
     else                                                                                                             \
       nvfp4_mma_kernel<1, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);  \
   }
-  switch (split) {
-    case 2: BLZ_MMA_LAUNCH(2) break;
-    case 8: BLZ_MMA_LAUNCH(8) break;
-    default: BLZ_MMA_LAUNCH(4) break;
+  if (mt >= 2) {
+    // 2 or 4 warps along K (the partial sums of 4 tiles x 64 rows x 8 warps would not fit in shared memory)
+    if (split >= 4) BLZ_MMA_TILED(4) else BLZ_MMA_TILED(2)
+  } else {
+    switch (split) {
+      case 2: BLZ_MMA_LAUNCH(2) break;
+      case 8: BLZ_MMA_LAUNCH(8) break;
+      default: BLZ_MMA_LAUNCH(4) break;
+    }
   }
 #undef BLZ_MMA_LAUNCH
+#undef BLZ_MMA_MT
+#undef BLZ_MMA_TILED
   return cudaGetLastError();
 }
 
