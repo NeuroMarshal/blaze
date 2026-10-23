@@ -37,6 +37,12 @@ cudaError_t blz_fp8_weight_dequant(const uint8_t* w, const float* block_scale, i
 cudaError_t blz_mxfp8_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale, uint16_t* y,
                                int64_t ldy, int rows, int n, int k, cudaStream_t stream);
 
+/// \brief blz_mxfp8_gemv_mma with an explicit launch (warps along K, 8-row weight tiles per block; 0: the default).
+cudaError_t blz_mxfp8_gemv_mma_cfg(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale, uint16_t* y,
+                                   int64_t ldy, int rows, int n, int k, int split, int tiles, cudaStream_t stream);
+int blz_mxfp8_mma_default_cfg(int rows, int k, int* split, int* tiles);
+int blz_mxfp8_mma_cfg_valid(int rows, int split, int tiles);
+
 /// \brief The MXFP8 weight as a BF16 matrix [n, k] (k a multiple of 32).
 cudaError_t blz_mxfp8_weight_dequant(const uint8_t* w, const uint8_t* scale, int n, int k, uint16_t* out,
                                      cudaStream_t stream);

@@ -30,6 +30,15 @@ cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w,
                                const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
                                cudaStream_t stream);
 
+/// \brief blz_nvfp4_gemv_mma with an explicit launch: `split` warps along K (2, 4, 8) and `tiles` 8-row weight tiles per
+/// block (1, 2, 4); 0 for either picks blz_nvfp4_mma_default_cfg. cudaErrorInvalidValue for a combination that does not
+/// fit (blz_nvfp4_mma_cfg_valid).
+cudaError_t blz_nvfp4_gemv_mma_cfg(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
+                                   const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k, int split,
+                                   int tiles, cudaStream_t stream);
+int blz_nvfp4_mma_default_cfg(int rows, int k, int* split, int* tiles);
+int blz_nvfp4_mma_cfg_valid(int rows, int split, int tiles);
+
 /// \brief out[j, i] = bf16(e2m1(w[j, i]) * e4m3(scale[j, i / 16]) * alpha[j]): the weight as a BF16 matrix [n, k].
 cudaError_t blz_nvfp4_weight_dequant(const uint8_t* w, const uint8_t* scale, const float* alpha, int n, int k, uint16_t* out,
                               cudaStream_t stream);

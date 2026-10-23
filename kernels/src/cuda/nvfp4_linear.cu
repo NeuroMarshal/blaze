@@ -7,7 +7,6 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#include <cstdlib>
 
 #include "blaze/nvfp4_linear.h"
 
@@ -337,65 +336,78 @@ extern "C" cudaError_t blz_nvfp4_gemv(const uint16_t* x, int64_t ldx, const uint
   }
 }
 
+namespace {
+
+// Partial sums of a block: kSplit x 8 kTiles x (16 kMT + 1) floats, within the 48 KiB of static shared memory.
+constexpr bool mma_cfg_fits(int tiles, int split, int mt) { return split * tiles * 8 * (16 * mt + 1) * 4 <= 48 * 1024; }
+
+template <int T, int S>
+cudaError_t launch_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale, const float* alpha,
+                       uint16_t* y, int64_t ldy, int rows, int n, int k, cudaStream_t stream) {
+  const int blocks = (n + 8 * T - 1) / (8 * T), mt = (rows + 15) / 16;
+  if (mt == 1 && rows <= 8)
+    nvfp4_mma_kernel<T, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+  else if (mt == 1)
+    nvfp4_mma_kernel<T, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+  else if (mt == 2)
+    nvfp4_mma_kernel<T, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+  else if constexpr (mma_cfg_fits(T, S, 4)) {
+    if (mt == 3)
+      nvfp4_mma_kernel<T, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+    else
+      nvfp4_mma_kernel<T, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);
+  } else {
+    return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+}  // namespace
+
+extern "C" int blz_nvfp4_mma_default_cfg(int rows, int k, int* split, int* tiles) {
+  // Measured on the RTX 5070 Ti with cold weights: 8 warps along K for a few rows of long inputs (17408 x 5120: 879
+  // GB/s), 2 for short inputs and 9..16 rows; above 16 rows several weight tiles per block, so that fewer blocks re-read
+  // the inputs from L2 (32 rows: 110 us with 2 tiles, 401 with 1; 64 rows: 202 us with 4, 835 with 1). The tuner
+  // (crates/blaze/src/tune.rs) measures the real shapes instead.
+  const int mt = (rows + 15) / 16;
+  *split = mt == 1 && rows <= 8 && k >= 5120 ? 8 : 2;
+  *tiles = mt == 1 ? 1 : (mt == 2 ? 2 : 4);
+  return 0;
+}
+
+extern "C" int blz_nvfp4_mma_cfg_valid(int rows, int split, int tiles) {
+  const int mt = (rows + 15) / 16;
+  return (split == 2 || split == 4 || split == 8) && (tiles == 1 || tiles == 2 || tiles == 4) && mt >= 1 && mt <= 4 &&
+         mma_cfg_fits(tiles, split, mt) && !(tiles == 4 && split == 8);
+}
+
+extern "C" cudaError_t blz_nvfp4_gemv_mma_cfg(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
+                                              const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
+                                              int split, int tiles, cudaStream_t stream) {
+  if (rows <= 0 || n <= 0) return cudaSuccess;
+  if (k % 128 != 0 || rows > BLZ_NVFP4_MMA_MAX_ROWS) return cudaErrorInvalidValue;
+  if (split == 0 || tiles == 0) blz_nvfp4_mma_default_cfg(rows, k, &split, &tiles);
+  if (!blz_nvfp4_mma_cfg_valid(rows, split, tiles)) return cudaErrorInvalidValue;
+#define BLZ_MMA_S(T)                                                                                    \
+  switch (split) {                                                                                      \
+    case 2: return launch_mma<T, 2>(x, ldx, w, scale, alpha, y, ldy, rows, n, k, stream);               \
+    case 4: return launch_mma<T, 4>(x, ldx, w, scale, alpha, y, ldy, rows, n, k, stream);               \
+    default: return launch_mma<T, 8>(x, ldx, w, scale, alpha, y, ldy, rows, n, k, stream);              \
+  }
+  switch (tiles) {
+    case 1: BLZ_MMA_S(1)
+    case 2: BLZ_MMA_S(2)
+    default:
+      if (split == 2) return launch_mma<4, 2>(x, ldx, w, scale, alpha, y, ldy, rows, n, k, stream);
+      return launch_mma<4, 4>(x, ldx, w, scale, alpha, y, ldy, rows, n, k, stream);
+  }
+#undef BLZ_MMA_S
+}
+
 extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
                                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
                                           cudaStream_t stream) {
-  if (rows <= 0 || n <= 0) return cudaSuccess;
-  if (k % 128 != 0 || rows > BLZ_NVFP4_MMA_MAX_ROWS) return cudaErrorInvalidValue;
-  // Warps splitting K per block of 8 weight rows. Cold weights on the RTX 5070 Ti: 8 for long rows of a few tokens
-  // (17408 x 5120: 879 GB/s), 2 for short rows (k <= 4096) and for 9..16 tokens. BLZ_MMA_SPLIT overrides.
-  static const int forced = [] {
-    const char* e = getenv("BLZ_MMA_SPLIT");
-    return e ? atoi(e) : 0;
-  }();
-  const int split = forced ? forced : (rows <= 8 && k >= 5120 ? 8 : 2);
-  const int mt = (rows + 15) / 16;
-  // More than 16 rows: several 8-row weight tiles per block, so that fewer blocks re-read the input rows (L2 traffic of
-  // the inputs: blocks x rows x k). BLZ_MMA_TILES overrides (1, 2, 4).
-  static const int forced_tiles = [] {
-    const char* e = getenv("BLZ_MMA_TILES");
-    return e ? atoi(e) : 0;
-  }();
-  // RTX 5070 Ti, 17408 x 5120: 32 rows 110 us with 2 tiles (401 with 1), 64 rows 202 us with 4 (835 with 1)
-  const int tiles = mt == 1 ? 1 : (forced_tiles ? forced_tiles : (mt == 2 ? 2 : 4));
-#define BLZ_MMA_MT(T, S)                                                                                              \
-  {                                                                                                                   \
-    const int blocks = (n + 8 * T - 1) / (8 * T);                                                                     \
-    if (mt == 4)                                                                                                      \
-      nvfp4_mma_kernel<T, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);    \
-    else if (mt == 3)                                                                                                 \
-      nvfp4_mma_kernel<T, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);    \
-    else                                                                                                              \
-      nvfp4_mma_kernel<T, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);    \
-  }
-#define BLZ_MMA_TILED(S)                                                                                             \
-  {                                                                                                                  \
-    if (tiles == 4) BLZ_MMA_MT(4, S)                                                                                 \
-    else if (tiles == 1) BLZ_MMA_MT(1, S)                                                                            \
-    else BLZ_MMA_MT(2, S)                                                                                            \
-  }
-#define BLZ_MMA_LAUNCH(S)                                                                                            \
-  {                                                                                                                  \
-    const int blocks = (n + 7) / 8;                                                                                  \
-    if (rows > 8)                                                                                                    \
-      nvfp4_mma_kernel<1, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
-    else                                                                                                             \
-      nvfp4_mma_kernel<1, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);  \
-  }
-  if (mt >= 2) {
-    // 2 warps along K (4 measured no faster; 8 would not fit the partial sums of 4 tiles x 64 rows in shared memory)
-    if (forced >= 4) BLZ_MMA_TILED(4) else BLZ_MMA_TILED(2)
-  } else {
-    switch (split) {
-      case 2: BLZ_MMA_LAUNCH(2) break;
-      case 8: BLZ_MMA_LAUNCH(8) break;
-      default: BLZ_MMA_LAUNCH(4) break;
-    }
-  }
-#undef BLZ_MMA_LAUNCH
-#undef BLZ_MMA_MT
-#undef BLZ_MMA_TILED
-  return cudaGetLastError();
+  return blz_nvfp4_gemv_mma_cfg(x, ldx, w, scale, alpha, y, ldy, rows, n, k, 0, 0, stream);
 }
 
 extern "C" cudaError_t blz_nvfp4_weight_dequant(const uint8_t* w, const uint8_t* scale, const float* alpha, int n, int k,
