@@ -126,7 +126,7 @@ impl Drop for Graph {
 type GraphKey = (Vec<usize>, bool, bool, bool, bool);
 
 /// Most verify graphs kept (their span shapes vary with the draft lengths); beyond them verify steps run eagerly.
-const MAX_VERIFY_GRAPHS: usize = 48;
+const MAX_VERIFY_GRAPHS: usize = 128;
 
 /// One rank: its model shard and the per-step machinery.
 struct Runner {

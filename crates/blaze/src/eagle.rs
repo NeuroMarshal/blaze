@@ -207,9 +207,8 @@ pub struct Draft {
     warmed: std::collections::HashSet<DraftKey>,
 }
 
-/// A captured draft call: chain length, per item (row in the target step, extended rows) or (MAX, 1) for a chain
-/// without its extend, whether the extend is in the graph, the tree shape ((0, 0): a chain).
-type DraftKey = (usize, Vec<(usize, usize)>, bool, (usize, usize));
+/// A captured draft call after its (eager) extend: chain length, items, the tree shape ((0, 0): a chain).
+type DraftKey = (usize, usize, (usize, usize));
 
 /// Device buffers of the draft trees (blaze/tree.h).
 struct TreeBufs {
@@ -226,9 +225,7 @@ struct TreeBufs {
     slot_base: usize,
     cap: usize,
 }
-const MAX_DRAFT_GRAPHS: usize = 64;
-/// Extends of at most this many rows (after a verify or a decode step) are captured with the chain.
-const GRAPH_EXTEND_ROWS: usize = 64;
+const MAX_DRAFT_GRAPHS: usize = 192;
 
 struct DraftGraph {
     exec: sys::cudaGraphExec_t,
@@ -566,24 +563,15 @@ impl Draft {
         }
         let (fwds, n_ext, ext_start) = self.prepare(model, plan)?;
         let s = &model.stream;
-        // small extends (after a verify or a decode step) and the chain replay as one CUDA graph per shape; a long
-        // extend (a prompt's last window) runs eagerly, its chain through the chain graph
-        let ext_rows: usize = fwds[..n_ext].iter().flat_map(|f| f.spans.iter().map(|s| s.1)).sum();
-        if plan.k > 0 && n_ext == 1 && ext_rows <= GRAPH_EXTEND_ROWS && model.opts.draft_graphs {
-            let key: DraftKey = (plan.k, plan.items.iter().map(|it| (it.aux_row, it.tokens.len())).collect(), true, (0, 0));
-            self.graphed(model, key, |d| {
-                d.extend(model, plan, &fwds[..n_ext], &ext_start)?;
-                d.chain(model, n_items, &fwds[n_ext..])
-            })?;
-        } else {
-            self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
-            if plan.k > 0 {
-                let key: DraftKey = (plan.k, vec![(usize::MAX, 1); n_items], false, (0, 0));
-                if model.opts.draft_graphs {
-                    self.graphed(model, key, |d| d.chain(model, n_items, &fwds[n_ext..]))?;
-                } else {
-                    self.chain(model, n_items, &fwds[n_ext..])?;
-                }
+        // the extend runs eagerly: its shape (the items' accepted lengths and rows) changes every call, graphs of it
+        // would mostly be captured, not replayed; the chain runs through one CUDA graph per (length, items)
+        self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
+        if plan.k > 0 {
+            let key: DraftKey = (plan.k, n_items, (0, 0));
+            if model.opts.draft_graphs {
+                self.graphed(model, key, |d| d.chain(model, n_items, &fwds[n_ext..]))?;
+            } else {
+                self.chain(model, n_items, &fwds[n_ext..])?;
             }
         }
         if plan.k == 0 {
@@ -611,21 +599,13 @@ impl Draft {
             bail!("tree draft of {n_items} items, shape {:?} (buffers: {} items, shape {:?})", (k, d), self.max_items, self.tree_shape);
         }
         let (fwds, n_ext, ext_start) = self.prepare(model, plan)?;
-        let ext_rows: usize = fwds[..n_ext].iter().flat_map(|f| f.spans.iter().map(|s| s.1)).sum();
-        if n_ext == 1 && ext_rows <= GRAPH_EXTEND_ROWS && model.opts.draft_graphs {
-            let key: DraftKey = (0, plan.items.iter().map(|it| (it.aux_row, it.tokens.len())).collect(), true, (k, d));
-            self.graphed(model, key, |dr| {
-                dr.extend(model, plan, &fwds[..n_ext], &ext_start)?;
-                dr.grow(model, n_items, &fwds[n_ext..])
-            })?;
+        // as in `run`: the extend eagerly, the growth through one graph per (items, width, depth)
+        self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
+        let key: DraftKey = (0, n_items, (k, d));
+        if model.opts.draft_graphs {
+            self.graphed(model, key, |dr| dr.grow(model, n_items, &fwds[n_ext..]))?;
         } else {
-            self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
-            let key: DraftKey = (0, vec![(usize::MAX, 1); n_items], false, (k, d));
-            if model.opts.draft_graphs {
-                self.graphed(model, key, |dr| dr.grow(model, n_items, &fwds[n_ext..]))?;
-            } else {
-                self.grow(model, n_items, &fwds[n_ext..])?;
-            }
+            self.grow(model, n_items, &fwds[n_ext..])?;
         }
         model.stream.sync()?;
         let t = self.tree.as_ref().unwrap();

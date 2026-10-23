@@ -287,6 +287,9 @@ pub enum SpecMethod {
     Eagle,
 }
 
+/// Node counts a tree round verifies per sequence (rows: one more).
+const TREE_NODES: [usize; 12] = [0, 1, 3, 5, 7, 11, 15, 23, 31, 39, 47, 63];
+
 /// Tokens of earlier outputs kept for suffix decoding.
 const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
 
@@ -911,6 +914,9 @@ impl Loop {
         } else {
             cands.iter().map(Vec::len).collect()
         };
+        // node counts from a few sizes (verify rows 1, 2, 4, 6, 8, 12, 16, ...): the verify step's CUDA graph is keyed by
+        // the rows of every sequence, and free counts of several sequences would make too many shapes to replay
+        let counts: Vec<usize> = counts.into_iter().map(|c| TREE_NODES.iter().copied().filter(|&x| x <= c).max().unwrap_or(0)).collect();
         if counts.iter().all(|&c| c == 0) {
             return Ok(false);
         }
