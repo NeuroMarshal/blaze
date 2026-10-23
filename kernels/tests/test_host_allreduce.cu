@@ -176,6 +176,41 @@ int child(int rank, const std::string& name, int created_fd, int opened_fd, int 
                   1000.0f * ms / iters, iters);
     cudaFree(d);
   }
+  // all-reduce + residual + RMSNorm of decode / verify rows (27B: hidden 5120), against the plain all-reduce of the
+  // same bytes
+  {
+    const int dim = 5120, max_rows = 32;
+    uint16_t *x = nullptr, *res = nullptr, *w = nullptr, *out = nullptr;
+    check(cudaMalloc(&x, size_t(max_rows) * dim * 2), "malloc", rank);
+    check(cudaMalloc(&res, size_t(max_rows) * dim * 2), "malloc", rank);
+    check(cudaMalloc(&w, size_t(dim) * 2), "malloc", rank);
+    check(cudaMalloc(&out, size_t(max_rows) * dim * 2), "malloc", rank);
+    check(cudaMemset(x, 0, size_t(max_rows) * dim * 2), "memset", rank);
+    check(cudaMemset(res, 0, size_t(max_rows) * dim * 2), "memset", rank);
+    check(cudaMemset(w, 0, size_t(dim) * 2), "memset", rank);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    const int n = iters / 4;
+    for (int rows : {1, 2, 4, 8, 16, 32}) {
+      float ms[2] = {0, 0};
+      for (int kind = 0; kind < 2; ++kind) {
+        auto call = [&]() {
+          return kind == 0 ? blz_host_ar_rmsnorm(ar, x, res, w, 1e-6f, rows, dim, 1, out, s)
+                           : blz_host_ar_all_reduce(ar, x, int64_t(rows) * dim * 2, BLZ_AR_BF16, s);
+        };
+        for (int i = 0; i < 20; ++i) check(call(), "warmup", rank);
+        cudaEventRecord(e0, s);
+        for (int i = 0; i < n; ++i) check(call(), "bench", rank);
+        cudaEventRecord(e1, s);
+        check(cudaStreamSynchronize(s), "bench sync", rank);
+        cudaEventElapsedTime(&ms[kind], e0, e1);
+      }
+      if (rank == 0)
+        std::printf("%2d rows x %d: ar+rmsnorm %.2f us, ar %.2f us\n", rows, dim, 1000.0f * ms[0] / n, 1000.0f * ms[1] / n);
+    }
+    cudaFree(x), cudaFree(res), cudaFree(w), cudaFree(out);
+  }
   blz_host_ar_close(ar);
   return fails ? 1 : 0;
 }
