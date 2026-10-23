@@ -336,7 +336,7 @@ impl Draft {
         } else {
             None
         };
-        Ok(Self {
+        let d = Self {
             fc: lin(&[("fc", Cut::All)])?,
             fc_norm,
             input_ln: vec("layers.0.input_layernorm.weight")?,
@@ -418,7 +418,14 @@ impl Draft {
             dumped: 0,
             warmed: Default::default(),
             cfg,
-        })
+        };
+        // the drafter's tensor-core GEMV launches (an MXFP8 checkpoint) for this device
+        let mut weights = Vec::new();
+        for lin in [&d.fc, &d.qkv, &d.o, &d.gu, &d.down, &d.lr_head] {
+            weights.extend(lin.tune_weights());
+        }
+        model.lin_ctx().tune.tune(&weights, s)?;
+        Ok(d)
     }
 
     /// Bytes of VRAM the drafter takes beyond its weights' share (KV ring and work buffers), for logging.

@@ -58,6 +58,8 @@ pub struct LinCtx {
     pub gemm: *mut sys::blz_gemm,
     pub scratch: *mut u16,
     pub scratch_elems: usize,
+    /// launch configurations of the tensor-core GEMVs measured for this device (tune.rs)
+    pub tune: std::sync::Arc<crate::tune::Tuning>,
 }
 
 /// Rows `rows` of a row-major tensor with `row_bytes` per row, bytes `cols` of each.
@@ -317,6 +319,33 @@ impl Linear {
         Ok(Store::Bf16(w))
     }
 
+    /// The parts the tensor-core GEMVs serve, for the tuner (tune.rs).
+    pub fn tune_weights(&self) -> Vec<crate::tune::Weight> {
+        let mut v = Vec::new();
+        for p in &self.parts {
+            match &p.store {
+                Store::Nvfp4 { codes, scales, alpha } => v.push(crate::tune::Weight {
+                    kernel: crate::tune::Kernel::Nvfp4,
+                    n: p.n,
+                    k: self.k,
+                    codes: codes.ptr::<u8>() as *const u8,
+                    scales: scales.ptr::<u8>() as *const u8,
+                    alpha: alpha.ptr::<f32>() as *const f32,
+                }),
+                Store::Mxfp8 { codes, scales } => v.push(crate::tune::Weight {
+                    kernel: crate::tune::Kernel::Mxfp8,
+                    n: p.n,
+                    k: self.k,
+                    codes: codes.ptr::<u8>() as *const u8,
+                    scales: scales.ptr::<u8>() as *const u8,
+                    alpha: std::ptr::null(),
+                }),
+                _ => {}
+            }
+        }
+        v
+    }
+
     /// Device memory the layer reads, in reading order: (address, bytes).
     pub fn regions(&self) -> Vec<(*const u8, usize)> {
         let mut v = Vec::new();
@@ -350,10 +379,11 @@ impl Linear {
             match &p.store {
                 Store::Nvfp4 { codes, scales, alpha } => {
                     if m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 {
+                        let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, p.n, k, m);
                         check(
                             unsafe {
-                                sys::blz_nvfp4_gemv_mma(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
-                                                        p.n as c_int, k as c_int, s.0)
+                                sys::blz_nvfp4_gemv_mma_cfg(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
+                                                            p.n as c_int, k as c_int, split, tiles, s.0)
                             },
                             "blz_nvfp4_gemv_mma",
                         )?;
@@ -417,10 +447,11 @@ impl Linear {
                 }
                 Store::Mxfp8 { codes, scales } => {
                     if m <= sys::BLZ_MXFP8_MMA_MAX_ROWS {
+                        let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Mxfp8, p.n, k, m);
                         check(
                             unsafe {
-                                sys::blz_mxfp8_gemv_mma(x, ldx as i64, codes.ptr(), scales.ptr(), o, ldo as i64, m as c_int, p.n as c_int,
-                                                        k as c_int, s.0)
+                                sys::blz_mxfp8_gemv_mma_cfg(x, ldx as i64, codes.ptr(), scales.ptr(), o, ldo as i64, m as c_int, p.n as c_int,
+                                                            k as c_int, split, tiles, s.0)
                             },
                             "blz_mxfp8_gemv_mma",
                         )?;

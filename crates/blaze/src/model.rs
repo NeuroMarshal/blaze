@@ -1029,7 +1029,7 @@ impl Model {
             ple_state,
             embed,
             moe: None,
-            lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems },
+            lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems, tune: std::sync::Arc::new(crate::tune::Tuning::open(tp.rank)) },
             _scratch: scratch,
             inv_freq,
             rope_scale,
@@ -1063,6 +1063,32 @@ impl Model {
             opts,
             num_sms: num_sms.max(1) as usize,
         };
+        // the tensor-core GEMVs' launches for this device and these shapes (cached; measured once per new shape)
+        let mut weights = model.lm_head.tune_weights();
+        for l in &model.layers {
+            let mut lins: Vec<&Linear> = Vec::new();
+            if let Some(a) = &l.attn {
+                lins.extend([&a.qkv, &a.o]);
+            }
+            if let Some(g) = &l.gdn {
+                lins.extend([&g.in_proj, &g.out]);
+            }
+            if let Some(pl) = &l.ple {
+                lins.extend([&pl.key, &pl.value]);
+            }
+            match &l.mlp {
+                Mlp::Moe { gate, shared_gu, shared_down, .. } => lins.extend([gate, shared_gu, shared_down]),
+                Mlp::Dense { gu, down } => lins.extend([gu, down]),
+            }
+            for lin in lins {
+                weights.extend(lin.tune_weights());
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let tuned = model.lin.tune.tune(&weights, &model.stream)?;
+        if tuned > 0 && model.tp.rank == 0 {
+            eprintln!("blaze: tuned the GEMV launches of {tuned} weight shapes in {:.1} s", t0.elapsed().as_secs_f64());
+        }
         if let MlpConfig::Moe { top_k, .. } = model.cfg.mlp {
             model.moe = Some(model.start_moe(dir, top_k)?);
         }
@@ -1628,6 +1654,45 @@ impl Model {
             bail!("all-reduce of {bytes} B exceeds the buffer ({} B)", self.tp.ar_bytes);
         }
         check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, data.cast(), bytes as i64, sys::BLZ_AR_BF16, self.stream.0) }, "all-reduce")
+    }
+
+    /// Microseconds per all-reduce of each size in `sizes` (bytes) through the zero-copy and the DMA path: every rank
+    /// must call this at the same time (the calls are collective). For the choice of the DMA threshold.
+    pub fn time_all_reduce(&self, sizes: &[usize]) -> Result<Vec<(f32, f32)>> {
+        if self.tp.world == 1 {
+            return Ok(Vec::new());
+        }
+        let s = &self.stream;
+        let max = sizes.iter().copied().max().unwrap_or(0).min(self.tp.ar_bytes);
+        let buf = DevBuf::zeroed(max.max(16), s)?;
+        let timer = crate::gpu::Timer::new()?;
+        let mut out = Vec::new();
+        for &bytes in sizes {
+            let bytes = bytes.min(max) / 16 * 16;
+            let mut us = [0.0f32; 2];
+            for (i, dma_min) in [i64::MAX, 0].into_iter().enumerate() {
+                unsafe { sys::blz_host_ar_set_dma_min(self.tp.ar, dma_min) };
+                let call = || check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, buf.ptr(), bytes as i64, sys::BLZ_AR_BF16, s.0) }, "all-reduce");
+                for _ in 0..5 {
+                    call()?;
+                }
+                const N: usize = 30;
+                timer.start(s)?;
+                for _ in 0..N {
+                    call()?;
+                }
+                us[i] = 1000.0 * timer.stop(s)? / N as f32;
+            }
+            out.push((us[0], us[1]));
+        }
+        Ok(out)
+    }
+
+    /// All-reduces of at least `bytes` take the DMA path (the same value on every rank, between calls).
+    pub fn set_dma_min(&self, bytes: i64) {
+        if self.tp.world > 1 {
+            unsafe { sys::blz_host_ar_set_dma_min(self.tp.ar, bytes) };
+        }
     }
 
     /// Logits of `rows` normed hidden states into out [rows, vocab]: this rank's vocabulary slice, then the sum over
