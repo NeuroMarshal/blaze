@@ -1041,11 +1041,14 @@ impl Draft {
     /// hin += x (all-reduced over the ranks first), out = rmsnorm(hin, w).
     fn add_norm(&self, x: *mut u16, w: *const u16, out: *mut u16, n: usize, s: &crate::gpu::Stream) -> Result<()> {
         let (h, eps) = (self.cfg.hidden, self.cfg.eps);
-        if self.ar.is_null() {
-            check(unsafe { sys::blz_rmsnorm(x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 0, out, s.0) }, "draft norm")
-        } else {
-            check(unsafe { sys::blz_host_ar_rmsnorm(self.ar, x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 0, out, s.0) }, "draft all-reduce norm")
+        if !self.ar.is_null() && n <= 64 {
+            return check(unsafe { sys::blz_host_ar_rmsnorm(self.ar, x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 0, out, s.0) }, "draft all-reduce norm");
         }
+        // a long extend (the fused kernel takes 64 rows): the same bits from the all-reduce, then the norm
+        if !self.ar.is_null() {
+            check(unsafe { sys::blz_host_ar_all_reduce(self.ar, x.cast(), (n * h * 2) as i64, sys::BLZ_AR_BF16, s.0) }, "draft all-reduce")?;
+        }
+        check(unsafe { sys::blz_rmsnorm(x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 0, out, s.0) }, "draft norm")
     }
 
     /// Candidate head on `last_normed`: draft token of chain step `step` for every item, in `tok` and the record.
