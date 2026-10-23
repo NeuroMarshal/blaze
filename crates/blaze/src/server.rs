@@ -1,14 +1,19 @@
-//! OpenAI-compatible HTTP server: /v1/chat/completions (streaming or not, reasoning split out, tool calls parsed),
-//! /v1/completions, /v1/models, /health. Chat templates, reasoning and tool-call parsing come from the vendored
-//! blaze-chat; generation runs on the scheduler.
+//! HTTP inference API with streaming, tool calls and structured outputs.
+//! The vendored blaze-chat renders chat templates and parses model output.
+
+mod chat;
+mod completions;
+mod tokenize;
 
 use crate::sampler::SamplingParams;
 use crate::sched::{Finish, GenEvent, GenRequest, Scheduler, ThinkBudget, TokenLogprob};
 use crate::structured::{Constraint, Grammars, grammar_of};
 use crate::text::Text;
-use anyhow::{Result, anyhow};
-use axum::extract::State;
-use axum::http::StatusCode;
+use anyhow::Result;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,14 +21,18 @@ use axum::{Json, Router};
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use blaze_chat::dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletionRequest};
-use blaze_chat::dynamo_renderer::{OAIChatLikeRequest, TextInput};
-use blaze_chat::{ChatEvent, ChatFinishReason, ChatFormatter, ChatResponseProcessor, DecodedChatEvent, ProcessorError};
-use std::collections::HashMap;
+use blaze_chat::ProcessorError;
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc::unbounded_channel;
+
+/// Largest request body: a 500k-token prompt is a few MB of JSON, images (inlined as base64) more.
+const BODY_LIMIT: usize = 512 << 20;
+/// Most choices of one request (`n`); the scheduler queues what does not fit its rows at once.
+const MAX_N: u64 = 64;
+/// Most alternatives per token (`top_logprobs`, completions `logprobs`), as vLLM's default max_logprobs.
+const MAX_TOP_LOGPROBS: u64 = 20;
 
 pub struct ServeConfig {
     pub served_name: String,
@@ -40,11 +49,27 @@ pub struct ServeConfig {
 struct AppState {
     sched: Scheduler,
     text: Arc<Text>,
-    formatter: Option<ChatFormatter>,
+    formatter: Option<blaze_chat::ChatFormatter>,
     cfg: ServeConfig,
     max_context: usize,
+    vocab: usize,
     /// structured outputs (None: the tokenizer could not be read for grammars)
     grammars: Option<Grammars>,
+    /// `created` of /v1/models: when the server started
+    started: u64,
+    metrics: Metrics,
+}
+
+/// Request counters of /metrics (the scheduler's own are in `Scheduler::stats`).
+#[derive(Default)]
+struct Metrics {
+    requests: AtomicU64,
+    prompt_tokens: AtomicU64,
+    generation_tokens: AtomicU64,
+    /// generations still open on the HTTP side
+    open: AtomicUsize,
+    /// generations dropped before their end (the client went away or a stop string ended them)
+    dropped: AtomicU64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,14 +83,48 @@ impl From<ProcessorError> for ApiError {
     }
 }
 
-fn error(code: StatusCode, message: impl Into<String>) -> Response {
-    let message = message.into();
-    (code, Json(json!({"error": {"object": "error", "message": message, "type": "BadRequestError", "code": code.as_u16()}})))
-        .into_response()
+/// An error in OpenAI's shape: {"error": {"message", "type", "param", "code"}}.
+fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>, param: Option<&str>) -> Response {
+    let kind = if status.is_server_error() { "server_error" } else { "invalid_request_error" };
+    (status, Json(json!({"error": {"message": message.into(), "type": kind, "param": param, "code": code}}))).into_response()
+}
+
+fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    api_error(status, message, None, None)
+}
+
+fn bad_param(param: &str, message: impl Into<String>) -> Response {
+    api_error(StatusCode::BAD_REQUEST, message, None, Some(param))
+}
+
+/// The prompt does not fit the context (Hermes and opencode read this code to compact the conversation).
+fn too_long(prompt_tokens: usize, max_context: usize) -> Response {
+    api_error(
+        StatusCode::BAD_REQUEST,
+        format!(
+            "This model's maximum context length is {max_context} tokens. However, your prompt contains {prompt_tokens} \
+             tokens. Please reduce the length of the messages or the prompt."
+        ),
+        Some("context_length_exceeded"),
+        Some("messages"),
+    )
+}
+
+/// An error event of a stream, in the same shape.
+fn stream_error(message: &str) -> String {
+    json!({"error": {"message": message, "type": "server_error", "param": null, "code": null}}).to_string()
 }
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn parse_body(bytes: &Bytes) -> std::result::Result<Value, Response> {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(error(StatusCode::BAD_REQUEST, "the request body must be a JSON object")),
+        Err(e) => Err(error(StatusCode::BAD_REQUEST, format!("invalid JSON in the request body: {e}"))),
+    }
 }
 
 pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cfg: ServeConfig, max_context: usize,
@@ -88,12 +147,32 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         eprintln!("blaze: grammar compiler ready in {:.2} s", t0.elapsed().as_secs_f64());
     }
     let addr = format!("{}:{}", cfg.host, cfg.port);
-    let state = Arc::new(AppState { sched, text: Arc::new(text), formatter, cfg, max_context, grammars });
+    let state = Arc::new(AppState {
+        sched,
+        text: Arc::new(text),
+        formatter,
+        cfg,
+        max_context,
+        vocab,
+        grammars,
+        started: now(),
+        metrics: Metrics::default(),
+    });
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/ping", get(|| async { "ok" }).post(|| async { "ok" }))
+        .route("/version", get(version))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat))
-        .route("/v1/completions", post(completions))
+        .route("/v1/models/{*id}", get(model))
+        .route("/v1/chat/completions", post(chat::chat))
+        .route("/v1/completions", post(completions::completions))
+        .route("/tokenize", post(tokenize::tokenize))
+        .route("/detokenize", post(tokenize::detokenize))
+        .fallback(|| async { api_error(StatusCode::NOT_FOUND, "no such endpoint", Some("not_found"), None) })
+        .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed") })
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("blaze: serving on http://{addr}");
@@ -101,9 +180,114 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
     Ok(())
 }
 
+/// CORS for browser clients: any origin, the headers it asks for; preflights answer here.
+async fn cors(req: Request, next: Next) -> Response {
+    let ask = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
+    let preflight = req.method() == Method::OPTIONS;
+    let mut res = if preflight { StatusCode::NO_CONTENT.into_response() } else { next.run(req).await };
+    let h = res.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    if preflight {
+        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, ask.unwrap_or(HeaderValue::from_static("*")));
+        h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    }
+    res
+}
+
+async fn version() -> Json<Value> {
+    Json(json!({"version": env!("CARGO_PKG_VERSION")}))
+}
+
+/// Prometheus text: the counters of the HTTP side and the scheduler's gauges.
+async fn metrics(State(st): State<Arc<AppState>>) -> Response {
+    let m = &st.metrics;
+    let s = &st.sched.stats;
+    let rows = [
+        ("blaze_requests_total", "counter", "Generations started", m.requests.load(Ordering::Relaxed) as f64),
+        ("blaze_prompt_tokens_total", "counter", "Prompt tokens of finished or dropped generations", m.prompt_tokens.load(Ordering::Relaxed) as f64),
+        ("blaze_generation_tokens_total", "counter", "Generated tokens", m.generation_tokens.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_dropped_total", "counter", "Generations dropped before their end (client gone or stop string)", m.dropped.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_cancelled_total", "counter", "Requests the scheduler dropped because their client was gone", s.cancelled.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_open", "gauge", "Generations open on the HTTP side", m.open.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_running", "gauge", "Requests prefilling or decoding", s.running.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_waiting", "gauge", "Requests waiting for a free row or KV room", s.waiting.load(Ordering::Relaxed) as f64),
+    ];
+    let mut out = String::new();
+    for (name, kind, help, v) in rows {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n"));
+    }
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
+}
+
+fn model_card(st: &AppState) -> Value {
+    json!({"id": st.cfg.served_name, "object": "model", "created": st.started, "owned_by": "blaze", "root": st.cfg.served_name,
+           "parent": null, "max_model_len": st.max_context, "permission": []})
+}
+
 async fn models(State(st): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"object": "list", "data": [{"id": st.cfg.served_name, "object": "model", "created": now(), "owned_by": "blaze",
-                                             "max_model_len": st.max_context}]}))
+    Json(json!({"object": "list", "data": [model_card(&st)]}))
+}
+
+async fn model(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if id != st.cfg.served_name {
+        return api_error(StatusCode::NOT_FOUND, format!("The model '{id}' does not exist"), Some("model_not_found"), Some("model"));
+    }
+    Json(model_card(&st)).into_response()
+}
+
+// request fields
+
+type Checked<T> = std::result::Result<T, Response>;
+
+/// Numeric fields out of range: what the engines would reject (or silently turn into garbage), and token ids that are
+/// not in the vocabulary (the GPU would index outside its tables).
+fn check_ranges(st: &AppState, body: &Value) -> Checked<()> {
+    let num = |k: &str| body.get(k).and_then(Value::as_f64);
+    if num("temperature").is_some_and(|t| t < 0.0) {
+        return Err(bad_param("temperature", "temperature must be at least 0"));
+    }
+    if num("top_p").is_some_and(|p| p <= 0.0 || p > 1.0) {
+        return Err(bad_param("top_p", "top_p must be in (0, 1]"));
+    }
+    for k in ["presence_penalty", "frequency_penalty"] {
+        if num(k).is_some_and(|p| !(-2.0..=2.0).contains(&p)) {
+            return Err(bad_param(k, format!("{k} must be in [-2, 2]")));
+        }
+    }
+    if num("repetition_penalty").is_some_and(|p| p <= 0.0) {
+        return Err(bad_param("repetition_penalty", "repetition_penalty must be positive"));
+    }
+    if body.get("min_p").and_then(Value::as_f64).is_some_and(|p| !(0.0..=1.0).contains(&p)) {
+        return Err(bad_param("min_p", "min_p must be in [0, 1]"));
+    }
+    let n = body.get("n").and_then(Value::as_u64);
+    if body.get("n").is_some_and(|v| !v.is_null()) && n.is_none_or(|n| n == 0 || n > MAX_N) {
+        return Err(bad_param("n", format!("n must be an integer between 1 and {MAX_N}")));
+    }
+    for k in ["max_tokens", "max_completion_tokens"] {
+        if body.get(k).is_some_and(|v| v.as_i64().is_some_and(|x| x < 1)) {
+            return Err(bad_param(k, format!("{k} must be an integer of at least 1")));
+        }
+    }
+    if body.get("top_logprobs").and_then(Value::as_u64).is_some_and(|k| k > MAX_TOP_LOGPROBS) {
+        return Err(bad_param("top_logprobs", format!("top_logprobs is at most {MAX_TOP_LOGPROBS}")));
+    }
+    if matches!(body.get("logprobs"), Some(Value::Number(k)) if k.as_u64().is_none_or(|k| k > MAX_TOP_LOGPROBS)) {
+        return Err(bad_param("logprobs", format!("logprobs is at most {MAX_TOP_LOGPROBS}")));
+    }
+    let outside = |mut ids: Box<dyn Iterator<Item = i64> + '_>| ids.find(|&t| t < 0 || t as usize >= st.vocab);
+    if let Some(bad) = body.get("stop_token_ids").and_then(Value::as_array).and_then(|a| outside(Box::new(a.iter().filter_map(Value::as_i64)))) {
+        return Err(bad_param("stop_token_ids", format!("token id {bad} is outside the vocabulary of {}", st.vocab)));
+    }
+    if let Some(bad) = body.get("logit_bias").and_then(Value::as_object).and_then(|m| outside(Box::new(m.keys().filter_map(|k| k.parse().ok())))) {
+        return Err(bad_param("logit_bias", format!("token id {bad} is outside the vocabulary of {}", st.vocab)));
+    }
+    Ok(())
+}
+
+fn n_of(body: &Value) -> usize {
+    body.get("n").and_then(Value::as_u64).unwrap_or(1) as usize
 }
 
 /// Sampling parameters of a request body: the OpenAI fields, vLLM / SGLang extras (top_k, min_p, repetition_penalty,
@@ -171,100 +355,27 @@ fn stop_strings(body: &Value) -> Vec<String> {
     }
 }
 
-/// Text of the generated tokens, emitted as soon as it is valid UTF-8, with stop strings cut.
-struct Detok {
-    text: Arc<Text>,
-    ids: Vec<u32>,
-    prefix: usize,
-    read: usize,
-    out: String,
+/// What the scheduler is asked for apart from the prompt.
+struct Spec {
+    params: SamplingParams,
+    max_tokens: usize,
     stops: Vec<String>,
-    stopped: bool,
+    /// vLLM's include_stop_str_in_output
+    include_stop: bool,
+    stop_ids: Vec<i32>,
+    think: Option<ThinkBudget>,
 }
 
-impl Detok {
-    fn new(text: Arc<Text>, stops: Vec<String>) -> Self {
-        Self { text, ids: Vec::new(), prefix: 0, read: 0, out: String::new(), stops, stopped: false }
-    }
-
-    /// New text after `id` (empty while a character is incomplete).
-    fn push(&mut self, id: u32) -> String {
-        if self.stopped {
-            return String::new();
+impl Spec {
+    fn of(st: &AppState, body: &Value, max_tokens: usize, think: Option<ThinkBudget>) -> Self {
+        Self {
+            params: sampling_of(body, &st.cfg.defaults, &st.text),
+            max_tokens,
+            stops: stop_strings(body),
+            include_stop: body.get("include_stop_str_in_output").and_then(Value::as_bool).unwrap_or(false),
+            stop_ids: stop_ids_of(body, &st.text),
+            think,
         }
-        self.ids.push(id);
-        let before = self.text.decode_skip(&self.ids[self.prefix..self.read]).unwrap_or_default();
-        let after = self.text.decode_skip(&self.ids[self.prefix..]).unwrap_or_default();
-        if after.len() <= before.len() || after.ends_with('\u{FFFD}') || !after.is_char_boundary(before.len()) {
-            return String::new();
-        }
-        let mut delta = after[before.len()..].to_string();
-        self.prefix = self.read;
-        self.read = self.ids.len();
-        // stop strings: cut at the first one in the whole output
-        let start = self.out.len();
-        self.out.push_str(&delta);
-        if let Some(cut) = self.stops.iter().filter_map(|s| self.out.find(s.as_str())).min() {
-            self.stopped = true;
-            self.out.truncate(cut);
-            delta = if cut > start { self.out[start..].to_string() } else { String::new() };
-        }
-        delta
-    }
-}
-
-/// One generation's events as text deltas: (delta, finish, prompt tokens, cached tokens, completion tokens), and the
-/// logprobs of its tokens when asked for.
-struct Gen {
-    logprobs: Vec<(u32, TokenLogprob)>,
-    rx: tokio::sync::mpsc::UnboundedReceiver<GenEvent>,
-    cancel: Arc<AtomicBool>,
-    detok: Detok,
-    prompt_tokens: usize,
-    cached_tokens: usize,
-    completion_tokens: usize,
-}
-
-enum Piece {
-    Text(String),
-    Finish(Finish),
-    Error(String),
-}
-
-impl Gen {
-    async fn next(&mut self) -> Option<Piece> {
-        loop {
-            match self.rx.recv().await? {
-                GenEvent::Started { prompt_tokens, cached_tokens } => {
-                    self.prompt_tokens = prompt_tokens;
-                    self.cached_tokens = cached_tokens;
-                }
-                GenEvent::Token(t, lp) => {
-                    self.completion_tokens += 1;
-                    if let Some(lp) = lp {
-                        self.logprobs.push((t as u32, lp));
-                    }
-                    let d = self.detok.push(t as u32);
-                    if self.detok.stopped {
-                        self.cancel.store(true, Ordering::Relaxed);
-                    }
-                    if !d.is_empty() {
-                        return Some(Piece::Text(d));
-                    }
-                }
-                GenEvent::Done(f) => {
-                    let f = if self.detok.stopped { Finish::Stop } else { f };
-                    return Some(Piece::Finish(f));
-                }
-                GenEvent::Error(e) => return Some(Piece::Error(e)),
-            }
-        }
-    }
-}
-
-impl Drop for Gen {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
     }
 }
 
@@ -291,21 +402,223 @@ fn think_budget(st: &AppState, body: &Value, starts_inside: bool) -> Option<Thin
 }
 
 /// The request's grammar as a scheduler constraint (applied after `after` when the output opens with reasoning).
-fn constraint_of(st: &AppState, body: &Value, after: Option<i32>) -> std::result::Result<Option<Constraint>, String> {
-    let Some(g) = grammar_of(body).map_err(|e| e.to_string())? else { return Ok(None) };
+/// `forced`: a grammar of the server's own (tool_choice) used when the request asks for none.
+fn constraint_of(st: &AppState, body: &Value, after: Option<i32>, forced: Option<&str>) -> std::result::Result<Option<Constraint>, String> {
+    use llguidance::api::TopLevelGrammar;
+    let g = match grammar_of(body).map_err(|e| e.to_string())? {
+        Some(g) => g,
+        None => match forced {
+            Some(lark) => TopLevelGrammar::from_lark_or_grammar_list(lark).map_err(|e| e.to_string())?,
+            None => return Ok(None),
+        },
+    };
     let gr = st.grammars.as_ref().ok_or("structured outputs are unavailable for this tokenizer")?;
     let matcher = gr.matcher(g).map_err(|e| e.to_string())?;
     Ok(Some(Constraint { matcher, after }))
 }
 
-fn submit(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
-          stop_ids: Vec<i32>, constraint: Option<Constraint>) -> Result<Gen> {
-    submit_ex(st, tokens, params, max_tokens, stops, stop_ids, None, constraint)
+// generation
+
+/// Cuts stop strings out of a text stream. The tail that may still grow into a stop string is held back, so a stop
+/// string that spans chunks never reaches the client in part.
+struct StopCutter {
+    stops: Vec<String>,
+    include: bool,
+    held: String,
+    stopped: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens: usize, stops: Vec<String>,
-             stop_ids: Vec<i32>, think: Option<ThinkBudget>, constraint: Option<Constraint>) -> Result<Gen> {
+impl StopCutter {
+    fn new(stops: Vec<String>, include: bool) -> Self {
+        Self { stops: stops.into_iter().filter(|s| !s.is_empty()).collect(), include, held: String::new(), stopped: false }
+    }
+
+    /// Text that is safe to send after `delta`.
+    fn push(&mut self, delta: &str) -> String {
+        if self.stopped {
+            return String::new();
+        }
+        if self.stops.is_empty() {
+            return delta.to_string();
+        }
+        self.held.push_str(delta);
+        // the earliest stop string of the held text (it may begin in an earlier chunk)
+        let hit = self.stops.iter().filter_map(|s| self.held.find(s.as_str()).map(|i| (i, s.len()))).min_by_key(|&(i, l)| (i, l));
+        if let Some((at, len)) = hit {
+            self.stopped = true;
+            let end = if self.include { at + len } else { at };
+            let out = self.held[..end].to_string();
+            self.held.clear();
+            return out;
+        }
+        let keep = self.stops.iter().map(|s| overlap(&self.held, s)).max().unwrap_or(0);
+        let cut = self.held.len() - keep;
+        let out = self.held[..cut].to_string();
+        self.held.drain(..cut);
+        out
+    }
+
+    /// The held-back tail when the output ends without the stop string completing.
+    fn flush(&mut self) -> String {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// Bytes of the longest suffix of `text` that is a proper prefix of `stop`.
+fn overlap(text: &str, stop: &str) -> usize {
+    (1..stop.len()).rev().filter(|&k| stop.is_char_boundary(k)).find(|&k| text.ends_with(&stop[..k])).unwrap_or(0)
+}
+
+/// Text of the generated tokens, emitted as soon as it is valid UTF-8, with stop strings cut.
+struct Detok {
+    text: Arc<Text>,
+    ids: Vec<u32>,
+    prefix: usize,
+    read: usize,
+    cutter: StopCutter,
+}
+
+impl Detok {
+    fn new(text: Arc<Text>, stops: Vec<String>, include_stop: bool) -> Self {
+        Self { text, ids: Vec::new(), prefix: 0, read: 0, cutter: StopCutter::new(stops, include_stop) }
+    }
+
+    fn stopped(&self) -> bool {
+        self.cutter.stopped
+    }
+
+    /// New text after `id` (empty while a character is incomplete or a stop string may be coming).
+    fn push(&mut self, id: u32) -> String {
+        if self.cutter.stopped {
+            return String::new();
+        }
+        self.ids.push(id);
+        let before = self.text.decode_skip(&self.ids[self.prefix..self.read]).unwrap_or_default();
+        let after = self.text.decode_skip(&self.ids[self.prefix..]).unwrap_or_default();
+        if after.len() <= before.len() || after.ends_with('\u{FFFD}') || !after.is_char_boundary(before.len()) {
+            return String::new();
+        }
+        let delta = after[before.len()..].to_string();
+        self.prefix = self.read;
+        self.read = self.ids.len();
+        self.cutter.push(&delta)
+    }
+}
+
+/// One generation's events as text: a piece is some text with the logprobs of the tokens behind it, or the end.
+enum Piece {
+    Text(String, Vec<(u32, TokenLogprob)>),
+    Finish(Finish),
+    Error(String),
+}
+
+/// One generation on the scheduler: its events, detokenized.
+struct Gen {
+    rx: tokio::sync::mpsc::UnboundedReceiver<GenEvent>,
+    cancel: Arc<AtomicBool>,
+    detok: Detok,
+    /// logprobs of the tokens whose text has not been sent yet
+    logprobs: Vec<(u32, TokenLogprob)>,
+    prompt_tokens: usize,
+    cached_tokens: usize,
+    completion_tokens: usize,
+    /// the end, after the held-back text
+    queued: Option<Piece>,
+    done: bool,
+    st: Arc<AppState>,
+}
+
+impl Gen {
+    async fn next(&mut self) -> Option<Piece> {
+        if let Some(p) = self.queued.take() {
+            return Some(p);
+        }
+        if self.done {
+            return None;
+        }
+        loop {
+            let Some(ev) = self.rx.recv().await else {
+                self.done = true;
+                return Some(Piece::Error("generation ended unexpectedly".into()));
+            };
+            match ev {
+                GenEvent::Started { prompt_tokens, cached_tokens } => {
+                    self.prompt_tokens = prompt_tokens;
+                    self.cached_tokens = cached_tokens;
+                }
+                GenEvent::Token(t, lp) => {
+                    self.completion_tokens += 1;
+                    if let Some(lp) = lp {
+                        self.logprobs.push((t as u32, lp));
+                    }
+                    let d = self.detok.push(t as u32);
+                    if self.detok.stopped() {
+                        self.cancel.store(true, Ordering::Relaxed);
+                    }
+                    if !d.is_empty() {
+                        return Some(Piece::Text(d, std::mem::take(&mut self.logprobs)));
+                    }
+                }
+                GenEvent::Done(f) => {
+                    self.done = true;
+                    let f = if self.detok.stopped() { Finish::Stop } else { f };
+                    let tail = self.detok.cutter.flush();
+                    if tail.is_empty() {
+                        return Some(Piece::Finish(f));
+                    }
+                    self.queued = Some(Piece::Finish(f));
+                    return Some(Piece::Text(tail, std::mem::take(&mut self.logprobs)));
+                }
+                GenEvent::Error(e) => {
+                    self.done = true;
+                    return Some(Piece::Error(e));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Gen {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let m = &self.st.metrics;
+        m.open.fetch_sub(1, Ordering::Relaxed);
+        if !self.done {
+            m.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        m.prompt_tokens.fetch_add(self.prompt_tokens as u64, Ordering::Relaxed);
+        m.generation_tokens.fetch_add(self.completion_tokens as u64, Ordering::Relaxed);
+    }
+}
+
+/// Token counts of one API request, summed over its generations.
+struct Totals {
+    prompt: usize,
+    cached: AtomicUsize,
+    completion: AtomicUsize,
+}
+
+impl Totals {
+    fn new(prompt: usize) -> Arc<Self> {
+        Arc::new(Self { prompt, cached: AtomicUsize::new(0), completion: AtomicUsize::new(0) })
+    }
+
+    /// Fold in what `g` has produced since `seen` tokens.
+    fn note(&self, g: &Gen, seen: &mut usize) {
+        self.cached.fetch_max(g.cached_tokens, Ordering::Relaxed);
+        self.completion.fetch_add(g.completion_tokens - *seen, Ordering::Relaxed);
+        *seen = g.completion_tokens;
+    }
+
+    fn usage(&self) -> Value {
+        let c = self.completion.load(Ordering::Relaxed);
+        json!({"prompt_tokens": self.prompt, "completion_tokens": c, "total_tokens": self.prompt + c,
+               "prompt_tokens_details": {"cached_tokens": self.cached.load(Ordering::Relaxed)}})
+    }
+}
+
+/// Submit one generation. `choice` (0..n) offsets the seed so that the choices of a seeded request differ.
+fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constraint: Option<Constraint>) -> Checked<Gen> {
     let (tx, rx) = unbounded_channel();
     let cancel = Arc::new(AtomicBool::new(false));
     // Prompt-cache point before the last turn header: the next turn of a chat repeats everything up to it.
@@ -316,359 +629,117 @@ fn submit_ex(st: &AppState, tokens: Vec<i64>, params: SamplingParams, max_tokens
         .filter(|&p| p > 0)
         .into_iter()
         .collect();
+    let mut params = spec.params.clone();
+    params.seed = params.seed.map(|s| s.wrapping_add(choice as u64));
     st.sched
-        .submit(GenRequest { tokens, params, max_tokens, stop_ids, cache_points, think, constraint, events: tx, cancel: cancel.clone() })
-        .map_err(|_| anyhow!("scheduler stopped"))?;
+        .submit(GenRequest {
+            tokens: tokens.to_vec(),
+            params,
+            max_tokens: spec.max_tokens,
+            stop_ids: spec.stop_ids.clone(),
+            cache_points,
+            think: spec.think.clone(),
+            constraint,
+            events: tx,
+            cancel: cancel.clone(),
+        })
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "the scheduler has stopped"))?;
+    st.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    st.metrics.open.fetch_add(1, Ordering::Relaxed);
     Ok(Gen {
-        logprobs: Vec::new(),
         rx,
         cancel,
-        detok: Detok::new(st.text.clone(), stops),
+        detok: Detok::new(st.text.clone(), spec.stops.clone(), spec.include_stop),
+        logprobs: Vec::new(),
         prompt_tokens: 0,
         cached_tokens: 0,
         completion_tokens: 0,
+        queued: None,
+        done: false,
+        st: st.clone(),
     })
 }
 
-fn usage(g: &Gen) -> Value {
-    json!({"prompt_tokens": g.prompt_tokens, "completion_tokens": g.completion_tokens,
-           "total_tokens": g.prompt_tokens + g.completion_tokens,
-           "prompt_tokens_details": {"cached_tokens": g.cached_tokens}})
-}
-
-fn finish_str(f: Finish) -> &'static str {
-    match f {
-        Finish::Length => "length",
-        _ => "stop",
-    }
-}
-
-// completions
-
-async fn completions(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let prompt = match body.get("prompt") {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Array(a)) if a.len() == 1 && a[0].is_string() => a[0].as_str().unwrap().to_string(),
-        _ => return error(StatusCode::BAD_REQUEST, "prompt must be a string"),
-    };
-    let tokens: Vec<i64> = match st.text.encode(&prompt) {
-        Ok(t) => t.into_iter().map(i64::from).collect(),
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let params = sampling_of(&body, &st.cfg.defaults, &st.text);
-    let max_tokens = body.get("max_tokens").and_then(Value::as_u64).map(|x| x as usize).unwrap_or(16);
-    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let constraint = match constraint_of(&st, &body, None) {
-        Ok(c) => c,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
-    let mut g = match submit(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text), constraint) {
-        Ok(g) => g,
-        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
-    };
-    let id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-    let model = st.cfg.served_name.clone();
-    if stream {
-        let s = async_stream::stream! {
-            while let Some(p) = g.next().await {
-                match p {
-                    Piece::Text(t) => yield json!({"id": id, "object": "text_completion", "created": now(), "model": model,
-                                                   "choices": [{"index": 0, "text": t, "finish_reason": null}]}).to_string(),
-                    Piece::Finish(f) => {
-                        yield json!({"id": id, "object": "text_completion", "created": now(), "model": model,
-                                     "choices": [{"index": 0, "text": "", "finish_reason": finish_str(f)}], "usage": usage(&g)}).to_string();
-                        break;
-                    }
-                    Piece::Error(e) => { yield json!({"error": {"message": e}}).to_string(); break; }
-                }
-            }
-            yield "[DONE]".to_string();
-        };
-        return sse(s);
-    }
-    let mut text = String::new();
-    let mut finish = Finish::Stop;
-    while let Some(p) = g.next().await {
-        match p {
-            Piece::Text(t) => text.push_str(&t),
-            Piece::Finish(f) => {
-                finish = f;
-                break;
-            }
-            Piece::Error(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
-        }
-    }
-    let logprobs = if g.logprobs.is_empty() {
-        Value::Null
-    } else {
-        let tok = |t: u32| st.text.decode(&[t]).unwrap_or_default();
-        json!({
-            "tokens": g.logprobs.iter().map(|(t, _)| tok(*t)).collect::<Vec<_>>(),
-            "token_logprobs": g.logprobs.iter().map(|(_, l)| l.logprob).collect::<Vec<_>>(),
-            "top_logprobs": g.logprobs.iter().map(|(_, l)| {
-                l.top.iter().map(|&(t, lp)| (tok(t as u32), json!(lp))).collect::<serde_json::Map<_, _>>()
-            }).collect::<Vec<_>>(),
+/// The `n` generations of one prompt; each gets its own grammar matcher from `constraint`.
+fn submit_n(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, n: usize, first_choice: usize,
+            constraint: &dyn Fn() -> std::result::Result<Option<Constraint>, String>) -> Checked<Vec<Gen>> {
+    (0..n)
+        .map(|i| {
+            let c = constraint().map_err(|e| error(StatusCode::BAD_REQUEST, e))?;
+            submit(st, tokens, spec, first_choice + i, c)
         })
-    };
-    Json(json!({"id": id, "object": "text_completion", "created": now(), "model": model,
-                "choices": [{"index": 0, "text": text, "logprobs": logprobs, "finish_reason": finish_str(finish)}], "usage": usage(&g)}))
-    .into_response()
+        .collect()
 }
 
 fn sse(s: impl Stream<Item = String> + Send + 'static) -> Response {
-    Sse::new(s.map(|d| Ok::<_, Infallible>(Event::default().data(d)))).keep_alive(KeepAlive::default()).into_response()
+    let mut res = Sse::new(s.map(|d| Ok::<_, Infallible>(Event::default().data(d)))).keep_alive(KeepAlive::default()).into_response();
+    // proxies must not hold the stream back
+    res.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
+    res
 }
 
-// chat
-
-/// The request with the template kwargs the client sent (chat_template_kwargs), for the renderer.
-struct TemplateRequest<'a> {
-    request: &'a CreateChatCompletionRequest,
-    kwargs: Option<&'a HashMap<String, Value>>,
+/// Every prompt token must have a place in the context, with room for one more.
+fn check_fits(st: &AppState, prompt_tokens: usize) -> Checked<()> {
+    if prompt_tokens + 1 > st.max_context {
+        return Err(too_long(prompt_tokens, st.max_context));
+    }
+    Ok(())
 }
 
-impl OAIChatLikeRequest for TemplateRequest<'_> {
-    fn model(&self) -> String {
-        self.request.model()
-    }
-    fn messages(&self) -> minijinja::Value {
-        self.request.messages()
-    }
-    fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
-        self.request.typed_messages()
-    }
-    fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
-    }
-    fn tool_choice(&self) -> Option<minijinja::Value> {
-        self.request.tool_choice()
-    }
-    fn response_format(&self) -> Option<minijinja::Value> {
-        self.request.response_format()
-    }
-    fn reasoning_effort(&self) -> Option<minijinja::Value> {
-        self.request.reasoning_effort()
-    }
-    fn should_add_generation_prompt(&self) -> bool {
-        self.request.should_add_generation_prompt()
-    }
-    fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
-        self.kwargs
-    }
-    fn extract_text(&self) -> Option<TextInput> {
-        self.request.extract_text()
-    }
-    fn mm_processor_kwargs(&self) -> Option<&Value> {
-        self.request.mm_processor_kwargs()
+/// vLLM's truncate_prompt_tokens: keep the last k prompt tokens (-1: the context's size).
+fn truncate_prompt(st: &AppState, body: &Value, tokens: &mut Vec<i64>) {
+    let k = match body.get("truncate_prompt_tokens").and_then(Value::as_i64) {
+        Some(-1) => st.max_context.saturating_sub(1),
+        Some(k) if k > 0 => k as usize,
+        _ => return,
+    };
+    if tokens.len() > k {
+        tokens.drain(..tokens.len() - k);
     }
 }
 
-fn finish_of(f: Finish) -> ChatFinishReason {
-    match f {
-        Finish::Length => ChatFinishReason::Length,
-        _ => ChatFinishReason::Stop,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn finish_name(f: ChatFinishReason) -> &'static str {
-    match f {
-        ChatFinishReason::Stop => "stop",
-        ChatFinishReason::Length => "length",
-        ChatFinishReason::ContentFilter => "content_filter",
-        ChatFinishReason::ToolCalls => "tool_calls",
-    }
-}
-
-async fn chat(State(st): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
-    let Some(formatter) = st.formatter.clone() else { return error(StatusCode::BAD_REQUEST, "this model has no chat template") };
-    let request: CreateChatCompletionRequest = match serde_json::from_value(body.clone()) {
-        Ok(r) => r,
-        Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad request: {e}")),
-    };
-    if request.messages.is_empty() {
-        return error(StatusCode::BAD_REQUEST, "messages cannot be empty");
-    }
-    use blaze_chat::dynamo_protocols::types::ChatCompletionToolChoiceOption as Choice;
-    let tools = match blaze_chat::chat_tool_definitions(request.tools.as_deref(), &request.messages) {
-        Ok(t) => t,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let tools_enabled = !tools.is_empty() && !matches!(request.tool_choice, Some(Choice::None));
-    let named = matches!(request.tool_choice, Some(Choice::Named(_)));
-    let mut kwargs: Option<HashMap<String, Value>> =
-        body.get("chat_template_kwargs").and_then(|v| serde_json::from_value(v.clone()).ok());
-    let _thinking = formatter.resolve_thinking(&mut kwargs, tools_enabled, named);
-    let prompt = match formatter.render_prompt(&TemplateRequest { request: &request, kwargs: kwargs.as_ref() }) {
-        Ok(p) => p.into_text(),
-        Err(e) => return error(StatusCode::BAD_REQUEST, format!("chat template render failed: {e}")),
-    };
-    let tokens: Vec<i64> = match st.text.encode(&prompt) {
-        Ok(t) => t.into_iter().map(i64::from).collect(),
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    let params = sampling_of(&body, &st.cfg.defaults, &st.text);
-    #[allow(deprecated)]
-    let max_tokens = request.max_completion_tokens.or(request.max_tokens).map(|x| x as usize).unwrap_or(st.cfg.default_max_tokens);
-    let stream = request.stream.unwrap_or(false);
-    let include_usage = request.stream_options.as_ref().is_some_and(|o| o.include_usage);
-    let starts_in_reasoning = matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"))
-        && prompt.trim_end_matches('\n').ends_with("<think>");
-    let think = think_budget(&st, &body, starts_in_reasoning);
-    // with reasoning first, the grammar applies to the answer after </think>
-    let after = starts_in_reasoning.then(|| st.text.token_id("</think>")).flatten().map(|t| t as i32);
-    let constraint = match constraint_of(&st, &body, after) {
-        Ok(c) => c,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e),
-    };
-    let mut g = match submit_ex(&st, tokens, params, max_tokens, stop_strings(&body), stop_ids_of(&body, &st.text), think,
-                                constraint) {
-        Ok(g) => g,
-        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
-    };
-    let tool_parser = tools_enabled.then(|| st.cfg.tool_parser.clone()).flatten();
-    let processor = ChatResponseProcessor::new(
-        tool_parser,
-        st.cfg.reasoning_parser.clone(),
-        (!tools.is_empty()).then_some(tools),
-        request.tool_choice.clone(),
-        false,
-        request.parallel_tool_calls.unwrap_or(true),
-        1,
-    )
-    .with_reasoning_state(starts_in_reasoning.then_some(true));
-    // generation events -> decoded chat events (prompt tokens ride on every event; counts are per event)
-    let (meta_tx, mut meta_rx) = tokio::sync::watch::channel((0usize, 0usize, 0usize));
-    // logprobs of the tokens decoded so far, taken by the next response chunk
-    let lps: Arc<std::sync::Mutex<Vec<(u32, TokenLogprob)>>> = Default::default();
-    let lps_gen = lps.clone();
-    let decoded = async_stream::stream! {
-        loop {
-            let piece = g.next().await;
-            lps_gen.lock().unwrap().append(&mut g.logprobs);
-            match piece {
-                Some(Piece::Text(t)) => {
-                    let _ = meta_tx.send((g.prompt_tokens, g.cached_tokens, g.completion_tokens));
-                    yield Ok::<_, ApiError>(DecodedChatEvent { choice: 0, text: t, token_ids: Vec::new(), finish_reason: None,
-                        logprobs: None, prompt_tokens: g.prompt_tokens as u32, completion_tokens: 1 });
-                }
-                Some(Piece::Finish(f)) => {
-                    let _ = meta_tx.send((g.prompt_tokens, g.cached_tokens, g.completion_tokens));
-                    yield Ok(DecodedChatEvent { choice: 0, text: String::new(), token_ids: Vec::new(), finish_reason: Some(finish_of(f)),
-                        logprobs: None, prompt_tokens: g.prompt_tokens as u32, completion_tokens: 0 });
-                    break;
-                }
-                Some(Piece::Error(e)) => { yield Err(ApiError { message: e }); break; }
-                None => break,
-            }
+    fn cut(stops: &[&str], include: bool, chunks: &[&str]) -> (String, bool) {
+        let mut c = StopCutter::new(stops.iter().map(|s| s.to_string()).collect(), include);
+        let mut out = String::new();
+        for ch in chunks {
+            out.push_str(&c.push(ch));
         }
-    };
-    let mut events = processor.process_stream(Box::pin(decoded));
-    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let model = st.cfg.served_name.clone();
-    let created = now();
-    let usage_of = |m: (usize, usize, usize)| {
-        json!({"prompt_tokens": m.0, "completion_tokens": m.2, "total_tokens": m.0 + m.2,
-               "prompt_tokens_details": {"cached_tokens": m.1}})
-    };
-    let text = st.text.clone();
-    let take_lps = move || -> Value {
-        let items = std::mem::take(&mut *lps.lock().unwrap());
-        if items.is_empty() {
-            return Value::Null;
+        if !c.stopped {
+            out.push_str(&c.flush());
         }
-        let entry = |t: u32, lp: f32| {
-            let s = text.decode(&[t]).unwrap_or_default();
-            json!({"token": s, "logprob": lp, "bytes": s.as_bytes()})
-        };
-        json!({"content": items.iter().map(|(t, l)| {
-            let mut e = entry(*t, l.logprob);
-            e["top_logprobs"] = l.top.iter().map(|&(t, lp)| entry(t as u32, lp)).collect();
-            e
-        }).collect::<Vec<_>>()})
-    };
-    if stream {
-        let s = async_stream::stream! {
-            while let Some(ev) = events.next().await {
-                let chunk = |choices: Value, usage: Value| json!({"id": id, "object": "chat.completion.chunk", "created": created,
-                                                                  "model": model, "choices": choices, "usage": usage}).to_string();
-                match ev {
-                    Ok(ChatEvent::Role { .. }) => yield chunk(json!([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]), Value::Null),
-                    Ok(ChatEvent::Delta { content, reasoning_content, tool_calls, finish_reason, .. }) => {
-                        let mut delta = serde_json::Map::new();
-                        if let Some(c) = content { delta.insert("content".into(), json!(c)); }
-                        if let Some(r) = reasoning_content { delta.insert("reasoning_content".into(), json!(r)); }
-                        if let Some(tc) = tool_calls {
-                            let v: Vec<Value> = tc.iter().map(|t| {
-                                let mut o = json!({"index": t.index, "type": "function", "function": {}});
-                                if let Some(id) = &t.id { o["id"] = json!(id); }
-                                if let Some(n) = &t.name { o["function"]["name"] = json!(n); }
-                                if let Some(a) = &t.arguments { o["function"]["arguments"] = json!(a); }
-                                o
-                            }).collect();
-                            delta.insert("tool_calls".into(), json!(v));
-                        }
-                        yield chunk(json!([{"index": 0, "delta": delta, "logprobs": take_lps(),
-                                            "finish_reason": finish_reason.map(finish_name)}]), Value::Null);
-                    }
-                    Ok(ChatEvent::Usage { .. }) => {
-                        let m = *meta_rx.borrow_and_update();
-                        if include_usage { yield chunk(json!([]), usage_of(m)); }
-                    }
-                    Err(e) => { yield json!({"error": {"message": e.message}}).to_string(); break; }
-                }
-            }
-            yield "[DONE]".to_string();
-        };
-        return sse(s);
+        (out, c.stopped)
     }
-    let (mut content, mut reasoning) = (String::new(), String::new());
-    let mut calls: Vec<Value> = Vec::new();
-    let mut finish = None;
-    while let Some(ev) = events.next().await {
-        match ev {
-            Ok(ChatEvent::Delta { content: c, reasoning_content: r, tool_calls, finish_reason, .. }) => {
-                if let Some(c) = c {
-                    content.push_str(&c);
-                }
-                if let Some(r) = r {
-                    reasoning.push_str(&r);
-                }
-                for t in tool_calls.unwrap_or_default() {
-                    let i = t.index as usize;
-                    while calls.len() <= i {
-                        calls.push(json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
-                    }
-                    if let Some(id) = t.id {
-                        calls[i]["id"] = json!(id);
-                    }
-                    if let Some(n) = t.name {
-                        calls[i]["function"]["name"] = json!(n);
-                    }
-                    if let Some(a) = t.arguments {
-                        let prev = calls[i]["function"]["arguments"].as_str().unwrap_or("").to_string();
-                        calls[i]["function"]["arguments"] = json!(prev + &a);
-                    }
-                }
-                if finish_reason.is_some() {
-                    finish = finish_reason;
-                }
-            }
-            Ok(_) => {}
-            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.message),
-        }
+
+    #[test]
+    fn stop_string_inside_a_chunk() {
+        assert_eq!(cut(&["END"], false, &["abc ", "xENDy", "more"]), ("abc x".into(), true));
     }
-    let mut message = json!({"role": "assistant", "content": if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) }});
-    if !reasoning.is_empty() {
-        message["reasoning_content"] = json!(reasoning);
+
+    #[test]
+    fn stop_string_across_chunks_is_held_back() {
+        assert_eq!(cut(&["STOP"], false, &["go ST", "O", "P tail"]), ("go ".into(), true));
+        assert_eq!(cut(&["STOP"], true, &["go ST", "O", "P tail"]), ("go STOP".into(), true));
     }
-    if !calls.is_empty() {
-        message["tool_calls"] = json!(calls);
+
+    #[test]
+    fn near_miss_is_released() {
+        assert_eq!(cut(&["STOP"], false, &["a ST", "ONE"]), ("a STONE".into(), false));
+        assert_eq!(cut(&["STOP"], false, &["a ST"]), ("a ST".into(), false));
     }
-    let m = *meta_rx.borrow_and_update();
-    let u = usage_of(m);
-    Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "message": message, "logprobs": take_lps(),
-                             "finish_reason": finish.map(finish_name).unwrap_or("stop")}],
-                "usage": u}))
-    .into_response()
+
+    #[test]
+    fn earliest_of_several_and_multibyte() {
+        assert_eq!(cut(&["zz", "b"], false, &["aab", "zz"]), ("aa".into(), true));
+        assert_eq!(cut(&["日本語"], false, &["x日", "本", "語y"]), ("x".into(), true));
+        assert_eq!(cut(&["日本語"], false, &["x日", "本x"]), ("x日本x".into(), false));
+    }
+
+    #[test]
+    fn no_stops_pass_through() {
+        assert_eq!(cut(&[], false, &["a", "b"]), ("ab".into(), false));
+    }
 }
