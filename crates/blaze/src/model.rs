@@ -1018,6 +1018,7 @@ impl Model {
             sys::cudaDeviceGetAttribute(&mut num_sms, sys::ATTR_MULTIPROCESSOR_COUNT, dev);
         }
 
+        let rank = tp.rank;
         let mut model = Self {
             cfg,
             dims,
@@ -1029,7 +1030,7 @@ impl Model {
             ple_state,
             embed,
             moe: None,
-            lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems, tune: std::sync::Arc::new(crate::tune::Tuning::open(tp.rank)) },
+            lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems, tune: std::sync::Arc::new(crate::tune::Tuning::open(rank)) },
             _scratch: scratch,
             inv_freq,
             rope_scale,
