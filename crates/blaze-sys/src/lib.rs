@@ -114,6 +114,21 @@ unsafe extern "C" {
                          m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
 }
 
+// blaze/vision.h
+unsafe extern "C" {
+    pub fn blz_vis_layernorm(x: *const bf16, gamma: *const bf16, beta: *const bf16, eps: f32, rows: c_int, dim: c_int,
+                             out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_embed_pos(x: *mut bf16, bias: *const bf16, table: *const bf16, side: c_int, grid_h: c_int, grid_w: c_int,
+                             merge: c_int, dim: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_qkv_rope(qkv: *const bf16, bias: *const bf16, grid_h: c_int, grid_w: c_int, merge: c_int, heads: c_int,
+                            head_dim: c_int, theta: f32, q: *mut bf16, k: *mut bf16, v: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_attention(q: *const bf16, k: *const bf16, v: *const bf16, n: c_int, heads: c_int, head_dim: c_int,
+                             o: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_bias_residual(g: *const bf16, bias: *const bf16, res: *const bf16, rows: c_int, dim: c_int, out: *mut bf16,
+                                 s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_bias_act(x: *mut bf16, bias: *const bf16, rows: c_int, dim: c_int, act: c_int, s: cudaStream_t) -> cudaError_t;
+}
+
 // KV cache, attention
 pub const BLZ_BF16: c_int = 0;
 pub const BLZ_I32: c_int = 0;
