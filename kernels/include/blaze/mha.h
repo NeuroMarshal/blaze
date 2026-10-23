@@ -39,6 +39,26 @@ cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok, int64_t q
                                   float scale, int window, int causal, float* partial_o, float* partial_ml, blz_half_t dtype,
                                   void* out, int64_t out_stride_tok, int64_t out_stride_head, cudaStream_t stream);
 
+/// \brief blz_mha_decode_window for one query row per batch entry (q_len 1, causal) whose last tail_len positions come
+/// from the entry's own slot list tail[b * tail_stride + j] (position kv_len - tail_len + j) instead of req_to_token:
+/// a draft tree step, its rows sharing the sequence's committed window and each with its own path.
+cudaError_t blz_mha_decode_tail(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                                blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int splits, float scale,
+                                int window, const int32_t* tail, int tail_len, int tail_stride, float* partial_o,
+                                float* partial_ml, blz_half_t dtype, void* out, int64_t out_stride_tok,
+                                int64_t out_stride_head, cudaStream_t stream);
+
+/// \brief blz_nvfp4_mha_decode of a tree verify: query row i of request b sees the earlier positions and, of the
+/// request's last q_len positions (the verify rows), those whose bit is set in tree_mask[b * q_len + i] (bit j: row j;
+/// its ancestors and itself). q_len <= 64.
+cudaError_t blz_nvfp4_mha_tree(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                               blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                               blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len, int splits,
+                               float scale, const uint64_t* tree_mask, float* partial_o, float* partial_ml,
+                               blz_half_t dtype, void* out, int64_t out_stride_tok, int64_t out_stride_head,
+                               cudaStream_t stream);
+
 /// \brief Context parts of blz_nvfp4_mha_decode (the partial workspaces' third dimension): splits times the warps a CTA
 /// runs along the context for this query geometry; 0 for an unsupported one.
 int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits);

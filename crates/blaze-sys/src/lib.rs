@@ -126,6 +126,31 @@ pub struct blz_index_ptr {
     pub kind: c_int,
 }
 
+/// A buffer of fixed-size rows (blaze/tree.h).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct blz_row_buf {
+    pub ptr: *mut c_void,
+    pub row_bytes: i64,
+}
+
+/// The draft tree's device buffers and shape (blaze/tree.h).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct blz_draft_tree {
+    pub scores: *mut f32,
+    pub tokens: *mut i64,
+    pub parents: *mut i32,
+    pub front_scores: *mut f32,
+    pub front_tokens: *mut i64,
+    pub front_node: *mut i32,
+    pub ancestors: *mut i32,
+    pub slot_base: i32,
+    pub top_k: i32,
+    pub max_depth: i32,
+    pub cap: i32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct blz_nvfp4_pool {
@@ -166,6 +191,34 @@ unsafe extern "C" {
                                  splits: c_int, scale: f32, window: c_int, causal: c_int, partial_o: *mut f32, partial_ml: *mut f32,
                                  dtype: c_int, out: *mut c_void, out_stride_tok: i64, out_stride_head: i64,
                                  s: cudaStream_t) -> cudaError_t;
+    pub fn blz_mha_decode_tail(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
+                               pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64,
+                               req_indices: blz_index_ptr, kv_lens: blz_index_ptr, batch: c_int, splits: c_int, scale: f32,
+                               window: c_int, tail: *const i32, tail_len: c_int, tail_stride: c_int, partial_o: *mut f32,
+                               partial_ml: *mut f32, dtype: c_int, out: *mut c_void, out_stride_tok: i64,
+                               out_stride_head: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_mha_tree(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
+                              pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64,
+                              req_indices: blz_index_ptr, kv_lens: blz_index_ptr, batch: c_int, q_len: c_int,
+                              splits: c_int, scale: f32, tree_mask: *const u64, partial_o: *mut f32, partial_ml: *mut f32,
+                              dtype: c_int, out: *mut c_void, out_stride_tok: i64, out_stride_head: i64,
+                              s: cudaStream_t) -> cudaError_t;
+    // draft trees (blaze/tree.h)
+    pub fn blz_gdn_conv_tree(x: *const bf16, ldx: i64, parent: *const i32, seq_start: *const i32, slots: *const i32,
+                             seqs: c_int, channels: c_int, kernel: c_int, weight: *const bf16, state: *const bf16,
+                             out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gdn_recurrent_tree(qkv: *const bf16, g: *const f32, beta: *const f32, prog: *const i32,
+                                  seq_start: *const i32, slots: *const i32, seqs: c_int, k_heads: c_int, v_heads: c_int,
+                                  dk: c_int, dv: c_int, state: *const f32, scratch: *mut f32, levels: c_int,
+                                  out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gdn_tree_scratch_floats(seqs: c_int, v_heads: c_int, dv: c_int, levels: c_int) -> usize;
+    pub fn blz_move_rows(bufs: *const blz_row_buf, nbuf: c_int, pairs: *const i32, n: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_candidate_topk(logits: *const f32, ids: *const i32, rows: c_int, c: c_int, k: c_int, probs: *mut f32,
+                              tokens: *mut i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_tree_begin(t: blz_draft_tree, items: c_int, probs: *const f32, tokens: *const i64, root_hidden: *const bf16,
+                          dim: c_int, front_hidden: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_tree_step(t: blz_draft_tree, items: c_int, step: c_int, probs: *const f32, tokens: *const i64,
+                         hidden: *const bf16, dim: c_int, front_hidden: *mut bf16, s: cudaStream_t) -> cudaError_t;
     // EAGLE-4 draft (blaze/eagle.h)
     pub fn blz_gemv_wide(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
                          n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;

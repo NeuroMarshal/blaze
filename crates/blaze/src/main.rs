@@ -83,6 +83,12 @@ struct EngineArgs {
     /// eager decode steps instead of CUDA graphs
     #[arg(long)]
     no_graphs: bool,
+    /// EAGLE-4 draft trees: frontier rows per depth (each node's top-k children; 0 or 1: chains)
+    #[arg(long, default_value_t = 0)]
+    draft_tree_width: usize,
+    /// EAGLE-4 draft trees: depth
+    #[arg(long, default_value_t = 6)]
+    draft_tree_depth: usize,
 }
 
 impl EngineArgs {
@@ -126,6 +132,8 @@ impl EngineArgs {
                 draft: self.draft_model.clone(),
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
+                tree_levels: if self.draft_tree_width > 1 { self.draft_tree_depth } else { 0 },
+                tree_width: if self.draft_tree_width > 1 { self.draft_tree_width } else { 0 },
             },
             self.tp,
             !self.no_graphs,
@@ -304,6 +312,9 @@ fn main() -> Result<()> {
             let chunk = e.info.max_chunk;
             let mut first = 0;
             let mut drafts = Vec::new();
+            // draft trees: `draft` nodes verified per round (the best by path probability)
+            let shape = (e.info.tree_width > 1).then_some((e.info.tree_width, e.info.tree_levels));
+            let mut tree: Option<blaze::eagle::DraftTree> = None;
             for c0 in (0..n).step_by(chunk) {
                 let c1 = (c0 + chunk).min(n);
                 first = e.step(&mut [&mut seq], &[&ids[c0..c1]])?[0] as i64;
@@ -312,13 +323,40 @@ fn main() -> Result<()> {
                     let tokens: Vec<i64> = (lo..c1).map(|p| if p + 1 < n { ids[p + 1] } else { first }).collect();
                     let item = blaze::eagle::DraftItem { row: seq.row, aux_row: lo - c0, tokens, pos0: lo };
                     let k = if c1 == n { draft } else { 0 };
-                    drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k })?.remove(0);
+                    if c1 == n && shape.is_some() {
+                        tree = Some(e.draft_tree(blaze::eagle::DraftPlan { items: vec![item], k: 0, tree: shape })?.remove(0));
+                    } else {
+                        drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k, tree: None })?.remove(0);
+                    }
                 }
             }
             let mut out = vec![first];
             let (mut rounds, mut drafted, mut accepted_total) = (0usize, 0usize, 0usize);
             let (mut t_verify, mut t_commit, mut t_draft) = (0.0f64, 0.0f64, 0.0f64);
             let t1 = Instant::now();
+            while out.len() < max_tokens && tree.is_some() {
+                let t = tree.as_ref().unwrap();
+                let room = max_tokens - out.len();
+                let nodes: Vec<usize> = blaze::tree::ranked(t, room.saturating_sub(1)).into_iter().take(draft).map(|x| x.1).collect();
+                let rows = blaze::tree::rows_of(t, *out.last().unwrap(), &nodes);
+                let start = seq.len();
+                let tv = Instant::now();
+                let picks = e.verify_many_tree(&mut [&mut seq], &[&rows.tokens], Some(&[&rows.parents]))?.remove(0);
+                t_verify += tv.elapsed().as_secs_f64();
+                let path = rows.accept(|r| (picks[r] as i64, false));
+                let emitted: Vec<i64> = path.iter().map(|&r| picks[r] as i64).collect();
+                out.extend_from_slice(&emitted);
+                let tc = Instant::now();
+                e.commit_many_tree(&mut [&mut seq], &[path.clone()])?;
+                t_commit += tc.elapsed().as_secs_f64();
+                rounds += 1;
+                drafted += nodes.len();
+                accepted_total += path.len() - 1;
+                let item = blaze::eagle::DraftItem { row: seq.row, aux_row: 0, tokens: emitted, pos0: start };
+                let td = Instant::now();
+                tree = Some(e.draft_tree(blaze::eagle::DraftPlan { items: vec![item], k: 0, tree: shape })?.remove(0));
+                t_draft += td.elapsed().as_secs_f64();
+            }
             while out.len() < max_tokens {
                 let k = draft.min(max_tokens - out.len());
                 let d = &drafts[..k.min(drafts.len())];
@@ -342,7 +380,7 @@ fn main() -> Result<()> {
                 accepted_total += m;
                 let item = blaze::eagle::DraftItem { row: seq.row, aux_row: 0, tokens: emitted, pos0: start };
                 let td = Instant::now();
-                drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k: draft })?.remove(0);
+                drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k: draft, tree: None })?.remove(0);
                 t_draft += td.elapsed().as_secs_f64();
             }
             let spec = (out.len() - 1) as f64 / t1.elapsed().as_secs_f64();

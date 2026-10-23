@@ -53,6 +53,11 @@ struct StepMeta {
     /// grammar masks of the sampled rows and the mask row of each logit row (-1: none)
     mask: Vec<u32>,
     mask_row: Vec<i32>,
+    /// tree verify: ancestor masks, parent rows, the GDN program (MetaLayout tree_*)
+    tree: bool,
+    tree_mask: Vec<u64>,
+    tree_parent: Vec<i32>,
+    tree_prog: Vec<i32>,
 }
 
 enum Cmd {
@@ -65,8 +70,8 @@ enum Cmd {
     /// PLE read-ahead: previous tokens, upcoming tokens
     PleWarm(Arc<(Vec<i64>, Vec<i64>)>),
     /// sequence row, accepted rows of the last verify, its first position, its tokens
-    /// ... and its verify slot and row offset in the verify step
-    Commit(usize, usize, usize, Arc<Vec<i64>>, usize, usize),
+    /// ... and its verify slot and row offset in the verify step, and a tree's moves (rows, KV slots)
+    Commit(usize, usize, usize, Arc<Vec<i64>>, usize, usize, Option<Arc<(Vec<(i32, i32)>, Vec<(i32, i32)>)>>),
     /// sequence row, verify slot
     PreVerify(usize, usize),
     /// EAGLE-4 drafter (rank 0): extend over the last step's rows, then draft
@@ -84,6 +89,7 @@ enum Reply {
     Logits(Vec<f32>),
     AllLogits(Vec<Vec<f32>>),
     Drafts(Vec<Vec<i64>>),
+    Trees(Vec<crate::eagle::DraftTree>),
     Done,
 }
 
@@ -101,8 +107,9 @@ impl Drop for Graph {
     }
 }
 
-/// A captured step: the rows of every sequence (decode: all 1), sampled head, sparse attention, speculative verify.
-type GraphKey = (Vec<usize>, bool, bool, bool);
+/// A captured step: the rows of every sequence (decode: all 1), sampled head, sparse attention, speculative verify,
+/// tree verify.
+type GraphKey = (Vec<usize>, bool, bool, bool, bool);
 
 /// Most verify graphs kept (their span shapes vary with the draft lengths); beyond them verify steps run eagerly.
 const MAX_VERIFY_GRAPHS: usize = 48;
@@ -153,6 +160,12 @@ impl Runner {
             self.put(m.mask, &meta.mask);
             tail = vec![(m.pen_ids, meta.pen_ids.len() * 4), (m.pen_coef, meta.pen_coef.len() * 4), (m.mask, meta.mask.len() * 4)];
         }
+        if meta.tree {
+            self.put(m.tree_mask, &meta.tree_mask);
+            self.put(m.tree_parent, &meta.tree_parent);
+            self.put(m.tree_prog, &meta.tree_prog);
+            tail.extend([(m.tree_mask, meta.tree_mask.len() * 8), (m.tree_parent, meta.tree_parent.len() * 4), (m.tree_prog, meta.tree_prog.len() * 4)]);
+        }
         let s = self.model.stream.0;
         let dev = self.model.meta_buffer().ptr::<u8>();
         let host = self.staging.host_ptr().cast::<u8>();
@@ -165,7 +178,7 @@ impl Runner {
         }
         let n = meta.logit_rows.len();
         let lens: Vec<usize> = meta.spans.iter().map(|sp| sp.len).collect();
-        let key: GraphKey = (lens, meta.sample, meta.sparse, verify);
+        let key: GraphKey = (lens, meta.sample, meta.sparse, verify, meta.tree);
         let graphable = if verify {
             // verify shapes repeat (the draft lengths), each captured on its second sight
             self.graphs.contains_key(&key) || self.graphs.keys().filter(|k| k.3).count() < MAX_VERIFY_GRAPHS
@@ -175,7 +188,7 @@ impl Runner {
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
-            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse)?;
+            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree)?;
         }
         if meta.sample { Ok(Reply::Cands(self.model.candidates(n)?)) } else { Ok(Reply::Tokens(self.model.next_tokens(n)?)) }
     }
@@ -184,18 +197,18 @@ impl Runner {
     /// every kernel, then the capture, then replays. Every rank takes the same path for the same key, so their
     /// all-reduces stay paired.
     fn run_graph(&mut self, key: GraphKey, n: usize, spans: &[Span]) -> Result<()> {
-        let (sample, sparse, verify) = (key.1, key.2, key.3);
+        let (sample, sparse, verify, tree) = (key.1, key.2, key.3, key.4);
         if let Some(g) = self.graphs.get(&key) {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
         if self.warmed.insert(key.clone()) {
-            return self.model.forward(spans, n, verify, sample, sparse);
+            return self.model.forward(spans, n, verify, sample, sparse, tree);
         }
         // The step's own metadata copy is already enqueued; capture after it completes.
         self.model.stream.sync()?;
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, verify, sample, sparse);
+        let captured = self.model.forward(spans, n, verify, sample, sparse, tree);
         let mut graph = null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
         captured?;
@@ -221,13 +234,16 @@ impl Runner {
             }
             Cmd::Draft(plan) => {
                 let d = self.draft.as_mut().ok_or_else(|| anyhow!("no drafter loaded"))?;
-                Reply::Drafts(d.run(&self.model, &plan)?)
+                if plan.tree.is_some() { Reply::Trees(d.run_tree(&self.model, &plan)?) } else { Reply::Drafts(d.run(&self.model, &plan)?) }
             }
             Cmd::SetKvRow(row, slots) => {
                 self.model.set_kv_row(row, &slots)?;
                 Reply::Done
             }
-            Cmd::Commit(row, accepted, start, tokens, k, offset) => {
+            Cmd::Commit(row, accepted, start, tokens, k, offset, moves) => {
+                if let Some(mv) = moves {
+                    self.model.tree_moves(k, &mv.0, &mv.1)?;
+                }
                 self.model.commit(row, accepted, start, &tokens, k, offset)?;
                 Reply::Done
             }
@@ -267,6 +283,12 @@ pub struct Info {
     pub qsa_budget: usize,
     /// attention window of the EAGLE-4 drafter (0: none loaded)
     pub draft_window: usize,
+    /// branching levels a tree verify can hold (0: no tree verify)
+    pub tree_levels: usize,
+    /// most verify rows per sequence
+    pub max_verify: usize,
+    /// EAGLE-4 draft trees: frontier rows per depth (0: chains); their depth is tree_levels
+    pub tree_width: usize,
 }
 
 /// A cached prefix: the recurrent state after its tokens (state row `row`, outside the live rows) and the KV slots of
@@ -379,11 +401,15 @@ fn worker_main(
                 page: r.model.page_size(),
                 qsa_budget: r.model.qsa_budget(),
                 draft_window: r.draft.as_ref().map_or(0, |d| d.window()),
+                tree_levels: if r.model.has_tree() { r.model.opts.tree_levels } else { 0 },
+                max_verify: r.model.opts.max_verify,
+                tree_width: if r.model.has_tree() { r.model.opts.tree_width } else { 0 },
             };
             let _ = tx.send(Ok(Reply::Logits(vec![info.max_tokens as f32, info.max_seqs as f32, info.max_chunk as f32,
                                                    info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32,
                                                    info.page as f32, info.qsa_budget.min(1 << 24) as f32,
-                                                   info.draft_window as f32])));
+                                                   info.draft_window as f32, info.tree_levels as f32,
+                                                   info.max_verify as f32, info.tree_width as f32])));
             r
         }
         Err(e) => {
@@ -441,6 +467,9 @@ impl Engine {
                         page: v[6] as usize,
                         qsa_budget: if v[7] as usize >= 1 << 24 { usize::MAX } else { v[7] as usize },
                         draft_window: v[8] as usize,
+                        tree_levels: v[9] as usize,
+                        max_verify: v[10] as usize,
+                        tree_width: v[11] as usize,
                     });
                 }
                 Ok(_) => unreachable!(),
@@ -562,23 +591,46 @@ impl Engine {
         self.free_cache_rows.push(snap.row);
     }
 
-    /// Metadata of a step; `all_rows`: greedy picks for every row (a verify) instead of each item's last row.
-    fn plan(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], all_rows: bool) -> Result<StepMeta> {
+    /// Metadata of a step; `all_rows`: greedy picks for every row (a verify) instead of each item's last row; `tree`:
+    /// the parent row of every row of each item (a tree verify: positions by depth, ancestor masks, the GDN program).
+    fn plan(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], all_rows: bool, tree: Option<&[&[i32]]>) -> Result<StepMeta> {
         let stride = self.info.ctx_stride;
         let page = self.info.page;
         let pages: usize = seqs.iter().zip(tokens).map(|(s, t)| (s.len() + t.len()).div_ceil(page) - s.len().div_ceil(page)).sum();
         if self.free_pages.len() < pages {
             bail!("KV cache full: {} free pages for {pages}", self.free_pages.len());
         }
-        let mut m = StepMeta { seq_start: vec![0], ..Default::default() };
-        for (seq, t) in seqs.iter_mut().zip(tokens) {
+        let mut m = StepMeta { seq_start: vec![0], tree: tree.is_some(), ..Default::default() };
+        for (si, (seq, t)) in seqs.iter_mut().zip(tokens).enumerate() {
             if seq.len() + t.len() > stride {
                 bail!("sequence of {} tokens exceeds the context ({stride})", seq.len() + t.len());
             }
             let kv_len = seq.len() + t.len();
             m.sparse |= kv_len > self.info.qsa_budget;
-            m.spans.push(Span { offset: m.tokens.len(), len: t.len() });
-            for &id in t.iter() {
+            let offset = m.tokens.len();
+            m.spans.push(Span { offset, len: t.len() });
+            let start = seq.len();
+            let mut depth = vec![0usize; t.len()];
+            if let Some(tr) = tree {
+                let parent = tr[si];
+                if parent.len() != t.len() || t.len() > 64 {
+                    bail!("tree of {} rows for {} tokens (at most 64)", parent.len(), t.len());
+                }
+                for j in 0..t.len() {
+                    let pj = parent[j];
+                    if (j == 0) != (pj < 0) || pj >= j as i32 {
+                        bail!("tree row {j} has parent {pj} (row 0 the root, parents before children)");
+                    }
+                    let mask = if j == 0 { 1u64 } else { m.tree_mask[offset + pj as usize] | 1u64 << j };
+                    if j > 0 {
+                        depth[j] = depth[pj as usize] + 1;
+                    }
+                    m.tree_mask.push(mask);
+                    m.tree_parent.push(if pj < 0 { -1 } else { (offset as i32) + pj });
+                }
+                m.tree_prog.extend(tree_program(parent, offset, self.info.tree_levels)?);
+            }
+            for (j, &id) in t.iter().enumerate() {
                 let p = seq.len();
                 let slot = if p % page == 0 {
                     let pg = self.free_pages.pop().unwrap();
@@ -588,7 +640,7 @@ impl Engine {
                     seq.slots[p - 1] + 1
                 };
                 m.tokens.push(id);
-                m.positions.push(p as i64);
+                m.positions.push((start + depth[j]) as i64);
                 m.locs.push(slot as i64);
                 m.rt_index.push((seq.row * stride + p) as i64);
                 m.tok_row.push(seq.row as i32);
@@ -610,7 +662,7 @@ impl Engine {
     /// One step: `tokens[i]` is appended to `seqs[i]`; decode items (one token) must come first. Returns the greedy
     /// next token of every item.
     pub fn step(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]]) -> Result<Vec<i32>> {
-        let meta = Arc::new(self.plan(seqs, tokens, false)?);
+        let meta = Arc::new(self.plan(seqs, tokens, false, None)?);
         match self.broadcast(|| Cmd::Step(meta.clone(), true, false))? {
             Reply::Tokens(t) => Ok(t),
             _ => unreachable!(),
@@ -620,7 +672,7 @@ impl Engine {
     /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
     /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
     pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Cands>> {
-        let mut m = self.plan(seqs, tokens, false)?;
+        let mut m = self.plan(seqs, tokens, false, None)?;
         m.sample = true;
         fill_edits(&mut m, pens);
         let n = m.logit_rows.len();
@@ -651,7 +703,7 @@ impl Engine {
 
     /// Teacher-forced logits of `tokens` appended to `seq` (one chunk): row i is the distribution after token i.
     pub fn score_chunk(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<Vec<Vec<f32>>> {
-        let meta = Arc::new(self.plan(&mut [seq], &[tokens], false)?);
+        let meta = Arc::new(self.plan(&mut [seq], &[tokens], false, None)?);
         self.broadcast(|| Cmd::Step(meta.clone(), false, false))?;
         match self.broadcast(|| Cmd::AllLogits(tokens.len()))? {
             Reply::AllLogits(l) => Ok(l),
@@ -663,8 +715,14 @@ impl Engine {
     /// `seqs[i]` without touching their recurrent states (the inputs are recorded); returns the greedy pick after every
     /// row, per sequence. `commit_many` keeps the accepted rows.
     pub fn verify_many(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]]) -> Result<Vec<Vec<i32>>> {
+        self.verify_many_tree(seqs, tokens, None)
+    }
+
+    /// `verify_many` of draft trees: `parents[i][r]` is the parent row of row r of item i (row 0, the pending token,
+    /// -1). Each row sees its ancestors and gets the greedy pick after them; `commit_many_tree` keeps one path.
+    pub fn verify_many_tree(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], parents: Option<&[&[i32]]>) -> Result<Vec<Vec<i32>>> {
         self.pre_verify(seqs, tokens)?;
-        let meta = Arc::new(self.plan(seqs, tokens, true)?);
+        let meta = Arc::new(self.plan(seqs, tokens, true, parents)?);
         let picks = match self.broadcast(|| Cmd::Step(meta.clone(), true, true))? {
             Reply::Tokens(t) => t,
             _ => unreachable!(),
@@ -675,8 +733,14 @@ impl Engine {
     /// Sampled speculative verify: like `verify_many`, but every row gets its sampling candidates (with row r's
     /// penalties `pens[r]`, rows of all sequences in order, which count the draft tokens before it).
     pub fn verify_many_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Vec<Cands>>> {
+        self.verify_many_tree_sampled(seqs, tokens, None, pens)
+    }
+
+    /// `verify_many_sampled` of draft trees (see `verify_many_tree`).
+    pub fn verify_many_tree_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], parents: Option<&[&[i32]]>,
+                                    pens: &[Penalty]) -> Result<Vec<Vec<Cands>>> {
         self.pre_verify(seqs, tokens)?;
-        let mut m = self.plan(seqs, tokens, true)?;
+        let mut m = self.plan(seqs, tokens, true, parents)?;
         m.sample = true;
         fill_edits(&mut m, pens);
         let n = m.logit_rows.len();
@@ -742,10 +806,34 @@ impl Engine {
     /// After `verify_many`: keep the first `accepted[i]` rows of every verified sequence (the pending token and the
     /// matched drafts), drop the rest of their KV and replay the kept rows into the recurrent states.
     pub fn commit_many(&mut self, seqs: &mut [&mut Seq], accepted: &[usize]) -> Result<()> {
+        let paths: Vec<Vec<usize>> = accepted.iter().map(|&a| (0..a).collect()).collect();
+        self.commit_many_tree(seqs, &paths)
+    }
+
+    /// After `verify_many_tree`: keep the rows of `paths[i]` (row 0, then the accepted rows in path order) of every
+    /// verified sequence as its next positions; their recorded inputs, captured hidden states and KV move to the front
+    /// first, then the commit replays them like a chain.
+    pub fn commit_many_tree(&mut self, seqs: &mut [&mut Seq], paths: &[Vec<usize>]) -> Result<()> {
         let page = self.info.page;
-        for (seq, &acc) in seqs.iter_mut().zip(accepted) {
+        for (seq, path) in seqs.iter_mut().zip(paths) {
+            let acc = path.len();
             let k = self.last_verify.iter().position(|v| v.0 == seq.row).ok_or_else(|| anyhow!("commit without a verify"))?;
             let (row, start, toks, offset) = self.last_verify[k].clone();
+            let mut moves = None;
+            if path.iter().enumerate().any(|(j, &r)| r != j) {
+                let (mut rows, mut slots) = (Vec::new(), Vec::new());
+                for (j, &r) in path.iter().enumerate() {
+                    if r < j || r >= toks.len() || (j > 0 && r <= path[j - 1]) {
+                        bail!("tree path {path:?} is not increasing within {} rows", toks.len());
+                    }
+                    if r != j {
+                        rows.push(((offset + r) as i32, (offset + j) as i32));
+                        slots.push((seq.slots[start + r] as i32, seq.slots[start + j] as i32));
+                    }
+                }
+                moves = Some(Arc::new((rows, slots)));
+            }
+            let toks: Arc<Vec<i64>> = if moves.is_some() { Arc::new(path.iter().map(|&r| toks[r]).collect()) } else { toks };
             let keep = start + acc;
             // whole pages past the kept positions go back; a partly kept page stays with the sequence
             let first_free = keep.div_ceil(page) * page;
@@ -754,7 +842,7 @@ impl Engine {
             for pg in dropped.into_iter().rev() {
                 self.unref(pg);
             }
-            self.broadcast(|| Cmd::Commit(row, acc, start, toks.clone(), k, offset))?;
+            self.broadcast(|| Cmd::Commit(row, acc, start, toks.clone(), k, offset, moves.clone()))?;
         }
         self.last_verify.clear();
         Ok(())
@@ -773,6 +861,15 @@ impl Engine {
         let plan = Arc::new(plan);
         match self.broadcast(|| Cmd::Draft(plan.clone()))? {
             Reply::Drafts(d) => Ok(d),
+            _ => unreachable!(),
+        }
+    }
+
+    /// EAGLE-4 draft trees: extend over the last step's rows and grow a tree of `plan.tree` after each item.
+    pub fn draft_tree(&self, plan: crate::eagle::DraftPlan) -> Result<Vec<crate::eagle::DraftTree>> {
+        let plan = Arc::new(plan);
+        match self.broadcast(|| Cmd::Draft(plan.clone()))? {
+            Reply::Trees(t) => Ok(t),
             _ => unreachable!(),
         }
     }
@@ -832,4 +929,37 @@ fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
             None => m.mask_row.push(-1),
         }
     }
+}
+
+/// Depth-first GDN program of one tree (blaze/tree.h, blz_gdn_recurrent_tree): [row, load, save] per row, rows at
+/// `row0`. A row continues from the row before it when that is its parent, else restores its parent's saved state;
+/// a row with several children saves its state, in the level counted by the branching rows above it.
+fn tree_program(parent: &[i32], row0: usize, levels: usize) -> Result<Vec<i32>> {
+    let n = parent.len();
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for r in 1..n {
+        kids[parent[r] as usize].push(r);
+    }
+    let mut level = vec![-1i32; n];
+    let mut prog = Vec::with_capacity(3 * n);
+    let mut prev: i32 = -1;
+    let mut stack = vec![(0usize, 0i32)];
+    while let Some((r, above)) = stack.pop() {
+        let load = if r == 0 || prev == parent[r] { -1 } else { level[parent[r] as usize] };
+        let (mut save, mut below) = (-1, above);
+        if kids[r].len() >= 2 {
+            if above as usize >= levels {
+                bail!("tree with {} nested branchings (the GDN tree verify holds {levels})", above + 1);
+            }
+            save = above;
+            level[r] = above;
+            below = above + 1;
+        }
+        prog.extend([(row0 + r) as i32, load, save]);
+        prev = r as i32;
+        for &c in kids[r].iter().rev() {
+            stack.push((c, below));
+        }
+    }
+    Ok(prog)
 }

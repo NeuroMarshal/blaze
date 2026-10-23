@@ -2,7 +2,7 @@
 //! draft steps) and DFlash2 (a block drafted in one pass).
 
 use crate::dflash::{DFlash, DFlashConfig};
-use crate::eagle::{Draft, DraftConfig, DraftPlan};
+use crate::eagle::{Draft, DraftConfig, DraftPlan, DraftTree};
 use crate::gpu::HostMapped;
 use crate::model::Model;
 use anyhow::{Result, bail};
@@ -55,6 +55,14 @@ impl Drafter {
         match self {
             Self::Eagle(d) => d.run(model, plan),
             Self::DFlash(d) => d.run(model, plan),
+        }
+    }
+
+    /// Draft trees (EAGLE-4 only).
+    pub fn run_tree(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<DraftTree>> {
+        match self {
+            Self::Eagle(d) => d.run_tree(model, plan),
+            Self::DFlash(_) => bail!("draft trees need an EAGLE-4 drafter"),
         }
     }
 

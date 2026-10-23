@@ -205,6 +205,11 @@ pub struct Options {
     /// YaRN context extension (Qwen's recipe) by this factor over max_position_embeddings, when the config has no
     /// rope scaling of its own (the checkpoint stays as is)
     pub yarn_factor: Option<f64>,
+    /// Draft trees: state levels of the GDN tree verify (the branching rows on one path it can hold; 0: no tree
+    /// verify)
+    pub tree_levels: usize,
+    /// EAGLE-4 draft trees: frontier rows per item (top-k children per node; 0: chains); their depth is tree_levels
+    pub tree_width: usize,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
@@ -287,6 +292,11 @@ pub struct MetaLayout {
     pub pen_coef: usize,
     pub mask_words: usize,
     pub mask: usize,
+    /// tree verify (copied on tree steps only): ancestor mask per token (u64, bit j: row j of its sequence), parent row
+    /// per token (absolute, -1: a root), the GDN program per token ([row, load, save] i32, depth-first per sequence)
+    pub tree_mask: usize,
+    pub tree_parent: usize,
+    pub tree_prog: usize,
     pub bytes: usize,
 }
 
@@ -320,6 +330,9 @@ impl MetaLayout {
         let pen_coef = take(max_pen * 12);
         let mask_words = vocab.div_ceil(32);
         let mask = take(max_seqs * mask_words * 4);
+        let tree_mask = take(max_tokens * 8);
+        let tree_parent = take(max_tokens * 4);
+        let tree_prog = take(max_tokens * 12);
         Self {
             max_tokens,
             max_seqs,
@@ -342,6 +355,9 @@ impl MetaLayout {
             pen_coef,
             mask_words,
             mask,
+            tree_mask,
+            tree_parent,
+            tree_prog,
             bytes: o,
         }
     }
@@ -516,6 +532,13 @@ pub struct Model {
     /// commit metadata per verify slot ([0, accepted, row, pad] i32): the uploads are synchronous copies that do not
     /// wait for the model stream, so the commits of one step must not share it
     commit_meta: DevBuf,
+    /// Draft trees: the GDN tree verify's saved states, the row buffers a commit compacts (captured hidden states,
+    /// GDN records: rows of the step) and the KV buffers (rows: slots), as blz_row_buf arrays with their counts, and
+    /// the move pairs per verify slot ([rows: max_verify][slots: max_verify] pairs of i32)
+    tree_scratch: Option<DevBuf>,
+    tree_row_bufs: Option<(DevBuf, usize)>,
+    tree_kv_bufs: Option<(DevBuf, usize)>,
+    tree_pairs: DevBuf,
     /// Captured hidden states [max_tokens, capture_layers, hidden] bf16.
     pub aux: Option<DevBuf>,
     work: Work,
@@ -887,6 +910,46 @@ impl Model {
             Some(DevBuf::zeroed(meta.max_tokens * opts.capture_layers.len() * cfg.hidden * 2, s)?)
         };
         mark("captured hidden states", s)?;
+        let (mut tree_scratch, mut tree_row_bufs, mut tree_kv_bufs) = (None, None, None);
+        if opts.tree_levels > 0 && opts.max_verify > 0 {
+            if cfg.qsa.is_some() || cfg.ple.is_some() {
+                bail!("draft trees with QSA or PLE layers are not supported");
+            }
+            if let Some(g) = &cfg.gdn {
+                let floats = unsafe { sys::blz_gdn_tree_scratch_floats(opts.max_seqs as c_int, dims.v_heads as c_int, g.v_dim as c_int, opts.tree_levels as c_int) };
+                tree_scratch = Some(DevBuf::zeroed(floats * 4, s)?);
+            }
+            let mut rows: Vec<sys::blz_row_buf> = Vec::new();
+            if let Some(a) = &aux {
+                rows.push(sys::blz_row_buf { ptr: a.ptr(), row_bytes: (opts.capture_layers.len() * cfg.hidden * 2) as i64 });
+            }
+            if let Some(g) = &cfg.gdn {
+                let channels = 2 * dims.k_heads * g.k_dim + dims.v_heads * g.v_dim;
+                for [qkv, gg, beta] in &records {
+                    rows.push(sys::blz_row_buf { ptr: qkv.ptr(), row_bytes: (channels * 2) as i64 });
+                    rows.push(sys::blz_row_buf { ptr: gg.ptr(), row_bytes: (dims.v_heads * 4) as i64 });
+                    rows.push(sys::blz_row_buf { ptr: beta.ptr(), row_bytes: (dims.v_heads * 4) as i64 });
+                }
+            }
+            let mut kvb: Vec<sys::blz_row_buf> = Vec::new();
+            let per_slot = (dims.kv_heads * hd) as f64;
+            let (codes, scales) = ((per_slot * code_bytes) as i64, (per_slot * scale_bytes) as i64);
+            for pool in &kv {
+                kvb.push(sys::blz_row_buf { ptr: pool[0].ptr(), row_bytes: codes });
+                kvb.push(sys::blz_row_buf { ptr: pool[1].ptr(), row_bytes: codes });
+                if scales > 0 {
+                    kvb.push(sys::blz_row_buf { ptr: pool[2].ptr(), row_bytes: scales });
+                    kvb.push(sys::blz_row_buf { ptr: pool[3].ptr(), row_bytes: scales });
+                }
+            }
+            if rows.iter().chain(&kvb).any(|b| b.row_bytes % 4 != 0) {
+                bail!("draft trees: a row of a moved buffer is not a multiple of 4 bytes");
+            }
+            tree_row_bufs = Some((DevBuf::from_slice(&rows)?, rows.len()));
+            tree_kv_bufs = Some((DevBuf::from_slice(&kvb)?, kvb.len()));
+        }
+        let tree_pairs = DevBuf::zeroed(opts.max_seqs.max(1) * 4 * opts.max_verify.max(1) * 4, s)?;
+        mark("draft-tree scratch", s)?;
         let work = Self::alloc_work(&cfg, &dims, w, &layers, &opts, &meta, s)?;
         mark("activations (chunk + head rows)", s)?;
         if tp.rank == 0 {
@@ -964,6 +1027,10 @@ impl Model {
             rec_state,
             records,
             commit_meta,
+            tree_scratch,
+            tree_row_bufs,
+            tree_kv_bufs,
+            tree_pairs,
             aux,
             work,
             meta,
@@ -1163,6 +1230,11 @@ impl Model {
     }
 
     /// This rank's LM head (its vocabulary shard: dims.vocab rows from rank * dims.vocab).
+    /// Tree verify buffers are allocated (Options::tree_levels).
+    pub fn has_tree(&self) -> bool {
+        self.tree_row_bufs.is_some()
+    }
+
     pub fn lm_head(&self) -> &Linear {
         &self.lm_head
     }
@@ -1354,8 +1426,9 @@ impl Model {
     /// Enqueue the forward of a step whose metadata is already in the device buffer (MetaLayout). `spans`: decode
     /// sequences (len 1) first, then prefill chunks. The head runs on the first `n_logits` rows listed in
     /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
-    /// (its inputs are recorded for commit). Capturable into a CUDA graph (no host synchronization).
-    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool) -> Result<()> {
+    /// (its inputs are recorded for commit); `tree`: the verify rows of each span form a tree (MetaLayout tree_*).
+    /// Capturable into a CUDA graph (no host synchronization).
+    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool, tree: bool) -> Result<()> {
         let t: usize = spans.iter().map(|s| s.len).sum();
         let n = spans.len();
         if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
@@ -1363,6 +1436,9 @@ impl Model {
         }
         if verify && spans.iter().any(|sp| sp.len > self.opts.max_verify) {
             bail!("verify of more than {} rows in a sequence", self.opts.max_verify);
+        }
+        if tree && (!verify || self.tree_row_bufs.is_none() || spans.iter().any(|sp| sp.len > 64)) {
+            bail!("tree step without tree verify buffers, outside a verify or wider than 64 rows");
         }
         let s = &self.stream;
         let cfg = &self.cfg;
@@ -1419,8 +1495,8 @@ impl Model {
                 )?;
             }
             match layer.kind {
-                LayerKind::Full => self.attention(layer, t, spans, sparse, verify)?,
-                LayerKind::Linear => self.gdn(layer, t, n, verify)?,
+                LayerKind::Full => self.attention(layer, t, spans, sparse, verify, tree)?,
+                LayerKind::Linear => self.gdn(layer, t, n, verify, tree)?,
             }
             match &layer.mix {
                 Mixing::Norm { post, .. } => self.reduce_norm(post, t)?,
@@ -1782,7 +1858,7 @@ impl Model {
         Ok(())
     }
 
-    fn attention(&self, layer: &Layer, t: usize, spans: &[Span], sparse: bool, verify: bool) -> Result<()> {
+    fn attention(&self, layer: &Layer, t: usize, spans: &[Span], sparse: bool, verify: bool, tree: bool) -> Result<()> {
         let a = layer.attn.as_ref().unwrap();
         let (cfg, w, s, m) = (&self.cfg, &self.work, &self.stream, &self.meta);
         let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, cfg.attn.head_dim);
@@ -1882,6 +1958,38 @@ impl Model {
         }
         for (first, count, q_len, off) in calls {
             let splits = if q_len == 1 { (4 * self.num_sms / (count * kvh)).clamp(1, 64) } else { 1 };
+            if tree && q_len > 1 {
+                // a tree verify span: each row sees its ancestors among the span's rows
+                check(
+                    unsafe {
+                        sys::blz_nvfp4_mha_tree(
+                            w.q.at::<u16>(off * heads * hd).cast(),
+                            (heads * hd) as i64,
+                            hd as i64,
+                            heads as c_int,
+                            view,
+                            self.req_to_token.ptr(),
+                            self.ctx_stride() as i64,
+                            sys::blz_index_ptr { ptr: self.meta_ptr::<i32>(m.req_idx + first * 4).cast(), kind: sys::BLZ_I32 },
+                            sys::blz_index_ptr { ptr: self.meta_ptr::<i32>(m.kv_lens + first * 4).cast(), kind: sys::BLZ_I32 },
+                            count as c_int,
+                            q_len as c_int,
+                            splits as c_int,
+                            1.0 / (hd as f32).sqrt(),
+                            self.meta_ptr::<u64>(m.tree_mask + off * 8),
+                            w.partial_o.ptr(),
+                            w.partial_ml.ptr(),
+                            sys::BLZ_BF16,
+                            w.attn.at::<u16>(off * heads * hd).cast(),
+                            (heads * hd) as i64,
+                            hd as i64,
+                            s.0,
+                        )
+                    },
+                    "mha tree",
+                )?;
+                continue;
+            }
             check(
                 unsafe {
                     sys::blz_nvfp4_mha_decode(
@@ -1940,6 +2048,34 @@ impl Model {
             let mut h = [0i64; 2];
             check(unsafe { sys::cudaMemcpy(h.as_mut_ptr().cast(), hist.at::<u8>(row * 16).cast(), 16, sys::MEMCPY_D2H) }, "hist")?;
             self.hist_save.borrow_mut()[k] = h;
+        }
+        Ok(())
+    }
+
+    /// A tree verify's accepted path (verify slot `k`): move its rows to the front of the sequence's rows, `rows`
+    /// pairs (src, dst) of step rows (captured hidden states, GDN records) and `slots` pairs of KV slots, so that the
+    /// commit replays it as a chain. Pairs in increasing order with src >= dst (a compaction in place).
+    pub fn tree_moves(&self, k: usize, rows: &[(i32, i32)], slots: &[(i32, i32)]) -> Result<()> {
+        let (Some((rb, nr)), Some((kb, nk))) = (&self.tree_row_bufs, &self.tree_kv_bufs) else {
+            bail!("tree commit without tree buffers");
+        };
+        let mv = self.opts.max_verify;
+        if rows.len() > mv || slots.len() > mv {
+            bail!("tree commit of {} rows (max {mv})", rows.len().max(slots.len()));
+        }
+        let flat = |p: &[(i32, i32)]| -> Vec<i32> { p.iter().flat_map(|&(a, b)| [a, b]).collect() };
+        let base = k * 4 * mv * 4;
+        let s = &self.stream;
+        if !rows.is_empty() {
+            self.tree_pairs.upload_at(base, &flat(rows))?;
+            check(unsafe { sys::blz_move_rows(rb.ptr(), *nr as c_int, self.tree_pairs.at::<u8>(base).cast(), rows.len() as c_int, s.0) }, "tree row moves")?;
+        }
+        if !slots.is_empty() {
+            self.tree_pairs.upload_at(base + 2 * mv * 4, &flat(slots))?;
+            check(
+                unsafe { sys::blz_move_rows(kb.ptr(), *nk as c_int, self.tree_pairs.at::<u8>(base + 2 * mv * 4).cast(), slots.len() as c_int, s.0) },
+                "tree kv moves",
+            )?;
         }
         Ok(())
     }
@@ -2019,7 +2155,7 @@ impl Model {
         Ok(())
     }
 
-    fn gdn(&self, layer: &Layer, t: usize, seqs: usize, verify: bool) -> Result<()> {
+    fn gdn(&self, layer: &Layer, t: usize, seqs: usize, verify: bool, tree: bool) -> Result<()> {
         let g = layer.gdn.as_ref().unwrap();
         let gc = self.cfg.gdn.as_ref().unwrap();
         let (cfg, w, s) = (&self.cfg, &self.work, &self.stream);
@@ -2043,14 +2179,25 @@ impl Model {
                 "record qkv",
             )?;
         }
-        check(
-            unsafe {
-                sys::blz_gdn_conv_ex(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
-                                     channels as c_int, gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(),
-                                     w.conv.ptr(), write, s.0)
-            },
-            "gdn_conv",
-        )?;
+        if tree {
+            check(
+                unsafe {
+                    sys::blz_gdn_conv_tree(w.proj.ptr(), ld as i64, self.meta_ptr(m.tree_parent), self.meta_ptr(m.seq_start),
+                                           self.meta_ptr(m.seq_slots), seqs as c_int, channels as c_int, gc.conv_kernel as c_int,
+                                           g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), s.0)
+                },
+                "gdn_conv tree",
+            )?;
+        } else {
+            check(
+                unsafe {
+                    sys::blz_gdn_conv_ex(w.proj.ptr(), ld as i64, self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots), seqs as c_int,
+                                         channels as c_int, gc.conv_kernel as c_int, g.conv_w.ptr(), self.conv_state[layer.slot].ptr(),
+                                         w.conv.ptr(), write, s.0)
+                },
+                "gdn_conv",
+            )?;
+        }
         check(
             unsafe {
                 sys::blz_gdn_gate(a, ld as i64, b, ld as i64, g.a_log.ptr(), g.dt_bias.ptr(), t as c_int, vh as c_int,
@@ -2063,14 +2210,27 @@ impl Model {
             check(unsafe { sys::cudaMemcpyAsync(rg.ptr(), w.g.ptr::<f32>().cast(), t * vh * 4, sys::MEMCPY_D2D, s.0) }, "record g")?;
             check(unsafe { sys::cudaMemcpyAsync(rb.ptr(), w.beta.ptr::<f32>().cast(), t * vh * 4, sys::MEMCPY_D2D, s.0) }, "record beta")?;
         }
-        check(
-            unsafe {
-                sys::blz_gdn_recurrent_ex(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots),
-                                          seqs as c_int, t as c_int, kh as c_int, vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
-                                          self.rec_state[layer.slot].ptr(), w.core.ptr(), write, s.0)
-            },
-            "gdn_recurrent",
-        )?;
+        if tree {
+            let scratch = self.tree_scratch.as_ref().unwrap();
+            check(
+                unsafe {
+                    sys::blz_gdn_recurrent_tree(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.tree_prog), self.meta_ptr(m.seq_start),
+                                                self.meta_ptr(m.seq_slots), seqs as c_int, kh as c_int, vh as c_int, gc.k_dim as c_int,
+                                                gc.v_dim as c_int, self.rec_state[layer.slot].ptr(), scratch.ptr(),
+                                                self.opts.tree_levels as c_int, w.core.ptr(), s.0)
+                },
+                "gdn_recurrent tree",
+            )?;
+        } else {
+            check(
+                unsafe {
+                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), w.g.ptr(), w.beta.ptr(), self.meta_ptr(m.seq_start), self.meta_ptr(m.seq_slots),
+                                              seqs as c_int, t as c_int, kh as c_int, vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int,
+                                              self.rec_state[layer.slot].ptr(), w.core.ptr(), write, s.0)
+                },
+                "gdn_recurrent",
+            )?;
+        }
         check(
             unsafe {
                 sys::blz_gated_rmsnorm(w.core.ptr(), (vh * gc.v_dim) as i64, z, ld as i64, g.norm.ptr(), cfg.rms_eps,

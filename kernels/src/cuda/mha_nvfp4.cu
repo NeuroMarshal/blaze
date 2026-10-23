@@ -208,6 +208,7 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t sq_tok, int64_t sq_head, int group, int tokens_per_tile, int tiles,
     int q_heads, blz_nvfp4_pool pool, const int32_t* __restrict__ req_to_token, int64_t req_stride,
     blz_index_ptr req_indices, blz_index_ptr kv_lens, int q_len, int splits, float scale, int window, int causal,
+    const uint64_t* __restrict__ tree_mask, const int32_t* __restrict__ tail, int tail_len, int tail_stride,
     float* __restrict__ part_o, float* __restrict__ part_ml) {
   static_assert(D == 256 || (D == 128 && F == BLZ_KV_BF16), "head dim 128 only from BF16 pools");
   constexpr int kRows = 16 * MT;
@@ -238,6 +239,20 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
                               causal ? min(t1, lim[1] + 1) : (lim[1] >= 0 ? t1 : 0)};
   const int64_t row_begin[2] = {window > 0 ? lim[0] - window + 1 : 0, window > 0 ? lim[1] - window + 1 : 0};
   const float qscale = scale * kLog2e * __ldg(pool.k_g), vg = __ldg(pool.v_g);
+  // Tree verify: the query rows see the step's own positions (the last q_len) only where their ancestor mask has the
+  // bit (row 0 of the step at bit 0).
+  const int64_t tree_base = kv_len - q_len;
+  uint64_t tmask[2] = {~0ull, ~0ull};
+  if (tree_mask != nullptr) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int r = 16 * mt + gr + 8 * h;
+      if (r < valid_rows) tmask[h] = __ldg(tree_mask + int64_t(b) * q_len + qi0 + r / group);
+    }
+  }
+  // Positions past kv_len - tail_len come from the row's own slot list (draft tree steps: the path's KV slots).
+  const int64_t tail_from = kv_len - tail_len;
+  const int32_t* tail_row = tail != nullptr ? tail + int64_t(b) * tail_stride : nullptr;
 
   // Q of every tile into shared memory in the permuted head-dim order: f16(q * scale * log2 e * K global scale).
   if (t0 < t1) {
@@ -265,7 +280,9 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
   // Slot rows of chunk positions: lane i (and i + 16) holds position i.
   auto slots_of = [&](int64_t tc) -> int32_t {
     const int64_t t = tc + (lane & 15);
-    return t < t1 ? int32_t(__ldg(r2t + t) * head_rows + g) : -1;
+    if (t >= t1) return -1;
+    const int32_t sl = tail_row != nullptr && t >= tail_from ? __ldg(tail_row + (t - tail_from)) : __ldg(r2t + t);
+    return int32_t(sl * head_rows + g);
   };
   typename Chunks<F>::K kc;
   typename Chunks<F>::V vc;
@@ -349,7 +366,9 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
         for (int e = 0; e < 4; ++e) {
           const float x = sacc[0][n][e] + sacc[1][n][e];
           const int idx = 8 * n + 2 * c + (e & 1);
-          sv[n][e] = idx < vis[e >> 1] && tc + idx >= row_begin[e >> 1] ? x : -INFINITY;
+          const int64_t rel = tc + idx - tree_base;
+          const bool in_tree = rel < 0 || ((tmask[e >> 1] >> (rel & 63)) & 1);
+          sv[n][e] = idx < vis[e >> 1] && tc + idx >= row_begin[e >> 1] && in_tree ? x : -INFINITY;
         }
       float p[2][4], alpha[2];
       bool grow = false;
@@ -517,12 +536,14 @@ extern "C" int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int spl
   return splits * blaze::parts_per_cta(mt);
 }
 
-extern "C" cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
-                                             blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
-                                             blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len,
-                                             int splits, float scale, int window, int causal, float* partial_o,
-                                             float* partial_ml, blz_half_t dtype, void* out, int64_t out_stride_tok,
-                                             int64_t out_stride_head, cudaStream_t stream) {
+namespace {
+cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads, blz_nvfp4_pool pool,
+                       const int32_t* req_to_token, int64_t req_stride, blz_index_ptr req_indices,
+                       blz_index_ptr kv_lens, int batch, int q_len, int splits, float scale, int window, int causal,
+                       const uint64_t* tree_mask, const int32_t* tail, int tail_len, int tail_stride,
+                       float* partial_o, float* partial_ml, blz_half_t dtype, void* out, int64_t out_stride_tok,
+                       int64_t out_stride_head, cudaStream_t stream) {
+  if (tree_mask != nullptr && q_len > 64) return cudaErrorNotSupported;
   const bool dim_ok = pool.dim == 256 || (pool.dim == 128 && pool.format == BLZ_KV_BF16);
   if (dtype != BLZ_BF16 || !dim_ok || pool.heads <= 0 || q_heads % pool.heads != 0 || q_heads / pool.heads > 16 ||
       q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 || pool.format > BLZ_KV_BF16 || window < 0)
@@ -540,7 +561,8 @@ extern "C" cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok
   auto launch = [&](auto kernel, int warps) {
     kernel<<<grid, 32 * warps, smem, stream>>>(
         static_cast<const __nv_bfloat16*>(q), q_stride_tok, q_stride_head, group, per_tile, tiles, q_heads, pool,
-        req_to_token, req_stride, req_indices, kv_lens, q_len, splits, scale, window, causal, partial_o, partial_ml);
+        req_to_token, req_stride, req_indices, kv_lens, q_len, splits, scale, window, causal, tree_mask, tail,
+        tail_len, tail_stride, partial_o, partial_ml);
   };
   auto by_tiles = [&](auto fmt, auto dim) {
     constexpr int F = decltype(fmt)::value, Dc = decltype(dim)::value;
@@ -572,6 +594,41 @@ extern "C" cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok
     blaze::mha_combine_kernel<__nv_bfloat16, 256><<<cgrid, 256, 0, stream>>>(partial_o, partial_ml, parts, q_heads, o,
                                                                             out_stride_tok, out_stride_head);
   return cudaGetLastError();
+}
+}  // namespace
+
+extern "C" cudaError_t blz_mha_decode_window(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                             blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                                             blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len,
+                                             int splits, float scale, int window, int causal, float* partial_o,
+                                             float* partial_ml, blz_half_t dtype, void* out, int64_t out_stride_tok,
+                                             int64_t out_stride_head, cudaStream_t stream) {
+  return mha_launch(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride, req_indices, kv_lens,
+                    batch, q_len, splits, scale, window, causal, nullptr, nullptr, 0, 0, partial_o, partial_ml, dtype,
+                    out, out_stride_tok, out_stride_head, stream);
+}
+
+extern "C" cudaError_t blz_mha_decode_tail(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                           blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                                           blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int splits,
+                                           float scale, int window, const int32_t* tail, int tail_len,
+                                           int tail_stride, float* partial_o, float* partial_ml, blz_half_t dtype,
+                                           void* out, int64_t out_stride_tok, int64_t out_stride_head,
+                                           cudaStream_t stream) {
+  return mha_launch(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride, req_indices, kv_lens,
+                    batch, 1, splits, scale, window, 1, nullptr, tail, tail_len, tail_stride, partial_o, partial_ml,
+                    dtype, out, out_stride_tok, out_stride_head, stream);
+}
+
+extern "C" cudaError_t blz_nvfp4_mha_tree(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                          blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride,
+                                          blz_index_ptr req_indices, blz_index_ptr kv_lens, int batch, int q_len,
+                                          int splits, float scale, const uint64_t* tree_mask, float* partial_o,
+                                          float* partial_ml, blz_half_t dtype, void* out, int64_t out_stride_tok,
+                                          int64_t out_stride_head, cudaStream_t stream) {
+  return mha_launch(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride, req_indices, kv_lens,
+                    batch, q_len, splits, scale, 0, 1, tree_mask, nullptr, 0, 0, partial_o, partial_ml, dtype, out,
+                    out_stride_tok, out_stride_head, stream);
 }
 
 extern "C" cudaError_t blz_nvfp4_mha_decode(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,

@@ -92,11 +92,33 @@ pub struct DraftItem {
     pub pos0: usize,
 }
 
-/// One draft call: extend every item, then draft `k` tokens after each (0: extend only).
+/// One draft call: extend every item, then draft `k` tokens after each (0: extend only), or with `tree` = (K, D) a
+/// tree of depth D with K frontier rows per item instead of the chain.
 #[derive(Clone, Debug, Default)]
 pub struct DraftPlan {
     pub items: Vec<DraftItem>,
     pub k: usize,
+    pub tree: Option<(usize, usize)>,
+}
+
+/// One item's draft tree (eagle_harness core/draft_tree.py): node n's token, path probability (the product of the
+/// draft's probabilities from the root) and parent node (-1: a child of the root). Depth 1 at [0, K), the children of
+/// depth d's frontier at K + (d - 1) K^2.
+#[derive(Clone, Debug, Default)]
+pub struct DraftTree {
+    pub tokens: Vec<i64>,
+    pub scores: Vec<f32>,
+    pub parents: Vec<i32>,
+    pub top_k: usize,
+    pub depth: usize,
+}
+
+impl DraftTree {
+    /// Depth of node n (1 for the root's children).
+    pub fn depth_of(&self, n: usize) -> usize {
+        let k = self.top_k;
+        if n < k { 1 } else { 2 + (n - k) / (k * k) }
+    }
 }
 
 /// Rows of one draft forward; the chain holds at most this many draft tokens.
@@ -171,13 +193,32 @@ pub struct Draft {
     staging: HostMapped,
     meta: DevBuf,
     graphs: std::collections::HashMap<DraftKey, DraftGraph>,
+    /// draft trees: (K, D) of the buffers, the device tree, the frontier's hidden inputs, every row's top-K
+    tree_shape: (usize, usize),
+    tree: Option<TreeBufs>,
     dumped: bool,
     warmed: std::collections::HashSet<DraftKey>,
 }
 
 /// A captured draft call: chain length, per item (row in the target step, extended rows) or (MAX, 1) for a chain
-/// without its extend, whether the extend is in the graph.
-type DraftKey = (usize, Vec<(usize, usize)>, bool);
+/// without its extend, whether the extend is in the graph, the tree shape ((0, 0): a chain).
+type DraftKey = (usize, Vec<(usize, usize)>, bool, (usize, usize));
+
+/// Device buffers of the draft trees (blaze/tree.h).
+struct TreeBufs {
+    scores: DevBuf,
+    tokens: DevBuf,
+    parents: DevBuf,
+    front_scores: DevBuf,
+    front_tokens: DevBuf,
+    front_node: DevBuf,
+    ancestors: DevBuf,
+    front_hidden: DevBuf,
+    probs: DevBuf,
+    cand_tokens: DevBuf,
+    slot_base: usize,
+    cap: usize,
+}
 const MAX_DRAFT_GRAPHS: usize = 64;
 /// Extends of at most this many rows (after a verify or a decode step) are captured with the chain.
 const GRAPH_EXTEND_ROWS: usize = 64;
@@ -253,8 +294,35 @@ impl Draft {
         let (qd, kvd) = (heads * hd, kv_heads * hd);
         let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, 1, 64) } as usize;
         let partial_rows = (ROWS * heads).max(max_items * heads * parts_decode);
-        let meta_bytes = (MAX_CHAIN + 8) * (3 * 8 * ROWS + 2 * 4 * max_items.max(1) + 256) + 4096;
+        let (tk, td) = if model.opts.tree_width > 1 { (model.opts.tree_width, model.opts.tree_levels) } else { (0, 0) };
+        if tk > 0 && (max_items * tk > ROWS || td < 2 || td > 32 || tk > 16) {
+            bail!("draft tree of width {tk} and depth {td} for {max_items} items (K <= 16, 2 <= D <= 32, K * items <= {ROWS})");
+        }
+        let meta_bytes = (MAX_CHAIN.max(td) + 8) * (5 * 8 * ROWS + 256) + 4096;
         let c = cfg.candidates;
+        // head rows of one call: an item each, or a tree's frontier rows
+        let head_rows = max_items * tk.max(1);
+        let ring_slots = max_items * w;
+        let tree_slots = max_items * td * tk;
+        let tree = if tk > 0 {
+            let cap = tk + (td - 1) * tk * tk;
+            Some(TreeBufs {
+                scores: b(max_items * cap * 4)?,
+                tokens: b(max_items * cap * 8)?,
+                parents: b(max_items * cap * 4)?,
+                front_scores: b(max_items * tk * 4)?,
+                front_tokens: b(max_items * tk * 8)?,
+                front_node: b(max_items * tk * 4)?,
+                ancestors: b(max_items * tk * td * 4)?,
+                front_hidden: b(max_items * tk * h * 2)?,
+                probs: b(max_items * tk * tk * 4)?,
+                cand_tokens: b(max_items * tk * tk * 8)?,
+                slot_base: ring_slots,
+                cap,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             fc: lin(&[("fc", Cut::All)])?,
             fc_norm,
@@ -279,8 +347,8 @@ impl Draft {
             ar: if world > 1 { model.tp.ar } else { std::ptr::null_mut() },
             inv_freq: DevBuf::from_slice(&freqs)?,
             one: DevBuf::from_slice(&[1.0f32])?,
-            k_pool: b(max_items * w * kv_row)?,
-            v_pool: b(max_items * w * kv_row)?,
+            k_pool: b((ring_slots + tree_slots) * kv_row)?,
+            v_pool: b((ring_slots + tree_slots) * kv_row)?,
             no_scales: b(16)?,
             r2t: DevBuf::from_slice(&table)?,
             stride,
@@ -301,16 +369,18 @@ impl Draft {
             partial_ml: b(partial_rows * 2 * 4)?,
             last_normed: b(max_items * h * 2)?,
             last_next: b(max_items * h * 2)?,
-            lr: b(max_items * 128.max(c) * 2)?,
-            scores: b(max_items * cfg.vocab * 2)?,
-            cand_vals: b(max_items * c * 4)?,
-            cand_ids: b(max_items * c * 4)?,
-            cand_logits: b(max_items * c * 4)?,
+            lr: b(head_rows * 128.max(c) * 2)?,
+            scores: b(head_rows * cfg.vocab * 2)?,
+            cand_vals: b(head_rows * c * 4)?,
+            cand_ids: b(head_rows * c * 4)?,
+            cand_logits: b(head_rows * c * 4)?,
             tok: b(max_items * 8)?,
             record: b(MAX_CHAIN * max_items * 8)?,
             staging: HostMapped::new(meta_bytes)?,
             meta: b(meta_bytes)?,
             graphs: Default::default(),
+            tree_shape: (tk, td),
+            tree,
             dumped: false,
             warmed: Default::default(),
             cfg,
@@ -319,8 +389,12 @@ impl Draft {
 
     /// Bytes of VRAM the drafter takes beyond its weights' share (KV ring and work buffers), for logging.
     pub fn describe(&self) -> String {
+        let tree = match self.tree_shape {
+            (0, _) => "chains".to_string(),
+            (k, d) => format!("trees of width {k}, depth {d}"),
+        };
         format!(
-            "EAGLE-4 draft: window {}, {} candidates, KV ring {:.0} MiB, LM head {:.1} GiB in pinned RAM",
+            "EAGLE-4 draft: window {}, {} candidates, {tree}, KV {:.0} MiB, LM head {:.1} GiB in pinned RAM",
             self.cfg.window,
             self.cfg.candidates,
             (self.k_pool.bytes() * 2) as f64 / (1u64 << 20) as f64,
@@ -335,19 +409,13 @@ impl Draft {
         dst.copy_from_slice(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes) });
     }
 
-    /// Extend over `plan.items` (the last target step's rows, its hidden states captured by `model`), then draft
-    /// `plan.k` tokens after each item. Returns the drafts per item.
-    pub fn run(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<Vec<i64>>> {
+    /// The metadata of a call in the staging buffer, copied to the device: the draft forwards after the extend (chain
+    /// steps, or the tree's steps) first, at offsets that depend only on the shape, so that a captured call replays;
+    /// then the extend in chunks of ROWS rows (rows before the last `window` of an item are skipped: no draft position
+    /// reads them). Returns the forwards, how many of them the extend has, and each extend span's first row in its item.
+    fn prepare(&mut self, model: &Model, plan: &DraftPlan) -> Result<(Vec<Fwd>, usize, Vec<Vec<usize>>)> {
         let n_items = plan.items.len();
-        if n_items == 0 {
-            return Ok(Vec::new());
-        }
-        if n_items > self.max_items || plan.k > MAX_CHAIN {
-            bail!("draft of {n_items} items x {} tokens (max {} x {MAX_CHAIN})", plan.k, self.max_items);
-        }
         let w = self.cfg.window;
-        // forwards: the extend in chunks of ROWS rows (rows before the last `window` of an item are skipped: no draft
-        // position reads them), then one forward per chain step
         let mut fwds: Vec<Fwd> = Vec::new();
         let mut off = 0usize;
         let mut alloc = |n: usize, sz: usize| {
@@ -360,16 +428,17 @@ impl Draft {
             let n = spans.len();
             Fwd { pos: alloc(rows, 8), loc: alloc(rows, 8), tok: alloc(rows, 8), req: alloc(n, 4), kvl: alloc(n, 4), spans }
         };
-        // chain forwards first: their metadata offsets depend only on (items, k), so a captured chain replays
-        let chain: Vec<Fwd> = (1..plan.k).map(|_| layout((0..n_items).map(|i| (i, 1)).collect(), &mut alloc)).collect();
-        let mut skip = vec![0usize; n_items];
+        // after the extend: chain step j (one row per item), or tree step j (K rows per item, one span each)
+        let steps: Vec<Fwd> = match plan.tree {
+            Some((k, d)) => (1..d).map(|_| layout((0..n_items * k).map(|r| (r / k, 1)).collect(), &mut alloc)).collect(),
+            None => (1..plan.k).map(|_| layout((0..n_items).map(|i| (i, 1)).collect(), &mut alloc)).collect(),
+        };
         let mut cur: Vec<(usize, usize)> = Vec::new();
         let mut cur_rows = 0;
         let mut ext_start: Vec<Vec<usize>> = Vec::new(); // per forward: first row of each span within its item
         let mut starts: Vec<usize> = Vec::new();
         for (i, it) in plan.items.iter().enumerate() {
-            skip[i] = it.tokens.len().saturating_sub(w);
-            let mut r = skip[i];
+            let mut r = it.tokens.len().saturating_sub(w);
             while r < it.tokens.len() {
                 let take = (it.tokens.len() - r).min(ROWS - cur_rows);
                 cur.push((i, take));
@@ -388,15 +457,26 @@ impl Draft {
             ext_start.push(std::mem::take(&mut starts));
         }
         let n_ext = fwds.len();
-        fwds.extend(chain);
+        fwds.extend(steps);
         if off > self.staging_len() {
             bail!("draft metadata of {off} bytes exceeds the staging buffer");
         }
-        // fill the metadata
+        let (tk, td) = plan.tree.unwrap_or((0, 0));
+        let slot_base = self.tree.as_ref().map_or(0, |t| t.slot_base);
         for (f, fwd) in fwds.iter().enumerate() {
             let (mut pos, mut loc, mut tok, mut req, mut kvl) = (vec![], vec![], vec![], vec![], vec![]);
             for (si, &(i, len)) in fwd.spans.iter().enumerate() {
                 let it = &plan.items[i];
+                let end = it.pos0 + it.tokens.len();
+                if f >= n_ext && tk > 0 {
+                    // tree step j: the frontier rows at depth j, each at its own KV slot, the committed window frozen
+                    let (j, lane) = (f - n_ext + 1, si % tk);
+                    pos.push((end + j - 1) as i64);
+                    loc.push((slot_base + (i * td + j - 1) * tk + lane) as i64);
+                    req.push(it.row as i32);
+                    kvl.push((end + j) as i32);
+                    continue;
+                }
                 let first = if f < n_ext {
                     let r0 = ext_start[f][si];
                     for r in r0..r0 + len {
@@ -405,7 +485,7 @@ impl Draft {
                     it.pos0 + r0
                 } else {
                     // chain step j = f - n_ext + 1: the position after the extend's last, plus j - 1
-                    it.pos0 + it.tokens.len() + (f - n_ext)
+                    end + (f - n_ext)
                 };
                 for p in first..first + len {
                     pos.push(p as i64);
@@ -425,11 +505,26 @@ impl Draft {
             unsafe { sys::cudaMemcpyAsync(self.meta.ptr(), self.staging.host_ptr(), off, sys::MEMCPY_H2D, s.0) },
             "draft meta copy",
         )?;
+        Ok((fwds, n_ext, ext_start))
+    }
+
+    /// Extend over `plan.items` (the last target step's rows, its hidden states captured by `model`), then draft
+    /// `plan.k` tokens after each item. Returns the drafts per item.
+    pub fn run(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<Vec<i64>>> {
+        let n_items = plan.items.len();
+        if n_items == 0 {
+            return Ok(Vec::new());
+        }
+        if n_items > self.max_items || plan.k > MAX_CHAIN || plan.tree.is_some() {
+            bail!("draft of {n_items} items x {} tokens (max {} x {MAX_CHAIN}, chains)", plan.k, self.max_items);
+        }
+        let (fwds, n_ext, ext_start) = self.prepare(model, plan)?;
+        let s = &model.stream;
         // small extends (after a verify or a decode step) and the chain replay as one CUDA graph per shape; a long
         // extend (a prompt's last window) runs eagerly, its chain through the chain graph
         let ext_rows: usize = fwds[..n_ext].iter().flat_map(|f| f.spans.iter().map(|s| s.1)).sum();
         if plan.k > 0 && n_ext == 1 && ext_rows <= GRAPH_EXTEND_ROWS && model.opts.draft_graphs {
-            let key: DraftKey = (plan.k, plan.items.iter().map(|it| (it.aux_row, it.tokens.len())).collect(), true);
+            let key: DraftKey = (plan.k, plan.items.iter().map(|it| (it.aux_row, it.tokens.len())).collect(), true, (0, 0));
             self.graphed(model, key, |d| {
                 d.extend(model, plan, &fwds[..n_ext], &ext_start)?;
                 d.chain(model, n_items, &fwds[n_ext..])
@@ -437,7 +532,7 @@ impl Draft {
         } else {
             self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
             if plan.k > 0 {
-                let key: DraftKey = (plan.k, vec![(usize::MAX, 1); n_items], false);
+                let key: DraftKey = (plan.k, vec![(usize::MAX, 1); n_items], false, (0, 0));
                 if model.opts.draft_graphs {
                     self.graphed(model, key, |d| d.chain(model, n_items, &fwds[n_ext..]))?;
                 } else {
@@ -458,6 +553,127 @@ impl Draft {
             }
         }
         Ok(drafts)
+    }
+
+    /// Extend over `plan.items`, then grow a draft tree of `plan.tree` = (K, D) after each (eagle_harness
+    /// sglang/draft_steps.py): the extend's head gives the root's K children; step j runs the K frontier rows of depth
+    /// j (each attends to the committed window and its own path), adds every row's top-K candidates as children, keeps
+    /// the best K by path probability as the next frontier. One CUDA graph per shape; one host sync at the end.
+    pub fn run_tree(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<DraftTree>> {
+        let n_items = plan.items.len();
+        let Some((k, d)) = plan.tree else { bail!("tree draft without a tree shape") };
+        if n_items == 0 {
+            return Ok(Vec::new());
+        }
+        if n_items > self.max_items || (k, d) != self.tree_shape {
+            bail!("tree draft of {n_items} items, shape {:?} (buffers: {} items, shape {:?})", (k, d), self.max_items, self.tree_shape);
+        }
+        let (fwds, n_ext, ext_start) = self.prepare(model, plan)?;
+        let ext_rows: usize = fwds[..n_ext].iter().flat_map(|f| f.spans.iter().map(|s| s.1)).sum();
+        if n_ext == 1 && ext_rows <= GRAPH_EXTEND_ROWS && model.opts.draft_graphs {
+            let key: DraftKey = (0, plan.items.iter().map(|it| (it.aux_row, it.tokens.len())).collect(), true, (k, d));
+            self.graphed(model, key, |dr| {
+                dr.extend(model, plan, &fwds[..n_ext], &ext_start)?;
+                dr.grow(model, n_items, &fwds[n_ext..])
+            })?;
+        } else {
+            self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
+            let key: DraftKey = (0, vec![(usize::MAX, 1); n_items], false, (k, d));
+            if model.opts.draft_graphs {
+                self.graphed(model, key, |dr| dr.grow(model, n_items, &fwds[n_ext..]))?;
+            } else {
+                self.grow(model, n_items, &fwds[n_ext..])?;
+            }
+        }
+        model.stream.sync()?;
+        let t = self.tree.as_ref().unwrap();
+        let cap = t.cap;
+        let scores: Vec<f32> = t.scores.download(n_items * cap)?;
+        let tokens: Vec<i64> = t.tokens.download(n_items * cap)?;
+        let parents: Vec<i32> = t.parents.download(n_items * cap)?;
+        Ok((0..n_items)
+            .map(|i| DraftTree {
+                tokens: tokens[i * cap..(i + 1) * cap].to_vec(),
+                scores: scores[i * cap..(i + 1) * cap].to_vec(),
+                parents: parents[i * cap..(i + 1) * cap].to_vec(),
+                top_k: k,
+                depth: d,
+            })
+            .collect())
+    }
+
+    /// The tree's device part after the extend (capturable): root candidates, then the D - 1 steps.
+    fn grow(&self, model: &Model, items: usize, steps: &[Fwd]) -> Result<()> {
+        let (h, s) = (self.cfg.hidden, &model.stream);
+        let t = self.tree.as_ref().unwrap();
+        let (k, d) = self.tree_shape;
+        let dt = sys::blz_draft_tree {
+            scores: t.scores.ptr(),
+            tokens: t.tokens.ptr(),
+            parents: t.parents.ptr(),
+            front_scores: t.front_scores.ptr(),
+            front_tokens: t.front_tokens.ptr(),
+            front_node: t.front_node.ptr(),
+            ancestors: t.ancestors.ptr(),
+            slot_base: t.slot_base as i32,
+            top_k: k as i32,
+            max_depth: d as i32,
+            cap: t.cap as i32,
+        };
+        self.head_topk(model, self.last_normed.ptr(), items, k, t.probs.ptr(), t.cand_tokens.ptr())?;
+        check(
+            unsafe {
+                sys::blz_tree_begin(dt, items as c_int, t.probs.ptr(), t.cand_tokens.ptr(), self.last_next.ptr(), h as c_int,
+                                    t.front_hidden.ptr(), s.0)
+            },
+            "tree begin",
+        )?;
+        let rows = items * k;
+        let next = if self.cfg.norm_output { &self.normed } else { &self.hin };
+        for (j, fwd) in steps.iter().enumerate() {
+            let step = j + 1;
+            check(
+                unsafe { sys::cudaMemcpyAsync(self.hin.ptr(), t.front_hidden.ptr::<u8>().cast(), rows * h * 2, sys::MEMCPY_D2D, s.0) },
+                "tree hidden",
+            )?;
+            self.layer_with(model, fwd, t.front_tokens.ptr(), Some(step))?;
+            self.head_topk(model, self.normed.ptr(), rows, k, t.probs.ptr(), t.cand_tokens.ptr())?;
+            check(
+                unsafe {
+                    sys::blz_tree_step(dt, items as c_int, step as c_int, t.probs.ptr(), t.cand_tokens.ptr(), next.ptr(), h as c_int,
+                                       t.front_hidden.ptr(), s.0)
+                },
+                "tree step",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Candidate head on `rows` rows of `input`: the top `k` of each row's softmax over its candidates (probs f32,
+    /// tokens i64, [rows][k]).
+    fn head_topk(&self, model: &Model, input: *const u16, rows: usize, k: usize, probs: *mut f32, tokens: *mut i64) -> Result<()> {
+        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+        let (h, nc, rank) = (c.hidden, c.candidates, self.lr_down.n);
+        self.lr_down.run(lin, input, h, rows, self.lr.ptr(), rank, s)?;
+        self.lr_head.run(lin, self.lr.ptr(), rank, rows, self.scores.ptr(), c.vocab, s)?;
+        check(
+            unsafe {
+                sys::blz_topk(self.scores.ptr(), c.vocab as i64, rows as c_int, c.vocab as c_int, 0, nc as c_int, self.cand_vals.ptr(),
+                              self.cand_ids.ptr(), std::ptr::null_mut(), s.0)
+            },
+            "draft candidates",
+        )?;
+        check(
+            unsafe {
+                sys::blz_candidate_logits(input, h as i64, rows as c_int, h as c_int, self.lm_head.dev_ptr(), self.cand_ids.ptr(),
+                                          nc as c_int, self.cand_logits.ptr(), s.0)
+            },
+            "draft candidate logits",
+        )?;
+        check(
+            unsafe { sys::blz_candidate_topk(self.cand_logits.ptr(), self.cand_ids.ptr(), rows as c_int, nc as c_int, k as c_int, probs, tokens, s.0) },
+            "draft candidate top-k",
+        )
     }
 
     /// BLAZE_DRAFT_DUMP=dir: the first drafting call's first item (its captured target features, tokens, positions)
@@ -588,9 +804,15 @@ impl Draft {
     /// The draft layer over the forward's rows: inputs `hin` (hidden) and the tokens at `tok`; leaves the normed
     /// output in `normed` and the un-normed sum in `hin`.
     fn layer(&self, model: &Model, fwd: &Fwd, tok: *const i64) -> Result<()> {
+        self.layer_with(model, fwd, tok, None)
+    }
+
+    /// `layer`; with `tree_step` = j the rows are a tree step's frontier (one span each): they attend to the committed
+    /// window of their item, frozen at the extend's end, and to their own path's j slots (the tree's ancestors).
+    fn layer_with(&self, model: &Model, fwd: &Fwd, tok: *const i64, tree_step: Option<usize>) -> Result<()> {
         let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
         let (h, hd) = (c.hidden, c.head_dim);
-        let (heads, kv_heads, inter) = (self.heads, self.kv_heads, self.inter);
+        let (heads, kv_heads) = (self.heads, self.kv_heads);
         let (qd, kvd) = (heads * hd, kv_heads * hd);
         let ldq = qd + 2 * kvd;
         let n: usize = fwd.spans.iter().map(|s| s.1).sum();
@@ -641,6 +863,41 @@ impl Draft {
             dim: hd as c_int,
             format: sys::BLZ_KV_BF16,
         };
+        if let Some(j) = tree_step {
+            let t = self.tree.as_ref().unwrap();
+            let splits = (4 * model.sms() / (n * kv_heads)).clamp(1, 64);
+            check(
+                unsafe {
+                    sys::blz_mha_decode_tail(
+                        self.qkv_out.ptr::<u16>().cast(),
+                        ldq as i64,
+                        hd as i64,
+                        heads as c_int,
+                        pool,
+                        self.r2t.ptr(),
+                        self.stride as i64,
+                        sys::blz_index_ptr { ptr: self.meta.at::<u8>(fwd.req).cast(), kind: sys::BLZ_I32 },
+                        sys::blz_index_ptr { ptr: self.meta.at::<u8>(fwd.kvl).cast(), kind: sys::BLZ_I32 },
+                        n as c_int,
+                        splits as c_int,
+                        1.0 / (hd as f32).sqrt(),
+                        (c.window + j) as c_int,
+                        t.ancestors.ptr(),
+                        j as c_int,
+                        self.tree_shape.1 as c_int,
+                        self.partial_o.ptr(),
+                        self.partial_ml.ptr(),
+                        sys::BLZ_BF16,
+                        self.attn.ptr::<u16>().cast(),
+                        qd as i64,
+                        hd as i64,
+                        s.0,
+                    )
+                },
+                "draft tree attention",
+            )?;
+            return self.finish_layer(model, n);
+        }
         // leading one-row spans in one call, every longer span on its own
         let n1 = fwd.spans.iter().take_while(|sp| sp.1 == 1).count();
         let mut calls: Vec<(usize, usize, usize, usize)> = Vec::new(); // (first span, spans, q_len, first row)
@@ -684,6 +941,14 @@ impl Draft {
                 "draft attention",
             )?;
         }
+        self.finish_layer(model, n)
+    }
+
+    /// The layer after its attention (in `attn`): o, residual + norm, MLP, residual + final norm.
+    fn finish_layer(&self, model: &Model, n: usize) -> Result<()> {
+        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+        let (h, hd) = (c.hidden, c.head_dim);
+        let (qd, inter) = (self.heads * hd, self.inter);
         self.o.run(lin, self.attn.ptr(), qd, n, self.o_out.ptr(), h, s)?;
         // residual: hin += attention (summed over the ranks); x2 = norm(hin)
         self.add_norm(self.o_out.ptr(), self.post_ln.ptr(), self.x2.ptr(), n, s)?;

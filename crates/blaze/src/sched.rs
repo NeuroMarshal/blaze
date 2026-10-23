@@ -97,6 +97,11 @@ struct Active {
     eagle_k: usize,
     /// first draft token proposed while a plain step ran instead (scored against the step's output)
     shadow: Option<i64>,
+    /// EAGLE-4 draft tree after the request's last output (tree mode), and the decayed sums of its accepted nodes and
+    /// of their predicted number (the scores of the verified nodes): the calibration of the draft's probabilities
+    tree: Option<crate::eagle::DraftTree>,
+    tree_hit: f64,
+    tree_pred: f64,
 }
 
 /// Draft acceptance of one request by depth: decayed counts of the draft tokens at depth j that were compared (all
@@ -182,6 +187,30 @@ impl SpecCost {
             p[i] = gain;
             d[i] += 1;
             tokens += gain;
+            let r = tokens / self.verify_time(n, n + d.iter().sum::<usize>(), decode);
+            if r > rate {
+                (best, rate) = (d.clone(), r);
+            }
+        }
+        best
+    }
+}
+
+impl SpecCost {
+    /// Draft-tree nodes per request of a batch: `gains[i]` the expected accepted tokens each further node of request i
+    /// adds, best first. Nodes go one at a time to the request whose next node adds the most; the prefix of that order
+    /// with the most tokens per second wins (all zero: a plain step).
+    fn choose_gains(&self, gains: &[Vec<f64>]) -> Vec<usize> {
+        let n = gains.len();
+        let Some(decode) = Self::lookup(&self.decode, n) else { return gains.iter().map(Vec::len).collect() };
+        let mut d = vec![0usize; n];
+        let mut tokens = n as f64;
+        let (mut best, mut rate) = (d.clone(), n as f64 / decode);
+        loop {
+            let next = (0..n).filter(|&i| d[i] < gains[i].len()).map(|i| (i, gains[i][d[i]])).max_by(|a, b| a.1.total_cmp(&b.1));
+            let Some((i, g)) = next else { break };
+            d[i] += 1;
+            tokens += g;
             let r = tokens / self.verify_time(n, n + d.iter().sum::<usize>(), decode);
             if r > rate {
                 (best, rate) = (d.clone(), r);
@@ -448,6 +477,9 @@ impl Loop {
                 shadow: None,
                 eagle: Vec::new(),
                 eagle_k: usize::MAX,
+                tree: None,
+                tree_hit: 0.0,
+                tree_pred: 0.0,
             });
         }
     }
@@ -589,9 +621,18 @@ impl Loop {
         if items.is_empty() {
             return Ok(());
         }
+        if self.tree_on() {
+            let shape = (self.engine.info.tree_width, self.engine.info.tree_levels);
+            let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
+            let trees = self.engine.draft_tree(crate::eagle::DraftPlan { items, k: 0, tree: Some(shape) })?;
+            for (i, t) in idx.into_iter().zip(trees) {
+                self.active[i].tree = Some(t);
+            }
+            return Ok(());
+        }
         let k = idx_k(&items, &self.active).min(self.cfg.spec_tokens).min(crate::eagle::MAX_CHAIN).max(1);
         let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
-        let drafts = self.engine.draft(crate::eagle::DraftPlan { items, k })?;
+        let drafts = self.engine.draft(crate::eagle::DraftPlan { items, k, tree: None })?;
         for (i, d) in idx.into_iter().zip(drafts) {
             self.active[i].eagle = d;
         }
@@ -602,9 +643,17 @@ impl Loop {
         self.cfg.spec_method == SpecMethod::Eagle && self.cfg.spec_tokens > 0
     }
 
+    /// EAGLE-4 drafts trees (the engine has tree buffers).
+    fn tree_on(&self) -> bool {
+        self.eagle_on() && self.engine.info.tree_width > 1
+    }
+
     /// Speculative step of every active request (all decoding): drafts verified in one step, each request keeps its
     /// matched drafts and one more token. False: no request has a draft worth verifying (a plain step runs).
     fn spec_step(&mut self) -> Result<bool> {
+        if self.tree_on() {
+            return self.spec_step_tree();
+        }
         let n = self.active.len();
         let mut drafts: Vec<Vec<i64>> = (0..n).map(|i| self.draft_for(i)).collect();
         if drafts.iter().all(|d| d.is_empty()) {
@@ -746,6 +795,176 @@ impl Loop {
             self.eagle_extend(items)?;
         }
         let total: usize = rows.iter().map(Vec::len).sum();
+        SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
+        finished.sort_by(|a, b| b.0.cmp(&a.0));
+        for (i, reason) in finished {
+            let a = self.active.swap_remove(i);
+            if reason != Finish::Cancelled {
+                let mut tokens = a.req.tokens.clone();
+                tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
+                self.remember(&a.seq, tokens);
+            }
+            let _ = a.req.events.send(GenEvent::Done(reason));
+            self.keep_output(&a);
+            self.engine.close(a.seq);
+        }
+        Ok(true)
+    }
+
+    /// Ranked nodes of request `i`'s draft tree it may verify (none: it only decodes its pending token): at most `cap`,
+    /// no deeper than its room for tokens.
+    fn tree_candidates(&self, i: usize, cap: usize) -> Vec<(f32, usize)> {
+        let a = &self.active[i];
+        let Some(t) = a.tree.as_ref() else { return Vec::new() };
+        if a.pending.is_none() || a.req.constraint.is_some() {
+            return Vec::new();
+        }
+        if let Some(tb) = a.req.think.as_ref()
+            && tb.budget < usize::MAX
+            && (a.in_think || !a.forced.is_empty())
+            && a.think_count + t.depth >= tb.budget
+        {
+            return Vec::new();
+        }
+        let room = (a.req.max_tokens - a.generated.len()).min(self.engine.info.ctx_stride - a.seq.len() - 1);
+        let mut r = crate::tree::ranked(t, room.saturating_sub(1));
+        r.truncate(cap);
+        r
+    }
+
+    /// `spec_step` with EAGLE-4 draft trees (eagle_harness's dynamic drafter): every request verifies the best nodes of
+    /// its tree by path probability, as many as the cost model finds worth their verify rows (the expected accepted
+    /// length of n nodes: the sum of their scores, scaled by the request's measured calibration); the target's pick
+    /// after each row decides the path; the path's rows are kept.
+    fn spec_step_tree(&mut self) -> Result<bool> {
+        let n = self.active.len();
+        let cap = self.engine.info.max_verify.saturating_sub(1).min(64 - 1);
+        let cands: Vec<Vec<(f32, usize)>> = (0..n).map(|i| self.tree_candidates(i, cap)).collect();
+        if cands.iter().all(|c| c.is_empty()) {
+            return Ok(false);
+        }
+        let counts: Vec<usize> = if self.cfg.spec_adaptive {
+            let gains: Vec<Vec<f64>> = cands
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let a = &self.active[i];
+                    let cal = (a.tree_hit + 1.0) / (a.tree_pred + 1.0);
+                    c.iter().map(|x| (x.0 as f64 * cal).min(1.0)).collect()
+                })
+                .collect();
+            self.spec_cost.choose_gains(&gains)
+        } else {
+            cands.iter().map(Vec::len).collect()
+        };
+        if counts.iter().all(|&c| c == 0) {
+            return Ok(false);
+        }
+        let t0 = Instant::now();
+        let rows: Vec<crate::tree::VerifyRows> = (0..n)
+            .map(|i| {
+                let a = &self.active[i];
+                let pending = a.pending.unwrap() as i64;
+                match a.tree.as_ref() {
+                    Some(t) if counts[i] > 0 => {
+                        let nodes: Vec<usize> = cands[i][..counts[i]].iter().map(|x| x.1).collect();
+                        crate::tree::rows_of(t, pending, &nodes)
+                    }
+                    _ => crate::tree::VerifyRows::single(pending),
+                }
+            })
+            .collect();
+        // decode-only rows first (the engine attends to leading one-row spans in one call)
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| rows[i].len());
+        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some());
+        let words = self.engine.info.vocab.div_ceil(32);
+        let mut pens: Vec<Penalty> = Vec::new();
+        if sampled {
+            for &i in &order {
+                for r in 0..rows[i].len() {
+                    let mut p = self.edits_for(i, &rows[i].path_tokens(r));
+                    let a = &mut self.active[i];
+                    if let Some(c) = a.req.constraint.as_mut() {
+                        p.mask = c.mask(words).unwrap_or_else(|e| {
+                            eprintln!("blaze: grammar dropped: {e}");
+                            a.req.constraint = None;
+                            None
+                        });
+                    }
+                    pens.push(p);
+                }
+            }
+        }
+        let tok_rows: Vec<&[i64]> = order.iter().map(|&i| rows[i].tokens.as_slice()).collect();
+        let parent_rows: Vec<&[i32]> = order.iter().map(|&i| rows[i].parents.as_slice()).collect();
+        let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
+        // SAFETY: `order` holds distinct indices, so the pointers are distinct and live for these calls.
+        let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
+        // per request, per row: the greedy pick, or the sampling candidates
+        enum Picks {
+            Greedy(Vec<i32>),
+            Sampled(Vec<crate::engine::Cands>),
+        }
+        let picks: Vec<Picks> = if sampled {
+            let c = self.engine.verify_many_tree_sampled(&mut seqs, &tok_rows, Some(&parent_rows), &pens)?;
+            c.into_iter().map(Picks::Sampled).collect()
+        } else {
+            let p = self.engine.verify_many_tree(&mut seqs, &tok_rows, Some(&parent_rows))?;
+            p.into_iter().map(Picks::Greedy).collect()
+        };
+        drop(seqs);
+        let mut paths = Vec::with_capacity(n);
+        let mut finished = Vec::new();
+        for (&i, pk) in order.iter().zip(picks) {
+            let v = &rows[i];
+            let mut finish = None;
+            let path = v.accept(|r| {
+                let (x, lp) = match &pk {
+                    Picks::Greedy(p) => (p[r], None),
+                    Picks::Sampled(cs) => {
+                        let a = &mut self.active[i];
+                        let x = sample(&cs[r].top, &a.req.params, &mut a.rng);
+                        (x, logprob_of(&cs[r], x, a.req.params.logprobs))
+                    }
+                };
+                let (tok, f) = self.emit(i, x, lp);
+                let stop = f.is_some();
+                finish = f;
+                (tok as i64, stop)
+            });
+            let a = &mut self.active[i];
+            if v.len() > 1 && finish.is_none() {
+                let predicted: f64 = v.scores[1..].iter().map(|&x| x as f64).sum();
+                a.tree_hit = 0.9 * a.tree_hit + (path.len() - 1) as f64;
+                a.tree_pred = 0.9 * a.tree_pred + predicted;
+            }
+            self.spec_stats.0 += 1;
+            self.spec_stats.1 += path.len();
+            if let Some(f) = finish {
+                finished.push((i, f));
+            }
+            paths.push(path);
+        }
+        let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
+        // SAFETY: as above.
+        let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
+        self.engine.commit_many_tree(&mut seqs, &paths)?;
+        drop(seqs);
+        // the drafter over every request's kept rows (moved to the front of its verify rows), in verify-row order
+        let mut items = Vec::new();
+        let mut aux_row = 0;
+        for (o, &i) in order.iter().enumerate() {
+            let a = &self.active[i];
+            let e = paths[o].len();
+            if !finished.iter().any(|f| f.0 == i) {
+                let tokens: Vec<i64> = a.generated[a.generated.len() - e..].iter().map(|&t| t as i64).collect();
+                items.push((i, crate::eagle::DraftItem { row: a.seq.row, aux_row, tokens, pos0: a.seq.len() - e }));
+            }
+            aux_row += rows[i].len();
+        }
+        self.eagle_extend(items)?;
+        let total: usize = rows.iter().map(|r| r.len()).sum();
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
