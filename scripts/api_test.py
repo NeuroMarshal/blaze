@@ -312,9 +312,10 @@ def chat_reasoning_effort_switches_the_template():
     for kw in ({"reasoning_effort": "none"}, {"reasoning": {"effort": "none"}}):
         p = prompt(**kw)
         check(p.rstrip().endswith("</think>"), (kw, repr(p[-60:])))
-    # an explicit template kwarg wins over the effort
-    p = prompt(reasoning_effort="none", chat_template_kwargs={"enable_thinking": True})
-    check(p.rstrip().endswith("<think>"), repr(p[-60:]))
+    # an explicit template kwarg wins over what reasoning.enabled implies (Qwen3.8's template itself treats the
+    # effort "none" as thinking off, whatever enable_thinking says)
+    p = prompt(reasoning={"enabled": True}, chat_template_kwargs={"enable_thinking": False})
+    check(p.rstrip().endswith("</think>"), repr(p[-60:]))
     # the effort reaches templates that announce it (Qwen3.8); others ignore it
     hi, lo = prompt(reasoning_effort="xhigh"), prompt(reasoning_effort="low")
     check(hi.rstrip().endswith("<think>") and lo.rstrip().endswith("<think>"), "effort should not switch thinking off")
