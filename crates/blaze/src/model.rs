@@ -1960,7 +1960,7 @@ impl Model {
             calls.push((i, 1, sp.len, sp.offset));
         }
         for (first, count, q_len, off) in calls {
-            let splits = if q_len == 1 { (4 * self.num_sms / (count * kvh)).clamp(1, 64) } else { 1 };
+            let splits = self.attn_splits(count, q_len);
             if tree && q_len > 1 {
                 // a tree verify span: each row sees its ancestors among the span's rows
                 check(
@@ -2024,6 +2024,22 @@ impl Model {
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
         self.prefetch_mlp(layer, t)
+    }
+
+    /// Context splits of an attention call of `count` requests of `q_len` query rows: about four CTAs per SM over the
+    /// call's query tiles and KV heads (a verify span of a few rows gets as many as a decode step, not one CTA walking
+    /// the whole context), within the partial-result workspace.
+    fn attn_splits(&self, count: usize, q_len: usize) -> usize {
+        let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, self.cfg.attn.head_dim);
+        let group = heads / kvh;
+        let mt = (q_len * group).div_ceil(16).min(3);
+        let tiles = q_len.div_ceil((16 * mt / group).max(1));
+        let cap = self.work.partial_o.bytes() / (heads * hd * 4);
+        let mut splits = (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64);
+        while splits > 1 && count * q_len * unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, splits as c_int) } as usize > cap {
+            splits /= 2;
+        }
+        splits
     }
 
     fn prefetch_mlp(&self, layer: &Layer, t: usize) -> Result<()> {

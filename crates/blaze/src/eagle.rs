@@ -989,7 +989,17 @@ impl Draft {
             row += sp.1;
         }
         for (first, count, q_len, r0) in calls {
-            let splits = if q_len == 1 { (4 * model.sms() / (count * kv_heads)).clamp(1, 64) } else { 1 };
+            // about four CTAs per SM over the call's query tiles and KV heads, within the partial workspace
+            let group = heads / kv_heads;
+            let mt = (q_len * group).div_ceil(16).min(3);
+            let tiles = q_len.div_ceil((16 * mt / group).max(1));
+            let cap = self.partial_o.bytes() / (heads * hd * 4);
+            let mut splits = (4 * model.sms() / (count * tiles * kv_heads)).clamp(1, 64);
+            while splits > 1
+                && count * q_len * unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, q_len as c_int, splits as c_int) } as usize > cap
+            {
+                splits /= 2;
+            }
             check(
                 unsafe {
                     sys::blz_mha_decode_window(
