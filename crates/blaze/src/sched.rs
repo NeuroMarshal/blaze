@@ -1257,13 +1257,20 @@ impl Loop {
             for (p, m) in pens.iter_mut().zip(masks) {
                 p.mask = m;
             }
+            let glog = std::env::var_os("BLAZE_GRAMMAR_LOG").is_some();
+            let allowed: Vec<Option<u32>> = pens.iter().map(|p| p.mask.as_ref().map(|m| m.iter().map(|w| w.count_ones()).sum())).collect();
             let cands = self.engine.step_sampled(&mut seqs, &tok_refs, &pens)?;
             order
                 .iter()
                 .zip(cands)
-                .map(|(&i, c)| {
+                .zip(allowed)
+                .map(|((&i, c), allowed)| {
                     let a = &mut self.active[i];
                     let x = sample(&c.top, &a.req.params, &mut a.rng);
+                    if glog && a.req.constraint.is_some() {
+                        let top: Vec<String> = c.top.iter().take(4).map(|(v, t)| format!("{t}:{v:.2}")).collect();
+                        eprintln!("blaze grammar: step {} mask {:?} allowed, pick {x}, top {}", a.generated.len(), allowed, top.join(" "));
+                    }
                     (x, logprob_of(&c, x, a.req.params.logprobs))
                 })
                 .unzip()
