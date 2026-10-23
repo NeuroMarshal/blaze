@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <numeric>
 #include <random>
 #include <set>
@@ -66,6 +67,102 @@ void norm_rope(float* v, const std::vector<uint16_t>& w, int64_t pos, const std:
     o[i + ROT / 2] = v[i + ROT / 2] * c + v[i] * s;
   }
   for (int i = 0; i < D; ++i) v[i] = rb(o[i]);
+}
+
+
+// Reference order of one row's table: blocks above the k-th best score in block order, then the lowest ties of the k-th
+// score in block order, each expanded to its slots, then the slots of the incomplete block.
+std::vector<int32_t> ref_table(const std::vector<float>& sc, int nvis, int64_t pos, const std::vector<int32_t>& rt, int topk) {
+  std::vector<float> sorted(sc.begin(), sc.begin() + nvis);
+  std::nth_element(sorted.begin(), sorted.begin() + (topk - 1), sorted.end(), std::greater<float>());
+  const float thr = sorted[topk - 1];
+  int n_gt = 0;
+  for (int i = 0; i < nvis; ++i) n_gt += sc[i] > thr;
+  std::vector<int> sel;
+  for (int i = 0; i < nvis; ++i)
+    if (sc[i] > thr) sel.push_back(i);
+  int ties = topk - n_gt;
+  for (int i = 0; i < nvis && ties > 0; ++i)
+    if (sc[i] == thr) sel.push_back(i), --ties;
+  std::vector<int32_t> out;
+  for (int b : sel)
+    for (int m = 0; m < RATIO; ++m) out.push_back(rt[b * RATIO + m]);
+  for (int64_t t = int64_t(nvis) * RATIO; t <= pos; ++t) out.push_back(rt[t]);
+  return out;
+}
+
+// One decode row against `nvis` random compressed keys (the scores buffer is laid out for max_blocks, as in the model).
+bool decode_case(int nvis, int max_blocks) {
+  std::mt19937 rng(nvis + 5);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  const int64_t pos = int64_t(nvis) * RATIO + 2;
+  const int64_t stride = int64_t(max_blocks) * RATIO + 16;
+  std::vector<uint16_t> comp(size_t(nvis + 4) * D), q(HEADS * D);
+  for (auto& x : comp) x = bf(nd(rng));
+  for (auto& x : q) x = bf(nd(rng));
+  std::vector<int32_t> rt(stride, 0);
+  for (int64_t i = 0; i <= pos; ++i) rt[i] = int32_t(i);  // page = block
+  // copies of the keys, one per layer in turn, so that the scores read them from DRAM as they do in the model
+  const int copies = 4;
+  uint16_t* dcomps[copies];
+  for (auto& c : dcomps) c = dev(comp);
+  uint16_t* dq = dev(q);
+  int32_t* drt = dev(rt);
+  std::vector<int64_t> hp = {pos};
+  std::vector<int32_t> trow = {0};
+  int64_t* dp = dev(hp);
+  int32_t* dtr = dev(trow);
+  float* scores;
+  check(cudaMalloc(&scores, size_t(max_blocks) * 4), "malloc");
+  int32_t *table, *counts;
+  check(cudaMalloc(&table, 2056 * 4), "malloc");
+  check(cudaMalloc(&counts, 4), "malloc");
+  cudaStream_t st;
+  cudaStreamCreate(&st);
+  int turn = 0;
+  auto run_scores = [&] {
+    check(blz_qsa_scores(dq, HEADS, D, dp, dtr, 0, 1, 0, RATIO, drt, stride, dcomps[turn++ % copies], max_blocks, scores, max_blocks, st),
+          "scores");
+  };
+  auto run_select = [&] {
+    check(blz_qsa_select(scores, max_blocks, dp, dtr, 0, 1, RATIO, TOPK_BLOCKS, drt, stride, table, 2056, counts, st), "select");
+  };
+  run_scores();
+  run_select();
+  check(cudaStreamSynchronize(st), "run");
+  auto hs = host(scores, nvis);
+  auto ht = host(table, 2056);
+  auto hc = host(counts, 1);
+  const auto want = ref_table(hs, nvis, pos, rt, TOPK_BLOCKS);
+  const bool same = hc[0] == int(want.size()) && std::equal(want.begin(), want.end(), ht.begin());
+  // time: 40 calls captured in a graph, so launch overhead does not count
+  auto time_us = [&](auto&& body) {
+    cudaGraph_t g;
+    cudaGraphExec_t ge;
+    check(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal), "capture");
+    for (int i = 0; i < 40; ++i) body();
+    check(cudaStreamEndCapture(st, &g), "capture end");
+    check(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+    cudaGraphLaunch(ge, st);
+    cudaStreamSynchronize(st);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0), cudaEventCreate(&e1);
+    cudaEventRecord(e0, st);
+    for (int rep = 0; rep < 3; ++rep) cudaGraphLaunch(ge, st);
+    cudaEventRecord(e1, st);
+    check(cudaEventSynchronize(e1), "time");
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    cudaGraphExecDestroy(ge), cudaGraphDestroy(g);
+    return ms * 1000.0f / 120;
+  };
+  const float t_sc = time_us(run_scores), t_sel = time_us(run_select), t_both = time_us([&] { run_scores(); run_select(); });
+  std::printf("decode row, %d blocks (scores laid out for %d): %s; scores %.1f us, select %.1f us, both %.1f us\n", nvis,
+              max_blocks, same ? "exact in order" : "MISMATCH", t_sc, t_sel, t_both);
+  for (auto c : dcomps) cudaFree(c);
+  cudaFree(dq), cudaFree(drt), cudaFree(dp), cudaFree(dtr), cudaFree(scores), cudaFree(table), cudaFree(counts);
+  cudaStreamDestroy(st);
+  return same;
 }
 
 }  // namespace
@@ -264,14 +361,7 @@ int main() {
         check(blz_qsa_select(dsc, nvis, dp, dtr, 0, 1, RATIO, TOPK_BLOCKS, drt, stride, table, 2056, counts, 0), "select");
         auto ht = host(table, 2056);
         auto hc = host(counts, 1);
-        std::vector<int> idx(nvis);
-        std::iota(idx.begin(), idx.end(), 0);
-        std::partial_sort(idx.begin(), idx.begin() + TOPK_BLOCKS, idx.end(),
-                          [&](int x, int y) { return sc[x] > sc[y] || (sc[x] == sc[y] && x < y); });
-        std::multiset<int> want, got(ht.begin(), ht.begin() + hc[0]);
-        for (int j = 0; j < TOPK_BLOCKS; ++j)
-          for (int m = 0; m < RATIO; ++m) want.insert(idx[j] * RATIO + m);
-        for (int64_t t = int64_t(nvis) * RATIO; t <= pos; ++t) want.insert(int(t));
+        const auto want = ref_table(sc, nvis, pos, rt, TOPK_BLOCKS);
         cudaEvent_t e0, e1;
         cudaEventCreate(&e0), cudaEventCreate(&e1);
         cudaEventRecord(e0);
@@ -281,7 +371,7 @@ int main() {
         check(cudaEventSynchronize(e1), "time");
         float ms = 0;
         cudaEventElapsedTime(&ms, e0, e1);
-        const bool same = got == want;
+        const bool same = hc[0] == int(want.size()) && std::equal(want.begin(), want.end(), ht.begin());
         std::printf("select %d blocks, %s: %s, %.1f us per row\n", nvis,
                     kind == 0 ? "relu scores" : kind == 1 ? "coarse ties" : "threshold at zero", same ? "exact" : "MISMATCH",
                     ms * 1000.0f / 50);
@@ -289,6 +379,11 @@ int main() {
         cudaFree(dsc), cudaFree(dp), cudaFree(dtr), cudaFree(drt), cudaFree(table), cudaFree(counts);
       }
   }
+  // decode-shaped call as the model makes it: one row, scores over the compressed keys then select, exact in order and timed
+  ok &= decode_case(63000, 135001);
+  ok &= decode_case(127000, 135001);
+  ok &= decode_case(63000, 63001);
+  ok &= decode_case(127000, 127001);
   std::printf("%s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
