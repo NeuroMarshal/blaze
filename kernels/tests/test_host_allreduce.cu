@@ -365,6 +365,7 @@ struct Emu {
   int64_t dma_min = kDmaMinDefault;
   uint32_t seq = 0;       // the GPU's call counter
   uint32_t last_dma = 0;  // seq of the last DMA call: the GPU has read the slots of the played ranks by then
+  int delay_us = 0;       // a slow reader of the GPU's DMA slot: the GPU must not refill it before consumed
 
   uint32_t* flags() const { return reinterpret_cast<uint32_t*>(base); }
 
@@ -400,6 +401,7 @@ struct Emu {
     for (int r = 0; r < world; ++r)
       if (r != gpu) __atomic_store_n(flags() + kReadyWord + r, s, __ATOMIC_RELEASE);
     if (!wait(flags() + kReadyWord + gpu, s)) return false;
+    if (delay_us) std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
     std::memcpy(gpu_slot, slot(gpu), bytes);
     for (int r = 0; r < world; ++r)
       if (r != gpu) __atomic_store_n(flags() + kConsumedWord + r, s, __ATOMIC_RELEASE);
@@ -704,6 +706,7 @@ int cpu_peer_test(int idx) {
   const int sequential = cases;
 
   const int64_t pipe_sizes[] = {16, 10240, 65520, 65536, 81920, 327680, 1 << 20, kDmaChunk + 16};
+  e.delay_us = 500;
   for (int batch = 0; batch < cfg.rounds; ++batch) {
     std::mt19937 rng(7u + unsigned(batch));
     std::vector<std::pair<int64_t, blz_ar_dtype_t>> calls;
@@ -712,6 +715,7 @@ int cpu_peer_test(int idx) {
     c += 16;
   }
   const int pipelined = cases - sequential;
+  e.delay_us = 0;
 
   for (int64_t mode : {kDmaMinDefault, int64_t(16), kNever})
     if (!done(graph_case(e, ar, s, c += 10, mode))) return 1;
