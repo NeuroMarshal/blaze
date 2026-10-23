@@ -360,8 +360,10 @@ struct Spec {
     params: SamplingParams,
     max_tokens: usize,
     stops: Vec<String>,
-    /// vLLM's include_stop_str_in_output
+    /// vLLM's include_stop_str_in_output (SGLang: no_stop_trim)
     include_stop: bool,
+    /// vLLM / SGLang skip_special_tokens: special tokens are left out of the text (default) or written
+    skip_special: bool,
     stop_ids: Vec<i32>,
     think: Option<ThinkBudget>,
 }
@@ -372,7 +374,8 @@ impl Spec {
             params: sampling_of(body, &st.cfg.defaults, &st.text),
             max_tokens,
             stops: stop_strings(body),
-            include_stop: body.get("include_stop_str_in_output").and_then(Value::as_bool).unwrap_or(false),
+            include_stop: ["include_stop_str_in_output", "no_stop_trim"].iter().any(|k| body.get(*k).and_then(Value::as_bool) == Some(true)),
+            skip_special: body.get("skip_special_tokens").and_then(Value::as_bool).unwrap_or(true),
             stop_ids: stop_ids_of(body, &st.text),
             think,
         }
@@ -475,12 +478,19 @@ struct Detok {
     ids: Vec<u32>,
     prefix: usize,
     read: usize,
+    skip_special: bool,
     cutter: StopCutter,
 }
 
 impl Detok {
-    fn new(text: Arc<Text>, stops: Vec<String>, include_stop: bool) -> Self {
-        Self { text, ids: Vec::new(), prefix: 0, read: 0, cutter: StopCutter::new(stops, include_stop) }
+    fn new(text: Arc<Text>, spec: &Spec) -> Self {
+        Self { text, ids: Vec::new(), prefix: 0, read: 0, skip_special: spec.skip_special,
+               cutter: StopCutter::new(spec.stops.clone(), spec.include_stop) }
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        let text = if self.skip_special { self.text.decode_skip(ids) } else { self.text.decode(ids) };
+        text.unwrap_or_default()
     }
 
     fn stopped(&self) -> bool {
@@ -493,8 +503,8 @@ impl Detok {
             return String::new();
         }
         self.ids.push(id);
-        let before = self.text.decode_skip(&self.ids[self.prefix..self.read]).unwrap_or_default();
-        let after = self.text.decode_skip(&self.ids[self.prefix..]).unwrap_or_default();
+        let before = self.decode(&self.ids[self.prefix..self.read]);
+        let after = self.decode(&self.ids[self.prefix..]);
         if after.len() <= before.len() || after.ends_with('\u{FFFD}') || !after.is_char_boundary(before.len()) {
             return String::new();
         }
@@ -649,7 +659,7 @@ fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constr
     Ok(Gen {
         rx,
         cancel,
-        detok: Detok::new(st.text.clone(), spec.stops.clone(), spec.include_stop),
+        detok: Detok::new(st.text.clone(), spec),
         logprobs: Vec::new(),
         prompt_tokens: 0,
         cached_tokens: 0,

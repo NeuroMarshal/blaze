@@ -271,16 +271,18 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let gens = submit_n(&st, &p.tokens, &spec, n, 0, &|| constraint_of(&st, body, after, p.forced_call.as_deref()))?;
     let tools = blaze_chat::chat_tool_definitions(p.request.tools.as_deref(), &p.request.messages)
         .map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // SGLang's separate_reasoning=false leaves the reasoning in the content
+    let separate = body.get("separate_reasoning").and_then(Value::as_bool).unwrap_or(true);
     let processor = ChatResponseProcessor::new(
         p.tools_enabled.then(|| st.cfg.tool_parser.clone()).flatten(),
-        st.cfg.reasoning_parser.clone(),
+        st.cfg.reasoning_parser.clone().filter(|_| separate),
         (!tools.is_empty()).then_some(tools),
         p.request.tool_choice.clone(),
         false,
         p.request.parallel_tool_calls.unwrap_or(true),
         n,
     )
-    .with_reasoning_state(p.starts_in_reasoning.then_some(true));
+    .with_reasoning_state((p.starts_in_reasoning && separate).then_some(true));
     let totals = Totals::new(p.tokens.len());
     let decoded = futures::stream::select_all(
         gens.into_iter().enumerate().map(|(i, g)| decoded_events(g, i, totals.clone(), st.text.clone())).collect::<Vec<_>>(),
