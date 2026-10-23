@@ -60,6 +60,18 @@ struct StepMeta {
     tree_prog: Vec<i32>,
 }
 
+/// One sequence's commit after a verify: its row, the accepted rows, its first position, the kept tokens, its verify
+/// slot and row offset in the step, and a tree's moves (rows, KV slots).
+struct CommitItem {
+    row: usize,
+    accepted: usize,
+    start: usize,
+    tokens: Arc<Vec<i64>>,
+    k: usize,
+    offset: usize,
+    moves: Option<(Vec<(i32, i32)>, Vec<(i32, i32)>)>,
+}
+
 enum Cmd {
     /// metadata, CUDA graph allowed, speculative verify
     Step(Arc<StepMeta>, bool, bool),
@@ -69,11 +81,10 @@ enum Cmd {
     SetKvRow(usize, Arc<Vec<i32>>),
     /// PLE read-ahead: previous tokens, upcoming tokens
     PleWarm(Arc<(Vec<i64>, Vec<i64>)>),
-    /// sequence row, accepted rows of the last verify, its first position, its tokens
-    /// ... and its verify slot and row offset in the verify step, and a tree's moves (rows, KV slots)
-    Commit(usize, usize, usize, Arc<Vec<i64>>, usize, usize, Option<Arc<(Vec<(i32, i32)>, Vec<(i32, i32)>)>>),
-    /// sequence row, verify slot
-    PreVerify(usize, usize),
+    /// the commits of a verify step's sequences
+    Commit(Arc<Vec<CommitItem>>),
+    /// (sequence row, verify slot) of every sequence of the next verify
+    PreVerify(Arc<Vec<(usize, usize)>>),
     /// EAGLE-4 drafter (rank 0): extend over the last step's rows, then draft
     Draft(Arc<crate::eagle::DraftPlan>),
     Reset(usize),
@@ -240,15 +251,19 @@ impl Runner {
                 self.model.set_kv_row(row, &slots)?;
                 Reply::Done
             }
-            Cmd::Commit(row, accepted, start, tokens, k, offset, moves) => {
-                if let Some(mv) = moves {
-                    self.model.tree_moves(k, &mv.0, &mv.1)?;
+            Cmd::Commit(items) => {
+                for c in items.iter() {
+                    if let Some(mv) = &c.moves {
+                        self.model.tree_moves(c.k, &mv.0, &mv.1)?;
+                    }
+                    self.model.commit(c.row, c.accepted, c.start, &c.tokens, c.k, c.offset)?;
                 }
-                self.model.commit(row, accepted, start, &tokens, k, offset)?;
                 Reply::Done
             }
-            Cmd::PreVerify(row, k) => {
-                self.model.pre_verify(row, k)?;
+            Cmd::PreVerify(items) => {
+                for &(row, k) in items.iter() {
+                    self.model.pre_verify(row, k)?;
+                }
                 Reply::Done
             }
             Cmd::Reset(row) => {
@@ -764,12 +779,14 @@ impl Engine {
     fn pre_verify(&mut self, seqs: &[&mut Seq], tokens: &[&[i64]]) -> Result<()> {
         self.last_verify.clear();
         let mut offset = 0;
+        let mut items = Vec::with_capacity(seqs.len());
         for (k, (seq, t)) in seqs.iter().zip(tokens).enumerate() {
-            let row = seq.row;
-            self.broadcast(|| Cmd::PreVerify(row, k))?;
-            self.last_verify.push((row, seq.len(), Arc::new(t.to_vec()), offset));
+            items.push((seq.row, k));
+            self.last_verify.push((seq.row, seq.len(), Arc::new(t.to_vec()), offset));
             offset += t.len();
         }
+        let items = Arc::new(items);
+        self.broadcast(|| Cmd::PreVerify(items.clone()))?;
         Ok(())
     }
 
@@ -815,6 +832,7 @@ impl Engine {
     /// first, then the commit replays them like a chain.
     pub fn commit_many_tree(&mut self, seqs: &mut [&mut Seq], paths: &[Vec<usize>]) -> Result<()> {
         let page = self.info.page;
+        let mut items = Vec::with_capacity(seqs.len());
         for (seq, path) in seqs.iter_mut().zip(paths) {
             let acc = path.len();
             let k = self.last_verify.iter().position(|v| v.0 == seq.row).ok_or_else(|| anyhow!("commit without a verify"))?;
@@ -831,7 +849,7 @@ impl Engine {
                         slots.push((seq.slots[start + r] as i32, seq.slots[start + j] as i32));
                     }
                 }
-                moves = Some(Arc::new((rows, slots)));
+                moves = Some((rows, slots));
             }
             let toks: Arc<Vec<i64>> = if moves.is_some() { Arc::new(path.iter().map(|&r| toks[r]).collect()) } else { toks };
             let keep = start + acc;
@@ -842,8 +860,10 @@ impl Engine {
             for pg in dropped.into_iter().rev() {
                 self.unref(pg);
             }
-            self.broadcast(|| Cmd::Commit(row, acc, start, toks.clone(), k, offset, moves.clone()))?;
+            items.push(CommitItem { row, accepted: acc, start, tokens: toks, k, offset, moves });
         }
+        let items = Arc::new(items);
+        self.broadcast(|| Cmd::Commit(items.clone()))?;
         self.last_verify.clear();
         Ok(())
     }
