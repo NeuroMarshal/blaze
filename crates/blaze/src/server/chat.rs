@@ -157,6 +157,19 @@ pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool) ->
     if tail.as_deref() == Some("") {
         return Err(bad_param("continue_final_message", "the last message has no text to continue"));
     }
+    // SGLang's normalize_reasoning_inputs: reasoning_effort and reasoning.{effort,enabled} switch thinking and set the
+    // effort the template announces; explicit chat_template_kwargs win
+    let (thinking, effort) = (blaze_chat::requested_thinking(body), blaze_chat::requested_effort(body).cloned());
+    if thinking.is_some() || effort.is_some() {
+        let k = kwargs.get_or_insert_default();
+        if let Some(t) = thinking {
+            k.entry("thinking".into()).or_insert(t.into());
+            k.entry("enable_thinking".into()).or_insert(t.into());
+        }
+        if let Some(e) = effort {
+            k.entry("reasoning_effort".into()).or_insert(e);
+        }
+    }
     let _thinking = formatter.resolve_thinking(&mut kwargs, tools_enabled, named);
     let mut prompt = formatter
         .render_prompt(&TemplateRequest { request: &request, kwargs: kwargs.as_ref(), add_generation_prompt: add_generation.unwrap_or(true) && !continue_final })

@@ -298,6 +298,34 @@ def chat_stop_token_ids_and_skip_special_tokens():
 
 
 @test
+def chat_reasoning_effort_switches_the_template():
+    msgs = [{"role": "user", "content": "Say hi."}]
+
+    def prompt(**kw):
+        t = http("POST", "/tokenize", {"messages": msgs, "return_token_strs": True, **kw})
+        check(t[0] == 200, t)
+        return "".join(t[2]["token_strs"])
+
+    default = prompt()
+    check(default.rstrip().endswith("<think>"), repr(default[-60:]))
+    # OpenAI's reasoning_effort="none" and OpenRouter-style reasoning.effort turn thinking off, as in SGLang
+    for kw in ({"reasoning_effort": "none"}, {"reasoning": {"effort": "none"}}):
+        p = prompt(**kw)
+        check(p.rstrip().endswith("</think>"), (kw, repr(p[-60:])))
+    # an explicit template kwarg wins over the effort
+    p = prompt(reasoning_effort="none", chat_template_kwargs={"enable_thinking": True})
+    check(p.rstrip().endswith("<think>"), repr(p[-60:]))
+    # the effort reaches templates that announce it (Qwen3.8); others ignore it
+    hi, lo = prompt(reasoning_effort="xhigh"), prompt(reasoning_effort="low")
+    check(hi.rstrip().endswith("<think>") and lo.rstrip().endswith("<think>"), "effort should not switch thinking off")
+    if "Reasoning effort is set to" in lo:
+        check("Reasoning effort is set to low" in lo and "Reasoning effort is set to xhigh" in hi and hi != lo, (hi[:200], lo[:200]))
+    # and a real request with it answers
+    r = chat(msgs, max_tokens=30, reasoning_effort="none", extra_body={})
+    check(r.choices[0].message.content, r.choices[0].message)
+
+
+@test
 def chat_stop_strings():
     msgs = [{"role": "user", "content": "Write the numbers from 1 to 12 separated by commas and spaces, nothing else."}]
     full = chat(msgs, max_tokens=80).choices[0].message.content
@@ -557,6 +585,33 @@ def tokenize_detokenize():
     check(n2 > n, "tools do not change the token count")
     error_shape(*http("POST", "/detokenize", {"tokens": [10 ** 9]})[::2])
     error_shape(*http("POST", "/tokenize", {})[::2])
+
+
+@test
+def chat_agent_history_shapes():
+    # what opencode (AI SDK) and Hermes send back: content parts, null content next to tool calls, replayed reasoning
+    # (reasoning_content or reasoning), tool results as parts, extra keys such as name, an empty assistant string
+    call = {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": json.dumps({"city": "Paris"})}}
+    base = [{"role": "system", "content": "You are terse."},
+            {"role": "user", "content": [{"type": "text", "text": "Weather in Paris? Use the tool."}], "name": "alex"}]
+    results = [
+        {"role": "tool", "tool_call_id": "call_1", "content": json.dumps({"temp_c": 18})},
+        {"role": "tool", "tool_call_id": "call_1", "name": "get_weather", "content": [{"type": "text", "text": json.dumps({"temp_c": 18})}]},
+    ]
+    for asst in ({"role": "assistant", "content": None, "reasoning_content": "I should call the tool.", "tool_calls": [call]},
+                 {"role": "assistant", "content": "", "reasoning": "I should call the tool.", "tool_calls": [call]},
+                 {"role": "assistant", "content": [{"type": "text", "text": "Checking."}], "tool_calls": [call]}):
+        for res in results:
+            r = chat(base + [asst, res], tools=[WEATHER], max_tokens=120)
+            check("18" in (r.choices[0].message.content or ""), (asst, res, r.choices[0].message.content))
+    # a second user turn after a finished tool round, and a system message in the middle
+    msgs = base + [{"role": "assistant", "content": None, "tool_calls": [call]}, results[0],
+                   {"role": "assistant", "content": "It is 18 degrees."}, {"role": "user", "content": "Thanks. And is that warm? One word."}]
+    r = chat(msgs, tools=[WEATHER], max_tokens=60)
+    check(r.choices[0].message.content, r.choices[0].message)
+    # developer messages (new OpenAI SDKs send them for system prompts) are taken as system messages
+    s, _, b = raw_chat({"messages": [{"role": "developer", "content": "Answer with one word."}, {"role": "user", "content": "Capital of France?"}], "max_tokens": 20})
+    check(s == 200 and "Paris" in b["choices"][0]["message"]["content"], (s, b))
 
 
 @test
