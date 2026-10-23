@@ -268,11 +268,13 @@ def chat_reasoning_is_split_out():
 def chat_separate_reasoning_false_keeps_it_in_the_content():
     msgs = [{"role": "user", "content": "What is 17 * 3? Answer briefly."}]
     split = chat(msgs, max_tokens=700, extra_body={}).choices[0].message
+    reasoning = ((split.model_extra or {}).get("reasoning_content") or (split.model_extra or {}).get("reasoning") or "").strip()
+    check(reasoning, "no reasoning in the split response")
     s, _, b = raw_chat({"messages": msgs, "max_tokens": 700, "separate_reasoning": False, "chat_template_kwargs": {}})
     check(s == 200, b)
     m = b["choices"][0]["message"]
     check("reasoning_content" not in m and "reasoning" not in m, f"reasoning split out although separate_reasoning=false: {list(m)}")
-    check("51" in m["content"] and len(m["content"]) > len(split.content or "") + 50, (len(m["content"]), len(split.content or "")))
+    check(reasoning[:20] in m["content"] and "51" in m["content"], (reasoning[:20], m["content"][:200]))
 
 
 @test
