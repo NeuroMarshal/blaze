@@ -159,6 +159,20 @@ def endpoints_unknown_route_and_method():
 
 
 @test
+def endpoints_hermes_server_detection():
+    # Hermes probes LM Studio (/api/v1/models), Ollama (/api/tags), llama.cpp (/v1/props, /props), then vLLM (/version)
+    # and, when it knows the server type, reads the context window from /v1/models/{id}: none of the first four may
+    # answer 200, or the server is taken for another kind
+    for path in ("/api/v1/models", "/api/tags", "/v1/props", "/props"):
+        s = http("GET", path)[0]
+        check(s != 200, f"{path} answers 200: the server would be taken for LM Studio / Ollama / llama.cpp")
+    s, _, v = http("GET", "/version")
+    check(s == 200 and "version" in v, v)
+    s, _, m = http("GET", "/v1/models/" + urllib.parse.quote(MODEL, safe="/"))
+    check(s == 200 and m["max_model_len"] == MAX_LEN, m)
+
+
+@test
 def endpoints_cors():
     s, h, _ = http("OPTIONS", "/v1/chat/completions", headers={"Origin": "http://localhost:3000",
                    "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "authorization,content-type"})
