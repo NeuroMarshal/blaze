@@ -155,6 +155,20 @@ pub struct Layer {
     slot: usize,
 }
 
+struct CommitGraph {
+    exec: sys::cudaGraphExec_t,
+    graph: sys::cudaGraph_t,
+}
+
+impl Drop for CommitGraph {
+    fn drop(&mut self) {
+        unsafe {
+            sys::cudaGraphExecDestroy(self.exec);
+            sys::cudaGraphDestroy(self.graph);
+        }
+    }
+}
+
 pub struct MoeEngine(*mut sys::blz_moe_engine);
 
 unsafe impl Send for MoeEngine {}
@@ -542,6 +556,8 @@ pub struct Model {
     tree_row_bufs: Option<(DevBuf, usize)>,
     tree_kv_bufs: Option<(DevBuf, usize)>,
     tree_pairs: DevBuf,
+    /// CUDA graph of the GDN commit replay per verify slot
+    commit_graphs: std::cell::RefCell<std::collections::HashMap<usize, CommitGraph>>,
     /// Captured hidden states [max_tokens, capture_layers, hidden] bf16.
     pub aux: Option<DevBuf>,
     work: Work,
@@ -1034,6 +1050,7 @@ impl Model {
             tree_row_bufs,
             tree_kv_bufs,
             tree_pairs,
+            commit_graphs: Default::default(),
             aux,
             work,
             meta,
@@ -2144,11 +2161,38 @@ impl Model {
             s.sync()?;
             hist.upload_at(row * 16, &all[all.len() - 2..])?;
         }
-        let Some(gc) = self.cfg.gdn.as_ref() else { return Ok(()) };
+        if self.cfg.gdn.is_none() {
+            return Ok(());
+        }
+        // the replay reads rows [offset, offset + accepted) of the records and writes state row `row`, all through the
+        // slot's commit metadata: the kernels' arguments are the same every round, so one CUDA graph per verify slot
+        self.commit_meta.upload_at(k * 16, &[offset as i32, (offset + accepted) as i32, row as i32])?;
+        if let Some(g) = self.commit_graphs.borrow().get(&k) {
+            return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "commit graph launch");
+        }
+        if !self.opts.draft_graphs {
+            return self.commit_replay(k);
+        }
+        check(unsafe { sys::cudaStreamBeginCapture(s.0, sys::CAPTURE_MODE_THREAD_LOCAL) }, "commit capture")?;
+        let captured = self.commit_replay(k);
+        let mut graph = null_mut();
+        let end = unsafe { sys::cudaStreamEndCapture(s.0, &mut graph) };
+        captured?;
+        check(end, "commit capture end")?;
+        let mut exec = null_mut();
+        check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "commit graph instantiate")?;
+        let g = CommitGraph { exec, graph };
+        check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "commit graph launch")?;
+        self.commit_graphs.borrow_mut().insert(k, g);
+        Ok(())
+    }
+
+    /// The GDN part of a commit (verify slot `k`): conv and recurrent replay of the slot's accepted rows.
+    fn commit_replay(&self, k: usize) -> Result<()> {
+        let gc = self.cfg.gdn.as_ref().unwrap();
         let (w, s) = (&self.work, &self.stream);
         let (kh, vh) = (self.dims.k_heads, self.dims.v_heads);
         let channels = 2 * kh * gc.k_dim + vh * gc.v_dim;
-        self.commit_meta.upload_at(k * 16, &[0i32, accepted as i32, row as i32])?;
         let seq_start: *const i32 = self.commit_meta.at(k * 4);
         let slots: *const i32 = self.commit_meta.at(k * 4 + 2);
         for layer in &self.layers {
@@ -2156,17 +2200,16 @@ impl Model {
             let [qkv, gg, beta] = &self.records[layer.slot];
             check(
                 unsafe {
-                    sys::blz_gdn_conv_ex(qkv.at::<u16>(offset * channels), channels as i64, seq_start, slots, 1, channels as c_int, gc.conv_kernel as c_int,
+                    sys::blz_gdn_conv_ex(qkv.ptr(), channels as i64, seq_start, slots, 1, channels as c_int, gc.conv_kernel as c_int,
                                          g.conv_w.ptr(), self.conv_state[layer.slot].ptr(), w.conv.ptr(), 1, s.0)
                 },
                 "commit conv",
             )?;
             check(
                 unsafe {
-                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), gg.at::<f32>(offset * vh), beta.at::<f32>(offset * vh), seq_start, slots, 1,
-                                              accepted as c_int, kh as c_int,
-                                              vh as c_int, gc.k_dim as c_int, gc.v_dim as c_int, self.rec_state[layer.slot].ptr(),
-                                              w.core.ptr(), 1, s.0)
+                    sys::blz_gdn_recurrent_ex(w.conv.ptr(), gg.ptr(), beta.ptr(), seq_start, slots, 1, 0, kh as c_int, vh as c_int,
+                                              gc.k_dim as c_int, gc.v_dim as c_int, self.rec_state[layer.slot].ptr(), w.core.ptr(), 1,
+                                              s.0)
                 },
                 "commit recurrent",
             )?;
