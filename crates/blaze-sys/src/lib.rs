@@ -250,7 +250,7 @@ unsafe extern "C" {
 
 // linear layers
 pub const BLZ_NVFP4_GEMV_MAX_ROWS: usize = 8;
-pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 16;
+pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 64;
 pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
 pub const BLZ_FP8_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_TOPK_MAX: usize = 64;

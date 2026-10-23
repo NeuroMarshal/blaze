@@ -188,14 +188,16 @@ __device__ __forceinline__ uint32_t bf16x2_splat(float v) {
   return h | (h << 16);
 }
 
-template <int kTiles, int kSplit, bool kHi>
+// kMT 16-row tiles of tokens (up to 64): the weight fragments are widened once per chunk and multiply every tile.
+template <int kTiles, int kSplit, bool kHi, int kMT>
 __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* __restrict__ x, int64_t ldx,
                                                                 const uint8_t* __restrict__ w,
                                                                 const uint8_t* __restrict__ scale,
                                                                 const float* __restrict__ alpha,
                                                                 uint16_t* __restrict__ y, int64_t ldy, int m, int n,
                                                                 int k) {
-  __shared__ float red[kSplit][kTiles * 8][17];
+  constexpr int kTok = 16 * kMT;
+  __shared__ float red[kSplit][kTiles * 8][kTok + 1];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
   const int f0 = blockIdx.x * kTiles * 8;
@@ -208,12 +210,11 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* 
     wp[j] = w + f * wrow + 16 * t;
     sp[j] = scale + f * srow + 2 * t;
   }
-  const bool lo_ok = g < m, hi_ok = kHi && g + 8 < m;
-  const uint16_t* xlo = x + int64_t(lo_ok ? g : 0) * ldx + 32 * t;
-  const uint16_t* xhi = x + int64_t(hi_ok ? g + 8 : 0) * ldx + 32 * t;
-  float acc[kTiles][4];
+  float acc[kTiles][kMT][4];
 #pragma unroll
-  for (int j = 0; j < kTiles; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+  for (int j = 0; j < kTiles; ++j)
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) acc[j][mt][0] = acc[j][mt][1] = acc[j][mt][2] = acc[j][mt][3] = 0.0f;
 
   const int chunks = k >> 7;
   // Register double buffer of the weight codes and scales (the input rows come from L1/L2).
@@ -231,18 +232,8 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* 
     uint4 nw[kTiles];
     uint16_t ns[kTiles];
     if (c + kSplit < chunks) load(c + kSplit, nw, ns);
-    uint32_t xa[16], xb[16];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-      const uint4 v = lo_ok ? __ldg(reinterpret_cast<const uint4*>(xlo + c * 128) + q) : make_uint4(0, 0, 0, 0);
-      xa[4 * q] = v.x, xa[4 * q + 1] = v.y, xa[4 * q + 2] = v.z, xa[4 * q + 3] = v.w;
-      if (kHi) {
-        const uint4 u = hi_ok ? __ldg(reinterpret_cast<const uint4*>(xhi + c * 128) + q) : make_uint4(0, 0, 0, 0);
-        xb[4 * q] = u.x, xb[4 * q + 1] = u.y, xb[4 * q + 2] = u.z, xb[4 * q + 3] = u.w;
-      } else {
-        xb[4 * q] = xb[4 * q + 1] = xb[4 * q + 2] = xb[4 * q + 3] = 0;
-      }
-    }
+    // the chunk's weight fragments of every step, scaled
+    uint32_t bq[kTiles][8][2];
 #pragma unroll
     for (int j = 0; j < kTiles; ++j) {
       const uint32_t s0 = bf16x2_splat(e4m3(sq[j] & 0xff)), s1 = bf16x2_splat(e4m3(sq[j] >> 8));
@@ -252,23 +243,49 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* 
         uint32_t b0, b1;
         e2m1x4_to_bf16(codes[s >> 1] >> (16 * (s & 1)), b0, b1);
         const uint32_t sc = s < 4 ? s0 : s1;
-        mma_bf16(acc[j], xa[2 * s], xb[2 * s], xa[2 * s + 1], xb[2 * s + 1], bf16x2_mul(b0, sc), bf16x2_mul(b1, sc));
+        bq[j][s][0] = bf16x2_mul(b0, sc), bq[j][s][1] = bf16x2_mul(b1, sc);
       }
       wq[j] = nw[j];
       sq[j] = ns[j];
     }
-  }
-  // c0, c1: token g, rows 8j + 2t, +1; c2, c3: token g + 8
 #pragma unroll
-  for (int j = 0; j < kTiles; ++j) {
-    red[warp][8 * j + 2 * t][g] = acc[j][0];
-    red[warp][8 * j + 2 * t + 1][g] = acc[j][1];
-    red[warp][8 * j + 2 * t][g + 8] = acc[j][2];
-    red[warp][8 * j + 2 * t + 1][g + 8] = acc[j][3];
+    for (int mt = 0; mt < kMT; ++mt) {
+      const int rlo = 16 * mt + g, rhi = rlo + 8;
+      const bool lo_ok = rlo < m, hi_ok = kHi && rhi < m;
+      const uint16_t* xlo = x + int64_t(lo_ok ? rlo : 0) * ldx + 32 * t;
+      const uint16_t* xhi = x + int64_t(hi_ok ? rhi : 0) * ldx + 32 * t;
+      uint32_t xa[16], xb[16];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const uint4 v = lo_ok ? __ldg(reinterpret_cast<const uint4*>(xlo + c * 128) + q) : make_uint4(0, 0, 0, 0);
+        xa[4 * q] = v.x, xa[4 * q + 1] = v.y, xa[4 * q + 2] = v.z, xa[4 * q + 3] = v.w;
+        if (kHi) {
+          const uint4 u = hi_ok ? __ldg(reinterpret_cast<const uint4*>(xhi + c * 128) + q) : make_uint4(0, 0, 0, 0);
+          xb[4 * q] = u.x, xb[4 * q + 1] = u.y, xb[4 * q + 2] = u.z, xb[4 * q + 3] = u.w;
+        } else {
+          xb[4 * q] = xb[4 * q + 1] = xb[4 * q + 2] = xb[4 * q + 3] = 0;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kTiles; ++j)
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+          mma_bf16(acc[j][mt], xa[2 * s], xb[2 * s], xa[2 * s + 1], xb[2 * s + 1], bq[j][s][0], bq[j][s][1]);
+    }
   }
+  // c0, c1: token 16 mt + g, rows 8j + 2t, +1; c2, c3: token 16 mt + g + 8
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j)
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+      red[warp][8 * j + 2 * t][16 * mt + g] = acc[j][mt][0];
+      red[warp][8 * j + 2 * t + 1][16 * mt + g] = acc[j][mt][1];
+      red[warp][8 * j + 2 * t][16 * mt + g + 8] = acc[j][mt][2];
+      red[warp][8 * j + 2 * t + 1][16 * mt + g + 8] = acc[j][mt][3];
+    }
   __syncthreads();
-  for (int i = threadIdx.x; i < kTiles * 8 * 16; i += blockDim.x) {
-    const int r = i >> 4, tok = i & 15, f = f0 + r;
+  for (int i = threadIdx.x; i < kTiles * 8 * kTok; i += blockDim.x) {
+    const int r = i / kTok, tok = i % kTok, f = f0 + r;
     if (tok >= m || f >= n) continue;
     float v = 0.0f;
 #pragma unroll
@@ -324,7 +341,7 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
                                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
                                           cudaStream_t stream) {
   if (rows <= 0 || n <= 0) return cudaSuccess;
-  if (k % 128 != 0 || rows > 16) return cudaErrorInvalidValue;
+  if (k % 128 != 0 || rows > BLZ_NVFP4_MMA_MAX_ROWS) return cudaErrorInvalidValue;
   // Warps splitting K per block of 8 weight rows. Cold weights on the RTX 5070 Ti: 8 for long rows of a few tokens
   // (17408 x 5120: 879 GB/s), 2 for short rows (k <= 4096) and for 9..16 tokens. BLZ_MMA_SPLIT overrides.
   static const int forced = [] {
@@ -332,13 +349,20 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
     return e ? atoi(e) : 0;
   }();
   const int split = forced ? forced : (rows <= 8 && k >= 5120 ? 8 : 2);
+  const int mt = (rows + 15) / 16;
 #define BLZ_MMA_LAUNCH(S)                                                                                            \
   {                                                                                                                  \
     const int blocks = (n + 7) / 8;                                                                                  \
-    if (rows > 8)                                                                                                    \
-      nvfp4_mma_kernel<1, S, true><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);      \
+    if (mt == 4)                                                                                                     \
+      nvfp4_mma_kernel<1, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
+    else if (mt == 3)                                                                                                \
+      nvfp4_mma_kernel<1, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
+    else if (mt == 2)                                                                                                \
+      nvfp4_mma_kernel<1, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
+    else if (rows > 8)                                                                                               \
+      nvfp4_mma_kernel<1, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);   \
     else                                                                                                             \
-      nvfp4_mma_kernel<1, S, false><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);     \
+      nvfp4_mma_kernel<1, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);  \
   }
   switch (split) {
     case 2: BLZ_MMA_LAUNCH(2) break;

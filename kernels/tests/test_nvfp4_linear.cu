@@ -144,8 +144,8 @@ int main() {
                 e, pass ? "ok" : "FAIL");
   }
   Weights mid(200, 1152, rng);  // k a multiple of 128
-  for (int rows : {1, 2, 7, 8, 9, 16}) {
-    const double e = run(mid, rows, 1152 + (rows == 9 ? 128 : 0), rng, gemm, true);
+  for (int rows : {1, 2, 7, 8, 9, 16, 17, 24, 32, 40, 63, 64}) {
+    const double e = run(mid, rows, 1152 + (rows == 9 || rows == 40 ? 128 : 0), rng, gemm, true);
     const bool pass = e < 6e-3;
     ok &= pass;
     std::printf("rows %2d (mma): max rel err %.2e %s\n", rows, e, pass ? "ok" : "FAIL");
@@ -156,7 +156,7 @@ int main() {
   std::printf("rows  1, k 8704: max rel err %.2e %s\n", e, e < 6e-3 ? "ok" : "FAIL");
 
   std::printf("bandwidth:\n");
-  for (int rows : {1, 2, 4, 8, 16}) {
+  for (int rows : {1, 2, 4, 8, 16, 24, 32, 48, 64}) {
     for (bool mma : {false, true}) {
       if (!mma && rows > BLZ_NVFP4_GEMV_MAX_ROWS) continue;
       bench(rows, 17408, 5120, rng, mma);
