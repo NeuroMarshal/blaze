@@ -25,6 +25,8 @@ enum Store {
     Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf },
     /// E4M3 codes [n, k], optional FP32 scales per [block_n, 128] block, FP32 multiplier per row.
     Fp8 { codes: DevBuf, block_scale: Option<DevBuf>, block_n: usize, alpha: DevBuf },
+    /// MXFP8: E4M3 codes [n, k], E8M0 scales [n, k / 32].
+    Mxfp8 { codes: DevBuf, scales: DevBuf },
 }
 
 /// How a module is kept on the GPU; consecutive modules of one kind share a part.
@@ -33,6 +35,7 @@ enum Kind {
     Nvfp4,
     Fp8Channel,
     Fp8Block(usize),
+    Mxfp8,
     Bf16,
 }
 
@@ -87,6 +90,7 @@ impl Module {
             Format::Nvfp4 { .. } => Kind::Nvfp4,
             Format::Fp8Channel { .. } => Kind::Fp8Channel,
             Format::Fp8Block { block_n, block_k: 128, inverse: false, .. } => Kind::Fp8Block(*block_n),
+            Format::Mxfp8 => Kind::Mxfp8,
             _ => Kind::Bf16,
         }
     }
@@ -148,6 +152,7 @@ impl Linear {
             let store = match mods[i].kind() {
                 Kind::Nvfp4 => Self::load_nvfp4(ckpt, group, n, k)?,
                 Kind::Fp8Channel | Kind::Fp8Block(_) if k % 128 == 0 => Self::load_fp8(ckpt, group, n, k, mods[i].kind())?,
+                Kind::Mxfp8 if k % 128 == 0 => Self::load_mxfp8(ckpt, group, n, k)?,
                 _ => Self::load_16bit(ckpt, group, n, k, s)?,
             };
             parts.push(Part { store, col, n });
@@ -222,6 +227,23 @@ impl Linear {
         }
         let block_scale = if block_n > 0 { Some(DevBuf::from_slice(&blocks)?) } else { None };
         Ok(Store::Fp8 { codes, block_scale, block_n: block_n.max(1), alpha: DevBuf::from_slice(&alpha)? })
+    }
+
+    fn load_mxfp8(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize) -> Result<Store> {
+        let codes = DevBuf::new(n * k)?;
+        let scales = DevBuf::new(n * k / 32)?;
+        let mut row = 0;
+        for m in group {
+            if m.cols.start % 32 != 0 || m.cols.end % 32 != 0 {
+                bail!("{}: MXFP8 column cut {:?} not aligned to the 32-value blocks", m.name, m.cols);
+            }
+            let full_k = ckpt.info(&m.names.weight)?.shape[1];
+            codes.upload_at(row * k, &cut_rows(ckpt.bytes(&m.names.weight)?, full_k, &m.rows, m.cols.clone()))?;
+            let sc = cut_rows(ckpt.bytes(m.names.scale.as_ref().unwrap())?, full_k / 32, &m.rows, m.cols.start / 32..m.cols.end / 32);
+            scales.upload_at(row * k / 32, &sc)?;
+            row += m.n;
+        }
+        Ok(Store::Mxfp8 { codes, scales })
     }
 
     fn load_16bit(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, s: &Stream) -> Result<Store> {
@@ -306,6 +328,10 @@ impl Linear {
                 }
                 Store::Bf16(w) => v.push((w.ptr::<u8>() as *const u8, w.bytes())),
                 Store::Fp8 { codes, .. } => v.push((codes.ptr::<u8>() as *const u8, codes.bytes())),
+                Store::Mxfp8 { codes, scales } => {
+                    v.push((codes.ptr::<u8>() as *const u8, codes.bytes()));
+                    v.push((scales.ptr::<u8>() as *const u8, scales.bytes()));
+                }
             }
         }
         v
@@ -380,6 +406,30 @@ impl Linear {
                             },
                             "blz_fp8_weight_dequant",
                         )?;
+                        check(
+                            unsafe {
+                                sys::blz_gemm_bf16(ctx.gemm, x, ldx as i64, ctx.scratch, o, ldo as i64, m as c_int, p.n as c_int,
+                                                   k as c_int, s.0)
+                            },
+                            "blz_gemm_bf16",
+                        )?;
+                    }
+                }
+                Store::Mxfp8 { codes, scales } => {
+                    if m <= sys::BLZ_MXFP8_MMA_MAX_ROWS {
+                        check(
+                            unsafe {
+                                sys::blz_mxfp8_gemv_mma(x, ldx as i64, codes.ptr(), scales.ptr(), o, ldo as i64, m as c_int, p.n as c_int,
+                                                        k as c_int, s.0)
+                            },
+                            "blz_mxfp8_gemv_mma",
+                        )?;
+                    } else {
+                        if p.n * k > ctx.scratch_elems {
+                            bail!("MXFP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
+                        }
+                        check(unsafe { sys::blz_mxfp8_weight_dequant(codes.ptr(), scales.ptr(), p.n as c_int, k as c_int, ctx.scratch, s.0) },
+                              "blz_mxfp8_weight_dequant")?;
                         check(
                             unsafe {
                                 sys::blz_gemm_bf16(ctx.gemm, x, ldx as i64, ctx.scratch, o, ldo as i64, m as c_int, p.n as c_int,

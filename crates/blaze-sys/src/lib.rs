@@ -253,6 +253,7 @@ pub const BLZ_NVFP4_GEMV_MAX_ROWS: usize = 8;
 pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 64;
 pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
 pub const BLZ_FP8_MMA_MAX_ROWS: usize = 16;
+pub const BLZ_MXFP8_MMA_MAX_ROWS: usize = 64;
 pub const BLZ_TOPK_MAX: usize = 64;
 /// largest k of blz_topk
 pub const BLZ_TOPK_LIMIT: usize = 128;
@@ -280,6 +281,9 @@ unsafe extern "C" {
     pub fn blz_fp8_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, block_scale: *const f32, block_n: c_int,
                             alpha: *const f32, y: *mut bf16, ldy: i64, rows: c_int, n: c_int, k: c_int,
                             s: cudaStream_t) -> cudaError_t;
+    pub fn blz_mxfp8_gemv_mma(x: *const bf16, ldx: i64, w: *const u8, scale: *const u8, y: *mut bf16, ldy: i64, rows: c_int,
+                              n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_mxfp8_weight_dequant(w: *const u8, scale: *const u8, n: c_int, k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_fp8_weight_dequant(w: *const u8, block_scale: *const f32, block_n: c_int, alpha: *const f32, n: c_int,
                                   k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_weight_dequant(w: *const u8, scale: *const u8, alpha: *const f32, n: c_int, k: c_int,

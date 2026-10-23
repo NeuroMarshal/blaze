@@ -28,6 +28,19 @@ cudaError_t blz_fp8_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, c
 cudaError_t blz_fp8_weight_dequant(const uint8_t* w, const float* block_scale, int block_n, const float* alpha, int n,
                                    int k, uint16_t* out, cudaStream_t stream);
 
+#define BLZ_MXFP8_MMA_MAX_ROWS 64
+
+/// \brief MXFP8 (OCP microscaling, ModelOpt quant_algo MXFP8) W8A16: y = x . W^T with W[j, i] = e4m3(w[j, i]) *
+/// 2^(scale[j, i / 32] - 127), for 1..64 rows on tensor cores (BF16 MMAs over the codes widened and scaled exactly in
+/// registers, FP32 accumulation). x [rows, k] BF16 (16-byte aligned rows, k a multiple of 128), w [n, k] E4M3,
+/// scale [n, k / 32] E8M0, y [rows, n] BF16.
+cudaError_t blz_mxfp8_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale, uint16_t* y,
+                               int64_t ldy, int rows, int n, int k, cudaStream_t stream);
+
+/// \brief The MXFP8 weight as a BF16 matrix [n, k] (k a multiple of 32).
+cudaError_t blz_mxfp8_weight_dequant(const uint8_t* w, const uint8_t* scale, int n, int k, uint16_t* out,
+                                     cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

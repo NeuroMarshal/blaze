@@ -202,7 +202,8 @@ pub struct Draft {
     /// draft trees: (K, D) of the buffers, the device tree, the frontier's hidden inputs, every row's top-K
     tree_shape: (usize, usize),
     tree: Option<TreeBufs>,
-    dumped: bool,
+    /// drafting calls dumped so far (BLAZE_DRAFT_DUMP)
+    dumped: usize,
     warmed: std::collections::HashSet<DraftKey>,
 }
 
@@ -265,7 +266,12 @@ impl Draft {
         let cfg = DraftConfig::load(dir)?;
         let s = &model.stream;
         let ckpt = Checkpoint::open(dir)?;
-        let quant = QuantConfig::from_model_config(&serde_json::json!({}), None)?;
+        // an offline-quantized drafter (scripts/quantize_eagle4.py: ModelOpt MXFP8) carries hf_quant_config.json
+        let hf_quant: Option<Value> = match std::fs::read_to_string(dir.join("hf_quant_config.json")) {
+            Ok(t) => Some(serde_json::from_str(&t)?),
+            Err(_) => None,
+        };
+        let quant = QuantConfig::from_model_config(&serde_json::json!({}), hf_quant.as_ref())?;
         let (h, hd) = (cfg.hidden, cfg.head_dim);
         if hd != 128 || cfg.window == 0 {
             bail!("draft: head dim {hd}, window {} (128 and a sliding window supported)", cfg.window);
@@ -409,7 +415,7 @@ impl Draft {
             graphs: Default::default(),
             tree_shape: (tk, td),
             tree,
-            dumped: false,
+            dumped: 0,
             warmed: Default::default(),
             cfg,
         })
@@ -575,12 +581,7 @@ impl Draft {
         s.sync()?;
         let rec: Vec<i64> = self.record.download(plan.k * n_items)?;
         let drafts: Vec<Vec<i64>> = (0..n_items).map(|i| (0..plan.k).map(|j| rec[j * n_items + i]).collect()).collect();
-        if model.tp.rank == 0 && !self.dumped {
-            if let Some(dir) = std::env::var_os("BLAZE_DRAFT_DUMP") {
-                self.dumped = true;
-                self.dump(model, &plan.items[0], &drafts[0], Path::new(&dir))?;
-            }
-        }
+        self.maybe_dump(model, plan, &drafts)?;
         Ok(drafts)
     }
 
@@ -733,7 +734,21 @@ impl Draft {
     }
 
     /// BLAZE_DRAFT_DUMP=dir: the first drafting call's first item (its captured target features, tokens, positions)
-    /// and drafts, and the head input of the last chain step, for a reference implementation (scripts/ref_eagle4.py).
+    /// and drafts, and the head input of the last chain step, for a reference implementation (scripts/ref_eagle4.py);
+    /// with BLAZE_DRAFT_DUMP_CALLS=n the first n calls in dir/00000, dir/00001, ... (calibration data of the offline
+    /// quantization, scripts/quantize_eagle4.py).
+    fn maybe_dump(&mut self, model: &Model, plan: &DraftPlan, drafts: &[Vec<i64>]) -> Result<()> {
+        let Some(dir) = std::env::var_os("BLAZE_DRAFT_DUMP") else { return Ok(()) };
+        let calls: usize = std::env::var("BLAZE_DRAFT_DUMP_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        if model.tp.rank != 0 || self.dumped >= calls || plan.items.is_empty() {
+            return Ok(());
+        }
+        let dir = if calls == 1 { Path::new(&dir).to_path_buf() } else { Path::new(&dir).join(format!("{:05}", self.dumped)) };
+        self.dumped += 1;
+        let none = Vec::new();
+        self.dump(model, &plan.items[0], drafts.first().unwrap_or(&none), &dir)
+    }
+
     fn dump(&self, model: &Model, it: &DraftItem, drafts: &[i64], dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let h = self.cfg.hidden;
@@ -747,7 +762,9 @@ impl Draft {
         std::fs::write(dir.join("first_normed.bin"), last.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         let meta = serde_json::json!({"tokens": it.tokens, "pos0": it.pos0, "drafts": drafts, "hidden": h});
         std::fs::write(dir.join("meta.json"), meta.to_string())?;
-        eprintln!("blaze: draft dump of {rows} rows and {} drafts in {}", drafts.len(), dir.display());
+        if std::env::var("BLAZE_DRAFT_DUMP_CALLS").is_err() {
+            eprintln!("blaze: draft dump of {rows} rows and {} drafts in {}", drafts.len(), dir.display());
+        }
         Ok(())
     }
 

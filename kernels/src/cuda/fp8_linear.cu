@@ -142,7 +142,176 @@ __global__ void fp8_dequant_kernel(const uint8_t* __restrict__ w, const float* _
   }
 }
 
+// MXFP8 (OCP microscaling): E4M3 codes with an E8M0 scale per 32 values of a row. Over a 128-wide chunk thread (g, t)
+// holds exactly one scale block of row g, so its widened BF16 codes take the block's power of two (exact); kMT 16-row
+// tiles of tokens share the widened fragments, as in nvfp4_linear.cu.
+__device__ __forceinline__ uint32_t e8m0_bf16x2(uint32_t e) {
+  const uint32_t h = e == 0 ? 0x0040u : (e << 7);  // 2^(e - 127); e = 0: the BF16 subnormal 2^-127
+  return h | (h << 16);
+}
+
+__device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a, uint32_t b) {
+  __nv_bfloat162 r = __hmul2(*reinterpret_cast<__nv_bfloat162*>(&a), *reinterpret_cast<__nv_bfloat162*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+
+template <int kSplit, bool kHi, int kMT>
+__global__ void __launch_bounds__(kSplit * 32) mxfp8_mma_kernel(const uint16_t* __restrict__ x, int64_t ldx,
+                                                               const uint8_t* __restrict__ w,
+                                                               const uint8_t* __restrict__ scale,
+                                                               uint16_t* __restrict__ y, int64_t ldy, int m, int n,
+                                                               int k) {
+  constexpr int kTok = 16 * kMT;
+  __shared__ uint16_t lut[256];
+  __shared__ float red[kSplit][8][kTok + 1];
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) lut[i] = e4m3_bf16(i);
+  __syncthreads();
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int f0 = blockIdx.x * 8;
+  const int f = min(f0 + g, n - 1);
+  const uint8_t* wp = w + int64_t(f) * k + 32 * t;
+  const uint8_t* sp = scale + int64_t(f) * (k >> 5) + t;
+  const int chunks = k >> 7;
+  float acc[kMT][4];
+#pragma unroll
+  for (int mt = 0; mt < kMT; ++mt) acc[mt][0] = acc[mt][1] = acc[mt][2] = acc[mt][3] = 0.0f;
+
+  uint4 wq[2];
+  uint32_t sq = 0;
+  if (warp < chunks) {
+    wq[0] = ldg_stream(wp + warp * 128);
+    wq[1] = ldg_stream(wp + warp * 128 + 16);
+    sq = __ldg(sp + warp * 4);
+  }
+  for (int c = warp; c < chunks; c += kSplit) {
+    uint4 nw[2];
+    uint32_t ns = 0;
+    if (c + kSplit < chunks) {
+      nw[0] = ldg_stream(wp + (c + kSplit) * 128);
+      nw[1] = ldg_stream(wp + (c + kSplit) * 128 + 16);
+      ns = __ldg(sp + (c + kSplit) * 4);
+    }
+    const uint32_t codes[8] = {wq[0].x, wq[0].y, wq[0].z, wq[0].w, wq[1].x, wq[1].y, wq[1].z, wq[1].w};
+    const uint32_t sc = e8m0_bf16x2(sq);
+    uint32_t bq[8][2];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const uint32_t q = codes[s];
+      bq[s][0] = bf16x2_mul(uint32_t(lut[q & 0xff]) | (uint32_t(lut[(q >> 8) & 0xff]) << 16), sc);
+      bq[s][1] = bf16x2_mul(uint32_t(lut[(q >> 16) & 0xff]) | (uint32_t(lut[q >> 24]) << 16), sc);
+    }
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+      const int rlo = 16 * mt + g, rhi = rlo + 8;
+      const bool lo_ok = rlo < m, hi_ok = kHi && rhi < m;
+      const uint16_t* xlo = x + int64_t(lo_ok ? rlo : 0) * ldx + 32 * t;
+      const uint16_t* xhi = x + int64_t(hi_ok ? rhi : 0) * ldx + 32 * t;
+      uint32_t xa[16], xb[16];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const uint4 v = lo_ok ? __ldg(reinterpret_cast<const uint4*>(xlo + c * 128) + q) : make_uint4(0, 0, 0, 0);
+        xa[4 * q] = v.x, xa[4 * q + 1] = v.y, xa[4 * q + 2] = v.z, xa[4 * q + 3] = v.w;
+        if (kHi) {
+          const uint4 u = hi_ok ? __ldg(reinterpret_cast<const uint4*>(xhi + c * 128) + q) : make_uint4(0, 0, 0, 0);
+          xb[4 * q] = u.x, xb[4 * q + 1] = u.y, xb[4 * q + 2] = u.z, xb[4 * q + 3] = u.w;
+        } else {
+          xb[4 * q] = xb[4 * q + 1] = xb[4 * q + 2] = xb[4 * q + 3] = 0;
+        }
+      }
+#pragma unroll
+      for (int s = 0; s < 8; ++s) mma_bf16(acc[mt], xa[2 * s], xb[2 * s], xa[2 * s + 1], xb[2 * s + 1], bq[s][0], bq[s][1]);
+    }
+    wq[0] = nw[0];
+    wq[1] = nw[1];
+    sq = ns;
+  }
+#pragma unroll
+  for (int mt = 0; mt < kMT; ++mt) {
+    red[warp][2 * t][16 * mt + g] = acc[mt][0];
+    red[warp][2 * t + 1][16 * mt + g] = acc[mt][1];
+    red[warp][2 * t][16 * mt + g + 8] = acc[mt][2];
+    red[warp][2 * t + 1][16 * mt + g + 8] = acc[mt][3];
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < 8 * kTok; i += blockDim.x) {
+    const int r = i / kTok, tok = i % kTok, row = f0 + r;
+    if (tok >= m || row >= n) continue;
+    float v = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kSplit; ++q) v += red[q][r][tok];
+    y[tok * ldy + row] = __bfloat16_as_ushort(__float2bfloat16(v));
+  }
+}
+
+__global__ void mxfp8_dequant_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ scale, int n, int k,
+                                     uint16_t* __restrict__ out) {
+  const int64_t vecs = int64_t(n) * (k >> 4);
+  for (int64_t v = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; v < vecs; v += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t row = v / (k >> 4), col = (v % (k >> 4)) * 16;
+    const uint4 q = *reinterpret_cast<const uint4*>(w + row * k + col);
+    const uint32_t e = scale[row * (k >> 5) + col / 32];
+    const float s = e == 0 ? exp2f(-127.0f) : __uint_as_float(e << 23);
+    const uint32_t words[4] = {q.x, q.y, q.z, q.w};
+    uint32_t o[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t wd = words[i >> 1] >> (16 * (i & 1));
+      __nv_fp8_e4m3 a, b;
+      a.__x = uint8_t(wd & 0xff);
+      b.__x = uint8_t((wd >> 8) & 0xff);
+      o[i] = uint32_t(__bfloat16_as_ushort(__float2bfloat16(float(a) * s))) |
+             (uint32_t(__bfloat16_as_ushort(__float2bfloat16(float(b) * s))) << 16);
+    }
+    uint4* dst = reinterpret_cast<uint4*>(out + row * k + col);
+    dst[0] = make_uint4(o[0], o[1], o[2], o[3]);
+    dst[1] = make_uint4(o[4], o[5], o[6], o[7]);
+  }
+}
+
 }  // namespace
+
+extern "C" cudaError_t blz_mxfp8_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
+                                          uint16_t* y, int64_t ldy, int rows, int n, int k, cudaStream_t stream) {
+  if (rows <= 0 || n <= 0) return cudaSuccess;
+  if (k % 128 != 0 || rows > BLZ_MXFP8_MMA_MAX_ROWS) return cudaErrorInvalidValue;
+  static const int forced = [] {
+    const char* e = getenv("BLZ_MMA_SPLIT");
+    return e ? atoi(e) : 0;
+  }();
+  const int split = forced ? forced : (rows <= 8 && k >= 5120 ? 8 : (k >= 2048 ? 4 : 2));
+  const int blocks = (n + 7) / 8, mt = (rows + 15) / 16;
+#define BLZ_MX_LAUNCH(S)                                                                                         \
+  {                                                                                                              \
+    if (mt == 4)                                                                                                 \
+      mxfp8_mma_kernel<S, true, 4><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, y, ldy, rows, n, k);         \
+    else if (mt == 3)                                                                                            \
+      mxfp8_mma_kernel<S, true, 3><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, y, ldy, rows, n, k);         \
+    else if (mt == 2)                                                                                            \
+      mxfp8_mma_kernel<S, true, 2><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, y, ldy, rows, n, k);         \
+    else if (rows > 8)                                                                                           \
+      mxfp8_mma_kernel<S, true, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, y, ldy, rows, n, k);         \
+    else                                                                                                         \
+      mxfp8_mma_kernel<S, false, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, y, ldy, rows, n, k);        \
+  }
+  switch (split) {
+    case 2: BLZ_MX_LAUNCH(2) break;
+    case 8: BLZ_MX_LAUNCH(8) break;
+    default: BLZ_MX_LAUNCH(4) break;
+  }
+#undef BLZ_MX_LAUNCH
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_mxfp8_weight_dequant(const uint8_t* w, const uint8_t* scale, int n, int k, uint16_t* out,
+                                                cudaStream_t stream) {
+  if (n <= 0) return cudaSuccess;
+  if (k % 32 != 0) return cudaErrorInvalidValue;
+  const int64_t vecs = int64_t(n) * (k >> 4);
+  const int blocks = int((vecs + 255) / 256 < 65535 * 8 ? (vecs + 255) / 256 : 65535 * 8);
+  mxfp8_dequant_kernel<<<blocks, 256, 0, stream>>>(w, scale, n, k, out);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_fp8_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const float* block_scale,
                                         int block_n, const float* alpha, uint16_t* y, int64_t ldy, int rows, int n,

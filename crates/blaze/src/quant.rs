@@ -26,6 +26,8 @@ pub enum Format {
     Fp8Block { block_n: usize, block_k: usize, scale_dtype: Dtype, inverse: bool },
     /// FP8 E4M3 weight with one scale per output channel or per tensor.
     Fp8Channel { per_tensor: bool },
+    /// MXFP8 (OCP microscaling, ModelOpt MXFP8): E4M3 codes with an E8M0 scale (uint8) per 32 values of a row.
+    Mxfp8,
     /// NVFP4: E2M1 codes two per byte, an E4M3 scale per `group` values, an FP32 global scale.
     /// `global_inverse`: compressed-tensors stores the reciprocal (`weight_global_scale`), ModelOpt the factor
     /// itself (`weight_scale_2`).
@@ -129,7 +131,7 @@ impl QuantConfig {
             default_act = match algo {
                 "NVFP4" | "NVFP4_AWQ" => ActQuant::Nvfp4,
                 "FP8" => ActQuant::Fp8Static,
-                "FP8_PB_WO" | "W4A16_NVFP4" | "W4A16_AWQ" | "" => ActQuant::None,
+                "FP8_PB_WO" | "W4A16_NVFP4" | "W4A16_AWQ" | "MXFP8" | "" => ActQuant::None,
                 other => bail!("ModelOpt quant_algo {other} is not supported yet"),
             };
         }
@@ -182,6 +184,14 @@ impl QuantConfig {
                 Format::Nvfp4 { group, global_inverse: false },
                 WeightNames { weight: name("weight"), scale: Some(name("weight_scale")), global: Some(name("weight_scale_2")), input_scale },
             )
+        } else if has("weight") == Some(Dtype::F8E4m3) && has("weight_scale") == Some(Dtype::U8) {
+            // ModelOpt MXFP8: E8M0 scales [n, k / 32]
+            let w = ckpt.info(&name("weight"))?;
+            let s = ckpt.info(&name("weight_scale"))?;
+            if s.shape.len() != 2 || s.shape[0] != w.shape[0] || s.shape[1] * 32 != w.shape[1] {
+                bail!("{module}: MXFP8 scales {:?} for a {:?} weight", s.shape, w.shape);
+            }
+            (Format::Mxfp8, WeightNames { weight: name("weight"), scale: Some(name("weight_scale")), global: None, input_scale })
         } else if has("weight") == Some(Dtype::F8E4m3) {
             let w = ckpt.info(&name("weight"))?;
             let (scale_name, inverse) = if has("weight_scale_inv").is_some() { (name("weight_scale_inv"), true) } else { (name("weight_scale"), false) };
@@ -214,6 +224,7 @@ impl Format {
             Format::Fp8Block { block_n, block_k, .. } => format!("fp8 block {block_n}x{block_k}"),
             Format::Fp8Channel { per_tensor: true } => "fp8 per-tensor".into(),
             Format::Fp8Channel { per_tensor: false } => "fp8 per-channel".into(),
+            Format::Mxfp8 => "mxfp8".into(),
             Format::Nvfp4 { group, .. } => format!("nvfp4 g{group}"),
         }
     }
