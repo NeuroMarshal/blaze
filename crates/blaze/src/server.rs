@@ -532,6 +532,9 @@ struct Gen {
     prompt_tokens: usize,
     cached_tokens: usize,
     completion_tokens: usize,
+    /// tokens that end the generation: their text is not part of the output unless the stop string is asked for (vLLM)
+    stop_ids: Vec<i32>,
+    keep_stop: bool,
     /// the end, after the held-back text
     queued: Option<Piece>,
     done: bool,
@@ -560,6 +563,9 @@ impl Gen {
                     self.completion_tokens += 1;
                     if let Some(lp) = lp {
                         self.logprobs.push((t as u32, lp));
+                    }
+                    if !self.keep_stop && self.stop_ids.contains(&t) {
+                        continue;
                     }
                     let d = self.detok.push(t as u32);
                     if self.detok.stopped() {
@@ -664,6 +670,8 @@ fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constr
         prompt_tokens: 0,
         cached_tokens: 0,
         completion_tokens: 0,
+        stop_ids: spec.stop_ids.clone(),
+        keep_stop: spec.include_stop,
         queued: None,
         done: false,
         st: st.clone(),

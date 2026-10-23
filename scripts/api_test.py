@@ -265,6 +265,37 @@ def chat_reasoning_is_split_out():
 
 
 @test
+def chat_separate_reasoning_false_keeps_it_in_the_content():
+    msgs = [{"role": "user", "content": "What is 17 * 3? Answer briefly."}]
+    split = chat(msgs, max_tokens=700, extra_body={}).choices[0].message
+    s, _, b = raw_chat({"messages": msgs, "max_tokens": 700, "separate_reasoning": False, "chat_template_kwargs": {}})
+    check(s == 200, b)
+    m = b["choices"][0]["message"]
+    check("reasoning_content" not in m and "reasoning" not in m, f"reasoning split out although separate_reasoning=false: {list(m)}")
+    check("51" in m["content"] and len(m["content"]) > len(split.content or "") + 50, (len(m["content"]), len(split.content or "")))
+
+
+@test
+def chat_stop_token_ids_and_skip_special_tokens():
+    msgs = [{"role": "user", "content": "Write the numbers from 1 to 12 separated by commas and spaces, nothing else."}]
+    seven = http("POST", "/tokenize", {"prompt": "7"})[2]["tokens"]
+    check(len(seven) == 1, seven)
+    # the token that ends the generation is not part of the text, as in vLLM, unless the stop string is asked for
+    r = chat(msgs, max_tokens=80, extra_body={**NOTHINK, "stop_token_ids": seven})
+    c = r.choices[0]
+    check(c.finish_reason == "stop" and c.message.content.rstrip().endswith("6,") and "7" not in c.message.content, c.message.content)
+    r = chat(msgs, max_tokens=80, extra_body={**NOTHINK, "stop_token_ids": seven, "include_stop_str_in_output": True})
+    check(r.choices[0].message.content.endswith("7"), r.choices[0].message.content)
+    # special tokens: left out by default; written with skip_special_tokens=false (blaze: the end-of-turn token shows
+    # when the stop token is asked for, too)
+    ask = [{"role": "user", "content": "Reply with exactly the word: pong"}]
+    plain = chat(ask, max_tokens=20).choices[0].message.content
+    check("<|im_end|>" not in plain and "<|endoftext|>" not in plain, plain)
+    raw = chat(ask, max_tokens=20, extra_body={**NOTHINK, "skip_special_tokens": False, "include_stop_str_in_output": True}).choices[0].message.content
+    check("<|im_end|>" in raw or "<|endoftext|>" in raw, raw)
+
+
+@test
 def chat_stop_strings():
     msgs = [{"role": "user", "content": "Write the numbers from 1 to 12 separated by commas and spaces, nothing else."}]
     full = chat(msgs, max_tokens=80).choices[0].message.content
