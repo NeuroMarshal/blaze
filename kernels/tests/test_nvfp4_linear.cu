@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
   std::mt19937 rng(7);
   if (argc > 1 && std::string(argv[1]) == "bench") {
     // quick: the tensor-core route over 8..64 rows on the 27B shapes
-    for (int rows : {8, 16, 24, 32, 48, 64}) {
+    for (int rows : {8, 10, 12, 16, 24, 32, 48, 64}) {
       bench(rows, 17408, 5120, rng, true);
       bench(rows, 5120, 8704, rng, true);
     }
