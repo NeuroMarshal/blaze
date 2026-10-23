@@ -245,7 +245,8 @@ impl SpecCost {
     /// with the most tokens per second wins (all zero: a plain step).
     fn choose_gains(&self, gains: &[Vec<f64>]) -> Vec<usize> {
         let n = gains.len();
-        let Some(decode) = Self::lookup(&self.decode, n) else { return gains.iter().map(Vec::len).collect() };
+        // no plain step timed yet (tree rounds never run one): a plain step now, so that the model has its base
+        let Some(decode) = Self::lookup(&self.decode, n) else { return vec![0; n] };
         let mut d = vec![0usize; n];
         let mut tokens = n as f64;
         let (mut best, mut rate) = (d.clone(), n as f64 / decode);

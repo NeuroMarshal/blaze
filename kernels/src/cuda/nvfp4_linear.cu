@@ -356,7 +356,8 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
     const char* e = getenv("BLZ_MMA_TILES");
     return e ? atoi(e) : 0;
   }();
-  const int tiles = mt == 1 ? 1 : (forced_tiles ? forced_tiles : 2);
+  // RTX 5070 Ti, 17408 x 5120: 32 rows 110 us with 2 tiles (401 with 1), 64 rows 202 us with 4 (835 with 1)
+  const int tiles = mt == 1 ? 1 : (forced_tiles ? forced_tiles : (mt == 2 ? 2 : 4));
 #define BLZ_MMA_MT(T, S)                                                                                              \
   {                                                                                                                   \
     const int blocks = (n + 8 * T - 1) / (8 * T);                                                                     \
@@ -382,8 +383,8 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
       nvfp4_mma_kernel<1, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, ldx, w, scale, alpha, y, ldy, rows, n, k);  \
   }
   if (mt >= 2) {
-    // 2 or 4 warps along K (the partial sums of 4 tiles x 64 rows x 8 warps would not fit in shared memory)
-    if (split >= 4) BLZ_MMA_TILED(4) else BLZ_MMA_TILED(2)
+    // 2 warps along K (4 measured no faster; 8 would not fit the partial sums of 4 tiles x 64 rows in shared memory)
+    if (forced >= 4) BLZ_MMA_TILED(4) else BLZ_MMA_TILED(2)
   } else {
     switch (split) {
       case 2: BLZ_MMA_LAUNCH(2) break;
