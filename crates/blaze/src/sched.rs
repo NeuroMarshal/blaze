@@ -7,7 +7,7 @@ use crate::suffix::{SuffixConfig, SuffixIndex};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
@@ -301,15 +301,29 @@ const TREE_NODES: [usize; 12] = [0, 1, 3, 5, 7, 11, 15, 23, 31, 39, 47, 63];
 /// Tokens of earlier outputs kept for suffix decoding.
 const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
 
+/// Counters the scheduler thread publishes for the server's metrics.
+#[derive(Default)]
+pub struct SchedStats {
+    /// requests prefilling or decoding
+    pub running: AtomicUsize,
+    /// requests admitted by nobody yet
+    pub waiting: AtomicUsize,
+    /// requests dropped because their client was gone
+    pub cancelled: AtomicU64,
+}
+
 /// Handle of the scheduler thread.
 #[derive(Clone)]
 pub struct Scheduler {
     tx: Sender<GenRequest>,
+    pub stats: Arc<SchedStats>,
 }
 
 impl Scheduler {
     pub fn start(engine: Engine, cfg: SchedConfig) -> Self {
         let (tx, rx) = channel();
+        let stats = Arc::new(SchedStats::default());
+        let loop_stats = stats.clone();
         std::thread::Builder::new()
             .name("blaze-sched".into())
             .spawn(move || {
@@ -330,11 +344,12 @@ impl Scheduler {
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
+                    stats: loop_stats,
                 };
                 s.run();
             })
             .expect("scheduler thread");
-        Self { tx }
+        Self { tx, stats }
     }
 
     pub fn submit(&self, req: GenRequest) -> Result<(), GenRequest> {
@@ -364,6 +379,7 @@ struct Loop {
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
     suffix_cfg: SuffixConfig,
+    stats: Arc<SchedStats>,
 }
 
 impl Loop {
@@ -371,6 +387,7 @@ impl Loop {
         loop {
             // intake: block while idle, poll while busy
             if self.active.is_empty() && self.waiting.is_empty() {
+                self.publish_stats();
                 match self.rx.recv() {
                     Ok(r) => self.waiting.push_back(r),
                     Err(_) => return,
@@ -388,7 +405,9 @@ impl Loop {
                     }
                 }
             }
+            self.reap_cancelled();
             self.admit();
+            self.publish_stats();
             if self.active.is_empty() {
                 // nothing admissible yet (KV full): wait for a finish or a new request
                 std::thread::sleep(Duration::from_millis(2));
@@ -401,6 +420,40 @@ impl Loop {
                     self.engine.close(a.seq);
                 }
             }
+        }
+    }
+
+    fn publish_stats(&self) {
+        self.stats.running.store(self.active.len(), Ordering::Relaxed);
+        self.stats.waiting.store(self.waiting.len(), Ordering::Relaxed);
+    }
+
+    /// Requests whose client is gone (cancel flag set, event channel closed) leave at once, also while they wait or
+    /// read a long prompt; decoding requests are checked after every token in `emit`.
+    fn reap_cancelled(&mut self) {
+        let gone = |r: &GenRequest| r.cancel.load(Ordering::Relaxed) || r.events.is_closed();
+        let mut n = 0;
+        self.waiting.retain(|r| {
+            if !gone(r) {
+                return true;
+            }
+            let _ = r.events.send(GenEvent::Done(Finish::Cancelled));
+            n += 1;
+            false
+        });
+        let mut i = 0;
+        while i < self.active.len() {
+            if self.active[i].pending.is_none() && gone(&self.active[i].req) {
+                let a = self.active.swap_remove(i);
+                let _ = a.req.events.send(GenEvent::Done(Finish::Cancelled));
+                self.engine.close(a.seq);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if n > 0 {
+            self.stats.cancelled.fetch_add(n, Ordering::Relaxed);
         }
     }
 
@@ -875,6 +928,9 @@ impl Loop {
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
                 self.remember(&a.seq, tokens);
             }
+            if reason == Finish::Cancelled {
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = a.req.events.send(GenEvent::Done(reason));
             self.keep_output(&a);
             self.engine.close(a.seq);
@@ -1077,6 +1133,9 @@ impl Loop {
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
                 self.remember(&a.seq, tokens);
             }
+            if reason == Finish::Cancelled {
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = a.req.events.send(GenEvent::Done(reason));
             self.keep_output(&a);
             self.engine.close(a.seq);
@@ -1278,6 +1337,9 @@ impl Loop {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
                 self.remember(&a.seq, tokens);
+            }
+            if reason == Finish::Cancelled {
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
             }
             let _ = a.req.events.send(GenEvent::Done(reason));
             self.keep_output(&a);
