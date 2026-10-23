@@ -1051,7 +1051,7 @@ impl Loop {
             .map(|&i| {
                 let a = &self.active[i];
                 let cal = (a.tree_hit + 1.0) / (a.tree_pred + 1.0);
-                rows[i].scores.iter().zip(&rows[i].depth).filter(|(_, &d)| d == cur).map(|(&s, _)| s as f64 * cal).sum::<f64>()
+                rows[i].scores.iter().zip(&rows[i].depth).filter(|(_, d)| **d == cur).map(|(s, _)| *s as f64 * cal).sum::<f64>()
             })
             .sum();
         let td = Instant::now();
