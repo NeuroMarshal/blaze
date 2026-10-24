@@ -698,6 +698,7 @@ fn main() -> Result<()> {
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
                     draft_cands: engine.mtp_head_cands > 0 && engine.mtp_window > 0,
+                    frequent: if engine.mtp_head_cands > 0 && engine.mtp_window > 0 { text.frequent_ids(vocab, 12288, 6144, 6144, 3072) } else { Vec::new() },
                     spec_method: match (spec_method.as_str(), drafter) {
                         ("ngram", _) => blaze::sched::SpecMethod::Ngram,
                         ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,

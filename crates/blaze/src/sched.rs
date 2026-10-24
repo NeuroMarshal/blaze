@@ -341,6 +341,8 @@ pub struct SchedConfig {
     pub spec_method: SpecMethod,
     /// MTP candidate head: every request keeps the set of token ids it has seen, handed to the drafter with its items
     pub draft_cands: bool,
+    /// the ids every candidate set starts with (a bit per token id; empty: the lowest FREQUENT_IDS)
+    pub frequent: Vec<u64>,
 }
 
 /// Where drafts come from.
@@ -642,7 +644,7 @@ impl Loop {
             } else {
                 Vec::new()
             };
-            let seen = if self.cfg.draft_cands { seen_set(&req.tokens, self.engine.info.vocab) } else { Vec::new() };
+            let seen = if self.cfg.draft_cands { seen_set(&req.tokens, &self.cfg.frequent, self.engine.info.vocab) } else { Vec::new() };
             self.active.push(Active {
                 seen,
                 prompt_set,
@@ -1450,10 +1452,14 @@ impl Loop {
 const FREQUENT_IDS: usize = 4096;
 
 /// The candidate set of a prompt: the frequent ids and the prompt's own (image rows are not tokens).
-fn seen_set(tokens: &[i64], vocab: usize) -> Vec<u64> {
+fn seen_set(tokens: &[i64], frequent: &[u64], vocab: usize) -> Vec<u64> {
     let mut seen = vec![0u64; vocab.div_ceil(64)];
-    for id in 0..FREQUENT_IDS.min(vocab) {
-        seen[id / 64] |= 1 << (id % 64);
+    if frequent.len() == seen.len() {
+        seen.copy_from_slice(frequent);
+    } else {
+        for id in 0..FREQUENT_IDS.min(vocab) {
+            seen[id / 64] |= 1 << (id % 64);
+        }
     }
     for &t in tokens {
         if (0..vocab as i64).contains(&t) {
@@ -1521,7 +1527,7 @@ mod tests {
     #[test]
     fn candidate_sets() {
         let vocab = 248320;
-        let mut s = seen_set(&[5, 100_000, 248_319, 1 << 62, -3, 300_000], vocab);
+        let mut s = seen_set(&[5, 100_000, 248_319, 1 << 62, -3, 300_000], &[], vocab);
         let ids = seen_ids(&s);
         // the frequent ids, the prompt's own (image keys, negatives and out-of-range ids are not tokens)
         assert_eq!(ids.len(), FREQUENT_IDS + 2);

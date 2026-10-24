@@ -48,6 +48,36 @@ impl Text {
         self.tok.token_to_id(token)
     }
 
+    /// The ids a draft head should always consider, a bit per id: the lowest ids of each script of the vocabulary (the BPE
+    /// merges are ordered by frequency within a script): `latin` ASCII tokens, `cyrillic`, `cjk` and `other` ones.
+    pub fn frequent_ids(&self, vocab: usize, latin: usize, cyrillic: usize, cjk: usize, other: usize) -> Vec<u64> {
+        let mut bits = vec![0u64; vocab.div_ceil(64)];
+        let mut left = [latin, cyrillic, cjk, other];
+        for id in 0..vocab {
+            if left.iter().all(|&l| l == 0) {
+                break;
+            }
+            let Ok(s) = self.tok.decode(&[id as u32], false) else { continue };
+            if s.is_empty() || s.contains('\u{fffd}') {
+                continue;
+            }
+            let class = if s.chars().any(|c| ('\u{400}'..='\u{4ff}').contains(&c)) {
+                1
+            } else if s.chars().any(|c| matches!(c, '\u{4e00}'..='\u{9fff}' | '\u{3040}'..='\u{30ff}' | '\u{ac00}'..='\u{d7af}')) {
+                2
+            } else if s.is_ascii() {
+                0
+            } else {
+                3
+            };
+            if left[class] > 0 {
+                left[class] -= 1;
+                bits[id / 64] |= 1 << (id % 64);
+            }
+        }
+        bits
+    }
+
     /// Decode without the special tokens (chat output: the stop token is not part of the text).
     pub fn decode_skip(&self, ids: &[u32]) -> Result<String> {
         self.tok.decode(ids, true).map_err(|e| anyhow!("decode: {e}"))
