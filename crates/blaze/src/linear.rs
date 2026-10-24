@@ -397,8 +397,8 @@ impl Linear {
             match &p.store {
                 Store::Nvfp4 { codes, scales, alpha, f16 } => {
                     if m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 {
-                        let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, p.n, k, m);
-                        if tiles > 8 && *f16 && m * k + 2 * m + 8 <= ctx.scratch_elems {
+                        let (s16, t16) = if *f16 && crate::tune::f16_enabled() { ctx.tune.get(crate::tune::Kernel::Nvfp4F16, p.n, k, m) } else { (0, 0) };
+                        if s16 > 0 && m * k + 2 * m + 8 <= ctx.scratch_elems {
                             let (xh, sh) = match x16 {
                                 Some(v) => v,
                                 None => {
@@ -411,13 +411,13 @@ impl Linear {
                             check(
                                 unsafe {
                                     sys::blz_nvfp4_gemv_mma_f16_cfg(xh, sh, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
-                                                                    p.n as c_int, k as c_int, split, tiles - 8, s.0)
+                                                                    p.n as c_int, k as c_int, s16, t16, s.0)
                                 },
                                 "blz_nvfp4_gemv_mma_f16",
                             )?;
                             continue;
                         }
-                        let (split, tiles) = (split, if tiles > 8 { tiles - 8 } else { tiles });
+                        let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, p.n, k, m);
                         check(
                             unsafe {
                                 sys::blz_nvfp4_gemv_mma_cfg(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,

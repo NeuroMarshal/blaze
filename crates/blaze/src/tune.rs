@@ -17,6 +17,8 @@ const VERSION: u32 = 2;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kernel {
     Nvfp4,
+    /// the FP16-accumulate NVFP4 GEMV: its best launch where it beats the BF16 kernel's best, else (0, 0)
+    Nvfp4F16,
     Mxfp8,
     Bf16,
 }
@@ -25,6 +27,7 @@ impl Kernel {
     fn name(self) -> &'static str {
         match self {
             Kernel::Nvfp4 => "nvfp4",
+            Kernel::Nvfp4F16 => "nvfp4f16",
             Kernel::Mxfp8 => "mxfp8",
             Kernel::Bf16 => "bf16",
         }
@@ -78,14 +81,11 @@ fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, x16: (*mut u16, *
           s: &Stream) -> c_int {
     let (n, k) = (w.n as c_int, w.k as c_int);
     unsafe {
-        if w.kernel == Kernel::Nvfp4 && b > 8 {
-            let e = sys::blz_nvfp4_f16_rows(x, w.k as i64, rows as c_int, k, x16.0, x16.1, s.0);
-            if e != 0 {
-                return e;
-            }
-            return sys::blz_nvfp4_gemv_mma_f16_cfg(x16.0, x16.1, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k, a, b - 8, s.0);
-        }
         match w.kernel {
+            Kernel::Nvfp4F16 => {
+                let e = sys::blz_nvfp4_f16_rows(x, w.k as i64, rows as c_int, k, x16.0, x16.1, s.0);
+                if e != 0 { e } else { sys::blz_nvfp4_gemv_mma_f16_cfg(x16.0, x16.1, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k, a, b, s.0) }
+            }
             Kernel::Nvfp4 => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k,
                                                         a, b, s.0),
             Kernel::Mxfp8 => sys::blz_mxfp8_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, y, w.n as i64, rows as c_int, n, k, a, b, s.0),
@@ -100,30 +100,27 @@ fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, x16: (*mut u16, *
     }
 }
 
-/// Whether the FP16-accumulate NVFP4 GEMV is among the candidates (BLAZE_NVFP4_F16=0: never).
-fn f16_enabled() -> bool {
-    std::env::var("BLAZE_NVFP4_F16").map(|v| v != "0").unwrap_or(true)
+/// Whether the FP16-accumulate NVFP4 GEMV may run (BLAZE_NVFP4_F16=0: never).
+pub fn f16_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BLAZE_NVFP4_F16").map(|v| v != "0").unwrap_or(true))
 }
 
-/// The configurations to measure for `rows` rows of a weight of `kernel` with `k` columns (`f16`: NVFP4 with block
-/// scales <= 1, whose FP16-accumulate launches count too).
-fn candidates(kernel: Kernel, rows: usize, k: usize, f16: bool) -> Vec<(c_int, c_int)> {
+/// The configurations to measure for `rows` rows of a weight of `kernel` with `k` columns.
+fn candidates(kernel: Kernel, rows: usize, k: usize) -> Vec<(c_int, c_int)> {
     match kernel {
-        Kernel::Nvfp4 | Kernel::Mxfp8 => {
+        Kernel::Nvfp4 | Kernel::Nvfp4F16 | Kernel::Mxfp8 => {
             let mut v = Vec::new();
             for split in [2, 4, 8] {
                 for tiles in [1, 2, 4] {
                     let ok = unsafe {
                         match kernel {
-                            Kernel::Nvfp4 => sys::blz_nvfp4_mma_cfg_valid(rows as c_int, split, tiles) != 0,
+                            Kernel::Nvfp4 | Kernel::Nvfp4F16 => sys::blz_nvfp4_mma_cfg_valid(rows as c_int, split, tiles) != 0,
                             _ => sys::blz_mxfp8_mma_cfg_valid(rows as c_int, split, tiles) != 0,
                         }
                     };
                     if ok {
                         v.push((split, tiles));
-                        if kernel == Kernel::Nvfp4 && f16 && rows > 1 && f16_enabled() {
-                            v.push((split, tiles + 8));
-                        }
                     }
                 }
             }
@@ -187,6 +184,7 @@ impl Tuning {
                 let parts: Vec<&str> = key.split(':').collect();
                 let kernel = match parts.first() {
                     Some(&"nvfp4") => Kernel::Nvfp4,
+                    Some(&"nvfp4f16") => Kernel::Nvfp4F16,
                     Some(&"mxfp8") => Kernel::Mxfp8,
                     Some(&"bf16") => Kernel::Bf16,
                     _ => continue,
@@ -221,11 +219,15 @@ impl Tuning {
         let mut shapes: HashMap<(Kernel, usize, usize), Vec<Weight>> = HashMap::new();
         for w in weights {
             let fits = match w.kernel {
-                Kernel::Nvfp4 | Kernel::Mxfp8 => w.k % 128 == 0,
+                Kernel::Nvfp4 | Kernel::Nvfp4F16 | Kernel::Mxfp8 => w.k % 128 == 0,
                 Kernel::Bf16 => w.k % 8 == 0 && w.codes as usize % 16 == 0,
             };
             if fits {
                 shapes.entry((w.kernel, w.n, w.k)).or_default().push(*w);
+                // the FP16-accumulate route of weights it may take, measured against the BF16 kernel's best
+                if w.kernel == Kernel::Nvfp4 && w.f16 && f16_enabled() {
+                    shapes.entry((Kernel::Nvfp4F16, w.n, w.k)).or_default().push(Weight { kernel: Kernel::Nvfp4F16, ..*w });
+                }
             }
         }
         let missing: Vec<_> = {
@@ -244,14 +246,20 @@ impl Tuning {
         let x16 = (x16.ptr::<u16>(), sh.ptr::<i32>());
         let timer = Timer::new()?;
         let mut found = Vec::new();
+        // BF16-kernel shapes first: the FP16 route of a shape is kept only where it beats their best time
+        let mut missing = missing;
+        missing.sort_by_key(|(key, _)| key.0 == Kernel::Nvfp4F16);
+        let mut best_bf: HashMap<(usize, usize, usize), f32> = HashMap::new();
         for ((kernel, n, k), ws) in &missing {
             // at most 16 weights in turn: enough to keep them out of L2, few enough to be quick
             let ws = &ws[..ws.len().min(16)];
             let rounds = (32 / ws.len()).clamp(2, 8);
             for (b, &rows) in BUCKETS.iter().enumerate() {
                 let mut best = (f32::INFINITY, 0, 0);
-                let f16 = ws.iter().all(|w| w.f16);
-                for (ca, cb) in candidates(*kernel, rows, *k, f16) {
+                for (ca, cb) in candidates(*kernel, rows, *k) {
+                    if *kernel == Kernel::Nvfp4F16 && rows < 2 {
+                        break;
+                    }
                     let mut err = 0;
                     for w in ws {
                         err |= launch(w, gemm, x.ptr(), x16, y.ptr(), rows, ca, cb, s);
@@ -270,8 +278,39 @@ impl Tuning {
                         best = (ms, ca, cb);
                     }
                 }
-                if best.1 > 0 {
-                    found.push(((*kernel, *n, *k, b), (best.1, best.2)));
+                match *kernel {
+                    Kernel::Nvfp4F16 => {
+                        // where the BF16 kernel's best is not known (cached from before), measure it now
+                        let bf = match best_bf.get(&(*n, *k, b)) {
+                            Some(&t) => t,
+                            None => {
+                                let mut t = f32::INFINITY;
+                                let cfg = self.get(Kernel::Nvfp4, *n, *k, rows);
+                                let w0: Vec<Weight> = ws.iter().map(|w| Weight { kernel: Kernel::Nvfp4, ..*w }).collect();
+                                for w in &w0 {
+                                    launch(w, gemm, x.ptr(), x16, y.ptr(), rows, cfg.0, cfg.1, s);
+                                }
+                                timer.start(s)?;
+                                for _ in 0..rounds {
+                                    for w in &w0 {
+                                        launch(w, gemm, x.ptr(), x16, y.ptr(), rows, cfg.0, cfg.1, s);
+                                    }
+                                }
+                                t = t.min(timer.stop(s)?);
+                                t
+                            }
+                        };
+                        let keep = best.1 > 0 && best.0 < bf;
+                        found.push(((*kernel, *n, *k, b), if keep { (best.1, best.2) } else { (0, 0) }));
+                    }
+                    _ => {
+                        if *kernel == Kernel::Nvfp4 {
+                            best_bf.insert((*n, *k, b), best.0);
+                        }
+                        if best.1 > 0 {
+                            found.push(((*kernel, *n, *k, b), (best.1, best.2)));
+                        }
+                    }
                 }
             }
         }
