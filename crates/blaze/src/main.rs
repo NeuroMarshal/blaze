@@ -118,6 +118,8 @@ impl EngineArgs {
                 blaze::drafter::Kind::Eagle => (16, 4, 15),
                 blaze::drafter::Kind::DFlash => (9, 0, 7),
             },
+            // the checkpoint's own MTP head: chains of 3 (each draft step reads the whole LM head: longer chains lose)
+            None if self.mtp_window > 0 => (4, 0, 3),
             None => (9, 0, 8),
         };
         let verify = self.max_verify.unwrap_or(verify);
@@ -139,6 +141,9 @@ impl EngineArgs {
         let mut later_vram = vec![0usize; world];
         if let Some(d) = &self.draft_model {
             let b = blaze::drafter::vram_estimate(d, world, head_vram)?;
+            later_vram.iter_mut().for_each(|x| *x += b);
+        } else if self.mtp_window > 0 {
+            let b = blaze::mtp::vram_estimate(&self.model, world, self.mtp_window, self.max_seqs, self.mtp_head_vocab)?;
             later_vram.iter_mut().for_each(|x| *x += b);
         }
         let (max_tokens, kv_auto) = match self.kv_tokens.as_str() {
@@ -628,18 +633,16 @@ fn main() -> Result<()> {
             allowed_media_domains,
         } => {
             let mut engine = engine;
-            let mut spec_ngram = spec_ngram;
             if spec_method == "mtp" {
-                // the checkpoint's own MTP head: chains of 3 unless asked otherwise, verify rows to match
+                // the checkpoint's own MTP head drafts chains
                 if engine.mtp_window == 0 {
                     engine.mtp_window = 8192;
                 }
-                if spec_ngram == 0 {
-                    spec_ngram = 3;
-                }
-                engine.max_verify = engine.max_verify.max(spec_ngram + 1);
-                if engine.draft_tree_width > 1 {
+                if engine.draft_tree_width.is_some_and(|w| w > 1) {
                     anyhow::bail!("--spec-method mtp drafts chains: no --draft-tree-width");
+                }
+                if engine.draft_model.is_some() {
+                    anyhow::bail!("--spec-method mtp uses the target's own head: no --draft-model");
                 }
             }
             let text = blaze::text::Text::load(&engine.model)?;

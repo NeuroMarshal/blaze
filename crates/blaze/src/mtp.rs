@@ -137,6 +137,30 @@ impl Drop for Graph {
 // The all-reduce handle is used only by the rank's own thread.
 unsafe impl Send for Mtp {}
 
+/// VRAM of the MTP head on each rank beyond the target (weights, KV ring, work buffers), for `--kv-tokens auto`.
+pub fn vram_estimate(dir: &Path, world: usize, window: usize, max_items: usize, head_vocab: usize) -> Result<usize> {
+    let ckpt = Checkpoint::open(dir)?;
+    let world = world.max(1);
+    let mut bytes = 0usize;
+    for (name, t) in &ckpt.tensors {
+        if name.starts_with("mtp.") {
+            // fc and the norms are on every rank, the layer's projections split
+            bytes += if name == "mtp.fc.weight" || name.contains("norm") { t.bytes() } else { t.bytes().div_ceil(world) };
+        }
+    }
+    if head_vocab > 0
+        && let Some(lm) = ckpt.get("lm_head.weight")
+    {
+        bytes += lm.bytes() / lm.shape[0].max(1) * head_vocab.div_ceil(world);
+    }
+    let cfg = crate::config::ModelConfig::load(dir)?;
+    let kv = cfg.attn.kv_heads.div_ceil(world) * cfg.attn.head_dim * 2;
+    let h = cfg.hidden;
+    // two BF16 pools, the metadata and the work buffers of ROWS rows (about 14 hidden-wide buffers, the qkv and MLP ones)
+    let work = ROWS * (14 * h + 3 * cfg.attn.heads * cfg.attn.head_dim + 4 * 17408usize.min(h * 4)) * 2 / world.max(1);
+    Ok(bytes + 2 * max_items * window * kv + work + (96 << 20))
+}
+
 /// Does the checkpoint in `dir` carry an MTP head (`mtp.*` tensors)?
 pub fn has_head(dir: &Path) -> Result<bool> {
     Ok(Checkpoint::open(dir)?.tensors.keys().any(|k| k.starts_with("mtp.")))
