@@ -2336,7 +2336,15 @@ impl Model {
             format: kvd.format(),
         };
         // KV in host memory: every row selects (below the budget the selection is every visible token, as dense)
-        let sparse = (sparse || self.host_kv.is_some() || std::env::var_os("BLAZE_QSA_SPARSE_ALWAYS").is_some()) && self.cfg.qsa.is_some();
+        // BLAZE_QSA_SPARSE_ALWAYS (check): 1 every step, decode / prefill only steps without / with a prefill span
+        let has_prefill = !verify && spans.iter().any(|sp| sp.len > 1);
+        let forced = match std::env::var("BLAZE_QSA_SPARSE_ALWAYS").ok().as_deref() {
+            Some("decode") => !has_prefill,
+            Some("prefill") => has_prefill,
+            Some(_) => true,
+            None => false,
+        };
+        let sparse = (sparse || self.host_kv.is_some() || forced) && self.cfg.qsa.is_some();
         if self.cfg.qsa.is_some() {
             self.qsa_index(layer, t, spans, sparse, verify)?;
         }
