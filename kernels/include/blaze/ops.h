@@ -40,6 +40,14 @@ cudaError_t blz_attn_prep(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_
                           int head_dim, int rotary_dim, const float* inv_freq, float rope_scale, uint16_t* q_out,
                           uint16_t* gate, cudaStream_t stream);
 
+/// \brief blz_attn_prep with multimodal rotary positions (M-RoPE): rotary frequency j takes its angle from the temporal
+/// stream `positions` (freq_comp[j] = 0), `pos_h` (1) or `pos_w` (2), each [tokens] int64; freq_comp [rotary_dim / 2].
+cudaError_t blz_attn_prep_mrope(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_t ld_k, const int64_t* positions,
+                                const int64_t* pos_h, const int64_t* pos_w, const uint8_t* freq_comp,
+                                const uint16_t* q_norm, const uint16_t* k_norm, float eps, int zero_centered, int tokens,
+                                int heads, int kv_heads, int head_dim, int rotary_dim, const float* inv_freq,
+                                float rope_scale, uint16_t* q_out, uint16_t* gate, cudaStream_t stream);
+
 /// \brief x <- x * sigmoid(gate), `n` values.
 cudaError_t blz_mul_sigmoid(uint16_t* x, const uint16_t* gate, int64_t n, cudaStream_t stream);
 

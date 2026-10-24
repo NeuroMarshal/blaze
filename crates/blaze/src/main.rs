@@ -252,6 +252,28 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         grammar_whitespace: usize,
     },
+    /// Vision tower check: the encoder on a reference's pixel values (scripts/vision_ref.py) against the Hugging Face
+    /// embeddings, with timings; `--image` also checks the image processor and the whole path from the file.
+    VisionCheck {
+        /// checkpoint directory (config.json, the vision weights)
+        #[arg(long)]
+        model: PathBuf,
+        /// directory with the reference's ref.safetensors
+        #[arg(long)]
+        reference: PathBuf,
+        /// the tower on the GPU
+        #[arg(long)]
+        gpu: bool,
+        /// the tower on the CPU
+        #[arg(long)]
+        cpu: bool,
+        /// CPU threads of the CPU path
+        #[arg(long, default_value_t = 8)]
+        threads: usize,
+        /// the picture the reference was made from
+        #[arg(long)]
+        image: Option<PathBuf>,
+    },
     /// Greedy generation from a raw text prompt (no chat template), for testing.
     Generate {
         #[command(flatten)]
@@ -272,6 +294,9 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { model } => blaze::inspect::run(&model),
+        Command::VisionCheck { model, reference, gpu, cpu, threads, image } => {
+            blaze::vision::check_reference(&model, &reference, gpu, cpu, threads, image.as_deref())
+        }
         Command::Score { engine, text_file, score_chunk: chunk } => {
             let text = blaze::text::Text::load(&engine.model)?;
             let ids: Vec<i64> = text.encode(&std::fs::read_to_string(&text_file)?)?.into_iter().map(i64::from).collect();
