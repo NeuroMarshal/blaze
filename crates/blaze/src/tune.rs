@@ -12,7 +12,7 @@ use std::sync::RwLock;
 /// Representative rows of the buckets (a call of m rows takes the first bucket >= m).
 pub const BUCKETS: [usize; 10] = [1, 2, 4, 8, 12, 16, 24, 32, 48, 64];
 /// Bump when kernel variants change: older cache files are ignored.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kernel {
@@ -58,6 +58,8 @@ pub fn wide_fits(rows: usize, k: usize, ldx: usize) -> bool {
 #[derive(Clone, Copy)]
 pub struct Weight {
     pub kernel: Kernel,
+    /// NVFP4: the FP16-accumulate GEMV may take it (block scales <= 1)
+    pub f16: bool,
     pub n: usize,
     pub k: usize,
     pub codes: *const u8,
@@ -69,11 +71,20 @@ fn bucket(m: usize) -> usize {
     BUCKETS.iter().position(|&b| b >= m).unwrap_or(BUCKETS.len() - 1)
 }
 
-/// One launch of configuration (a, b): NVFP4 / MXFP8 (split, tiles), BF16 (variant, columns per block).
+/// One launch of configuration (a, b): NVFP4 / MXFP8 (split, tiles; NVFP4 tiles + 8: the FP16-accumulate GEMV, its
+/// input conversion included, into `x16`), BF16 (variant, columns per block).
 #[allow(clippy::too_many_arguments)]
-fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, y: *mut u16, rows: usize, a: c_int, b: c_int, s: &Stream) -> c_int {
+fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, x16: (*mut u16, *mut i32), y: *mut u16, rows: usize, a: c_int, b: c_int,
+          s: &Stream) -> c_int {
     let (n, k) = (w.n as c_int, w.k as c_int);
     unsafe {
+        if w.kernel == Kernel::Nvfp4 && b > 8 {
+            let e = sys::blz_nvfp4_f16_rows(x, w.k as i64, rows as c_int, k, x16.0, x16.1, s.0);
+            if e != 0 {
+                return e;
+            }
+            return sys::blz_nvfp4_gemv_mma_f16_cfg(x16.0, x16.1, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k, a, b - 8, s.0);
+        }
         match w.kernel {
             Kernel::Nvfp4 => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k,
                                                         a, b, s.0),
@@ -89,8 +100,14 @@ fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, y: *mut u16, rows
     }
 }
 
-/// The configurations to measure for `rows` rows of a weight of `kernel` with `k` columns.
-fn candidates(kernel: Kernel, rows: usize, k: usize) -> Vec<(c_int, c_int)> {
+/// Whether the FP16-accumulate NVFP4 GEMV is among the candidates (BLAZE_NVFP4_F16=0: never).
+fn f16_enabled() -> bool {
+    std::env::var("BLAZE_NVFP4_F16").map(|v| v != "0").unwrap_or(true)
+}
+
+/// The configurations to measure for `rows` rows of a weight of `kernel` with `k` columns (`f16`: NVFP4 with block
+/// scales <= 1, whose FP16-accumulate launches count too).
+fn candidates(kernel: Kernel, rows: usize, k: usize, f16: bool) -> Vec<(c_int, c_int)> {
     match kernel {
         Kernel::Nvfp4 | Kernel::Mxfp8 => {
             let mut v = Vec::new();
@@ -104,6 +121,9 @@ fn candidates(kernel: Kernel, rows: usize, k: usize) -> Vec<(c_int, c_int)> {
                     };
                     if ok {
                         v.push((split, tiles));
+                        if kernel == Kernel::Nvfp4 && f16 && rows > 1 && f16_enabled() {
+                            v.push((split, tiles + 8));
+                        }
                     }
                 }
             }
@@ -220,6 +240,8 @@ impl Tuning {
         let rows_max = *BUCKETS.last().unwrap();
         let x = DevBuf::zeroed(rows_max * max_k * 2, s)?;
         let y = DevBuf::zeroed(rows_max * max_n * 2, s)?;
+        let (x16, sh) = (DevBuf::zeroed(rows_max * max_k * 2, s)?, DevBuf::zeroed(rows_max * 4, s)?);
+        let x16 = (x16.ptr::<u16>(), sh.ptr::<i32>());
         let timer = Timer::new()?;
         let mut found = Vec::new();
         for ((kernel, n, k), ws) in &missing {
@@ -228,10 +250,11 @@ impl Tuning {
             let rounds = (32 / ws.len()).clamp(2, 8);
             for (b, &rows) in BUCKETS.iter().enumerate() {
                 let mut best = (f32::INFINITY, 0, 0);
-                for (ca, cb) in candidates(*kernel, rows, *k) {
+                let f16 = ws.iter().all(|w| w.f16);
+                for (ca, cb) in candidates(*kernel, rows, *k, f16) {
                     let mut err = 0;
                     for w in ws {
-                        err |= launch(w, gemm, x.ptr(), y.ptr(), rows, ca, cb, s);
+                        err |= launch(w, gemm, x.ptr(), x16, y.ptr(), rows, ca, cb, s);
                     }
                     if err != 0 {
                         continue;
@@ -239,7 +262,7 @@ impl Tuning {
                     timer.start(s)?;
                     for _ in 0..rounds {
                         for w in ws {
-                            launch(w, gemm, x.ptr(), y.ptr(), rows, ca, cb, s);
+                            launch(w, gemm, x.ptr(), x16, y.ptr(), rows, ca, cb, s);
                         }
                     }
                     let ms = timer.stop(s)?;

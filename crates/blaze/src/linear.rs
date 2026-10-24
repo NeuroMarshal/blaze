@@ -22,7 +22,8 @@ pub enum Cut {
 
 enum Store {
     Bf16(DevBuf),
-    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf },
+    /// `f16`: every block scale <= 1, so the FP16-accumulate GEMV keeps its partial sums finite
+    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf, f16: bool },
     /// E4M3 codes [n, k], optional FP32 scales per [block_n, 128] block, FP32 multiplier per row.
     Fp8 { codes: DevBuf, block_scale: Option<DevBuf>, block_n: usize, alpha: DevBuf },
     /// MXFP8: E4M3 codes [n, k], E8M0 scales [n, k / 32].
@@ -172,6 +173,7 @@ impl Linear {
         let scales = DevBuf::new(n * k / 16)?;
         let mut alpha = Vec::with_capacity(n);
         let mut row = 0;
+        let mut f16 = true;
         for m in group {
             let Format::Nvfp4 { global_inverse, .. } = m.format else { unreachable!() };
             if m.cols.start % 32 != 0 {
@@ -182,13 +184,15 @@ impl Linear {
             let sc = cut_rows(ckpt.bytes(m.names.scale.as_ref().unwrap())?, full_k / 16, &m.rows, m.cols.start / 16..m.cols.end / 16);
             codes.upload_at(row * k / 2, &c)?;
             scales.upload_at(row * k / 16, &sc)?;
+            // positive E4M3 bytes order as their values; 1.0 is 0x38
+            f16 &= sc.iter().all(|&b| b & 0x7f <= 0x38);
             let g_name = m.names.global.as_ref().unwrap();
             let g = f32::from_le_bytes(ckpt.bytes(g_name)?[..4].try_into()?);
             let a = if global_inverse { 1.0 / g } else { g };
             alpha.extend(std::iter::repeat_n(a, m.n));
             row += m.n;
         }
-        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)? })
+        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)?, f16 })
     }
 
     fn load_fp8(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, kind: Kind) -> Result<Store> {
@@ -324,7 +328,8 @@ impl Linear {
         let mut v = Vec::new();
         for p in &self.parts {
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha } => v.push(crate::tune::Weight {
+                Store::Nvfp4 { codes, scales, alpha, f16 } => v.push(crate::tune::Weight {
+                    f16: *f16,
                     kernel: crate::tune::Kernel::Nvfp4,
                     n: p.n,
                     k: self.k,
@@ -333,6 +338,7 @@ impl Linear {
                     alpha: alpha.ptr::<f32>() as *const f32,
                 }),
                 Store::Mxfp8 { codes, scales } => v.push(crate::tune::Weight {
+                    f16: false,
                     kernel: crate::tune::Kernel::Mxfp8,
                     n: p.n,
                     k: self.k,
@@ -341,6 +347,7 @@ impl Linear {
                     alpha: std::ptr::null(),
                 }),
                 Store::Bf16(w) => v.push(crate::tune::Weight {
+                    f16: false,
                     kernel: crate::tune::Kernel::Bf16,
                     n: p.n,
                     k: self.k,
@@ -382,12 +389,35 @@ impl Linear {
     /// out[m, 0..n] (row stride ldo) = x[m, 0..k] (row stride ldx) . W^T.
     pub fn run(&self, ctx: &LinCtx, x: *const u16, ldx: usize, m: usize, out: *mut u16, ldo: usize, s: &Stream) -> Result<()> {
         let k = self.k;
+        // the FP16 inputs of the FP16-accumulate GEMV, made once for every part that takes it (in the scratch the
+        // prefill's widened weights use; these calls have 64 rows or fewer, which never widen)
+        let mut x16: Option<(*mut u16, *mut i32)> = None;
         for p in &self.parts {
             let o = unsafe { out.add(p.col) };
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha } => {
+                Store::Nvfp4 { codes, scales, alpha, f16 } => {
                     if m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 {
                         let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, p.n, k, m);
+                        if tiles > 8 && *f16 && m * k + 2 * m + 8 <= ctx.scratch_elems {
+                            let (xh, sh) = match x16 {
+                                Some(v) => v,
+                                None => {
+                                    let v = (ctx.scratch, unsafe { ctx.scratch.add((m * k).next_multiple_of(8)) }.cast::<i32>());
+                                    check(unsafe { sys::blz_nvfp4_f16_rows(x, ldx as i64, m as c_int, k as c_int, v.0, v.1, s.0) }, "f16 rows")?;
+                                    x16 = Some(v);
+                                    v
+                                }
+                            };
+                            check(
+                                unsafe {
+                                    sys::blz_nvfp4_gemv_mma_f16_cfg(xh, sh, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
+                                                                    p.n as c_int, k as c_int, split, tiles - 8, s.0)
+                                },
+                                "blz_nvfp4_gemv_mma_f16",
+                            )?;
+                            continue;
+                        }
+                        let (split, tiles) = (split, if tiles > 8 { tiles - 8 } else { tiles });
                         check(
                             unsafe {
                                 sys::blz_nvfp4_gemv_mma_cfg(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
