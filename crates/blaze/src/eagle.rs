@@ -416,12 +416,12 @@ impl Draft {
             warmed: Default::default(),
             cfg,
         };
-        // the drafter's tensor-core GEMV launches (an MXFP8 checkpoint) for this device
+        // the drafter's GEMV launches (MXFP8 and BF16 weights) for this device
         let mut weights = Vec::new();
-        for lin in [&d.fc, &d.qkv, &d.o, &d.gu, &d.down, &d.lr_head] {
+        for lin in [&d.fc, &d.qkv, &d.o, &d.gu, &d.down, &d.lr_down, &d.lr_head] {
             weights.extend(lin.tune_weights());
         }
-        model.lin_ctx().tune.tune(&weights, s)?;
+        model.lin_ctx().tune.tune(&weights, model.lin_ctx().gemm, s)?;
         Ok(d)
     }
 

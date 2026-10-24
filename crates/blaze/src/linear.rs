@@ -340,6 +340,14 @@ impl Linear {
                     scales: scales.ptr::<u8>() as *const u8,
                     alpha: std::ptr::null(),
                 }),
+                Store::Bf16(w) => v.push(crate::tune::Weight {
+                    kernel: crate::tune::Kernel::Bf16,
+                    n: p.n,
+                    k: self.k,
+                    codes: w.ptr::<u8>() as *const u8,
+                    scales: std::ptr::null(),
+                    alpha: std::ptr::null(),
+                }),
                 _ => {}
             }
         }
@@ -471,13 +479,20 @@ impl Linear {
                     }
                 }
                 Store::Bf16(w) => {
-                    let wide = m <= sys::BLZ_GEMV_WIDE_MAX_ROWS
-                        && p.n > 4096
-                        && k % 256 == 0
-                        && k <= sys::BLZ_GEMV_WIDE_MAX_K
-                        && m * k * 2 <= sys::BLZ_GEMV_WIDE_MAX_SMEM
-                        && ldx % 8 == 0;
-                    if wide {
+                    use crate::tune::{BF16_CUBLAS, BF16_SKINNY, BF16_WIDE, Kernel, skinny_fits, wide_fits};
+                    let skinny = x as usize % 16 == 0 && skinny_fits(m, k, ldx);
+                    let wide = wide_fits(m, k, ldx);
+                    // the kernel measured fastest on this GPU for the shape and rows (tune.rs); untuned: the wide GEMV for
+                    // an LM head of a few rows, the skinny kernel for a small n up to 64 rows, cuBLAS otherwise
+                    let (variant, cpb) = match ctx.tune.get(Kernel::Bf16, p.n, k, m) {
+                        (BF16_SKINNY, c) if skinny => (BF16_SKINNY, c),
+                        (BF16_WIDE, _) if wide => (BF16_WIDE, 0),
+                        (BF16_CUBLAS, _) => (BF16_CUBLAS, 0),
+                        _ if wide && p.n > 4096 => (BF16_WIDE, 0),
+                        _ if skinny && p.n <= 4096 => (BF16_SKINNY, 0),
+                        _ => (BF16_CUBLAS, 0),
+                    };
+                    if variant == BF16_WIDE {
                         check(
                             unsafe {
                                 sys::blz_gemv_wide(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), ldo as i64, m as c_int,
@@ -485,11 +500,11 @@ impl Linear {
                             },
                             "blz_gemv_wide",
                         )?;
-                    } else if m == 1 && p.n <= 4096 && k % 8 == 0 {
+                    } else if variant == BF16_SKINNY {
                         check(
                             unsafe {
-                                sys::blz_skinny_gemm(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), 1, p.n as c_int, k as c_int,
-                                                     sys::BLZ_BF16, s.0)
+                                sys::blz_skinny_gemm_cfg(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), ldo as i64, m as c_int,
+                                                         p.n as c_int, k as c_int, sys::BLZ_BF16, cpb, s.0)
                             },
                             "blz_skinny_gemm",
                         )?;

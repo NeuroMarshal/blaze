@@ -259,6 +259,7 @@ unsafe extern "C" {
 pub const BLZ_NVFP4_GEMV_MAX_ROWS: usize = 8;
 pub const BLZ_NVFP4_MMA_MAX_ROWS: usize = 64;
 pub const BLZ_SKINNY_MAX_ROWS: usize = 16;
+pub const BLZ_SKINNY_EX_MAX_ROWS: usize = 64;
 pub const BLZ_FP8_MMA_MAX_ROWS: usize = 16;
 pub const BLZ_MXFP8_MMA_MAX_ROWS: usize = 64;
 pub const BLZ_TOPK_MAX: usize = 64;
@@ -304,6 +305,10 @@ unsafe extern "C" {
                                     out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,
                            k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_skinny_gemm_ex(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
+                              n: c_int, k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_skinny_gemm_cfg(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
+                               n: c_int, k: c_int, dtype: c_int, cols_per_block: c_int, s: cudaStream_t) -> cudaError_t;
 }
 
 // host all-reduce

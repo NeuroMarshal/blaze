@@ -1086,7 +1086,7 @@ impl Model {
             }
         }
         let t0 = std::time::Instant::now();
-        let tuned = model.lin.tune.tune(&weights, &model.stream)?;
+        let tuned = model.lin.tune.tune(&weights, model.lin.gemm, &model.stream)?;
         if tuned > 0 && model.tp.rank == 0 {
             eprintln!("blaze: tuned the GEMV launches of {tuned} weight shapes in {:.1} s", t0.elapsed().as_secs_f64());
         }

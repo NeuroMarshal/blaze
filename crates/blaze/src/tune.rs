@@ -1,10 +1,11 @@
-//! Launch configurations of the tensor-core GEMV kernels (NVFP4, MXFP8), measured on this GPU for the model's own
-//! weight shapes and kept per device in ~/.cache/blaze, instead of constants tuned by hand on one GPU.
+//! Launch configurations of the GEMV kernels, measured on this GPU for the model's own weight shapes and kept per
+//! device in ~/.cache/blaze, instead of constants tuned by hand on one GPU.
 //!
-//! An entry is the fastest (warps along K, weight tiles per block) for a weight shape [n, k] and a bucket of input
-//! rows. It is measured over every layer of that shape in turn, so that the weights come from DRAM as in a forward
-//! pass, not from L2. Missing shapes are measured at load (a fraction of a second each); BLAZE_TUNE=0 keeps the
-//! kernels' built-in defaults.
+//! An entry is the fastest configuration for a weight shape [n, k] and a bucket of input rows: for the tensor-core
+//! NVFP4 / MXFP8 GEMVs (warps along K, weight tiles per block); for BF16 weights the kernel itself (the skinny kernel
+//! with 1, 2 or 4 columns per block, the wide GEMV of a few rows, or cuBLAS). It is measured over the layers of that
+//! shape in turn, so that large weights come from DRAM as in a forward pass, not from L2. Missing shapes are measured
+//! at load (a fraction of a second each); BLAZE_TUNE=0 keeps the built-in rules.
 
 use crate::gpu::{DevBuf, Stream, Timer};
 use anyhow::Result;
@@ -23,6 +24,7 @@ const VERSION: u32 = 1;
 pub enum Kernel {
     Nvfp4,
     Mxfp8,
+    Bf16,
 }
 
 impl Kernel {
@@ -30,11 +32,28 @@ impl Kernel {
         match self {
             Kernel::Nvfp4 => "nvfp4",
             Kernel::Mxfp8 => "mxfp8",
+            Kernel::Bf16 => "bf16",
         }
     }
 }
 
-/// A weight of one shape to measure: its device buffers (codes, scales, NVFP4 alpha).
+/// BF16 entries (variant, columns per block): the skinny kernel, the wide GEMV, cuBLAS.
+pub const BF16_SKINNY: c_int = 1;
+pub const BF16_WIDE: c_int = 2;
+pub const BF16_CUBLAS: c_int = 3;
+
+/// Whether blz_skinny_gemm_cfg takes a call (the alignment of x and w is checked by the caller).
+pub fn skinny_fits(rows: usize, k: usize, ldx: usize) -> bool {
+    rows <= sys::BLZ_SKINNY_EX_MAX_ROWS && k % 8 == 0 && ldx % 8 == 0
+}
+
+/// Whether blz_gemv_wide takes a call.
+pub fn wide_fits(rows: usize, k: usize, ldx: usize) -> bool {
+    rows <= sys::BLZ_GEMV_WIDE_MAX_ROWS && k % 256 == 0 && k <= sys::BLZ_GEMV_WIDE_MAX_K && rows * k * 2 <= sys::BLZ_GEMV_WIDE_MAX_SMEM
+        && ldx % 8 == 0
+}
+
+/// A weight of one shape to measure: its device buffers (codes, scales, NVFP4 alpha; BF16: the weight in codes).
 #[derive(Clone, Copy)]
 pub struct Weight {
     pub kernel: Kernel,
@@ -49,22 +68,54 @@ fn bucket(m: usize) -> usize {
     BUCKETS.iter().position(|&b| b >= m).unwrap_or(BUCKETS.len() - 1)
 }
 
-fn launch(w: &Weight, x: *const u16, y: *mut u16, rows: usize, split: c_int, tiles: c_int, s: &Stream) -> c_int {
+/// One launch of configuration (a, b): NVFP4 / MXFP8 (split, tiles), BF16 (variant, columns per block).
+#[allow(clippy::too_many_arguments)]
+fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, y: *mut u16, rows: usize, a: c_int, b: c_int, s: &Stream) -> c_int {
+    let (n, k) = (w.n as c_int, w.k as c_int);
     unsafe {
         match w.kernel {
-            Kernel::Nvfp4 => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int,
-                                                        w.n as c_int, w.k as c_int, split, tiles, s.0),
-            Kernel::Mxfp8 => sys::blz_mxfp8_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, y, w.n as i64, rows as c_int, w.n as c_int,
-                                                        w.k as c_int, split, tiles, s.0),
+            Kernel::Nvfp4 => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k,
+                                                        a, b, s.0),
+            Kernel::Mxfp8 => sys::blz_mxfp8_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, y, w.n as i64, rows as c_int, n, k, a, b, s.0),
+            Kernel::Bf16 => match a {
+                BF16_SKINNY => sys::blz_skinny_gemm_cfg(x.cast(), w.k as i64, w.codes.cast(), y.cast(), w.n as i64, rows as c_int, n, k,
+                                                        sys::BLZ_BF16, b, s.0),
+                BF16_WIDE => sys::blz_gemv_wide(x.cast(), w.k as i64, w.codes.cast(), y.cast(), w.n as i64, rows as c_int, n, k, s.0),
+                _ => sys::blz_gemm_bf16(gemm, x, w.k as i64, w.codes.cast(), y, w.n as i64, rows as c_int, n, k, s.0),
+            },
         }
     }
 }
 
-fn valid(kernel: Kernel, rows: usize, split: c_int, tiles: c_int) -> bool {
-    unsafe {
-        match kernel {
-            Kernel::Nvfp4 => sys::blz_nvfp4_mma_cfg_valid(rows as c_int, split, tiles) != 0,
-            Kernel::Mxfp8 => sys::blz_mxfp8_mma_cfg_valid(rows as c_int, split, tiles) != 0,
+/// The configurations to measure for `rows` rows of a weight of `kernel` with `k` columns.
+fn candidates(kernel: Kernel, rows: usize, k: usize) -> Vec<(c_int, c_int)> {
+    match kernel {
+        Kernel::Nvfp4 | Kernel::Mxfp8 => {
+            let mut v = Vec::new();
+            for split in [2, 4, 8] {
+                for tiles in [1, 2, 4] {
+                    let ok = unsafe {
+                        match kernel {
+                            Kernel::Nvfp4 => sys::blz_nvfp4_mma_cfg_valid(rows as c_int, split, tiles) != 0,
+                            _ => sys::blz_mxfp8_mma_cfg_valid(rows as c_int, split, tiles) != 0,
+                        }
+                    };
+                    if ok {
+                        v.push((split, tiles));
+                    }
+                }
+            }
+            v
+        }
+        Kernel::Bf16 => {
+            let mut v = vec![(BF16_CUBLAS, 0)];
+            if skinny_fits(rows, k, k) {
+                v.extend([(BF16_SKINNY, 1), (BF16_SKINNY, 2), (BF16_SKINNY, 4)]);
+            }
+            if wide_fits(rows, k, k) {
+                v.push((BF16_WIDE, 0));
+            }
+            v
         }
     }
 }
@@ -106,6 +157,7 @@ impl Tuning {
                 let kernel = match parts.first() {
                     Some(&"nvfp4") => Kernel::Nvfp4,
                     Some(&"mxfp8") => Kernel::Mxfp8,
+                    Some(&"bf16") => Kernel::Bf16,
                     _ => continue,
                 };
                 let (Some(n), Some(k), Some(b)) = (parts.get(1).and_then(|x| x.parse().ok()), parts.get(2).and_then(|x| x.parse().ok()),
@@ -129,14 +181,19 @@ impl Tuning {
     }
 
     /// Measure the shapes of `weights` not in the table (every bucket, every valid configuration; each timed over all
-    /// weights of the shape in turn) and save the table. Returns the shapes measured.
-    pub fn tune(&self, weights: &[Weight], s: &Stream) -> Result<usize> {
+    /// weights of the shape in turn) and save the table. `gemm`: the cuBLAS handle BF16 candidates use. Returns the
+    /// shapes measured.
+    pub fn tune(&self, weights: &[Weight], gemm: *mut sys::blz_gemm, s: &Stream) -> Result<usize> {
         if !self.enabled {
             return Ok(0);
         }
         let mut shapes: HashMap<(Kernel, usize, usize), Vec<Weight>> = HashMap::new();
         for w in weights {
-            if w.k % 128 == 0 {
+            let fits = match w.kernel {
+                Kernel::Nvfp4 | Kernel::Mxfp8 => w.k % 128 == 0,
+                Kernel::Bf16 => w.k % 8 == 0 && w.codes as usize % 16 == 0,
+            };
+            if fits {
                 shapes.entry((w.kernel, w.n, w.k)).or_default().push(*w);
             }
         }
@@ -160,24 +217,23 @@ impl Tuning {
             let rounds = (32 / ws.len()).clamp(2, 8);
             for (b, &rows) in BUCKETS.iter().enumerate() {
                 let mut best = (f32::INFINITY, 0, 0);
-                for split in [2, 4, 8] {
-                    for tiles in [1, 2, 4] {
-                        if !valid(*kernel, rows, split, tiles) {
-                            continue;
-                        }
+                for (ca, cb) in candidates(*kernel, rows, *k) {
+                    let mut err = 0;
+                    for w in ws {
+                        err |= launch(w, gemm, x.ptr(), y.ptr(), rows, ca, cb, s);
+                    }
+                    if err != 0 {
+                        continue;
+                    }
+                    timer.start(s)?;
+                    for _ in 0..rounds {
                         for w in ws {
-                            launch(w, x.ptr(), y.ptr(), rows, split, tiles, s);
+                            launch(w, gemm, x.ptr(), y.ptr(), rows, ca, cb, s);
                         }
-                        timer.start(s)?;
-                        for _ in 0..rounds {
-                            for w in ws {
-                                launch(w, x.ptr(), y.ptr(), rows, split, tiles, s);
-                            }
-                        }
-                        let ms = timer.stop(s)?;
-                        if ms < best.0 {
-                            best = (ms, split, tiles);
-                        }
+                    }
+                    let ms = timer.stop(s)?;
+                    if ms < best.0 {
+                        best = (ms, ca, cb);
                     }
                 }
                 if best.1 > 0 {
