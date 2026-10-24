@@ -43,6 +43,12 @@ cudaError_t blz_mxfp8_gemv_mma_cfg(const uint16_t* x, int64_t ldx, const uint8_t
 int blz_mxfp8_mma_default_cfg(int rows, int k, int* split, int* tiles);
 int blz_mxfp8_mma_cfg_valid(int rows, int split, int tiles);
 
+/// \brief BF16 weights [n, k] through the same tensor-core GEMV (no decode): y[rows, n] (row stride ldy) = x . w^T,
+/// FP32 sums; rows <= BLZ_MXFP8_MMA_MAX_ROWS, k % 128 == 0, ldx % 8 == 0, x and w 16-byte aligned. (split, tiles) as
+/// blz_mxfp8_gemv_mma_cfg (valid by blz_mxfp8_mma_cfg_valid; 0, 0: the default).
+cudaError_t blz_bf16_gemv_mma_cfg(const uint16_t* x, int64_t ldx, const uint16_t* w, uint16_t* y, int64_t ldy, int rows,
+                                  int n, int k, int split, int tiles, cudaStream_t stream);
+
 /// \brief The MXFP8 weight as a BF16 matrix [n, k] (k a multiple of 32).
 cudaError_t blz_mxfp8_weight_dequant(const uint8_t* w, const uint8_t* scale, int n, int k, uint16_t* out,
                                      cudaStream_t stream);

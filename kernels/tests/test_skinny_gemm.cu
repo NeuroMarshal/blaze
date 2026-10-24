@@ -1,5 +1,6 @@
-// blz_skinny_gemm: agreement with an FP64 reference (one rounding of the FP32 sum to 16 bits), and timing of the
-// shapes it serves (Qwen3.8-27B GDN in_proj_ba per TP rank: 48 x 5120).
+// blz_skinny_gemm(_ex) and the BF16 tensor-core GEMV (blz_bf16_gemv_mma_cfg): agreement with an FP64 reference (one
+// rounding of the FP32 sum to 16 bits), and timing of the shapes they serve (Qwen3.8-27B GDN in_proj_ba per TP rank:
+// 48 x 5120; the EAGLE-4 low-rank down: 128 x 5120).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -10,6 +11,7 @@
 #include <random>
 #include <vector>
 
+#include "blaze/fp8_linear.h"
 #include "blaze/skinny_gemm.h"
 
 namespace {
@@ -70,6 +72,37 @@ double run(int rows, int n, int k, int64_t x_stride, blz_half_t dt, std::mt19937
   return worst / std::max(peak, 1e-30);
 }
 
+// blz_bf16_gemv_mma_cfg into a wider output; the worst relative error, 1e30 on a write outside the part.
+double run_mma(int rows, int n, int k, int64_t y_stride, int split, int tiles, std::mt19937& rng) {
+  std::normal_distribution<float> d(0.0f, 1.0f);
+  std::vector<__nv_bfloat16> x(size_t(rows) * k), w(size_t(n) * k), y(size_t(rows) * y_stride, from_f<__nv_bfloat16>(7.0f));
+  for (auto& v : x) v = from_f<__nv_bfloat16>(d(rng));
+  for (auto& v : w) v = from_f<__nv_bfloat16>(d(rng) * 0.05f);
+  __nv_bfloat16 *dx, *dw, *dy;
+  check(cudaMalloc(&dx, x.size() * 2), "malloc");
+  check(cudaMalloc(&dw, w.size() * 2), "malloc");
+  check(cudaMalloc(&dy, y.size() * 2), "malloc");
+  check(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "upload");
+  check(cudaMemcpy(dw, w.data(), w.size() * 2, cudaMemcpyHostToDevice), "upload");
+  check(cudaMemcpy(dy, y.data(), y.size() * 2, cudaMemcpyHostToDevice), "upload");
+  check(blz_bf16_gemv_mma_cfg(reinterpret_cast<uint16_t*>(dx), k, reinterpret_cast<uint16_t*>(dw),
+                              reinterpret_cast<uint16_t*>(dy), y_stride, rows, n, k, split, tiles, nullptr), "bf16 mma");
+  check(cudaMemcpy(y.data(), dy, y.size() * 2, cudaMemcpyDeviceToHost), "download");
+  double worst = 0, peak = 0;
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < n; ++c) {
+      double ref = 0;
+      for (int i = 0; i < k; ++i) ref += double(to_f(x[size_t(r) * k + i])) * to_f(w[size_t(c) * k + i]);
+      worst = std::max(worst, std::fabs(double(to_f(y[size_t(r) * y_stride + c])) - ref));
+      peak = std::max(peak, std::fabs(ref));
+    }
+    for (int64_t c = n; c < y_stride; ++c)
+      if (to_f(y[size_t(r) * y_stride + c]) != 7.0f) worst = 1e30;
+  }
+  cudaFree(dx), cudaFree(dw), cudaFree(dy);
+  return worst / std::max(peak, 1e-30);
+}
+
 }  // namespace
 
 int main() {
@@ -97,6 +130,60 @@ int main() {
                 (long long)c.y_stride, eb, eh, ok ? "ok" : "FAIL");
     fails += !ok;
   }
+  // BF16 tensor-core GEMV: every valid configuration on parts of wider outputs
+  {
+    struct CaseM { int rows, n, k; int64_t y_stride; };
+    int checked = 0, bad = 0;
+    for (const CaseM c : {CaseM{1, 48, 5120, 96}, CaseM{8, 48, 5120, 48}, CaseM{16, 48, 5120, 50}, CaseM{33, 128, 5120, 300},
+                          CaseM{64, 48, 5120, 48}, CaseM{12, 1000, 128, 1003}, CaseM{3, 5, 2048, 9}})
+      for (int split : {2, 4, 8})
+        for (int tiles : {1, 2, 4}) {
+          if (!blz_mxfp8_mma_cfg_valid(c.rows, split, tiles)) continue;
+          const double e = run_mma(c.rows, c.n, c.k, c.y_stride, split, tiles, rng);
+          ++checked;
+          if (e >= 8e-3) {
+            ++bad;
+            std::printf("bf16 mma rows %d n %d k %d split %d tiles %d: error %.2e FAIL\n", c.rows, c.n, c.k, split, tiles, e);
+          }
+        }
+    std::printf("bf16 mma: %d configurations checked, %d failed\n", checked, bad);
+    fails += bad;
+  }
+  // Timing: skinny (_ex, its own choice of columns per block) and the best tensor-core configuration, for the GDN
+  // in_proj_ba of a 27B rank (48 x 5120) and the EAGLE-4 low-rank down (128 x 5120)
+  for (int n : {48, 128})
+    for (int rows : {2, 8, 16, 32, 64}) {
+      const int k = 5120, iters = 1000;
+      uint16_t *dx, *dw, *dy;
+      check(cudaMalloc(&dx, size_t(rows) * k * 2), "malloc");
+      check(cudaMalloc(&dw, size_t(n) * k * 2), "malloc");
+      check(cudaMalloc(&dy, size_t(rows) * n * 2), "malloc");
+      cudaMemset(dx, 0, size_t(rows) * k * 2), cudaMemset(dw, 0, size_t(n) * k * 2);
+      cudaEvent_t a, b;
+      cudaEventCreate(&a), cudaEventCreate(&b);
+      auto time = [&](auto&& f) {
+        for (int i = 0; i < 20; ++i) f();
+        cudaEventRecord(a);
+        for (int i = 0; i < iters; ++i) f();
+        cudaEventRecord(b);
+        check(cudaEventSynchronize(b), "time");
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        return 1000.0 * ms / iters;
+      };
+      const double sk = time([&] { blz_skinny_gemm_ex(dx, k, dw, dy, n, rows, n, k, BLZ_BF16, nullptr); });
+      double best = 1e30;
+      int bs = 0, bt = 0;
+      for (int split : {2, 4, 8})
+        for (int tiles : {1, 2, 4}) {
+          if (!blz_mxfp8_mma_cfg_valid(rows, split, tiles)) continue;
+          const double us = time([&] { blz_bf16_gemv_mma_cfg(dx, k, dw, dy, n, rows, n, k, split, tiles, nullptr); });
+          if (us < best) best = us, bs = split, bt = tiles;
+        }
+      std::printf("%3d x 5120 bf16, %2d rows: skinny %.2f us, tensor cores %.2f us (split %d, tiles %d)\n", n, rows, sk, best,
+                  bs, bt);
+      cudaFree(dx), cudaFree(dw), cudaFree(dy);
+    }
   // Timing through _ex: the GDN in_proj_ba of a 27B rank (48 x 5120) and the EAGLE-4 low-rank down (128 x 5120)
   for (int n : {48, 128})
     for (int rows : {2, 8, 16, 32, 64}) {
