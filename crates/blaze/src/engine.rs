@@ -101,7 +101,25 @@ enum Cmd {
     /// time the all-reduce paths at these sizes (collective)
     TimeAllReduce(Arc<Vec<usize>>),
     SetDmaMin(i64),
+    /// commands run in order, the last one's reply (deferred commands ahead of the next one)
+    Batch(Vec<Cmd>),
     Quit,
+}
+
+/// A command the engine holds back and sends ahead of the next one (one wake-up of the ranks instead of two): the
+/// commit of a verify and the saves before the next verify only enqueue GPU work that the next command orders after.
+enum Deferred {
+    Commit(Arc<Vec<CommitItem>>),
+    PreVerify(Arc<Vec<(usize, usize)>>),
+}
+
+impl Deferred {
+    fn cmd(&self) -> Cmd {
+        match self {
+            Deferred::Commit(c) => Cmd::Commit(c.clone()),
+            Deferred::PreVerify(p) => Cmd::PreVerify(p.clone()),
+        }
+    }
 }
 
 enum Reply {
@@ -313,6 +331,13 @@ impl Runner {
                 Reply::Done
             }
             Cmd::AllLogits(t) => Reply::AllLogits(self.model.all_logits(t)?),
+            Cmd::Batch(cmds) => {
+                let mut last = Reply::Done;
+                for c in cmds {
+                    last = self.handle(c)?;
+                }
+                last
+            }
             Cmd::Quit => Reply::Done,
         })
     }
@@ -390,6 +415,8 @@ pub struct Engine {
     page_refs: Vec<u32>,
     free_rows: Vec<usize>,
     free_cache_rows: Vec<usize>,
+    /// commands sent ahead of the next broadcast
+    deferred: std::cell::RefCell<Vec<Deferred>>,
     pub info: Info,
 }
 
@@ -546,6 +573,7 @@ impl Engine {
             page_refs: vec![0; info.max_tokens / info.page],
             free_rows: (0..info.max_seqs).rev().collect(),
             free_cache_rows: (info.max_seqs..info.max_seqs + info.cache_rows).rev().collect(),
+            deferred: Default::default(),
             info,
         };
         if world > 1 {
@@ -576,10 +604,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Send `cmd` to every rank (made by `make`), wait for all, return rank 0's reply.
+    /// Send `cmd` to every rank (made by `make`), after the deferred commands, wait for all, return rank 0's reply.
     fn broadcast(&self, make: impl Fn() -> Cmd) -> Result<Reply> {
+        let ahead = std::mem::take(&mut *self.deferred.borrow_mut());
         for w in &self.workers {
-            w.tx.send(make()).map_err(|_| anyhow!("rank exited"))?;
+            let cmd = if ahead.is_empty() { make() } else { Cmd::Batch(ahead.iter().map(Deferred::cmd).chain(std::iter::once(make())).collect()) };
+            w.tx.send(cmd).map_err(|_| anyhow!("rank exited"))?;
         }
         let mut first = None;
         let mut err = None;
@@ -875,8 +905,7 @@ impl Engine {
             self.last_verify.push((seq.row, seq.len(), Arc::new(t.to_vec()), offset));
             offset += t.len();
         }
-        let items = Arc::new(items);
-        self.broadcast(|| Cmd::PreVerify(items.clone()))?;
+        self.deferred.borrow_mut().push(Deferred::PreVerify(Arc::new(items)));
         Ok(())
     }
 
@@ -952,8 +981,7 @@ impl Engine {
             }
             items.push(CommitItem { row, accepted: acc, start, tokens: toks, k, offset, moves });
         }
-        let items = Arc::new(items);
-        self.broadcast(|| Cmd::Commit(items.clone()))?;
+        self.deferred.borrow_mut().push(Deferred::Commit(Arc::new(items)));
         self.last_verify.clear();
         Ok(())
     }
