@@ -200,6 +200,55 @@ impl SpecCost {
 }
 
 /// Sums of the tree rounds since the last log line (BLAZE_SPEC_LOG).
+/// EAGLE-4 trees: how often a verified node of a given draft score is accepted, measured (histogram binning over
+/// score bins (2^-(b+1), 2^-b], decayed per round). The drafter's path probabilities are not calibrated alike at every
+/// depth (one factor per request undercounted the nodes past the eighth by half), so the cost model takes a node's gain
+/// from its bin; a bin without data falls back to the score itself (TREE_CALIB_PRIOR pseudo-observations).
+#[derive(Default)]
+struct TreeCalib {
+    n: [f64; TREE_CALIB_BINS],
+    acc: [f64; TREE_CALIB_BINS],
+}
+
+const TREE_CALIB_BINS: usize = 10;
+const TREE_CALIB_PRIOR: f64 = 2.0;
+/// per tree round: a memory of a few hundred rounds
+const TREE_CALIB_DECAY: f64 = 0.995;
+
+impl TreeCalib {
+    fn bin(s: f32) -> usize {
+        if s.is_nan() || s <= 0.0 { TREE_CALIB_BINS - 1 } else { ((-s.min(1.0).log2()).floor() as usize).min(TREE_CALIB_BINS - 1) }
+    }
+
+    /// Expected acceptance of a verified node of score `s`.
+    fn rate(&self, s: f32) -> f64 {
+        let b = Self::bin(s);
+        (self.acc[b] + TREE_CALIB_PRIOR * s.clamp(0.0, 1.0) as f64) / (self.n[b] + TREE_CALIB_PRIOR)
+    }
+
+    fn note(&mut self, s: f32, accepted: bool) {
+        let b = Self::bin(s);
+        self.n[b] += 1.0;
+        self.acc[b] += accepted as u8 as f64;
+    }
+
+    /// The bins with data: score range, nodes, measured acceptance.
+    fn describe(&self) -> String {
+        (0..TREE_CALIB_BINS)
+            .filter(|&b| self.n[b] >= 1.0)
+            .map(|b| format!("2^-{}: {:.0} nodes {:.2}", b + 1, self.n[b], self.acc[b] / self.n[b]))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn decay(&mut self) {
+        for b in 0..TREE_CALIB_BINS {
+            self.n[b] *= TREE_CALIB_DECAY;
+            self.acc[b] *= TREE_CALIB_DECAY;
+        }
+    }
+}
+
 #[derive(Default)]
 struct SpecLog {
     every: Option<usize>,
@@ -215,11 +264,12 @@ struct SpecLog {
 }
 
 impl SpecLog {
+    /// Returns whether it printed (a summary every BLAZE_SPEC_LOG rounds).
     #[allow(clippy::too_many_arguments)]
-    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64, round: f64, depth: usize) {
+    fn note(&mut self, seqs: usize, rows: usize, kept: usize, verify: f64, commit: f64, draft: f64, round: f64, depth: usize) -> bool {
         let every = *self.every.get_or_insert_with(|| std::env::var("BLAZE_SPEC_LOG").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         if every == 0 {
-            return;
+            return false;
         }
         self.rounds += 1;
         self.seqs += seqs;
@@ -246,7 +296,9 @@ impl SpecLog {
                 1e3 * self.round / r
             );
             *self = SpecLog { every: self.every, ..Default::default() };
+            return true;
         }
+        false
     }
 }
 
@@ -343,6 +395,7 @@ impl Scheduler {
                     tree_depth: 0,
                     tree_rate: Vec::new(),
                     tree_rounds: 0,
+                    tree_calib: TreeCalib::default(),
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
@@ -377,6 +430,7 @@ struct Loop {
     tree_depth: usize,
     tree_rate: Vec<Vec<f64>>,
     tree_rounds: usize,
+    tree_calib: TreeCalib,
     spec_cost: SpecCost,
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
@@ -989,7 +1043,7 @@ impl Loop {
                 .map(|(i, c)| {
                     let a = &self.active[i];
                     let cal = (a.tree_hit + 1.0) / (a.tree_pred + 1.0);
-                    c.iter().map(|x| (x.0 as f64 * cal).min(1.0)).collect()
+                    c.iter().map(|x| (self.tree_calib.rate(x.0) * cal).min(1.0)).collect()
                 })
                 .collect();
             self.spec_cost.choose_gains(&gains)
@@ -1079,9 +1133,14 @@ impl Loop {
             });
             let a = &mut self.active[i];
             if v.len() > 1 && finish.is_none() {
-                let predicted: f64 = v.scores[1..].iter().map(|&x| x as f64).sum();
+                // the request's own factor over the binned forecast (how predictable its text is), and the bins
+                let predicted: f64 = v.scores[1..].iter().map(|&x| self.tree_calib.rate(x)).sum();
                 a.tree_hit = 0.9 * a.tree_hit + (path.len() - 1) as f64;
                 a.tree_pred = 0.9 * a.tree_pred + predicted;
+                self.tree_calib.decay();
+                for (r, &s) in v.scores.iter().enumerate().skip(1) {
+                    self.tree_calib.note(s, path.contains(&r));
+                }
             }
             self.spec_stats.0 += 1;
             self.spec_stats.1 += path.len();
@@ -1117,7 +1176,9 @@ impl Loop {
         let kept: usize = paths.iter().map(Vec::len).sum();
         let t_round = t0.elapsed().as_secs_f64();
         self.tree_depth = self.next_tree_depth(n, cur, kept as f64 / t_round);
-        self.spec_log.note(n, total, kept, t_verify, t_commit, t_draft, t_round, cur);
+        if self.spec_log.note(n, total, kept, t_verify, t_commit, t_draft, t_round, cur) {
+            eprintln!("blaze: tree node acceptance by score bin (score > bound): {}", self.tree_calib.describe());
+        }
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
