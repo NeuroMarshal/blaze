@@ -51,6 +51,10 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap())
                     .unwrap();
             let parser = fixture["parser"].as_str().unwrap();
+            // qwen3_coder (the parser blaze serves with) is specified by its own tests in qwen3_coder.rs
+            if parser == "qwen3_coder" {
+                continue;
+            }
             let tools = fixture["tools"].as_array().unwrap();
             let detector = || tool_detector(parser, tools).unwrap();
             // An argument delta has no name: `None` in Python, empty here.

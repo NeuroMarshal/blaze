@@ -41,8 +41,10 @@ impl VisionConfig {
         let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?)?;
         let Some(v) = root.get("vision_config") else { return Ok(None) };
         let kind = v.get("model_type").and_then(Value::as_str).unwrap_or("");
-        if !kind.starts_with("qwen3_5") {
-            bail!("vision tower of type '{kind}' is not supported (Qwen3.5 family only)");
+        // Qwen3.5 / 3.6 / 3.8 (qwen3_5_vision) and Qwen3.8 Flash Next (qwen4_exp_vision) carry the same tower: patch
+        // embedding of temporal pairs, learned position table, pre-norm ViT blocks, 2x2 patch merger
+        if !(kind.starts_with("qwen3_5") || kind == "qwen4_exp_vision") {
+            bail!("vision tower of type '{kind}' is not supported (qwen3_5_vision, qwen4_exp_vision)");
         }
         if v.get("deepstack_visual_indexes").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
             bail!("vision tower with deepstack features is not supported");

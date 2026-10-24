@@ -27,7 +27,15 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
 
 def load_vision(model_dir, dtype):
-    cfg = AutoConfig.from_pretrained(model_dir).vision_config
+    try:
+        cfg = AutoConfig.from_pretrained(model_dir).vision_config
+    except (ValueError, KeyError):
+        # a model type transformers does not know (Qwen3.8 Flash Next: qwen4_exp) with the Qwen3.5 tower
+        import json
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+        vc = dict(json.load(open(os.path.join(model_dir, "config.json")))["vision_config"])
+        vc.pop("model_type", None)
+        cfg = Qwen3_5VisionConfig(**vc)
     model = Qwen3_5VisionModel(cfg).to(dtype).eval()
     prefix = "model.visual."
     sd = {}

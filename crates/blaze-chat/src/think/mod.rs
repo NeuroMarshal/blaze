@@ -211,7 +211,11 @@ impl TagDetector {
         if partial {
             return Default::default();
         }
-        if !self.stripped_think_start && current.contains(self.start) {
+        // the opening tag of the reasoning, not a `<think>` after its end
+        if !self.stripped_think_start
+            && let Some(si) = current.find(self.start)
+            && current.find(self.end).is_none_or(|e| si < e)
+        {
             current = current.replacen(self.start, "", 1);
             self.buffer = current.clone();
             self.stripped_think_start = true;
@@ -222,6 +226,8 @@ impl TagDetector {
         {
             self.buffer.clear();
             self.in_reasoning = false;
+            // the reasoning is over: a `<think>` later on (in code, in a tool argument) is text
+            self.stripped_think_start = true;
             let normal = current[end_idx + self.end.len()..].to_owned();
             return (current[..end_idx].to_owned(), normal);
         }
@@ -229,6 +235,7 @@ impl TagDetector {
             if let Some(idx) = self.find_tool_start(&current, &self.streamed_reasoning_tail) {
                 self.buffer.clear();
                 self.in_reasoning = false;
+                self.stripped_think_start = true;
                 return (current[..idx].to_owned(), current[idx..].to_owned());
             }
             if !self.stream_reasoning {

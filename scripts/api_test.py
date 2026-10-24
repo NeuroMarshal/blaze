@@ -473,9 +473,21 @@ def chat_grammar_whitespace_is_bounded():
     c = chat(hello, max_tokens=200, response_format={"type": "json_object"}).choices[0]
     check(c.finish_reason == "stop" and isinstance(json.loads(c.message.content), dict), c)
     # vLLM's disable_any_whitespace: compact JSON
-    c = chat(hello, max_tokens=200, extra_body={**NOTHINK, "structured_outputs": {"json": {"type": "object"}, "disable_any_whitespace": True}}).choices[0]
-    j = json.loads(c.message.content)
-    check(c.message.content == json.dumps(j, separators=(",", ":"), ensure_ascii=False), c.message.content)
+    c = chat(hello, max_tokens=300, extra_body={**NOTHINK, "structured_outputs": {"json": {"type": "object"}, "disable_any_whitespace": True}}).choices[0]
+    if c.finish_reason == "length":
+        # cut by max_tokens: no whitespace outside the strings so far
+        text, in_str, esc, ws = c.message.content, False, False, 0
+        for ch in text:
+            if in_str:
+                esc, in_str = (False, in_str) if esc else (ch == "\\", ch != '"')
+            elif ch == '"':
+                in_str = True
+            elif ch in " \n\t\r":
+                ws += 1
+        check(ws == 0, f"{ws} whitespace characters outside strings in {text[:200]!r}")
+    else:
+        j = json.loads(c.message.content)
+        check(c.message.content == json.dumps(j, separators=(",", ":"), ensure_ascii=False), c.message.content)
 
 
 # tools

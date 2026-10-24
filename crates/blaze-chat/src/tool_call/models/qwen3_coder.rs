@@ -49,7 +49,12 @@ pub(super) struct Qwen3CoderDetector {
     current_tool_param_count: usize,
     json_started: bool,
     is_inside_tool_call: bool,
+    /// the open call started without `<tool_call>` (a declared tool's `<function=NAME>`): it ends at `</function>`
+    implicit_call: bool,
     current_func_name: Option<String>,
+    /// bytes after the open parameter's `>` already searched for the value's end (a long value is not searched again
+    /// on every delta)
+    value_scanned: usize,
 }
 
 impl Qwen3CoderDetector {
@@ -61,7 +66,9 @@ impl Qwen3CoderDetector {
             current_tool_param_count: 0,
             json_started: false,
             is_inside_tool_call: false,
+            implicit_call: false,
             current_func_name: None,
+            value_scanned: 0,
         }
     }
 
@@ -103,8 +110,19 @@ impl Qwen3CoderDetector {
         (text[..start].to_owned(), calls)
     }
 
-    /// `parse_streaming_increment`.
-    fn parse_streaming_increment(&mut self, new_text: &str) -> Parsed {
+    /// The declared tool names (a `<function=NAME>` outside `<tool_call>` starts a call only for one of them).
+    fn declared(&self, name: &str) -> bool {
+        self.tools.iter().any(|t| {
+            t.pointer("/function/name").or_else(|| t.get("name")).and_then(Value::as_str) == Some(name)
+        })
+    }
+
+    /// `parse_streaming_increment`, as a state machine over the tags: outside a call, inside `<tool_call>`, inside a
+    /// function, inside a parameter. A parameter or `</function>` tag counts only inside an open function (prose that
+    /// mentions them is text, no call of index -1); a value ends at a `</parameter>` that a tag follows (`<parameter=`,
+    /// `</function>`, `</tool_call>`), so code that contains those words stays in the value; a call the output leaves
+    /// open is closed at the end (`flush`), a `</tool_call>` closes its function. Every value is valid JSON.
+    fn parse_streaming_increment(&mut self, new_text: &str, flush: bool) -> Parsed {
         self.buffer.push_str(new_text);
         let mut calls = Vec::new();
         let mut normal = String::new();
@@ -114,86 +132,151 @@ impl Qwen3CoderDetector {
             name: name.to_owned(),
             parameters,
         };
+        // close the open function: its JSON object (empty when it had no parameter)
+        let close = |this: &mut Self, calls: &mut Vec<ToolCallItem>| {
+            if this.current_func_name.take().is_some() {
+                if !this.json_started {
+                    calls.push(item(this.current_tool_id, "", "{".into()));
+                }
+                calls.push(item(this.current_tool_id, "", "}".into()));
+                this.json_started = false;
+                if this.implicit_call {
+                    this.implicit_call = false;
+                    this.is_inside_tool_call = false;
+                }
+            }
+        };
         while pos < self.buffer.len() {
             let slice = &self.buffer[pos..];
-            if slice.starts_with(TOOL_CALL_START) {
-                pos += TOOL_CALL_START.len();
-                self.is_inside_tool_call = true;
-                continue;
-            }
-            if slice.starts_with(FUNCTION_PREFIX) {
-                let Some(end_angle) = slice.find('>') else {
-                    break;
-                };
-                let name = &slice[FUNCTION_PREFIX.len()..end_angle];
-                self.current_tool_id += 1;
-                self.current_tool_param_count = 0;
-                self.json_started = false;
-                self.current_func_name = Some(name.to_owned());
-                calls.push(item(self.current_tool_id, name, String::new()));
-                pos += end_angle + 1;
-                continue;
-            }
-            if slice.starts_with(PARAMETER_PREFIX) {
+            let in_function = self.current_func_name.is_some();
+            if in_function && slice.starts_with(PARAMETER_PREFIX) {
                 let Some(name_end) = slice.find('>') else {
+                    if flush {
+                        pos = self.buffer.len();
+                    }
                     break;
                 };
-                let rest = &slice[name_end + 1..];
-                // The parameter ends at the first of these; only `</parameter>` is consumed.
-                let end = [
-                    (rest.find(PARAMETER_END), PARAMETER_END.len()),
-                    (rest.find(PARAMETER_PREFIX), 0),
-                    (rest.find(FUNCTION_END), 0),
-                ]
-                .into_iter()
-                .filter_map(|(found, len)| Some((found?, len)))
-                .reduce(|best, next| if next.0 < best.0 { next } else { best });
-                let Some((end_pos, end_len)) = end else {
-                    break;
+                let value_start = name_end + 1;
+                let rest = &slice[value_start..];
+                let mut from = self.value_scanned.min(rest.len());
+                let mut end: Option<(usize, usize)> = None; // (value end, bytes consumed after the value start)
+                let mut wait = false;
+                while let Some(found) = rest[from..].find(PARAMETER_END) {
+                    let at = from + found;
+                    let after = rest[at + PARAMETER_END.len()..].trim_start_matches([' ', '\t', '\r', '\n']);
+                    let next_tag = [PARAMETER_PREFIX, FUNCTION_END, TOOL_CALL_END];
+                    if next_tag.iter().any(|t| after.starts_with(t)) {
+                        end = Some((at, at + PARAMETER_END.len()));
+                        break;
+                    }
+                    if after.is_empty() || next_tag.iter().any(|t| t.starts_with(after)) {
+                        // what follows is not here yet
+                        if flush {
+                            end = Some((at, at + PARAMETER_END.len()));
+                        } else {
+                            wait = true;
+                            self.value_scanned = at;
+                        }
+                        break;
+                    }
+                    from = at + 1;
+                }
+                // a value whose `</parameter>` the model left out ends at the next parameter or the function's end
+                // written at the start of a line (SGLang's tolerance; a tag inside a line stays text)
+                let open_end = [rest[from.min(rest.len())..].find("\n<parameter="), rest[from.min(rest.len())..].find("\n</function>")]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .map(|i| from.min(rest.len()) + i);
+                let open_end = if let Some(i) = open_end {
+                    // only before a proper end; the tag searched from the scan start, not from where a literal
+                    // `</parameter>` moved `from`
+                    let lead = [rest.find("\n<parameter="), rest.find("\n</function>")].into_iter().flatten().min();
+                    lead.filter(|&l| end.is_none_or(|(e, _)| l < e)).or(Some(i).filter(|_| end.is_none()))
+                } else {
+                    [rest.find("\n<parameter="), rest.find("\n</function>")].into_iter().flatten().min().filter(|&l| end.is_none_or(|(e, _)| l < e))
                 };
-                let param_name = &slice[PARAMETER_PREFIX.len()..name_end];
+                if let Some(l) = open_end {
+                    end = Some((l, l + 1));
+                    wait = false;
+                }
+                if end.is_none() && !wait {
+                    if flush {
+                        end = Some((rest.len(), rest.len())); // cut off inside the value: what it has
+                    } else {
+                        self.value_scanned = rest.len().saturating_sub(PARAMETER_END.len());
+                        while !rest.is_char_boundary(self.value_scanned) {
+                            self.value_scanned -= 1;
+                        }
+                    }
+                }
+                let Some((value_end, consumed)) = end else { break };
+                let param_name = slice[PARAMETER_PREFIX.len()..name_end].to_owned();
+                let raw = strip_newline(&rest[..value_end]).to_owned();
                 if !self.json_started {
                     calls.push(item(self.current_tool_id, "", "{".into()));
                     self.json_started = true;
                 }
                 let config = arguments_config(&self.tools, self.current_func_name.as_deref());
-                let value =
-                    convert_param_value(strip_newline(&rest[..end_pos]), param_name, &config);
+                let value = convert_param_value(&raw, &param_name, &config);
                 // `json.dumps` of the name escapes non-ASCII; of the value, it does not.
-                let key = python_json(&Value::String(param_name.to_owned()), true);
-                let separator = if self.current_tool_param_count > 0 {
-                    ", "
-                } else {
-                    ""
-                };
-                calls.push(item(
-                    self.current_tool_id,
-                    "",
-                    format!("{separator}{key}: {value}"),
-                ));
+                let key = python_json(&Value::String(param_name), true);
+                let separator = if self.current_tool_param_count > 0 { ", " } else { "" };
+                calls.push(item(self.current_tool_id, "", format!("{separator}{key}: {value}")));
                 self.current_tool_param_count += 1;
-                pos += name_end + 1 + end_pos + end_len;
+                self.value_scanned = 0;
+                pos += value_start + consumed;
                 continue;
             }
-            if slice.starts_with(FUNCTION_END) {
-                if !self.json_started {
-                    calls.push(item(self.current_tool_id, "", "{".into()));
-                    self.json_started = true;
-                }
-                calls.push(item(self.current_tool_id, "", "}".into()));
+            if in_function && slice.starts_with(FUNCTION_END) {
+                close(self, &mut calls);
                 pos += FUNCTION_END.len();
-                self.current_func_name = None;
                 continue;
             }
-            if slice.starts_with(TOOL_CALL_END) {
+            if slice.starts_with(TOOL_CALL_START) {
+                close(self, &mut calls);
+                pos += TOOL_CALL_START.len();
+                self.is_inside_tool_call = true;
+                continue;
+            }
+            if slice.starts_with(TOOL_CALL_END) && (self.is_inside_tool_call || in_function) {
+                close(self, &mut calls);
                 pos += TOOL_CALL_END.len();
                 self.is_inside_tool_call = false;
                 continue;
             }
-            // Text up to the next `<`, or a `<` that cannot start a tag; inside a
-            // tool call it is dropped.
+            if slice.starts_with(FUNCTION_PREFIX) {
+                let Some(end_angle) = slice.find('>') else {
+                    if flush {
+                        if !self.is_inside_tool_call {
+                            normal.push_str(slice);
+                        }
+                        pos = self.buffer.len();
+                    }
+                    break;
+                };
+                let name = slice[FUNCTION_PREFIX.len()..end_angle].to_owned();
+                // outside <tool_call>: only a declared tool's name starts a call
+                if self.is_inside_tool_call || self.declared(&name) {
+                    close(self, &mut calls);
+                    if !self.is_inside_tool_call {
+                        self.is_inside_tool_call = true;
+                        self.implicit_call = true;
+                    }
+                    self.current_tool_id += 1;
+                    self.current_tool_param_count = 0;
+                    self.json_started = false;
+                    self.value_scanned = 0;
+                    calls.push(item(self.current_tool_id, &name, String::new()));
+                    self.current_func_name = Some(name);
+                    pos += end_angle + 1;
+                    continue;
+                }
+            }
+            // Text up to the next `<`, or a `<` that cannot start a tag (a possible tag waits for more text, except at
+            // the end); inside a tool call it is dropped.
             let consumed = match slice.find('<') {
-                Some(0) if TAGS.iter().any(|tag| tag.starts_with(slice)) => break,
+                Some(0) if !flush && TAGS.iter().any(|tag| tag.starts_with(slice)) => break,
                 Some(0) => 1,
                 Some(next) => next,
                 None => slice.len(),
@@ -204,6 +287,13 @@ impl Qwen3CoderDetector {
             pos += consumed;
         }
         self.buffer.drain(..pos);
+        if flush {
+            close(self, &mut calls);
+            if !self.is_inside_tool_call {
+                normal.push_str(&std::mem::take(&mut self.buffer));
+            }
+            self.buffer.clear();
+        }
         (normal, calls)
     }
 }
@@ -220,9 +310,9 @@ impl ToolDetector for Qwen3CoderDetector {
         }
     }
 
-    /// The base `finish` flushes nothing.
-    fn parse_stream(&mut self, text: &str, _flush: bool) -> Parsed {
-        self.parse_streaming_increment(text)
+    /// `flush` (the last chunk): a call the output left open is closed, held-back text is released.
+    fn parse_stream(&mut self, text: &str, flush: bool) -> Parsed {
+        self.parse_streaming_increment(text, flush)
     }
 }
 
@@ -387,14 +477,52 @@ fn py_truthy(value: &Value) -> bool {
 
 /// `_convert_param_value`, as `json.dumps(value, ensure_ascii=False)`.
 fn convert_param_value(value: &str, name: &str, config: &Map<String, Value>) -> String {
-    if value.to_lowercase() == "null" {
-        return "null".into();
+    let out = convert_param_value_raw(value, name, config);
+    // a value Python prints as NaN / Infinity (no JSON) stays the model's text
+    match non_finite(&out) {
+        false => out,
+        true => python_json(&Value::String(value.to_owned()), false),
     }
+}
+
+/// `json.dumps` text with NaN, Infinity or -Infinity outside its strings.
+fn non_finite(json: &str) -> bool {
+    let (mut in_str, mut esc) = (false, false);
+    for c in json.chars() {
+        match (in_str, esc, c) {
+            (true, true, _) => esc = false,
+            (true, false, '\\') => esc = true,
+            (true, false, '"') => in_str = false,
+            (true, ..) => {}
+            (false, _, '"') => in_str = true,
+            (false, _, 'N' | 'I') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn convert_param_value_raw(value: &str, name: &str, config: &Map<String, Value>) -> String {
     let string = || python_json(&Value::String(value.to_owned()), false);
     let Some(schema) = config.get(name) else {
-        return string();
+        return if value.to_lowercase() == "null" { "null".into() } else { string() };
     };
-    let kind = infer_type(schema).map_or("string".into(), |t| py_strip(&t).to_lowercase());
+    let inferred = infer_type(schema);
+    // a string parameter keeps the text "null" (SGLang returns None for it whatever the type)
+    if value.to_lowercase() == "null" && !matches!(inferred.as_deref(), Some("string" | "str" | "text")) {
+        return "null".into();
+    }
+    // a schema without a type ($ref, {}, const): an object or array the model wrote stays one
+    if inferred.is_none() {
+        let t = value.trim_start();
+        if t.starts_with('{') || t.starts_with('[') {
+            if let Some(v) = python_json_reencode(value) {
+                return v;
+            }
+        }
+        return string();
+    }
+    let kind = inferred.map_or("string".into(), |t| py_strip(&t).to_lowercase());
     let starts = |prefixes: &[&str]| prefixes.iter().any(|p| kind.starts_with(p));
     match kind.as_str() {
         "string" | "str" | "text" | "varchar" | "char" | "enum" => string(),
@@ -995,5 +1123,139 @@ fn dump_literal(value: &Literal, out: &mut String) {
             }
             out.push('}');
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tools() -> Vec<Value> {
+        vec![
+            json!({"type": "function", "function": {"name": "edit", "parameters": {"type": "object", "properties": {
+                "filePath": {"type": "string"}, "oldString": {"type": "string"}, "newString": {"type": "string"}}}}}),
+            json!({"type": "function", "function": {"name": "calc", "parameters": {"type": "object", "properties": {
+                "x": {"type": "number"}, "n": {"type": "integer"}, "flag": {"type": "boolean"}, "opts": {"$ref": "#/defs/o"}}}}}),
+        ]
+    }
+
+    /// The stream's result: its text and per call (in index order) the name and the arguments, which must be JSON.
+    fn stream(chunks: &[&str]) -> (String, Vec<(String, Value)>) {
+        let mut d = Qwen3CoderDetector::new(tools());
+        let (mut text, mut calls) = (String::new(), std::collections::BTreeMap::<i64, (String, String)>::new());
+        for (i, c) in chunks.iter().enumerate() {
+            let (t, items) = d.parse_stream(c, i + 1 == chunks.len());
+            text += &t;
+            for it in items {
+                assert!(it.tool_index >= 0, "call index {} from {chunks:?}", it.tool_index);
+                let e = calls.entry(it.tool_index).or_default();
+                e.0 += &it.name;
+                e.1 += &it.parameters;
+            }
+        }
+        let calls = calls
+            .into_values()
+            .map(|(n, a)| {
+                let v = serde_json::from_str(&a).unwrap_or_else(|e| panic!("arguments {a:?} are no JSON ({e}) from {chunks:?}"));
+                (n, v)
+            })
+            .collect();
+        (text, calls)
+    }
+
+    /// The same result whatever the split: whole, every char, and every split in two.
+    fn all_splits(text: &str) -> (String, Vec<(String, Value)>) {
+        let whole = stream(&[text]);
+        let chars: Vec<String> = text.chars().map(String::from).collect();
+        assert_eq!(stream(&chars.iter().map(String::as_str).collect::<Vec<_>>()), whole, "char by char: {text:?}");
+        for (i, _) in text.char_indices().skip(1) {
+            assert_eq!(stream(&[&text[..i], &text[i..]]), whole, "split at {i}: {text:?}");
+        }
+        whole
+    }
+
+    #[test]
+    fn calls_and_text_around_them() {
+        let (t, c) = all_splits(
+            "Let me edit.\n\n<tool_call>\n<function=edit>\n<parameter=filePath>\n/a.rs\n</parameter>\n<parameter=oldString>\nx\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=calc>\n<parameter=x>\n2.5\n</parameter>\n<parameter=n>\n3\n</parameter>\n<parameter=flag>\ntrue\n</parameter>\n</function>\n</tool_call>",
+        );
+        assert_eq!(t, "Let me edit.\n\n\n");
+        assert_eq!(c, vec![
+            ("edit".into(), json!({"filePath": "/a.rs", "oldString": "x"})),
+            ("calc".into(), json!({"x": 2.5, "n": 3, "flag": true})),
+        ]);
+    }
+
+    #[test]
+    fn stray_tags_are_text() {
+        // before any function: no call, no index -1
+        let (t, c) = all_splits("Close it with </function>. A <parameter=x>v</parameter> tag.");
+        assert_eq!(t, "Close it with </function>. A <parameter=x>v</parameter> tag.");
+        assert!(c.is_empty());
+        // after a call: its arguments stay one object
+        let (t, c) = all_splits("<tool_call>\n<function=edit>\n<parameter=filePath>\n/a\n</parameter>\n</function>\n</tool_call> then </function>");
+        assert_eq!(t, " then </function>");
+        assert_eq!(c, vec![("edit".into(), json!({"filePath": "/a"}))]);
+    }
+
+    #[test]
+    fn values_keep_tag_like_text() {
+        let code = "fn f() { s = \"</function>\"; t = \"a </parameter> b\"; u = \"use <parameter=foo> syntax\"; }";
+        let (_, c) = all_splits(&format!(
+            "<tool_call>\n<function=edit>\n<parameter=newString>\n{code}\n</parameter>\n<parameter=filePath>\n/p.rs\n</parameter>\n</function>\n</tool_call>"
+        ));
+        assert_eq!(c, vec![("edit".into(), json!({"newString": code, "filePath": "/p.rs"}))]);
+    }
+
+    #[test]
+    fn missing_closing_tags() {
+        // no </parameter>: the next parameter or the function's end at a line start ends the value
+        let (_, c) = all_splits("<tool_call>\n<function=calc>\n<parameter=x>\n1\n<parameter=n>\n4\n</function>\n</tool_call>");
+        assert_eq!(c, vec![("calc".into(), json!({"x": 1, "n": 4}))]);
+        // no </function>: </tool_call> closes it
+        let (_, c) = all_splits("<tool_call>\n<function=calc>\n<parameter=n>\n4\n</parameter>\n</tool_call>");
+        assert_eq!(c, vec![("calc".into(), json!({"n": 4}))]);
+        // cut off: closed at the end with what it has
+        let (_, c) = stream(&["<tool_call>\n<function=edit>\n<parameter=filePath>\n/a", "b"]);
+        assert_eq!(c, vec![("edit".into(), json!({"filePath": "/ab"}))]);
+        let (_, c) = stream(&["<tool_call>\n<function=edit>\n"]);
+        assert_eq!(c, vec![("edit".into(), json!({}))]);
+    }
+
+    #[test]
+    fn value_types() {
+        let (_, c) = all_splits(
+            "<tool_call>\n<function=edit>\n<parameter=oldString>\nnull\n</parameter>\n</function>\n</tool_call>",
+        );
+        // a string parameter keeps the text "null"
+        assert_eq!(c, vec![("edit".into(), json!({"oldString": "null"}))]);
+        let (_, c) = all_splits(
+            "<tool_call>\n<function=calc>\n<parameter=x>\ninf\n</parameter>\n<parameter=n>\nnan\n</parameter>\n<parameter=opts>\n{\"a\": [1, 2]}\n</parameter>\n</function>\n</tool_call>",
+        );
+        // non-finite numbers stay text (JSON has none); an untyped ($ref) object stays an object
+        assert_eq!(c, vec![("calc".into(), json!({"x": "inf", "n": "nan", "opts": {"a": [1, 2]}}))]);
+    }
+
+    #[test]
+    fn a_declared_function_without_the_wrapper() {
+        let (t, c) = all_splits("Text then <function=edit>\n<parameter=filePath>\nx\n</parameter>\n</function>\nafter");
+        assert_eq!(t, "Text then \nafter");
+        assert_eq!(c, vec![("edit".into(), json!({"filePath": "x"}))]);
+        // an undeclared name is text
+        let (t, c) = all_splits("see <function=nope> here");
+        assert_eq!(t, "see <function=nope> here");
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn long_values_are_linear() {
+        let value = "y".repeat(400_000);
+        let text = format!("<tool_call>\n<function=edit>\n<parameter=newString>\n{value}\n</parameter>\n</function>\n</tool_call>");
+        let chunks: Vec<&str> = text.as_bytes().chunks(4).map(|c| std::str::from_utf8(c).unwrap()).collect();
+        let t0 = std::time::Instant::now();
+        let (_, c) = stream(&chunks);
+        assert!(t0.elapsed().as_secs_f64() < 2.0, "{:.1} s for a 400 KB value", t0.elapsed().as_secs_f64());
+        assert_eq!(c[0].1["newString"].as_str().map(str::len), Some(400_000));
     }
 }

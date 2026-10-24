@@ -114,6 +114,20 @@ pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool, im
             m["role"] = json!("system");
         }
     }
+    // a content of text parts only is their text, joined as the model's template joins them (no separator; the
+    // renderer would put a newline between them); parts with images stay parts
+    if let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for m in msgs.iter_mut() {
+            let Some(parts) = m.get("content").and_then(Value::as_array) else { continue };
+            let texts: Option<Vec<&str>> = parts
+                .iter()
+                .map(|p| p.get("type").and_then(Value::as_str).filter(|t| *t == "text").and(p.get("text")).and_then(Value::as_str))
+                .collect();
+            if let Some(texts) = texts.filter(|t| !t.is_empty()) {
+                m["content"] = json!(texts.concat());
+            }
+        }
+    }
     let request: CreateChatCompletionRequest = serde_json::from_value(body.clone())
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
     if request.messages.is_empty() {
@@ -395,6 +409,12 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
                 a.reasoning.extend(reasoning_content);
                 for t in tool_calls.unwrap_or_default() {
                     let i = t.index as usize;
+                    // the parser numbers calls from 0 in order: an index past the next one is a parser fault, not
+                    // a reason to grow the list
+                    if i > a.calls.len() {
+                        eprintln!("blaze: tool call index {i} after {} calls dropped", a.calls.len());
+                        continue;
+                    }
                     while a.calls.len() <= i {
                         a.calls.push(json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
                     }
