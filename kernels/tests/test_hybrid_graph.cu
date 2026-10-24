@@ -297,6 +297,13 @@ int main() {
       {expert::kFlashNext, 4, 12, 10, 1, 1, true},
       {expert::kFlashNext, 48, 16, 10, 1, 5, false},
   };
+  // the GPU1 helper runs next to GPU0's graph on device 0 here (in serving it has a GPU of its own): on a small GPU
+  // (the laptop's 24 SMs) the spinning wait kernels and the helper's kernels may not fit at once and block each other,
+  // so gpu/gpu1/cpu runs only where a second GPU exists
+  int n_dev = 0;
+  CHECK_CUDA(cudaGetDeviceCount(&n_dev));
+  const bool with_gpu1 = n_dev >= 2;
+  if (!with_gpu1) std::printf("one GPU: the gpu/gpu1/cpu residency is skipped\n");
   for (const Case& c : cases) {
     if (only_big && c.L != 48) continue;
     Model m = make_model(c.geo, c.L, c.E, c.K, rng);
@@ -320,6 +327,7 @@ int main() {
     std::vector<uint16_t> ref;
     if (c.check) ref = reference(m, c.T, x0, ids, w);
     for (int residency : {0, 1, 2, 3}) {
+      if (residency == 3 && !with_gpu1) continue;
       const Result r = run(m, c.T, x0, ids, w, residency, threads, c.replays);
       int bad = 0;
       if (c.check)
@@ -333,6 +341,7 @@ int main() {
     }
     for (int rank : {0, 2})
       for (int residency : {1, 2, 3}) {
+        if (residency == 3 && !with_gpu1) continue;
         const Result r = run(m, c.T, x0, ids, w, residency, threads, c.replays, rank);
         int bad = 0;
         if (c.check) {
