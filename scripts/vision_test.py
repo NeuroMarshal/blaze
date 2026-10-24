@@ -103,6 +103,22 @@ def main():
     # text only keeps working
     t.answer("text only", [{"role": "user", "content": "What is the capital of France? One word."}], expect_all=["Paris"], max_tokens=20)
 
+    # an http URL (this client serves the pictures on a local port); the server's fetch limits are its own options
+    import functools
+    import http.server
+    import threading
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    handler = functools.partial(Quiet, directory=d)
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    t.answer("image from an http URL", [user({"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{httpd.server_port}/words.png"}},
+                                             text("Which word is written large? Answer with the word only."))], expect_all=["BLAZE"], max_tokens=30)
+    t.error("http URL that does not exist", [user({"type": "image_url", "image_url": {"url": f"http://127.0.0.1:{httpd.server_port}/nope.png"}}, text("hi"))], 400, "cannot fetch")
+
     # the picture of words and shapes (PNG, 640x480)
     r = t.answer("describe words.png", [user(image_part(p("words.png")), text("Describe this picture: which word is written large, and which shapes with which colors are there?"))],
                  expect_all=["BLAZE", "circle", "square", "triangle"], expect_any=["red"])
