@@ -65,8 +65,9 @@ pub fn wide_fits(rows: usize, k: usize, ldx: usize) -> bool {
 #[derive(Clone, Copy)]
 pub struct Weight {
     pub kernel: Kernel,
-    /// NVFP4: the FP16-accumulate GEMV may take it (block scales <= 1)
+    /// NVFP4: the FP16-accumulate GEMV may take it, its block scales times 2^-wshift
     pub f16: bool,
+    pub wshift: i32,
     pub n: usize,
     pub k: usize,
     pub codes: *const u8,
@@ -97,7 +98,7 @@ fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, x16: (*mut u16, *
         match w.kernel {
             Kernel::Nvfp4F16 => {
                 let e = sys::blz_nvfp4_f16_rows(x, w.k as i64, rows as c_int, k, x16.0, x16.1, s.0);
-                if e != 0 { e } else { sys::blz_nvfp4_gemv_mma_f16_cfg(x16.0, x16.1, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k, a, b, s.0) }
+                if e != 0 { e } else { sys::blz_nvfp4_gemv_mma_f16_cfg(x16.0, x16.1, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k, w.wshift, a, b, s.0) }
             }
             Kernel::Nvfp4 | Kernel::Nvfp4Pass => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k,
                                                         a, b, s.0),

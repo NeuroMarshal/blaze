@@ -45,11 +45,12 @@ cudaError_t blz_nvfp4_f16_rows(const uint16_t* x, int64_t ldx, int rows, int k, 
                                cudaStream_t stream);
 
 /// \brief blz_nvfp4_gemv_mma_cfg on blz_nvfp4_f16_rows inputs with FP16 accumulation within each 128-wide chunk of K
-/// and FP32 across chunks (twice the tensor rate of FP32 accumulation on GeForce cards). Partial sums stay finite for
-/// block scales <= 1 (|code x block scale| <= 6); the caller keeps weights with larger scales on the BF16 kernel.
+/// and FP32 across chunks (twice the tensor rate of FP32 accumulation on GeForce cards). `wshift`: the block scales are
+/// taken times 2^-wshift (exact; choose it so that the weight's largest block scale is <= 1, blz_nvfp4_f16_wshift), which
+/// keeps the partial sums finite; the outputs get it back.
 cudaError_t blz_nvfp4_gemv_mma_f16_cfg(const uint16_t* x16, const int32_t* shift, const uint8_t* w, const uint8_t* scale,
-                                       const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k, int split,
-                                       int tiles, cudaStream_t stream);
+                                       const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k, int wshift,
+                                       int split, int tiles, cudaStream_t stream);
 
 /// \brief out[j, i] = bf16(e2m1(w[j, i]) * e4m3(scale[j, i / 16]) * alpha[j]): the weight as a BF16 matrix [n, k].
 cudaError_t blz_nvfp4_weight_dequant(const uint8_t* w, const uint8_t* scale, const float* alpha, int n, int k, uint16_t* out,
