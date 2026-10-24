@@ -69,6 +69,11 @@ pub struct Mtp {
     o: Linear,
     gu: Linear,
     down: Linear,
+    /// the head over the first `head_rows` rows of this rank's vocabulary shard (None: the target's own head over the
+    /// whole shard) and the pairs a rank without rows contributes
+    head_lin: Option<Linear>,
+    head_rows: usize,
+    no_pairs: DevBuf,
     /// this rank's heads, KV heads and MLP rows
     heads: usize,
     kv_heads: usize,
@@ -194,7 +199,19 @@ impl Mtp {
         let partial_rows = (ROWS * heads).max(max_items * heads * parts_decode);
         let meta_bytes = (MAX_CHAIN + 8) * (5 * 8 * ROWS + 256) + 4096;
         let shard = model.dims.vocab;
+        // a restricted head: this rank's rows among the first `head_vocab` ids
+        let head_vocab = model.opts.mtp_head_vocab;
+        let head_rows = if head_vocab == 0 { shard } else { head_vocab.saturating_sub(r * shard).min(shard) };
+        let head_lin = if head_vocab > 0 && head_rows > 0 {
+            Some(lin(vec![("lm_head", Cut::Rows(vec![r * shard..r * shard + head_rows]))])?)
+        } else {
+            None
+        };
+        let no_pairs: Vec<f32> = (0..max_items).flat_map(|_| [-3.0e38f32, 0.0]).collect();
         let m = Self {
+            head_lin,
+            head_rows,
+            no_pairs: DevBuf::from_slice(&no_pairs)?,
             pre_emb: vec("mtp.pre_fc_norm_embedding.weight", h)?,
             pre_hid: vec("mtp.pre_fc_norm_hidden.weight", h)?,
             input_ln: vec("mtp.layers.0.input_layernorm.weight", h)?,
@@ -261,8 +278,9 @@ impl Mtp {
     }
 
     pub fn describe(&self) -> String {
+        let head = if self.head_lin.is_some() { format!(", head over {} rows of this rank's vocabulary", self.head_rows) } else { String::new() };
         format!(
-            "MTP head: window {}, BF16 weights {:.0} MiB on this rank, KV ring {:.0} MiB",
+            "MTP head: window {}{head}, BF16 weights {:.0} MiB on this rank, KV ring {:.0} MiB",
             self.cfg.window,
             [&self.fc, &self.qkv, &self.o, &self.gu, &self.down].iter().flat_map(|l| l.regions()).map(|r| r.1).sum::<usize>() as f64 / (1u64 << 20) as f64,
             (self.k_pool.bytes() * 2) as f64 / (1u64 << 20) as f64,
@@ -644,16 +662,28 @@ impl Mtp {
     fn head(&self, model: &Model, items: usize, step: usize) -> Result<()> {
         let (s, h) = (&model.stream, self.cfg.hidden);
         let (rank, world, shard) = (model.tp.rank, model.tp.world, model.dims.vocab);
-        model.lm_head().run(model.lin_ctx(), self.last_normed.ptr(), h, items, self.logits.ptr(), shard, s)?;
+        let rows = self.head_rows;
         let bytes = (world * items * 8).next_multiple_of(16);
         check(unsafe { sys::cudaMemsetAsync(self.pairs.ptr(), 0, bytes, s.0) }, "MTP memset pairs")?;
-        check(
-            unsafe {
-                sys::blz_argmax_part(self.logits.ptr(), items as c_int, shard as c_int, shard as i64, (rank * shard) as c_int,
-                                     self.pairs.at::<f32>(rank * items * 2), s.0)
-            },
-            "MTP argmax part",
-        )?;
+        if rows == 0 {
+            // this rank's shard lies beyond the restricted vocabulary: a pair no pick can beat
+            check(
+                unsafe { sys::cudaMemcpyAsync(self.pairs.at::<f32>(rank * items * 2).cast(), self.no_pairs.ptr(), items * 8, sys::MEMCPY_D2D, s.0) },
+                "MTP empty pairs",
+            )?;
+        } else {
+            match &self.head_lin {
+                Some(l) => l.run(model.lin_ctx(), self.last_normed.ptr(), h, items, self.logits.ptr(), rows, s)?,
+                None => model.lm_head().run(model.lin_ctx(), self.last_normed.ptr(), h, items, self.logits.ptr(), shard, s)?,
+            }
+            check(
+                unsafe {
+                    sys::blz_argmax_part(self.logits.ptr(), items as c_int, rows as c_int, rows as i64, (rank * shard) as c_int,
+                                         self.pairs.at::<f32>(rank * items * 2), s.0)
+                },
+                "MTP argmax part",
+            )?;
+        }
         if !self.ar.is_null() {
             check(unsafe { sys::blz_host_ar_all_reduce(self.ar, self.pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "MTP head all-reduce")?;
         }

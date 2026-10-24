@@ -230,6 +230,10 @@ pub struct Options {
     /// The checkpoint's own MTP head as the drafter (its `mtp.*` weights; Qwen3.5 NextN): the attention window of its KV
     /// ring in positions (0: no MTP drafter). The target keeps the normed final hidden state of every row for it.
     pub mtp_window: usize,
+    /// MTP drafter: the draft head scores only the first this many token ids of the vocabulary (the frequent ones; 0: all
+    /// of them, the target's own head). The drafts are only proposals, the verify decides, so the loss is acceptance on
+    /// text whose tokens lie beyond (non-Latin scripts), the gain the share of the head's bandwidth.
+    pub mtp_head_vocab: usize,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).

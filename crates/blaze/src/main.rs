@@ -81,6 +81,10 @@ struct EngineArgs {
     /// `serve --spec-method mtp` takes 8192 when this is 0)
     #[arg(long, default_value_t = 0)]
     mtp_window: usize,
+    /// MTP drafter: score only the first N token ids of the vocabulary in its head (frequent tokens; 0: the whole
+    /// vocabulary). Cuts the draft's head bandwidth; drafts of tokens beyond N are never proposed
+    #[arg(long, default_value_t = 0)]
+    mtp_head_vocab: usize,
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
@@ -139,6 +143,7 @@ impl EngineArgs {
                 kv_dtype: self.kv_cache_dtype,
                 draft: self.draft_model.clone(),
                 mtp_window: self.mtp_window,
+                mtp_head_vocab: self.mtp_head_vocab,
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
                 tree_levels: if self.draft_tree_width > 1 { self.draft_tree_depth } else { 0 },
