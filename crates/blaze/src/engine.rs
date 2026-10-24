@@ -135,6 +135,9 @@ struct Runner {
     staging: HostMapped,
     graphs: HashMap<GraphKey, Graph>,
     warmed: HashSet<GraphKey>,
+    /// BLAZE_GRAPH_LOG=n (rank 0): how verify steps ran, printed every n of them: [graph replay, first sight (eager),
+    /// capture, eager past the graph limit]
+    graph_log: Option<(usize, [usize; 4])>,
     use_graphs: bool,
 }
 
@@ -199,6 +202,22 @@ impl Runner {
         } else {
             meta.spans.iter().all(|sp| sp.len == 1)
         };
+        if verify && let Some((every, c)) = self.graph_log.as_mut() {
+            let i = if !(allow_graph && self.use_graphs) || !graphable {
+                3
+            } else if self.graphs.contains_key(&key) {
+                0
+            } else if self.warmed.contains(&key) {
+                2
+            } else {
+                1
+            };
+            c[i] += 1;
+            if c.iter().sum::<usize>() % *every == 0 {
+                eprintln!("blaze: verify steps: {} replays, {} first sights, {} captures, {} eager past the limit ({} graphs)", c[0], c[1], c[2], c[3],
+                          self.graphs.keys().filter(|k| k.3).count());
+            }
+        }
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
@@ -410,7 +429,8 @@ fn worker_main(
             }
             _ => None,
         };
-        Ok(Runner { model, draft, staging, graphs: HashMap::new(), warmed: HashSet::new(), use_graphs })
+        let graph_log = std::env::var("BLAZE_GRAPH_LOG").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0 && rank == 0).map(|n| (n, [0; 4]));
+        Ok(Runner { model, draft, staging, graphs: HashMap::new(), warmed: HashSet::new(), use_graphs, graph_log })
     };
     let mut runner = match start() {
         Ok(r) => {

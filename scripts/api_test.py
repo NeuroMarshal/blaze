@@ -436,8 +436,9 @@ def chat_json_schema_and_object():
 
 @test
 def chat_grammar_whitespace_is_bounded():
-    # a greeting with thinking off: the model would rather answer in words, and whitespace is its likeliest allowed
-    # token before the '{'; unbounded runs of it fill max_tokens (blaze serve --grammar-whitespace 0 shows it)
+    # a greeting with thinking off: the model would rather answer in words, and whitespace may be its likeliest allowed
+    # token before the '{' (it was before the forced tool call's <tool_call>); runs are bounded by --grammar-whitespace.
+    # The 27B picks '{' here even with unbounded runs (--grammar-whitespace 0), so this guards rather than reproduces.
     hello = [{"role": "user", "content": "Hello there!"}]
     c = chat(hello, max_tokens=200, response_format={"type": "json_object"}).choices[0]
     check(c.finish_reason == "stop" and isinstance(json.loads(c.message.content), dict), c)
