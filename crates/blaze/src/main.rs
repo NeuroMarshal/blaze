@@ -55,9 +55,10 @@ struct EngineArgs {
     /// kernels (0: off)
     #[arg(long, default_value_t = 4)]
     l2_prefetch_mib: usize,
-    /// most rows of a speculative verify (0: no speculation buffers)
-    #[arg(long, default_value_t = 0)]
-    max_verify: usize,
+    /// most rows of a speculative verify (0: no speculation buffers; default: what was measured best for the draft
+    /// source: 16 for EAGLE-4 trees, 9 for DFlash2 and for suffix decoding)
+    #[arg(long)]
+    max_verify: Option<usize>,
     /// sequences decoded together (continuous batching)
     #[arg(long, default_value_t = 1)]
     max_seqs: usize,
@@ -85,11 +86,12 @@ struct EngineArgs {
     /// eager decode steps instead of CUDA graphs
     #[arg(long)]
     no_graphs: bool,
-    /// EAGLE-4 draft trees: frontier rows per depth (each node's top-k children; 0 or 1: chains)
-    #[arg(long, default_value_t = 0)]
-    draft_tree_width: usize,
-    /// EAGLE-4 draft trees: depth
-    #[arg(long, default_value_t = 6)]
+    /// EAGLE-4 draft trees: frontier rows per depth (each node's top-k children; 0 or 1: chains; default 4 with an
+    /// EAGLE-4 drafter: trees verified 164-181 / 273-302 tok/s against chains' 143-149 / 230-238 on the 27B)
+    #[arg(long)]
+    draft_tree_width: Option<usize>,
+    /// EAGLE-4 draft trees: the deepest level (the scheduler picks the depth of each round up to it by measurement)
+    #[arg(long, default_value_t = 8)]
     draft_tree_depth: usize,
     /// EAGLE-4: this rank's shard of the drafter's LM head in VRAM (on), in pinned RAM read over PCIe (off), or in VRAM
     /// when it fits with 1.5 GiB to spare (auto)
@@ -98,6 +100,21 @@ struct EngineArgs {
 }
 
 impl EngineArgs {
+    /// The speculation defaults of the draft source: (verify rows, tree width, draft tokens per verify) measured best on
+    /// the 27B (`concurrent_test.py`): EAGLE-4 trees 16 rows of width 4; DFlash2 9 rows, 7 drafts; suffix decoding 9
+    /// rows, 8 drafts. Explicit flags win.
+    fn spec_defaults(&self) -> Result<(usize, usize, usize)> {
+        let (verify, width, drafts) = match &self.draft_model {
+            Some(d) => match blaze::drafter::kind(d)? {
+                blaze::drafter::Kind::Eagle => (16, 4, 15),
+                blaze::drafter::Kind::DFlash => (9, 0, 7),
+            },
+            None => (9, 0, 8),
+        };
+        let verify = self.max_verify.unwrap_or(verify);
+        Ok((verify, self.draft_tree_width.unwrap_or(width), drafts.min(verify.saturating_sub(1))))
+    }
+
     fn load(&self, chunk: Option<usize>, full_logits: bool) -> Result<blaze::engine::Engine> {
         self.load_with(chunk, full_logits, 0)
     }
@@ -156,13 +173,13 @@ impl EngineArgs {
                 cache_rows: self.prompt_cache_slots,
                 ple_threads: self.ple_threads,
                 ple_cache_gib: self.ple_cache_gib,
-                max_verify: self.max_verify,
+                max_verify: self.spec_defaults()?.0,
                 kv_dtype: self.kv_cache_dtype,
                 draft: self.draft_model.clone(),
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
-                tree_levels: if self.draft_tree_width > 1 { self.draft_tree_depth } else { 0 },
-                tree_width: if self.draft_tree_width > 1 { self.draft_tree_width } else { 0 },
+                tree_levels: if self.spec_defaults()?.1 > 1 { self.draft_tree_depth } else { 0 },
+                tree_width: if self.spec_defaults()?.1 > 1 { self.spec_defaults()?.1 } else { 0 },
                 draft_head_vram: match self.draft_head_vram.as_str() {
                     "on" => Some(true),
                     "off" => Some(false),
@@ -254,9 +271,10 @@ enum Command {
         /// tokens of one step (decode tokens + the prefill chunk)
         #[arg(long, default_value_t = 2048)]
         step_tokens: usize,
-        /// n-gram speculative decoding (prompt lookup): draft tokens per step, 0 off (needs --max-verify >= this + 1)
-        #[arg(long, default_value_t = 0)]
-        spec_ngram: usize,
+        /// speculative decoding: draft tokens per verify, 0 off (at most --max-verify - 1; default: the draft
+        /// source's measured best, see --max-verify)
+        #[arg(long)]
+        spec_ngram: Option<usize>,
         /// always verify the whole n-gram draft (by default drafts are cut or skipped by the measured verify cost)
         #[arg(long)]
         spec_fixed: bool,
@@ -626,7 +644,7 @@ fn main() -> Result<()> {
                 e,
                 blaze::sched::SchedConfig {
                     step_tokens,
-                    spec_tokens: spec_ngram,
+                    spec_tokens: spec_ngram.unwrap_or(engine.spec_defaults()?.2),
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
                     spec_method: match (spec_method.as_str(), drafter) {
