@@ -57,6 +57,9 @@ struct AppState {
     vocab: usize,
     /// structured outputs (None: the tokenizer could not be read for grammars)
     grammars: Option<Grammars>,
+    /// the chat template knows no "developer" role (Qwen3.5/3.6 raise on it): such messages render as "system", the
+    /// role OpenAI's developer messages take the place of
+    developer_as_system: bool,
     /// `created` of /v1/models: when the server started
     started: u64,
     metrics: Metrics,
@@ -141,6 +144,12 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
     )
     .map_err(|e| eprintln!("blaze: chat completions disabled: {e}"))
     .ok();
+    // the template's text: chat_template.jinja, else tokenizer_config.json's chat_template (one or a list of named ones)
+    let template_text = std::fs::read_to_string(&template).ok().or_else(|| {
+        let c: Value = serde_json::from_str(&std::fs::read_to_string(&config).ok()?).ok()?;
+        Some(c.get("chat_template")?.to_string())
+    });
+    let developer_as_system = template_text.is_some_and(|t| !t.contains("developer"));
     let t0 = std::time::Instant::now();
     let grammars = Grammars::load(&model_dir.join("tokenizer.json"), &text.eos, vocab)
         .map_err(|e| eprintln!("blaze: structured outputs disabled: {e}"))
@@ -157,6 +166,7 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         max_context,
         vocab,
         grammars,
+        developer_as_system,
         started: now(),
         metrics: Metrics::default(),
     });

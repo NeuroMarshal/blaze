@@ -117,6 +117,13 @@ pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool) ->
     if body.get("model").is_none_or(Value::is_null) {
         body["model"] = json!(st.cfg.served_name);
     }
+    if st.developer_as_system
+        && let Some(msgs) = body.get_mut("messages").and_then(Value::as_array_mut)
+    {
+        for m in msgs.iter_mut().filter(|m| m.get("role").and_then(Value::as_str) == Some("developer")) {
+            m["role"] = json!("system");
+        }
+    }
     reject_media(body)?;
     let request: CreateChatCompletionRequest = serde_json::from_value(body.clone())
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
