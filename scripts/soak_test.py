@@ -95,12 +95,13 @@ def one(url, rng, stats, long_tokens, history):
                 return
             out = json.loads(r.read())
         msg = out["choices"][0]["message"]
-        if kind == "json":
+        cut = out["choices"][0].get("finish_reason") == "length"  # cut by max_tokens: the JSON may be unfinished
+        if kind == "json" and not cut:
             j = json.loads(msg["content"])
             if not (isinstance(j, dict) and set(j) == {"title", "score"}):
                 stats.error("json schema not followed", 1)
                 return
-        if kind == "tool" and body["tool_choice"] == "required":
+        if kind == "tool" and body["tool_choice"] == "required" and not cut:
             calls = msg.get("tool_calls") or []
             if not calls:
                 stats.error("required tool call missing", 1)
