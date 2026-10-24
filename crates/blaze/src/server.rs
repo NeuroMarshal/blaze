@@ -34,6 +34,13 @@ use tokio::sync::mpsc::unbounded_channel;
 const BODY_LIMIT: usize = 512 << 20;
 /// Most choices of one request (`n`); the scheduler queues what does not fit its rows at once.
 const MAX_N: u64 = 64;
+/// Most stop strings of a request and bytes of one (the cutter scans them after every token).
+const MAX_STOPS: usize = 64;
+const MAX_STOP_BYTES: usize = 1024;
+/// Most stop_token_ids and bad_words of a request.
+const MAX_STOP_IDS: usize = 1024;
+/// Most generations of one completions request (prompts x n): they queue before every other client's.
+pub(crate) const MAX_GENERATIONS: usize = 256;
 /// Most alternatives per token (`top_logprobs`, completions `logprobs`), as vLLM's default max_logprobs.
 const MAX_TOP_LOGPROBS: u64 = 20;
 
@@ -226,6 +233,7 @@ async fn metrics(State(st): State<Arc<AppState>>) -> Response {
         ("blaze_generation_tokens_total", "counter", "Generated tokens", m.generation_tokens.load(Ordering::Relaxed) as f64),
         ("blaze_requests_dropped_total", "counter", "Generations dropped before their end (client gone or stop string)", m.dropped.load(Ordering::Relaxed) as f64),
         ("blaze_requests_cancelled_total", "counter", "Requests the scheduler dropped because their client was gone", s.cancelled.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_kv_full_total", "counter", "Requests ended early because the KV pool could not hold them", s.kv_full.load(Ordering::Relaxed) as f64),
         ("blaze_requests_open", "gauge", "Generations open on the HTTP side", m.open.load(Ordering::Relaxed) as f64),
         ("blaze_requests_running", "gauge", "Requests prefilling or decoding", s.running.load(Ordering::Relaxed) as f64),
         ("blaze_requests_waiting", "gauge", "Requests waiting for a free row or KV room", s.waiting.load(Ordering::Relaxed) as f64),
@@ -299,6 +307,15 @@ fn check_ranges(st: &AppState, body: &Value) -> Checked<()> {
     }
     if let Some(bad) = body.get("logit_bias").and_then(Value::as_object).and_then(|m| outside(Box::new(m.keys().filter_map(|k| k.parse().ok())))) {
         return Err(bad_param("logit_bias", format!("token id {bad} is outside the vocabulary of {}", st.vocab)));
+    }
+    let stops = stop_strings(body);
+    if stops.len() > MAX_STOPS || stops.iter().any(|s| s.len() > MAX_STOP_BYTES) {
+        return Err(bad_param("stop", format!("at most {MAX_STOPS} stop strings of at most {MAX_STOP_BYTES} bytes each")));
+    }
+    for k in ["stop_token_ids", "bad_words"] {
+        if body.get(k).and_then(Value::as_array).is_some_and(|a| a.len() > MAX_STOP_IDS) {
+            return Err(bad_param(k, format!("{k} has at most {MAX_STOP_IDS} entries")));
+        }
     }
     Ok(())
 }
@@ -446,6 +463,8 @@ fn constraint_of(st: &AppState, body: &Value, after: Option<i32>, forced: Option
 /// string that spans chunks never reaches the client in part.
 struct StopCutter {
     stops: Vec<String>,
+    /// KMP prefix function of every stop string (its longest proper border at each length)
+    borders: Vec<Vec<usize>>,
     include: bool,
     held: String,
     stopped: bool,
@@ -453,7 +472,9 @@ struct StopCutter {
 
 impl StopCutter {
     fn new(stops: Vec<String>, include: bool) -> Self {
-        Self { stops: stops.into_iter().filter(|s| !s.is_empty()).collect(), include, held: String::new(), stopped: false }
+        let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
+        let borders = stops.iter().map(|s| borders(s.as_bytes())).collect();
+        Self { stops, borders, include, held: String::new(), stopped: false }
     }
 
     /// Text that is safe to send after `delta`.
@@ -474,7 +495,7 @@ impl StopCutter {
             self.held.clear();
             return out;
         }
-        let keep = self.stops.iter().map(|s| overlap(&self.held, s)).max().unwrap_or(0);
+        let keep = self.stops.iter().zip(&self.borders).map(|(s, b)| overlap(&self.held, s, b)).max().unwrap_or(0);
         let cut = self.held.len() - keep;
         let out = self.held[..cut].to_string();
         self.held.drain(..cut);
@@ -487,9 +508,40 @@ impl StopCutter {
     }
 }
 
-/// Bytes of the longest suffix of `text` that is a proper prefix of `stop`.
-fn overlap(text: &str, stop: &str) -> usize {
-    (1..stop.len()).rev().filter(|&k| stop.is_char_boundary(k)).find(|&k| text.ends_with(&stop[..k])).unwrap_or(0)
+/// KMP prefix function: for each length l of `p`, the longest proper border of p[..l] (index l - 1).
+fn borders(p: &[u8]) -> Vec<usize> {
+    let mut b = vec![0; p.len()];
+    let mut k = 0;
+    for i in 1..p.len() {
+        while k > 0 && p[i] != p[k] {
+            k = b[k - 1];
+        }
+        if p[i] == p[k] {
+            k += 1;
+        }
+        b[i] = k;
+    }
+    b
+}
+
+/// Bytes of the longest suffix of `text` that is a proper prefix of `stop`, on a character boundary of both (the KMP
+/// automaton of `stop` run over the last bytes of `text`: linear in the stop's length).
+fn overlap(text: &str, stop: &str, border: &[usize]) -> usize {
+    let (t, p) = (text.as_bytes(), stop.as_bytes());
+    let mut k = 0;
+    for &c in &t[t.len().saturating_sub(p.len())..] {
+        while k > 0 && (k == p.len() || c != p[k]) {
+            k = border[k - 1];
+        }
+        if c == p[k] {
+            k += 1;
+        }
+    }
+    // a whole match is found by the caller's search; a border that splits a character is no prefix to hold
+    while k > 0 && (k == p.len() || !stop.is_char_boundary(k) || !text.is_char_boundary(t.len() - k)) {
+        k = border[k - 1];
+    }
+    k
 }
 
 /// Text of the generated tokens, emitted as soon as it is valid UTF-8, with stop strings cut.
@@ -751,6 +803,28 @@ mod tests {
             out.push_str(&c.flush());
         }
         (out, c.stopped)
+    }
+
+    #[test]
+    fn overlap_matches_the_quadratic_search() {
+        let brute = |text: &str, stop: &str| {
+            (1..stop.len()).rev().filter(|&k| stop.is_char_boundary(k)).find(|&k| text.ends_with(&stop[..k])).unwrap_or(0)
+        };
+        let mut x = 7u64;
+        let alphabet = ["a", "b", "ab", "é", "日"];
+        let mut next = || {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (x >> 33) as usize
+        };
+        for _ in 0..3000 {
+            let (ls, lt) = (1 + next() % 6, next() % 9);
+            let stop: String = (0..ls).map(|_| alphabet[next() % alphabet.len()]).collect();
+            let text: String = (0..lt).map(|_| alphabet[next() % alphabet.len()]).collect();
+            if stop.is_empty() {
+                continue;
+            }
+            assert_eq!(overlap(&text, &stop, &borders(stop.as_bytes())), brute(&text, &stop), "text {text:?} stop {stop:?}");
+        }
     }
 
     #[test]

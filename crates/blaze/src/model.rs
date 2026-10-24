@@ -1,7 +1,7 @@
 //! Qwen3.5 / 3.6 / 3.8 model graphs with Gated DeltaNet, softmax attention and dense or MoE MLPs.
 //! Projections with a shared input are stacked at load time.
 
-use crate::config::{LayerKind, MlpConfig, ModelConfig, RopeScaling};
+use crate::config::{QSA_TABLE_STRIDE, LayerKind, MlpConfig, ModelConfig, RopeScaling};
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check, stream_after};
 use std::cell::Cell;
 use crate::linear::{Cut, LinCtx, Linear};
@@ -184,13 +184,57 @@ impl Drop for MoeEngine {
 /// after the model and reserve_gib, and takes as many KV tokens as the rest holds; the smallest count over the ranks
 /// wins (the pools of a TP model are the same size on every rank).
 pub struct KvAuto {
-    pub barrier: std::sync::Barrier,
+    pub barrier: RankBarrier,
     pub tokens: std::sync::atomic::AtomicUsize,
 }
 
 impl KvAuto {
     pub fn new(world: usize) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { barrier: std::sync::Barrier::new(world.max(1)), tokens: std::sync::atomic::AtomicUsize::new(usize::MAX) })
+        std::sync::Arc::new(Self { barrier: RankBarrier::new(world), tokens: std::sync::atomic::AtomicUsize::new(usize::MAX) })
+    }
+}
+
+/// A barrier of the rank threads that a failed rank breaks: its waiters get an error instead of waiting for a rank
+/// that will never come (a rank that runs out of VRAM loading its weights).
+pub struct RankBarrier {
+    n: usize,
+    state: std::sync::Mutex<(usize, u64, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl RankBarrier {
+    pub fn new(n: usize) -> Self {
+        Self { n: n.max(1), state: std::sync::Mutex::new((0, 0, false)), cv: std::sync::Condvar::new() }
+    }
+
+    /// Wait for every rank; Err once a rank has failed.
+    pub fn wait(&self) -> Result<()> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.2 {
+            bail!("another rank failed");
+        }
+        let generation = st.1;
+        st.0 += 1;
+        if st.0 == self.n {
+            st.0 = 0;
+            st.1 += 1;
+            self.cv.notify_all();
+            return Ok(());
+        }
+        while st.1 == generation && !st.2 {
+            st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        if st.1 == generation {
+            bail!("another rank failed");
+        }
+        Ok(())
+    }
+
+    /// This rank will not come: release the waiters (and fail later waits).
+    pub fn fail(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.2 = true;
+        self.cv.notify_all();
     }
 }
 
@@ -211,6 +255,8 @@ pub struct Options {
     /// VRAM on GPU 0 the vision tower would take there: kept for it by a dense model's KV (auto); a model with routed
     /// experts gives it to the expert slots (the tower takes the GPU only when room is left, else the CPU)
     pub vision_vram: usize,
+    /// --vision gpu: the tower goes to GPU 0 whatever the room, so a model with routed experts keeps vision_vram too
+    pub vision_gpu: bool,
     /// QSA models: KV pools in pinned host memory, read through a device row cache (decode) and a staged prefix
     /// (prefill); their VRAM goes to expert slots
     pub kv_host: bool,
@@ -420,7 +466,8 @@ impl MetaLayout {
         let tok_kv_len = take(max_tokens * 4);
         // a sampled row's edits: its penalized tokens (the output's distinct tokens, the prompt's with a repetition
         // penalty), bans, biases
-        let max_pen = (head_rows * 32768).clamp(1 << 16, 1 << 21);
+        // edits of a step: at least one row's worth of the whole vocabulary (the scheduler splits steps beyond it)
+        let max_pen = (head_rows * 32768).clamp(1 << 16, 1 << 21).max(vocab + 64);
         let pen_off = take((max_tokens + 1) * 4);
         let mask_row = take(max_tokens * 4);
         let base_bytes = take(0);
@@ -465,12 +512,11 @@ impl MetaLayout {
     }
 }
 
-/// QSA: query rows scored per pass (the scores scratch holds this many rows of the longest context's blocks), and the
-/// row stride of the selection table (block_topk * ratio + ratio - 1 rounded up).
+/// QSA: query rows scored per pass (the scores scratch holds this many rows of the longest context's blocks); the row
+/// stride of the selection table is config::QSA_TABLE_STRIDE (checked against the indexer's budget at load).
 const QSA_SCORE_ROWS: usize = 128;
 /// Rows of one sparse-attention call (a long prefill chunk goes in groups: smaller split-K partials).
 const SPARSE_ROWS: usize = 1024;
-const QSA_TABLE_STRIDE: usize = 2056;
 
 /// One sequence of a step: `len` tokens at `offset` in the step's token list (decode sequences first, len 1).
 #[derive(Clone, Copy, Debug)]
@@ -1256,6 +1302,9 @@ impl Model {
     /// sequence (decode tokens select mostly the same rows), the compact pool of GATHER_ROWS rows, the staging pool of one
     /// sequence's prefix.
     fn init_host_kv(&mut self) -> Result<()> {
+        if !matches!(self.opts.kv_dtype, KvDtype::Nvfp4FourOverSix | KvDtype::Nvfp4) {
+            bail!("--kv-host keeps NVFP4 KV pools only (the row cache and gathers read NVFP4 rows): use an NVFP4 KV dtype");
+        }
         let s = &self.stream;
         let q = self.cfg.qsa.as_ref().unwrap();
         let (code_bytes, scale_bytes) = self.opts.kv_dtype.bytes();
@@ -1326,7 +1375,7 @@ impl Model {
         let gib = (1u64 << 30) as f64;
         let moe = matches!(self.cfg.mlp, MlpConfig::Moe { .. });
         let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0)
-            + if self.tp.rank == 0 && !moe { self.opts.vision_vram } else { 0 };
+            + if self.tp.rank == 0 && (!moe || self.opts.vision_gpu) { self.opts.vision_vram } else { 0 };
         let reserve = (self.opts.reserve_gib * gib) as usize;
         // the probe pools are given back: they count as free
         let probe: usize = self.kv.iter().flatten().map(DevBuf::owned_bytes).sum::<usize>() + self.qsa_comp.iter().map(DevBuf::bytes).sum::<usize>();
@@ -1354,7 +1403,7 @@ impl Model {
         }
         tokens = tokens.min(cap);
         auto.tokens.fetch_min(tokens, std::sync::atomic::Ordering::SeqCst);
-        auto.barrier.wait();
+        auto.barrier.wait().context("--kv-tokens auto")?;
         let page = self.page_size().max(256);
         let tokens = auto.tokens.load(std::sync::atomic::Ordering::SeqCst) / page * page;
         if tokens < self.opts.max_chunk.max(page) {
@@ -1403,7 +1452,8 @@ impl Model {
     fn start_moe(&self, dir: &Path, top_k: usize) -> Result<MoeEngine> {
         let (free, _) = crate::gpu::mem_info()?;
         // what loads after the model (drafter, vision tower) keeps its room
-        let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0);
+        let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0)
+            + if self.tp.rank == 0 && self.opts.vision_gpu { self.opts.vision_vram } else { 0 };
         let gib = ((free.saturating_sub(later)) as f64 / (1u64 << 30) as f64 - self.opts.reserve_gib).max(0.0);
         let model_dir = CString::new(dir.to_string_lossy().as_bytes())?;
         let heat = self.opts.moe_heat.as_ref().map(|h| CString::new(h.as_bytes())).transpose()?;

@@ -483,6 +483,8 @@ impl Linear {
                         if p.n * k > ctx.scratch_elems {
                             bail!("NVFP4 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
                         }
+                        // the widened weights overwrite the FP16 inputs a tensor-core part may have left in the scratch
+                        x16 = None;
                         check(
                             unsafe {
                                 sys::blz_nvfp4_weight_dequant(codes.ptr(), scales.ptr(), alpha.ptr(), p.n as c_int, k as c_int,
@@ -513,6 +515,8 @@ impl Linear {
                         if p.n * k > ctx.scratch_elems {
                             bail!("FP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
                         }
+                        // the widened weights overwrite the FP16 inputs a tensor-core part may have left in the scratch
+                        x16 = None;
                         check(
                             unsafe {
                                 sys::blz_fp8_weight_dequant(codes.ptr(), bs, *block_n as c_int, alpha.ptr(), p.n as c_int, k as c_int,
@@ -543,6 +547,8 @@ impl Linear {
                         if p.n * k > ctx.scratch_elems {
                             bail!("MXFP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
                         }
+                        // the widened weights overwrite the FP16 inputs a tensor-core part may have left in the scratch
+                        x16 = None;
                         check(unsafe { sys::blz_mxfp8_weight_dequant(codes.ptr(), scales.ptr(), p.n as c_int, k as c_int, ctx.scratch, s.0) },
                               "blz_mxfp8_weight_dequant")?;
                         check(

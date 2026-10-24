@@ -7,6 +7,8 @@ use std::path::Path;
 pub struct Text {
     tok: tokenizers::Tokenizer,
     pub eos: Vec<u32>,
+    /// the raw bytes of every token (built on first use)
+    bytes: std::sync::OnceLock<Vec<Box<[u8]>>>,
 }
 
 impl Text {
@@ -33,7 +35,7 @@ impl Text {
                 }
             }
         }
-        Ok(Self { tok, eos })
+        Ok(Self { tok, eos, bytes: Default::default() })
     }
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
@@ -76,6 +78,53 @@ impl Text {
             }
         }
         bits
+    }
+
+    /// The raw bytes of token `id`: a byte-level BPE token may hold part of a UTF-8 character, which decoding it
+    /// alone turns into U+FFFD.
+    pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        let table = self.bytes.get_or_init(|| {
+            let byte_level = matches!(self.tok.get_decoder(), Some(tokenizers::DecoderWrapper::ByteLevel(_)));
+            // GPT-2's byte-to-character map, inverted
+            let mut of_char = std::collections::HashMap::new();
+            let mut n = 0u32;
+            for b in 0..=255u8 {
+                let printable = matches!(b, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF);
+                let c = if printable { b as u32 } else { n += 1; 255 + n };
+                of_char.insert(char::from_u32(c).unwrap(), b);
+            }
+            let added = self.tok.get_added_tokens_decoder();
+            (0..self.tok.get_vocab_size(true) as u32)
+                .map(|id| {
+                    if let Some(a) = added.get(&id) {
+                        return a.content.as_bytes().into();
+                    }
+                    let mapped = byte_level
+                        .then(|| self.tok.id_to_token(id))
+                        .flatten()
+                        .and_then(|t| t.chars().map(|c| of_char.get(&c).copied()).collect::<Option<Vec<u8>>>());
+                    mapped.unwrap_or_else(|| self.decode(&[id]).unwrap_or_default().into_bytes()).into_boxed_slice()
+                })
+                .collect()
+        });
+        match table.get(id as usize) {
+            Some(b) => b.to_vec(),
+            None => self.decode(&[id]).unwrap_or_default().into_bytes(),
+        }
+    }
+
+    /// Token `id` as logprobs show it: its text, the bytes of a partial UTF-8 character written as `\xNN` (as OpenAI
+    /// does), so different partial tokens stay different strings.
+    pub fn token_str(&self, id: u32) -> (String, Vec<u8>) {
+        let b = self.token_bytes(id);
+        let mut s = String::new();
+        for chunk in b.utf8_chunks() {
+            s.push_str(chunk.valid());
+            for x in chunk.invalid() {
+                s.push_str(&format!("\\x{x:02x}"));
+            }
+        }
+        (s, b)
     }
 
     /// Decode without the special tokens (chat output: the stop token is not part of the text).

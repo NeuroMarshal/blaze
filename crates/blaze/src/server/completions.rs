@@ -34,7 +34,7 @@ fn completion_logprobs(text: &Text, items: &[(u32, TokenLogprob)], offset: &mut 
     if items.is_empty() {
         return Value::Null;
     }
-    let tok = |t: u32| text.decode(&[t]).unwrap_or_default();
+    let tok = |t: u32| text.token_str(t).0;
     let strs: Vec<String> = items.iter().map(|(t, _)| tok(*t)).collect();
     let mut offsets = Vec::with_capacity(strs.len());
     for s in &strs {
@@ -110,8 +110,12 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
     if echo && body.get("logprobs").is_some_and(|v| !v.is_null()) {
         return Err(bad_param("echo", "logprobs of the prompt are not supported: echo and logprobs cannot be combined"));
     }
+    let prompts = prompts_of(&body)?;
+    if prompts.len() * n > super::MAX_GENERATIONS {
+        return Err(bad_param("prompt", format!("{} prompts x n = {n} generations: at most {} in one request", prompts.len(), super::MAX_GENERATIONS)));
+    }
     let mut jobs = Vec::new();
-    for p in prompts_of(&body)? {
+    for p in prompts {
         let (mut tokens, text): (Vec<i64>, String) = match p {
             Prompt::Text(s) => (st.text.encode(&s).map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?.into_iter().map(i64::from).collect(), s),
             Prompt::Ids(ids) => {

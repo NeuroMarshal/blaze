@@ -174,6 +174,8 @@ cudaError_t launch(const uint16_t* x, const uint16_t* w_down, const uint16_t* w_
   const float inv_hc = 1.0f / float(kHc);
   hc_down_kernel<kRows><<<(R + kDownRows - 1) / kDownRows, 32 * kWarps, 0, stream>>>(x, w_down, t, rows, K, R, inv_hc);
   const size_t smem = size_t(kRows) * R * sizeof(float);
+  // 16 rows of a 1024 low rank: 64 KiB, past the default 48 KiB of dynamic shared memory
+  if (smem > 48 * 1024) cudaFuncSetAttribute(hc_up_kernel<kRows, kHc>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
   hc_up_kernel<kRows, kHc><<<(hs + kWarps - 1) / kWarps, 32 * kWarps, smem, stream>>>(x, t, w_up, out, rows, R, hs,
                                                                                      inv_hc);
   return cudaGetLastError();

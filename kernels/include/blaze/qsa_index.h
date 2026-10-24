@@ -50,7 +50,8 @@ cudaError_t blz_qsa_scores(const uint16_t* q, int heads, int dim, const int64_t*
 /// \brief The positions each query row attends to, as KV slots: the best `block_topk` visible blocks (all of them when
 /// fewer; the scores of rows [row0, row0 + rows) at `scores`) expanded to their `ratio` tokens, plus the tokens of the
 /// row's own incomplete block; slots written to table[r, 0 .. count) and count to counts[r] (r - row0 rows of
-/// table / counts are written, at row r). With scores == null every visible block is taken.
+/// table / counts are written, at row r). With scores == null the visible blocks are taken, the newest block_topk of
+/// them when there are more. A row takes up to block_topk * ratio + ratio - 1 slots: table_stride must hold them.
 cudaError_t blz_qsa_select(const float* scores, int64_t ld_scores, const int64_t* positions, const int32_t* tok_row,
                            int row0, int rows, int ratio, int block_topk, const int32_t* req_to_token,
                            int64_t rt_stride, int32_t* table, int64_t table_stride, int32_t* counts,

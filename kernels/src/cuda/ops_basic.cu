@@ -398,7 +398,9 @@ using namespace blaze;
 extern "C" cudaError_t blz_rmsnorm(const uint16_t* x, uint16_t* residual, const uint16_t* w, float eps, int rows,
                                    int dim, int zero_centered, uint16_t* out, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
-  rmsnorm_kernel<<<rows, kNormThreads, size_t(dim) * sizeof(float), stream>>>(x, residual, w, eps, dim, zero_centered,
+  const size_t smem = size_t(dim) * sizeof(float);
+  if (smem > 48 * 1024) cudaFuncSetAttribute(rmsnorm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+  rmsnorm_kernel<<<rows, kNormThreads, smem, stream>>>(x, residual, w, eps, dim, zero_centered,
                                                                              out);
   return cudaGetLastError();
 }

@@ -436,6 +436,7 @@ dependencies = [
  "async-stream",
  "axum",
  "base64 0.22.1",
+ "blake3",
  "blaze-sys",
  "clap",
  "futures",
@@ -452,6 +453,7 @@ dependencies = [
  "tokio",
  "toktrie_hf_tokenizers",
  "ureq",
+ "url",
  "uuid",
 ]
 

@@ -421,8 +421,10 @@ __global__ void __launch_bounds__(kSelThreads) select_kernel(const float* __rest
   const int K = block_topk;
   int nsel;
   if (sc == nullptr || nvis <= K) {
-    for (int i = tid; i < nvis; i += kSelThreads) sel[i] = i;
-    nsel = nvis;
+    // without scores: the newest K blocks (the shared buffer and the table row hold K)
+    const int first = nvis > K ? nvis - K : 0;
+    nsel = nvis - first;
+    for (int i = tid; i < nsel; i += kSelThreads) sel[i] = first + i;
   } else {
     for (int i = tid; i < kBins; i += kSelThreads) hist[i] = 0;
     __syncthreads();
@@ -625,7 +627,8 @@ extern "C" cudaError_t blz_qsa_select(const float* scores, int64_t ld_scores, co
                                       const int32_t* req_to_token, int64_t rt_stride, int32_t* table,
                                       int64_t table_stride, int32_t* counts, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
-  if (block_topk > 2048) return cudaErrorInvalidValue;
+  // a row takes up to block_topk * ratio + ratio - 1 slots (the top blocks and the trailing partial one)
+  if (block_topk > 2048 || ratio < 1 || int64_t(block_topk) * ratio + ratio - 1 > table_stride) return cudaErrorInvalidValue;
   static bool attr[16] = {};
   int dev = 0;
   cudaGetDevice(&dev);

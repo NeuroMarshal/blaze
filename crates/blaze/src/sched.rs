@@ -410,6 +410,8 @@ pub struct SchedStats {
     pub waiting: AtomicUsize,
     /// requests dropped because their client was gone
     pub cancelled: AtomicU64,
+    /// requests ended early because the KV pool could not hold them
+    pub kv_full: AtomicU64,
 }
 
 /// Handle of the scheduler thread.
@@ -435,6 +437,8 @@ impl Scheduler {
                     active: Vec::new(),
                     cache: Vec::new(),
                     inflation: 0.0,
+                    pen_turn: 0,
+                    pen_split_logged: false,
                     snap_stats: SnapStats::default(),
                     spec_stats: (0, 0),
                     spec_log: SpecLog::default(),
@@ -467,6 +471,9 @@ struct Loop {
     cache: Vec<CacheEntry>,
     /// GreedyDual-Size inflation of the prompt cache (CacheEntry) and the usefulness of its snapshot kinds
     inflation: f64,
+    /// steps whose logit edits overflowed the engine's table rotate the requests that go first
+    pen_turn: usize,
+    pen_split_logged: bool,
     snap_stats: SnapStats,
     /// speculative verifies and the tokens they emitted
     spec_stats: (usize, usize),
@@ -635,8 +642,15 @@ impl Loop {
             let prompt = req.tokens.clone();
             let hit = self.lookup(&prompt);
             let cached = hit.map_or(0, |i| self.cache[i].tokens.len());
-            // KV room for the rest of the prompt: evict cached prefixes (not the one we are about to use) if needed
-            let need = prompt.len() - cached + 16;
+            // KV room for the rest of the prompt next to what the admitted requests still read (their prompts) and
+            // a verify of each decoding one: evict cached prefixes (not the one we are about to use) if needed
+            let page = self.engine.info.page;
+            let reserved: usize = self
+                .active
+                .iter()
+                .map(|a| if a.pending.is_some() { self.engine.info.max_verify.max(1) } else { a.req.tokens.len() - a.fed } + page)
+                .sum();
+            let need = prompt.len() - cached + 16 + reserved;
             while self.engine.free_slots() < need && self.cache.len() > hit.map_or(0, |_| 1) {
                 let keep = hit.map(|i| self.cache[i].tokens.clone());
                 let lru = self
@@ -653,6 +667,17 @@ impl Loop {
             }
             if self.engine.free_slots() < need && !self.active.is_empty() {
                 return; // wait for running requests to free their slots
+            }
+            if self.engine.free_slots() < need {
+                // alone and still too long for the pool: it would never get its pages
+                let req = self.waiting.pop_front().unwrap();
+                eprintln!("blaze: a prompt of {} tokens needs {need} KV slots, the pool has {}", req.tokens.len(), self.engine.free_slots());
+                let _ = req.events.send(GenEvent::Error(format!(
+                    "the prompt of {} tokens needs {need} KV cache slots; this server's pool holds {} (--kv-tokens)",
+                    req.tokens.len(),
+                    self.engine.free_slots()
+                )));
+                continue;
             }
             let req = self.waiting.pop_front().unwrap();
             let hit = self.lookup(&req.tokens);
@@ -768,6 +793,7 @@ impl Loop {
     /// actually emitted (the budget may replace it) and the finish reason if the request ends here.
     fn emit(&mut self, i: usize, pick: i32, lp: Option<TokenLogprob>) -> (i32, Option<Finish>) {
         let a = &mut self.active[i];
+        let sampled = pick;
         let mut pick = pick;
         if let Some(tb) = a.req.think.clone() {
             if let Some(f) = a.forced.pop_front() {
@@ -786,6 +812,14 @@ impl Loop {
                 a.think_count += 1;
             }
         }
+        // a token the thinking budget forced: its logprob from the step's candidates (MIN_LOGPROB when not among them),
+        // not the sampled token's
+        let lp = lp.map(|mut l| {
+            if pick != sampled {
+                l.logprob = l.top.iter().find(|&&(t, _)| t == pick).map_or(MIN_LOGPROB, |&(_, v)| v);
+            }
+            l
+        });
         a.pending = Some(pick);
         a.generated.push(pick);
         if let Some(w) = a.seen.get_mut(pick as usize / 64) {
@@ -962,6 +996,9 @@ impl Loop {
                     pens.push(p);
                 }
             }
+            if !self.pens_fit(&pens) {
+                return Ok(false); // a plain step, which splits the requests if their edits still do not fit
+            }
         }
         let mut seq_ptrs: Vec<*mut Seq> = order.iter().map(|&i| &mut self.active[i].seq as *mut Seq).collect();
         // SAFETY: `order` holds distinct indices, so the pointers are distinct and live for these calls.
@@ -1053,17 +1090,7 @@ impl Loop {
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
             let a = self.active.swap_remove(i);
-            if reason != Finish::Cancelled {
-                let mut tokens = a.req.tokens.clone();
-                tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
-                self.remember(&a.seq, tokens, SnapKind::Finish);
-            }
-            if reason == Finish::Cancelled {
-                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
-            }
-            let _ = a.req.events.send(GenEvent::Done(reason));
-            self.keep_output(&a);
-            self.engine.close(a.seq);
+            self.retire(a, reason);
         }
         Ok(true)
     }
@@ -1154,6 +1181,9 @@ impl Loop {
                     }
                     pens.push(p);
                 }
+            }
+            if !self.pens_fit(&pens) {
+                return Ok(false);
             }
         }
         let tok_rows: Vec<&[i64]> = order.iter().map(|&i| rows[i].tokens.as_slice()).collect();
@@ -1247,17 +1277,7 @@ impl Loop {
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
             let a = self.active.swap_remove(i);
-            if reason != Finish::Cancelled {
-                let mut tokens = a.req.tokens.clone();
-                tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
-                self.remember(&a.seq, tokens, SnapKind::Finish);
-            }
-            if reason == Finish::Cancelled {
-                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
-            }
-            let _ = a.req.events.send(GenEvent::Done(reason));
-            self.keep_output(&a);
-            self.engine.close(a.seq);
+            self.retire(a, reason);
         }
         Ok(true)
     }
@@ -1309,15 +1329,75 @@ impl Loop {
     }
 
     /// Suffix decoding: a finished output joins the earlier outputs.
+    /// A request that has finished: the conversation so far (prompt + output except the last, unfed token) kept for
+    /// the next turn, its end sent, its output kept for suffix decoding, its KV given back.
+    fn retire(&mut self, a: Active, reason: Finish) {
+        if reason != Finish::Cancelled {
+            let mut tokens = a.req.tokens.clone();
+            tokens.extend(a.generated[..a.generated.len().saturating_sub(1)].iter().map(|&t| t as i64));
+            self.remember(&a.seq, tokens, SnapKind::Finish);
+        }
+        if reason == Finish::Cancelled {
+            self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = a.req.events.send(GenEvent::Done(reason));
+        self.keep_output(&a);
+        self.engine.close(a.seq);
+    }
+
+    /// The rows' logit edits fit the engine's table of a step.
+    fn pens_fit(&self, pens: &[Penalty]) -> bool {
+        pens.iter().map(|p| p.edits.len()).sum::<usize>() <= self.engine.info.max_pen
+    }
+
+    /// Free KV pages for `pages` more, prompt-cache snapshots evicted (least worth first) as needed.
+    fn make_room(&mut self, pages: usize) -> bool {
+        while self.engine.free_page_count() < pages {
+            if !self.evict_lru() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Before a step: the KV pages every decoding request may take this step (a verify of max_verify rows). When the
+    /// pool cannot hold them even without the prompt cache, the newest decoding request ends (finish "length", logged)
+    /// instead of the step failing for every request.
+    fn decode_room(&mut self) {
+        let rows = self.engine.info.max_verify.max(1);
+        loop {
+            let need: usize = self.active.iter().filter(|a| a.pending.is_some()).map(|a| self.engine.pages_for(a.seq.len(), rows)).sum();
+            if self.make_room(need) {
+                return;
+            }
+            let Some(i) = (0..self.active.len()).rev().find(|&i| self.active[i].pending.is_some()) else { return };
+            let a = self.active.remove(i);
+            eprintln!(
+                "blaze: KV pool full ({} free pages for {need}): a request ends at {} tokens of output (finish length)",
+                self.engine.free_page_count(),
+                a.generated.len()
+            );
+            self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
+            self.retire(a, Finish::Length);
+        }
+    }
+
     fn keep_output(&mut self, a: &Active) {
         if self.cfg.spec_method == SpecMethod::Suffix && self.cfg.spec_tokens > 0 && !a.generated.is_empty() {
             self.suffix_global.extend(a.generated.iter().copied());
             self.suffix_global.end_seq();
-            self.suffix_global.trim(SUFFIX_GLOBAL_TOKENS);
+            // rebuilt once the corpus passes the limit by a quarter, down to three quarters of it: one rebuild per
+            // half a limit of new output, not one per request (it runs on this thread, every stream waits for it)
+            if self.suffix_global.len() > SUFFIX_GLOBAL_TOKENS + SUFFIX_GLOBAL_TOKENS / 4 {
+                let t0 = Instant::now();
+                self.suffix_global.trim(SUFFIX_GLOBAL_TOKENS * 3 / 4);
+                eprintln!("blaze: suffix corpus trimmed to {} tokens in {:.0} ms", self.suffix_global.len(), t0.elapsed().as_secs_f64() * 1e3);
+            }
         }
     }
 
     fn step(&mut self) -> Result<()> {
+        self.decode_room();
         if self.cfg.spec_tokens > 0
             && self.waiting.is_empty()
             && !self.active.is_empty()
@@ -1340,8 +1420,24 @@ impl Loop {
             {
                 chunk_len = chunk_len.min(p - a.fed);
             }
-            if self.engine.free_slots() >= order.len() + chunk_len {
+            // its pages and one row of every decoding request (decode_room kept those)
+            let decode: usize = order.iter().map(|&j| self.engine.pages_for(self.active[j].seq.len(), 1)).sum();
+            let need = decode + self.engine.pages_for(self.active[i].seq.len(), chunk_len);
+            if self.make_room(need) {
                 order.push(i);
+            } else if order.is_empty() {
+                // nothing decodes that would free pages: the prompt cannot go on (admit keeps room for the prompts it
+                // lets in, so only page rounding gets here)
+                let a = self.active.remove(i);
+                eprintln!("blaze: KV pool full: a prompt of {} tokens stops at {} ({} free pages)", a.req.tokens.len(), a.fed,
+                          self.engine.free_page_count());
+                self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
+                let _ = a.req.events.send(GenEvent::Error(format!(
+                    "the KV pool is full: the prompt of {} tokens does not fit next to the running requests",
+                    a.req.tokens.len()
+                )));
+                self.engine.close(a.seq);
+                return Ok(());
             } else {
                 chunk_len = 0;
             }
@@ -1359,6 +1455,34 @@ impl Loop {
                 let _ = self.engine.ple_warm(prev, &a.req.tokens[next0..next1]);
             }
         }
+        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some());
+        let mut pens: Vec<Penalty> = if sampled { order.iter().map(|&i| self.edits_for(i, &[])).collect() } else { Vec::new() };
+        if !self.pens_fit(&pens) {
+            // more logit edits than the engine's table: the requests past it wait for the next step, from a
+            // different first request each time
+            self.pen_turn = self.pen_turn.wrapping_add(1);
+            let (n, cap) = (order.len(), self.engine.info.max_pen);
+            let mut keep = vec![false; n];
+            let mut total = 0;
+            for k in 0..n {
+                let j = (k + self.pen_turn) % n;
+                if total + pens[j].edits.len() <= cap {
+                    keep[j] = true;
+                    total += pens[j].edits.len();
+                }
+            }
+            if !self.pen_split_logged {
+                self.pen_split_logged = true;
+                eprintln!("blaze: logit edits of {} requests exceed the step's {cap}: they take turns (logged once)", n);
+            }
+            if prefill.is_some_and(|p| keep.iter().zip(&order).any(|(&k, &i)| !k && i == p)) {
+                chunk_len = 0;
+            }
+            let mut it = keep.iter();
+            order.retain(|_| *it.next().unwrap());
+            let mut it = keep.iter();
+            pens.retain(|_| *it.next().unwrap());
+        }
         let toks: Vec<Vec<i64>> = order
             .iter()
             .map(|&i| {
@@ -1369,7 +1493,6 @@ impl Loop {
                 }
             })
             .collect();
-        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some());
         // grammar masks (a prefill chunk's pick before the prompt's end is thrown away: no mask)
         let words = self.engine.info.vocab.div_ceil(32);
         let masks: Vec<Option<Vec<u32>>> = order
@@ -1391,7 +1514,6 @@ impl Loop {
         let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
         let tok_refs: Vec<&[i64]> = toks.iter().map(|t| t.as_slice()).collect();
         let (picks, lps): (Vec<i32>, Vec<Option<TokenLogprob>>) = if sampled {
-            let mut pens: Vec<Penalty> = order.iter().map(|&i| self.edits_for(i, &[])).collect();
             for (p, m) in pens.iter_mut().zip(masks) {
                 p.mask = m;
             }
@@ -1483,18 +1605,7 @@ impl Loop {
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {
             let a = self.active.swap_remove(i);
-            // the conversation so far (prompt + output except the last, unfed token) for the next turn
-            if reason != Finish::Cancelled {
-                let mut tokens = a.req.tokens.clone();
-                tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
-                self.remember(&a.seq, tokens, SnapKind::Finish);
-            }
-            if reason == Finish::Cancelled {
-                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
-            }
-            let _ = a.req.events.send(GenEvent::Done(reason));
-            self.keep_output(&a);
-            self.engine.close(a.seq);
+            self.retire(a, reason);
         }
         Ok(())
     }
@@ -1566,10 +1677,15 @@ pub fn propose(ctx: &[i64], max_n: usize, min_n: usize, k: usize) -> Vec<i64> {
 }
 
 /// Logprob of the chosen token from its row's candidates (OpenAI logprobs), with `top` alternatives.
+/// Logprobs as the API shows them: -inf (a token the grammar or a bias ruled out) is -9999 as in vLLM, since JSON has
+/// no infinity and serde would write null.
+pub const MIN_LOGPROB: f32 = -9999.0;
+
 fn logprob_of(c: &crate::engine::Cands, x: i32, top: Option<usize>) -> Option<TokenLogprob> {
     let n = top?;
-    let lp = c.top.iter().find(|&&(_, t)| t == x).map(|&(l, _)| l - c.lse).unwrap_or(f32::NEG_INFINITY);
-    Some(TokenLogprob { logprob: lp, top: c.top.iter().take(n).map(|&(l, t)| (t, l - c.lse)).collect() })
+    let clamp = |l: f32| if l.is_finite() { l.max(MIN_LOGPROB) } else { MIN_LOGPROB };
+    let lp = c.top.iter().find(|&&(_, t)| t == x).map(|&(l, _)| clamp(l - c.lse)).unwrap_or(MIN_LOGPROB);
+    Some(TokenLogprob { logprob: lp, top: c.top.iter().take(n).map(|&(l, t)| (t, clamp(l - c.lse))).collect() })
 }
 
 #[cfg(test)]

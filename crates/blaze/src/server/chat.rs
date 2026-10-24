@@ -225,9 +225,9 @@ fn chat_logprobs(text: &Text, items: &[(u32, TokenLogprob)]) -> Option<ChatChoic
     let content = items
         .iter()
         .map(|(t, l)| {
-            let token = text.decode(&[*t]).unwrap_or_default();
+            let (token, bytes) = text.token_str(*t);
             ChatCompletionTokenLogprob {
-                bytes: Some(token.as_bytes().to_vec()),
+                bytes: Some(bytes),
                 token,
                 logprob: l.logprob,
                 token_id: None,
@@ -235,8 +235,8 @@ fn chat_logprobs(text: &Text, items: &[(u32, TokenLogprob)]) -> Option<ChatChoic
                     .top
                     .iter()
                     .map(|&(t, lp)| {
-                        let token = text.decode(&[t as u32]).unwrap_or_default();
-                        TopLogprobs { bytes: Some(token.as_bytes().to_vec()), token, logprob: lp }
+                        let (token, bytes) = text.token_str(t as u32);
+                        TopLogprobs { bytes: Some(bytes), token, logprob: lp }
                     })
                     .collect(),
             }

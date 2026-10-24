@@ -397,16 +397,22 @@ extern "C" cudaError_t blz_host_ar_rmsnorm(blz_host_ar* ar, const uint16_t* x, u
     return cudaErrorInvalidValue;
   const int threads = std::min(blaze::kNormMaxThreads, (dim / 8 + 31) / 32 * 32);
   const int64_t bytes = int64_t(rows) * dim * 2;
+  // the normed row in shared memory: past 48 KiB above a hidden size of 12288
+  const size_t smem = size_t(dim) * sizeof(float);
+  if (smem > 48 * 1024) {
+    cudaFuncSetAttribute(blaze::host_ar_rmsnorm_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+    cudaFuncSetAttribute(blaze::host_ar_rmsnorm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
+  }
   // Beyond one chunk (not reachable with rows <= 64 at hidden sizes) the zero-copy kernel stays.
   if (bytes >= ar->dma_min && bytes <= blaze::kDmaChunk) {
     const cudaError_t err = blaze::dma_exchange(ar, x, bytes, stream);
     if (err != cudaSuccess) return err;
-    blaze::host_ar_rmsnorm_kernel<true><<<rows, threads, size_t(dim) * sizeof(float), stream>>>(
+    blaze::host_ar_rmsnorm_kernel<true><<<rows, threads, smem, stream>>>(
         ar->dev, ar->ctl, ar->rank, ar->world, ar->max_bytes, reinterpret_cast<const uint4*>(ar->tmp), x, residual, w,
         eps, dim, zero_centered, out);
     return cudaGetLastError();
   }
-  blaze::host_ar_rmsnorm_kernel<false><<<rows, threads, size_t(dim) * sizeof(float), stream>>>(
+  blaze::host_ar_rmsnorm_kernel<false><<<rows, threads, smem, stream>>>(
       ar->dev, ar->ctl, ar->rank, ar->world, ar->max_bytes, nullptr, x, residual, w, eps, dim, zero_centered, out);
   return cudaGetLastError();
 }

@@ -132,15 +132,25 @@ impl EngineArgs {
             None => (9, 0, 8),
         };
         let verify = self.max_verify.unwrap_or(verify);
-        Ok((verify, self.draft_tree_width.unwrap_or(width), drafts.min(verify.saturating_sub(1))))
+        let width = self.draft_tree_width.unwrap_or(width);
+        // draft trees are EAGLE-4's: DFlash drafts a block, MTP and n-gram sources chains
+        let eagle = match &self.draft_model {
+            Some(d) => blaze::drafter::kind(d)? == blaze::drafter::Kind::Eagle,
+            None => false,
+        };
+        if width > 1 && !eagle {
+            anyhow::bail!("--draft-tree-width {width}: draft trees need an EAGLE-4 --draft-model (DFlash, MTP and n-gram drafts are chains)");
+        }
+        Ok((verify, width, drafts.min(verify.saturating_sub(1))))
     }
 
     fn load(&self, chunk: Option<usize>, full_logits: bool) -> Result<blaze::engine::Engine> {
-        self.load_with(chunk, full_logits, 0)
+        self.load_with(chunk, full_logits, 0, false)
     }
 
     /// `gpu0_later`: VRAM on GPU 0 the vision tower loaded after the engine would take there.
-    fn load_with(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize) -> Result<blaze::engine::Engine> {
+    /// `vision_gpu`: --vision gpu, the tower's VRAM is kept from the expert slots of a model with routed experts too.
+    fn load_with(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize, vision_gpu: bool) -> Result<blaze::engine::Engine> {
         let head_vram = match self.draft_head_vram.as_str() {
             "on" => Some(true),
             "off" => Some(false),
@@ -162,12 +172,19 @@ impl EngineArgs {
         let heat = match self.expert_heat.as_deref() {
             Some("none") => None,
             Some(p) => Some(p.to_string()),
-            None => {
+            // the default profile in ~/.cache/blaze: none without HOME or when the directory cannot be made (a
+            // read-only home); only a model with routed experts reads it
+            None => std::env::var_os("HOME").filter(|h| !h.is_empty()).and_then(|home| {
                 let name = self.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let dir = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/blaze");
-                std::fs::create_dir_all(&dir)?;
-                Some(dir.join(format!("heat-{name}.bin")).to_string_lossy().into_owned())
-            }
+                let dir = PathBuf::from(home).join(".cache/blaze");
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => Some(dir.join(format!("heat-{name}.bin")).to_string_lossy().into_owned()),
+                    Err(e) => {
+                        eprintln!("blaze: no expert heat profile: {}: {e}", dir.display());
+                        None
+                    }
+                }
+            }),
         };
         let mut options = self.expert_options.clone();
         if self.expert_defer >= 0 {
@@ -181,6 +198,7 @@ impl EngineArgs {
                 kv_auto,
                 later_vram,
                 vision_vram: gpu0_later,
+                vision_gpu,
                 kv_host: self.kv_host,
                 max_chunk: chunk.unwrap_or(self.chunk),
                 max_seqs: self.max_seqs,
@@ -665,7 +683,8 @@ fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("--mm-processor-kwargs: {e}"))?,
                 None => Default::default(),
             };
-            let e = engine.load_with(None, false, blaze::vision::vram_need(&engine.model, vision, mm_kwargs.max_pixels))?;
+            let e = engine.load_with(None, false, blaze::vision::vram_need(&engine.model, vision, mm_kwargs.max_pixels),
+                                     vision == blaze::vision::VisionMode::Gpu)?;
             // after the model, so that `auto` sees the VRAM that is left; on the first GPU, whatever the tensor parallelism
             // (the embeddings go to every rank through host memory)
             let cores = std::thread::available_parallelism().map_or(8, |n| n.get());

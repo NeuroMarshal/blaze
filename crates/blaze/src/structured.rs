@@ -13,11 +13,61 @@ pub struct Grammars {
     factory: ParserFactory,
 }
 
+/// The token environment of the grammars: toktrie_hf_tokenizers' bytes of every token, except that an added token
+/// the tokenizer does not call special (Qwen's `<tool_call>`, `</think>`) is its text. toktrie_hf_tokenizers takes
+/// every `<...>` added token for a special one (bytes behind the 0xFF marker) while its tokenize_bytes, the Hugging Face
+/// encoder, turns the text `<tool_call>` into that token: llguidance then forced the token for the text and rejected
+/// it when it was sampled ("token doesn't satisfy the grammar"), and the forced tool call ran without its grammar.
+struct TokEnvText {
+    trie: llguidance::toktrie::TokTrie,
+    tok: toktrie_hf_tokenizers::ByteTokenizer,
+}
+
+impl llguidance::toktrie::TokenizerEnv for TokEnvText {
+    fn tok_trie(&self) -> &llguidance::toktrie::TokTrie {
+        &self.trie
+    }
+
+    fn tokenize_bytes(&self, s: &[u8]) -> Vec<llguidance::toktrie::TokenId> {
+        self.trie.tokenize_with_greedy_fallback(s, |s| self.tok.hf_tokenizer.encode(s, false).map(|e| e.get_ids().to_vec()).unwrap_or_default())
+    }
+}
+
 impl Grammars {
     pub fn load(tokenizer_json: &Path, eos: &[u32], vocab: usize) -> Result<Self> {
         let mut tok = toktrie_hf_tokenizers::ByteTokenizer::from_file(tokenizer_json)?;
         tok.set_eos_tokens(eos);
-        let env = tok.into_tok_env(Some(vocab))?;
+        let mut info = tok.tokrx_info();
+        let mut bytes = tok.token_bytes();
+        let marker = llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER;
+        let mut texts = 0;
+        for (id, t) in tok.hf_tokenizer.get_added_tokens_decoder() {
+            if let Some(b) = bytes.get_mut(id as usize)
+                && !t.special
+                && b.first() == Some(&marker)
+            {
+                *b = t.content.as_bytes().to_vec();
+                texts += 1;
+            }
+        }
+        // ids the model has beyond the tokenizer (padding of the embedding): special placeholders
+        if vocab < bytes.len() {
+            bail!("vocabulary of {vocab} below the tokenizer's {}", bytes.len());
+        }
+        while bytes.len() < vocab {
+            let mut name = format!(".<[{}]>", bytes.len()).into_bytes();
+            name[0] = marker;
+            bytes.push(name);
+        }
+        info.vocab_size = vocab as u32;
+        let mut trie = llguidance::toktrie::TokTrie::from(&info, &bytes);
+        if eos.len() > 1 {
+            trie = trie.with_eos_tokens(eos);
+        }
+        if texts > 0 && std::env::var_os("BLAZE_GRAMMAR_LOG").is_some() {
+            eprintln!("blaze grammar: {texts} added tokens of the form <...> read as text (the tokenizer does not call them special)");
+        }
+        let env: llguidance::toktrie::TokEnv = std::sync::Arc::new(TokEnvText { trie, tok });
         let mut factory = ParserFactory::new_simple(&env)?;
         factory.quiet();
         Ok(Self { factory })
@@ -145,3 +195,41 @@ pub fn grammar_of(body: &Value, max_ws: usize) -> Result<Option<TopLevelGrammar>
     Ok(None)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Qwen tokenizer with `<tool_call>` as a non-special added token (BLAZE_TEST_TOKENIZER, else the laptop's
+    /// 35B-A3B; the test passes without one).
+    fn qwen_tokenizer() -> Option<std::path::PathBuf> {
+        let p = std::env::var_os("BLAZE_TEST_TOKENIZER")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/data/models/Qwen3.6-35B-A3B-Uncensored-NVFP4/tokenizer.json".into());
+        p.exists().then_some(p)
+    }
+
+    #[test]
+    fn added_text_tokens_satisfy_their_text() {
+        let Some(path) = qwen_tokenizer() else { return };
+        let hf = tokenizers::Tokenizer::from_file(&path).unwrap();
+        let id = |t: &str| hf.token_to_id(t).unwrap();
+        let g = Grammars::load(&path, &[id("<|im_end|>")], hf.get_vocab_size(true).next_multiple_of(64)).unwrap();
+        let lark = "start: \"<tool_call>\" \"\\n\" \"<function=\" name \">\" /[a-z ]*/ \"</tool_call>\"\nname: \"get_time\"\n";
+        // the tag as its own token, then the spelled-out rest
+        let mut m = g.matcher(TopLevelGrammar::from_lark_or_grammar_list(lark).unwrap()).unwrap();
+        let mask = m.compute_mask_or_eos().unwrap();
+        assert!(mask.is_allowed(id("<tool_call>")), "the tag token is masked out");
+        m.consume_token(id("<tool_call>")).unwrap();
+        for t in hf.encode("\n<function=get_time> x", false).unwrap().get_ids() {
+            m.consume_token(*t).unwrap();
+        }
+        m.consume_token(id("</tool_call>")).unwrap();
+        assert!(m.is_accepting().unwrap_or(false) || m.is_stopped());
+        // the tag spelled out in text tokens is the same text
+        let mut m = g.matcher(TopLevelGrammar::from_lark_or_grammar_list(lark).unwrap()).unwrap();
+        for t in hf.encode("<tool", false).unwrap().get_ids() {
+            m.consume_token(*t).unwrap();
+        }
+    }
+}

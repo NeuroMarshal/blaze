@@ -110,6 +110,8 @@ extern "C" cudaError_t blz_kv_host_gather(blz_nvfp4_pool pool, blz_nvfp4_row_cac
                                           blz_nvfp4_pool out, int64_t out_stride, int32_t* fills, int32_t* fill_n,
                                           int fill_cap, cudaStream_t stream) {
   if (rows <= 0 || max_count <= 0) return cudaSuccess;
+  // rows are sized as NVFP4 (data and scales): FP8 / BF16 pools are not read here
+  if (pool.format != BLZ_KV_NVFP4 || out.format != BLZ_KV_NVFP4) return cudaErrorNotSupported;
   if ((pool.heads * pool.dim) % 64 != 0) return cudaErrorInvalidValue;
   const dim3 grid((max_count + blaze::kWarps - 1) / blaze::kWarps, rows);
   blaze::kv_host_gather_kernel<<<grid, 32 * blaze::kWarps, 0, stream>>>(pool, cache, table, ldt, counts, out, out_stride,
@@ -120,6 +122,7 @@ extern "C" cudaError_t blz_kv_host_gather(blz_nvfp4_pool pool, blz_nvfp4_row_cac
 extern "C" cudaError_t blz_kv_host_fill(blz_nvfp4_row_cache cache, blz_nvfp4_pool out, const int32_t* fills,
                                         const int32_t* fill_n, int fill_cap, cudaStream_t stream) {
   if (cache.lines <= 0 || fill_cap <= 0) return cudaSuccess;
+  if (out.format != BLZ_KV_NVFP4) return cudaErrorNotSupported;
   const int blocks = (fill_cap + 255) / 256 < 1024 ? (fill_cap + 255) / 256 : 1024;
   blaze::kv_host_clear_kernel<<<blocks, 256, 0, stream>>>(cache, fills, fill_n, fill_cap);
   blaze::kv_host_claim_kernel<<<blocks * 4, 32 * blaze::kWarps, 0, stream>>>(cache, out, fills, fill_n, fill_cap);

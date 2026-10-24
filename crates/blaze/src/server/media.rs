@@ -5,7 +5,12 @@ use crate::mm::{ImageEmbeds, MmInput, hash_bytes};
 use crate::vision::{ImageSettings, Overrides, RgbImage, Vision, decode_image, preprocess};
 use base64::Engine as _;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Most image downloads of one request at a time.
+const FETCH_PARALLEL: usize = 8;
+/// Most redirects an image URL may take.
+const FETCH_REDIRECTS: usize = 5;
 
 /// Server-side image settings (command line).
 pub struct MmConfig {
@@ -126,8 +131,52 @@ fn image_parts(body: &Value) -> Checked<Vec<(String, Option<String>)>> {
     Ok(out)
 }
 
+/// The URL's host against --allowed-media-domains (empty: any host): the host as the HTTP client reads it (WHATWG:
+/// `\` is a `/`, user info and percent-encoding resolved), lower case, without a trailing dot.
+fn host_allowed(cfg: &MmConfig, u: &url::Url) -> std::result::Result<(), String> {
+    if cfg.allowed_domains.is_empty() {
+        return Ok(());
+    }
+    let host = u.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    if cfg.allowed_domains.iter().any(|d| d.trim_end_matches('.').eq_ignore_ascii_case(&host)) {
+        Ok(())
+    } else {
+        Err(format!("the URL's domain '{host}' is not allowed: allowed domains are {:?}", cfg.allowed_domains))
+    }
+}
+
+/// An http(s) image: every redirect target checked like the URL itself, the request's `deadline` over all its
+/// downloads.
+fn fetch_url(cfg: &MmConfig, url: &str, deadline: Instant) -> std::result::Result<Vec<u8>, String> {
+    let mut u = url::Url::parse(url).map_err(|e| format!("invalid image URL: {e}"))?;
+    for _ in 0..=FETCH_REDIRECTS {
+        if !matches!(u.scheme(), "http" | "https") {
+            return Err(format!("the image URL must be a data: URL (base64) or an http(s) URL, not {}:", u.scheme()));
+        }
+        host_allowed(cfg, &u)?;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("the request's image downloads took longer than their time limit".into());
+        }
+        let agent = ureq::AgentBuilder::new().timeout(cfg.fetch_timeout.min(left)).redirects(0).build();
+        let resp = agent.request_url("GET", &u).call().map_err(|e| format!("cannot fetch the image: {e}"))?;
+        if (300..400).contains(&resp.status()) {
+            let to = resp.header("location").ok_or("cannot fetch the image: a redirect without a Location")?;
+            u = u.join(to).map_err(|e| format!("cannot fetch the image: redirect to '{to}': {e}"))?;
+            continue;
+        }
+        let mut bytes = Vec::new();
+        resp.into_reader().take(cfg.fetch_max_bytes as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("cannot fetch the image: {e}"))?;
+        if bytes.len() > cfg.fetch_max_bytes {
+            return Err(format!("the image is larger than the limit of {} bytes", cfg.fetch_max_bytes));
+        }
+        return Ok(bytes);
+    }
+    Err(format!("cannot fetch the image: more than {FETCH_REDIRECTS} redirects"))
+}
+
 /// The bytes behind an image URL.
-fn load_url(cfg: &MmConfig, url: &str) -> std::result::Result<Vec<u8>, String> {
+fn load_url(cfg: &MmConfig, url: &str, deadline: Instant) -> std::result::Result<Vec<u8>, String> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (meta, data) = rest.split_once(',').ok_or("malformed data URL: no comma")?;
         if !meta.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
@@ -137,20 +186,9 @@ fn load_url(cfg: &MmConfig, url: &str) -> std::result::Result<Vec<u8>, String> {
         let e = &base64::engine::general_purpose::STANDARD;
         return e.decode(&data).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&data)).map_err(|e| format!("invalid base64 image: {e}"));
     }
-    if url.starts_with("http://") || url.starts_with("https://") {
-        let host = url.split("://").nth(1).unwrap_or("").split(['/', '?', '#']).next().unwrap_or("").rsplit('@').next().unwrap_or("");
-        let host = host.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map_or(host, |(h, _)| h);
-        if !cfg.allowed_domains.is_empty() && !cfg.allowed_domains.iter().any(|d| d == host) {
-            return Err(format!("the URL's domain '{host}' is not allowed: allowed domains are {:?}", cfg.allowed_domains));
-        }
-        let agent = ureq::AgentBuilder::new().timeout(cfg.fetch_timeout).redirects(5).build();
-        let resp = agent.get(url).call().map_err(|e| format!("cannot fetch the image: {e}"))?;
-        let mut bytes = Vec::new();
-        resp.into_reader().take(cfg.fetch_max_bytes as u64 + 1).read_to_end(&mut bytes).map_err(|e| format!("cannot fetch the image: {e}"))?;
-        if bytes.len() > cfg.fetch_max_bytes {
-            return Err(format!("the image is larger than the limit of {} bytes", cfg.fetch_max_bytes));
-        }
-        return Ok(bytes);
+    let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return fetch_url(cfg, url, deadline);
     }
     Err("the image URL must be a data: URL (base64) or an http(s) URL".into())
 }
@@ -181,10 +219,24 @@ pub(super) async fn gather(st: &Arc<AppState>, body: &Value) -> Checked<Vec<Part
     let st2 = st.clone();
     let parts = tokio::task::spawn_blocking(move || -> Checked<Vec<Part>> {
         let cfg = &st2.mm;
+        // the downloads FETCH_PARALLEL at a time, within one time limit for the request (four of one image's)
+        let deadline = Instant::now() + cfg.fetch_timeout * 4;
+        let mut loaded: Vec<std::result::Result<Vec<u8>, String>> = Vec::with_capacity(urls.len());
+        for batch in urls.chunks(FETCH_PARALLEL) {
+            let got: Vec<_> = std::thread::scope(|sc| {
+                let hs: Vec<_> = batch.iter().map(|(u, _)| sc.spawn(move || load_url(cfg, u, deadline))).collect();
+                hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("image download failed".into()))).collect()
+            });
+            let failed = got.iter().any(|r| r.is_err());
+            loaded.extend(got);
+            if failed {
+                break;
+            }
+        }
         let mut parts = Vec::new();
         let mut tokens = 0usize;
-        for (url, detail) in urls {
-            let bytes = load_url(cfg, &url).map_err(|e| bad_param("messages", e))?;
+        for ((_, detail), bytes) in urls.into_iter().zip(loaded) {
+            let bytes = bytes.map_err(|e| bad_param("messages", e))?;
             let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
                 .with_guessed_format()
                 .map_err(|e| bad_param("messages", format!("cannot read the image: {e}")))?
@@ -283,6 +335,24 @@ mod tests {
         MmConfig::new(None, Overrides::default(), 999, 0, Duration::from_millis(timeout_ms), max, domains.iter().map(|s| s.to_string()).collect())
     }
 
+    fn load(c: &MmConfig, url: &str) -> std::result::Result<Vec<u8>, String> {
+        load_url(c, url, Instant::now() + Duration::from_secs(60))
+    }
+
+    /// A one-shot HTTP server on a free port answering with a redirect to `to`.
+    fn redirect_once(to: String) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(s, "HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        port
+    }
+
     /// A one-shot HTTP server on a free port answering with `body` after `delay_ms`.
     fn serve_once(body: Vec<u8>, delay_ms: u64) -> u16 {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -302,27 +372,64 @@ mod tests {
     #[test]
     fn data_urls() {
         let c = cfg(1000, 1 << 20, &[]);
-        assert_eq!(load_url(&c, "data:image/png;base64,aGk=").unwrap(), b"hi");
-        assert_eq!(load_url(&c, "data:image/png;base64,aGk").unwrap(), b"hi");
-        assert!(load_url(&c, "data:image/png,hi").is_err());
-        assert!(load_url(&c, "file:///etc/passwd").is_err());
+        assert_eq!(load(&c, "data:image/png;base64,aGk=").unwrap(), b"hi");
+        assert_eq!(load(&c, "data:image/png;base64,aGk").unwrap(), b"hi");
+        assert!(load(&c, "data:image/png,hi").is_err());
+        assert!(load(&c, "file:///etc/passwd").is_err());
     }
 
     #[test]
     fn http_fetch_limits() {
         let body = vec![7u8; 1000];
         let port = serve_once(body.clone(), 0);
-        assert_eq!(load_url(&cfg(2000, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).unwrap(), body);
+        assert_eq!(load(&cfg(2000, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).unwrap(), body);
         // larger than the limit
         let port = serve_once(body.clone(), 0);
-        assert!(load_url(&cfg(2000, 500, &[]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err().contains("larger"));
+        assert!(load(&cfg(2000, 500, &[]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err().contains("larger"));
         // too slow
         let port = serve_once(body.clone(), 1500);
-        assert!(load_url(&cfg(300, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).is_err());
+        assert!(load(&cfg(300, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).is_err());
         // domain list
         let port = serve_once(body, 0);
-        let e = load_url(&cfg(2000, 4096, &["example.com"]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err();
+        let e = load(&cfg(2000, 4096, &["example.com"]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err();
         assert!(e.contains("not allowed"), "{e}");
+    }
+
+    #[test]
+    fn allowed_domains_as_the_client_reads_the_host() {
+        let c = cfg(500, 4096, &["allowed.com", "Example.ORG."]);
+        // WHATWG: a backslash ends the authority, the host is evil.internal (not the text after '@')
+        let e = load(&c, "http://evil.internal\\@allowed.com/x.png").unwrap_err();
+        assert!(e.contains("not allowed"), "{e}");
+        assert!(load(&c, "http://user@evil.internal/x.png").unwrap_err().contains("not allowed"));
+        // case and a trailing dot do not matter; an allowed host gets as far as the fetch
+        let e = load(&c, "http://EXAMPLE.org./x.png").unwrap_err();
+        assert!(!e.contains("not allowed"), "{e}");
+        assert!(load(&c, "ftp://allowed.com/x.png").is_err());
+    }
+
+    #[test]
+    fn redirects_are_checked_and_followed() {
+        let body = vec![5u8; 100];
+        // a redirect from an allowed host to one that is not: refused
+        let target = serve_once(body.clone(), 0);
+        let port = redirect_once(format!("http://localhost:{target}/b.png"));
+        let e = load(&cfg(2000, 4096, &["127.0.0.1"]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err();
+        assert!(e.contains("not allowed") && e.contains("localhost"), "{e}");
+        // a redirect within the allowed hosts: followed
+        let target = serve_once(body.clone(), 0);
+        let port = redirect_once(format!("http://127.0.0.1:{target}/b.png"));
+        assert_eq!(load(&cfg(2000, 4096, &["127.0.0.1"]), &format!("http://127.0.0.1:{port}/a.png")).unwrap(), body);
+        // a relative Location
+        let port = redirect_once("/c.png".into());
+        assert!(load(&cfg(500, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).is_err());
+    }
+
+    #[test]
+    fn the_request_deadline_bounds_every_download() {
+        let port = serve_once(vec![1u8; 10], 0);
+        let e = load_url(&cfg(2000, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png"), Instant::now()).unwrap_err();
+        assert!(e.contains("time limit"), "{e}");
     }
 
     #[test]

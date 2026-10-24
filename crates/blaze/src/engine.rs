@@ -10,7 +10,9 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
+
+use crate::model::RankBarrier;
 use std::thread::JoinHandle;
 
 /// A sequence in the KV cache: its row (KV table row and GDN state slot) and the KV slot of every position.
@@ -399,6 +401,8 @@ pub struct Info {
     pub tree_levels: usize,
     /// most verify rows per sequence
     pub max_verify: usize,
+    /// most logit edits (penalties, biases) of one sampled step, over all its rows
+    pub max_pen: usize,
     /// EAGLE-4 draft trees: frontier rows per depth (0: chains); their depth is tree_levels
     pub tree_width: usize,
 }
@@ -460,10 +464,11 @@ fn worker_main(
     embed: Arc<HostMapped>,
     draft_head: Option<Arc<HostMapped>>,
     use_graphs: bool,
-    barrier: Arc<Barrier>,
+    barrier: Arc<RankBarrier>,
     rx: Receiver<Cmd>,
     tx: Sender<Result<Reply>>,
 ) {
+    let kv_auto = opts.kv_auto.clone();
     let start = || -> Result<Runner> {
         gpu::set_device(rank as i32)?;
         let cfg = crate::config::ModelConfig::load(&dir)?;
@@ -477,11 +482,11 @@ fn worker_main(
             if rank == 0 {
                 err = unsafe { sys::blz_host_ar_open(name.as_ptr(), 0, world as i32, ar_bytes as i64, 1, &mut ar) };
             }
-            barrier.wait();
+            barrier.wait()?;
             if rank != 0 {
                 err = unsafe { sys::blz_host_ar_open(name.as_ptr(), rank as i32, world as i32, ar_bytes as i64, 0, &mut ar) };
             }
-            barrier.wait();
+            barrier.wait()?;
             if rank == 0 {
                 unsafe { sys::blz_host_ar_unlink(name.as_ptr()) };
             }
@@ -526,15 +531,21 @@ fn worker_main(
                 tree_levels: if r.model.has_tree() { r.model.opts.tree_levels } else { 0 },
                 max_verify: r.model.opts.max_verify,
                 tree_width: if r.model.has_tree() { r.model.opts.tree_width } else { 0 },
+                max_pen: r.model.meta.max_pen,
             };
             let _ = tx.send(Ok(Reply::Logits(vec![info.max_tokens as f32, info.max_seqs as f32, info.max_chunk as f32,
                                                    info.ctx_stride as f32, info.vocab as f32, info.cache_rows as f32,
                                                    info.page as f32, info.qsa_budget.min(1 << 24) as f32,
                                                    info.draft_window as f32, info.tree_levels as f32,
-                                                   info.max_verify as f32, info.tree_width as f32])));
+                                                   info.max_verify as f32, info.tree_width as f32, info.max_pen as f32])));
             r
         }
         Err(e) => {
+            // the other ranks may be waiting for this one: release them
+            barrier.fail();
+            if let Some(a) = &kv_auto {
+                a.barrier.fail();
+            }
             let _ = tx.send(Err(e.context(format!("rank {rank}"))));
             return;
         }
@@ -571,7 +582,7 @@ impl Engine {
             Some(d) if crate::drafter::kind(d)? == crate::drafter::Kind::Eagle => Some(Arc::new(crate::eagle::load_lm_head(d)?)),
             _ => None,
         };
-        let barrier = Arc::new(Barrier::new(world));
+        let barrier = Arc::new(RankBarrier::new(world));
         let mut workers = Vec::with_capacity(world);
         for rank in 0..world {
             let (ctx, crx) = channel();
@@ -585,8 +596,29 @@ impl Engine {
         }
         let mut info = None;
         let mut first_err = None;
-        for w in &workers {
-            match w.rx.recv().map_err(|_| anyhow!("a rank exited during load"))? {
+        // the ranks' replies as they come: a rank that fails is reported at once, whatever the others wait for
+        let mut pending: Vec<usize> = (0..world).collect();
+        while !pending.is_empty() && first_err.is_none() {
+            let mut got = None;
+            for (pi, &r) in pending.iter().enumerate() {
+                match workers[r].rx.try_recv() {
+                    Ok(reply) => {
+                        got = Some((pi, reply));
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        got = Some((pi, Err(anyhow!("rank {r} exited during load"))));
+                        break;
+                    }
+                }
+            }
+            let Some((pi, reply)) = got else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
+            pending.swap_remove(pi);
+            match reply {
                 Ok(Reply::Logits(v)) => {
                     info.get_or_insert(Info {
                         max_tokens: v[0] as usize,
@@ -601,6 +633,7 @@ impl Engine {
                         tree_levels: v[9] as usize,
                         max_verify: v[10] as usize,
                         tree_width: v[11] as usize,
+                        max_pen: v[12] as usize,
                     });
                 }
                 Ok(_) => unreachable!(),
@@ -679,6 +712,15 @@ impl Engine {
     /// Free KV slots (whole free pages).
     pub fn free_slots(&self) -> usize {
         self.free_pages.len() * self.info.page
+    }
+
+    pub fn free_page_count(&self) -> usize {
+        self.free_pages.len()
+    }
+
+    /// New KV pages a sequence of `len` tokens takes for `rows` more.
+    pub fn pages_for(&self, len: usize, rows: usize) -> usize {
+        (len + rows).div_ceil(self.info.page) - len.div_ceil(self.info.page)
     }
 
     pub fn free_rows(&self) -> usize {

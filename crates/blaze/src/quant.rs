@@ -51,6 +51,8 @@ pub struct WeightNames {
 
 pub struct QuantConfig {
     method: String,
+    /// FP8 block checkpoints: `weight_block_size` [rows, columns] of one scale
+    block: Option<(usize, usize)>,
     rules: Vec<(Vec<Matcher>, ActQuant)>,
     ignore: Vec<Matcher>,
     default_act: ActQuant,
@@ -106,7 +108,7 @@ impl QuantConfig {
     pub fn from_model_config(root: &Value, hf_quant: Option<&Value>) -> Result<Self> {
         let q = root.get("quantization_config").cloned().or_else(|| hf_quant.and_then(|h| h.get("quantization").cloned()));
         let Some(q) = q else {
-            return Ok(Self { method: "none".into(), rules: vec![], ignore: vec![], default_act: ActQuant::None });
+            return Ok(Self { method: "none".into(), block: None, rules: vec![], ignore: vec![], default_act: ActQuant::None });
         };
         let method = q
             .get("quant_method")
@@ -142,7 +144,11 @@ impl QuantConfig {
             .map(|t| t.iter().filter_map(Value::as_str).map(Matcher::parse).collect::<Result<Vec<_>>>())
             .transpose()?
             .unwrap_or_default();
-        Ok(Self { method, rules, ignore, default_act })
+        let block = q.get("weight_block_size").and_then(Value::as_array).and_then(|b| match b.as_slice() {
+            [n, k] => Some((n.as_u64()? as usize, k.as_u64()? as usize)),
+            _ => None,
+        });
+        Ok(Self { method, block, rules, ignore, default_act })
     }
 
     pub fn method(&self) -> &str {
@@ -197,12 +203,14 @@ impl QuantConfig {
             let (scale_name, inverse) = if has("weight_scale_inv").is_some() { (name("weight_scale_inv"), true) } else { (name("weight_scale"), false) };
             let s = ckpt.info(&scale_name)?;
             let format = if s.shape.len() == 2 && s.shape[1] > 1 {
-                Format::Fp8Block {
-                    block_n: w.shape[0].div_ceil(s.shape[0]),
-                    block_k: w.shape[1].div_ceil(s.shape[1]),
-                    scale_dtype: s.dtype,
-                    inverse,
+                // the block from the config, else the power of two the scale grid implies (a 200-row weight with two
+                // scale rows has blocks of 128, not 100); either must give the stored grid
+                let (n, k) = (w.shape[0], w.shape[1]);
+                let (bn, bk) = self.block.unwrap_or((n.div_ceil(s.shape[0]).next_power_of_two(), k.div_ceil(s.shape[1]).next_power_of_two()));
+                if bn == 0 || bk == 0 || n.div_ceil(bn) != s.shape[0] || k.div_ceil(bk) != s.shape[1] {
+                    bail!("{module}: FP8 scales {:?} do not match {bn}x{bk} blocks of a {:?} weight", s.shape, w.shape);
                 }
+                Format::Fp8Block { block_n: bn, block_k: bk, scale_dtype: s.dtype, inverse }
             } else {
                 Format::Fp8Channel { per_tensor: s.numel() == 1 }
             };

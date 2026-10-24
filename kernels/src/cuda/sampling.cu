@@ -112,6 +112,32 @@ __global__ void __launch_bounds__(kThreads) topk_radix_kernel(const uint16_t* __
     }
   }
   __syncthreads();
+  if (n_eq > kMaxTies) {
+    // more ties than the buffer kept, in arrival order (a grammar mask leaves most of a row at -inf): collect again the
+    // lowest columns among them, in column order, so the result does not depend on the order the threads ran
+    __shared__ int warp_n[kThreads / 32];
+    __shared__ int taken;
+    const int need = k - min(n_gt, KMAX);
+    if (tid == 0) taken = 0;
+    __syncthreads();
+    for (int base = 0; base < vocab && need > 0; base += kThreads) {
+      const int c = base + tid;
+      const bool tie = c < vocab && key_of(row[c]) == thr;
+      const unsigned m = __ballot_sync(0xffffffffu, tie);
+      if ((tid & 31) == 0) warp_n[tid >> 5] = __popc(m);
+      __syncthreads();
+      int slot = taken + __popc(m & ((1u << (tid & 31)) - 1));
+      for (int w = 0; w < (tid >> 5); ++w) slot += warp_n[w];
+      if (tie && slot < need) tv[slot] = bf(row[c]), ties[slot] = c;
+      __syncthreads();
+      if (tid == 0)
+        for (int w = 0; w < kThreads / 32; ++w) taken += warp_n[w];
+      __syncthreads();
+      if (taken >= need) break;
+    }
+    if (tid == 0) n_eq = max(0, min(taken, need));
+    __syncthreads();
+  }
   const int gt = min(n_gt, KMAX), eq = min(n_eq, kMaxTies);
   // ties: lowest columns first
   int ne = 1;

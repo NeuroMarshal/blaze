@@ -91,6 +91,37 @@ int main() {
   }
   std::printf("top-%d of %d rows x %d: %d mismatches\n", k, rows, vocab, bad);
 
+  // a grammar-masked row: 10 allowed tokens, the rest -inf (far more ties than the tie buffer): the -inf fillers are the
+  // lowest columns, the same every run
+  {
+    std::vector<uint16_t> m(vocab, 0xff80);
+    std::vector<int> allowed;
+    for (int j = 0; j < 10; ++j) {
+      const int c = int(rng() % vocab);
+      m[c] = bf(d(rng));
+      allowed.push_back(c);
+    }
+    std::vector<int> idx(vocab);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) {
+      const float va = fb(m[a]), vb = fb(m[b]);
+      return va > vb || (va == vb && a < b);
+    });
+    uint16_t* dm;
+    check(cudaMalloc(&dm, vocab * 2), "malloc");
+    check(cudaMemcpy(dm, m.data(), vocab * 2, cudaMemcpyHostToDevice), "copy");
+    int badm = 0;
+    for (int run = 0; run < 3; ++run) {
+      check(blz_topk(dm, vocab, 1, vocab, 0, k, ov, oid, ws, 0), "topk masked");
+      std::vector<int32_t> mi(k);
+      check(cudaMemcpy(mi.data(), oid, k * 4, cudaMemcpyDeviceToHost), "copy back");
+      for (int j = 0; j < k; ++j) badm += mi[j] != idx[j];
+    }
+    cudaFree(dm);
+    std::printf("top-%d of a masked row (10 allowed), 3 runs: %d mismatches\n", k, badm);
+    bad += badm;
+  }
+
   // top-128 (the EAGLE-4 candidate head), same rows after the penalties
   {
     const int k2 = 128;

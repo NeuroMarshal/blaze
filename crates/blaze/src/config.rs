@@ -71,6 +71,9 @@ pub struct PleConfig {
     pub conv_kernel: usize,
 }
 
+/// Slots of one row of the QSA selection table (the selected keys of one query row).
+pub const QSA_TABLE_STRIDE: usize = 2056;
+
 /// Qwen sparse attention (compressed indexer) of the softmax layers.
 #[derive(Debug, Clone)]
 pub struct QsaConfig {
@@ -191,12 +194,15 @@ impl ModelConfig {
             _ => None,
         };
         let qsa = usize_of(&t, "indexer_n_heads").map(|heads| -> Result<QsaConfig> {
-            Ok(QsaConfig {
-                heads,
-                head_dim: need(&t, "indexer_head_dim")?,
-                budget: need(&t, "indexer_budget")?,
-                compress_ratio: need(&t, "indexer_compress_ratio")?,
-            })
+            let (budget, ratio) = (need(&t, "indexer_budget")?, need(&t, "indexer_compress_ratio")?);
+            // a select row holds up to (budget / ratio) * ratio + ratio - 1 slots (blz_qsa_select: top blocks of
+            // `ratio` keys and the trailing partial block) in a table row of QSA_TABLE_STRIDE
+            let blocks = budget / ratio.max(1);
+            if ratio == 0 || blocks == 0 || blocks > 2048 || blocks * ratio + ratio - 1 > QSA_TABLE_STRIDE {
+                anyhow::bail!("indexer_budget {budget} / indexer_compress_ratio {ratio}: a selection of at most 2048 blocks and \
+                               {QSA_TABLE_STRIDE} slots is supported");
+            }
+            Ok(QsaConfig { heads, head_dim: need(&t, "indexer_head_dim")?, budget, compress_ratio: ratio })
         });
         let qsa = match qsa {
             Some(q) => Some(q?),

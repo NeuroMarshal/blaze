@@ -116,16 +116,19 @@ pub fn is_image_key(id: i64) -> bool {
     id >= 1 << 62
 }
 
-/// FNV-1a over bytes (an image's content hash; collisions only cost a wrong prefix-cache hit between two different
-/// images of the same size, so 64 bits of a simple hash are enough together with the position mix in `keyed`).
+/// An image's content key: BLAKE3 keyed with a secret of this process, 64 bits. The key is all the embeddings cache
+/// and the prefix cache compare, so a client must not be able to make another image's key: with an unknown key that
+/// takes some 2^63 tries against one image (an invertible hash let a client forge one by changing a few pixels).
 pub fn hash_bytes(data: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for chunk in data.chunks(8) {
-        let mut w = [0u8; 8];
-        w[..chunk.len()].copy_from_slice(chunk);
-        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01B3).rotate_left(23);
-    }
-    h ^ data.len() as u64
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut k = [0u8; 32];
+        k[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        k[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        k
+    });
+    let h = blake3::keyed_hash(key, data);
+    u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap())
 }
 
 #[cfg(test)]
