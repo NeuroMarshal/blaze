@@ -424,6 +424,25 @@ def chat_logprobs():
 
 
 @test
+def chat_logprobs_are_numbers_and_bytes_make_the_text():
+    # under a grammar most of the vocabulary is -inf: every logprob is still a number (vLLM writes -9999)
+    r = chat([{"role": "user", "content": "Give me a JSON object with a key 'a'."}], max_tokens=40, logprobs=True,
+             top_logprobs=5, response_format={"type": "json_object"})
+    lp = r.choices[0].logprobs.content
+    vals = [e.logprob for e in lp] + [t.logprob for e in lp for t in e.top_logprobs]
+    check(all(isinstance(v, (int, float)) and v <= 0 and v >= -9999 for v in vals), [v for v in vals if not isinstance(v, (int, float))][:5])
+    # the bytes of the tokens make the text, also where a token holds part of a character
+    r = chat([{"role": "user", "content": "Write the word 'hello' in Japanese, Russian and as an emoji, nothing else."}],
+             max_tokens=40, logprobs=True)
+    c = r.choices[0]
+    joined = b"".join(bytes(e.bytes) for e in c.logprobs.content)
+    check(joined.decode("utf-8", "replace") == c.message.content or c.finish_reason == "length", (joined, c.message.content))
+    partial = [e.token for e in c.logprobs.content if "\\x" in e.token]
+    note(not any("\ufffd" in e.token for e in c.logprobs.content), f"U+FFFD tokens: {[e.token for e in c.logprobs.content]}")
+    note(True, f"partial-byte tokens: {partial}")
+
+
+@test
 def chat_json_schema_and_object():
     schema = {"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}, "tags": {"type": "array", "items": {"type": "string"}}},
               "required": ["name", "age", "tags"], "additionalProperties": False}
@@ -556,6 +575,14 @@ def tools_tool_choice_none_required_named():
     c = r.choices[0]
     check(c.finish_reason == "tool_calls" and c.message.tool_calls[0].function.name == "get_time", c)
     json.loads(c.message.tool_calls[0].function.arguments)
+    # named, where the model writes the call tag as its one token right away (a greeting with thinking off): the grammar
+    # holds through the tag token
+    for q in ["Hello there!", "Thanks, bye.", "What is 2+2?"]:
+        r = chat([{"role": "user", "content": q}], tools=[WEATHER, TIME], max_tokens=200,
+                 tool_choice={"type": "function", "function": {"name": "get_time"}})
+        c = r.choices[0]
+        check(c.finish_reason == "tool_calls" and c.message.tool_calls and c.message.tool_calls[0].function.name == "get_time", (q, c))
+        json.loads(c.message.tool_calls[0].function.arguments)
     # streamed required
     names = []
     for ch in chat([{"role": "user", "content": "Hello there!"}], tools=[WEATHER, TIME], tool_choice="required", max_tokens=300, stream=True):
@@ -688,6 +715,12 @@ def errors_bad_requests():
     error_shape(*raw_chat({"messages": [{"role": "user", "content": "x"}], "response_format": {"type": "json_schema"}})[::2])
     error_shape(*http("POST", "/v1/completions", {"model": MODEL, "prompt": {"a": 1}})[::2])
     error_shape(*http("POST", "/v1/completions", {"model": MODEL, "prompt": [10 ** 9], "max_tokens": 4})[::2])
+    # bounded request sizes: stop strings, their length, prompts x n
+    e = error_shape(*raw_chat({"messages": [{"role": "user", "content": "x"}], "stop": [f"s{i}" for i in range(65)]})[::2])
+    check(e["param"] == "stop", e)
+    error_shape(*raw_chat({"messages": [{"role": "user", "content": "x"}], "stop": ["y" * 2000]})[::2])
+    error_shape(*raw_chat({"messages": [{"role": "user", "content": "x"}], "stop_token_ids": list(range(1025))})[::2])
+    error_shape(*http("POST", "/v1/completions", {"model": MODEL, "prompt": ["a"] * 40, "n": 8, "max_tokens": 2})[::2])
     # the server is still fine
     check(chat([{"role": "user", "content": "Say ok"}], max_tokens=5).choices[0].message.content, "no answer after the errors")
 

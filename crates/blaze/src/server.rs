@@ -101,8 +101,13 @@ impl From<ProcessorError> for ApiError {
 
 /// An error in OpenAI's shape: {"error": {"message", "type", "param", "code"}}.
 fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>, param: Option<&str>) -> Response {
+    let message = message.into();
     let kind = if status.is_server_error() { "server_error" } else { "invalid_request_error" };
-    (status, Json(json!({"error": {"message": message.into(), "type": kind, "param": param, "code": code}}))).into_response()
+    // server errors always on stderr, refused requests with BLAZE_REQ_LOG
+    if status.is_server_error() || std::env::var_os("BLAZE_REQ_LOG").is_some_and(|v| v != "0") {
+        eprintln!("blaze api: {} {}: {message}", status.as_u16(), param.unwrap_or("-"));
+    }
+    (status, Json(json!({"error": {"message": message, "type": kind, "param": param, "code": code}}))).into_response()
 }
 
 fn error(status: StatusCode, message: impl Into<String>) -> Response {

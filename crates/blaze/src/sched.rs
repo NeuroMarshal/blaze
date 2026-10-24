@@ -114,6 +114,9 @@ impl SnapStats {
 struct Active {
     req: GenRequest,
     seq: Seq,
+    /// health-log id and admission time
+    id: u64,
+    t0: Instant,
     /// bit per token id: the ids of the prompt and the output so far, and the most frequent ones (MTP candidate head)
     seen: Vec<u64>,
     /// prompt tokens fed so far
@@ -450,6 +453,7 @@ impl Scheduler {
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
                     stats: loop_stats,
+                    health: crate::health::Health::from_env(),
                 };
                 s.run();
             })
@@ -491,6 +495,7 @@ struct Loop {
     suffix_global: SuffixIndex,
     suffix_cfg: SuffixConfig,
     stats: Arc<SchedStats>,
+    health: crate::health::Health,
 }
 
 impl Loop {
@@ -499,9 +504,11 @@ impl Loop {
             // intake: block while idle, poll while busy
             if self.active.is_empty() && self.waiting.is_empty() {
                 self.publish_stats();
-                match self.rx.recv() {
+                self.health_tick();
+                match self.rx.recv_timeout(Duration::from_secs(5)) {
                     Ok(r) => self.waiting.push_back(r),
-                    Err(_) => return,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
             loop {
@@ -524,14 +531,31 @@ impl Loop {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             }
-            if let Err(e) = self.step() {
-                eprintln!("blaze: step failed: {e:#}");
+            let shape = self.step_shape();
+            let t0 = Instant::now();
+            let r = self.step();
+            self.health.step(t0.elapsed().as_secs_f64(), shape);
+            if let Err(e) = r {
+                eprintln!("blaze: step failed ({shape}; KV {} pages free): {e:#}", self.engine.free_page_count());
+                self.health.cur.errors += self.active.len() as u64;
                 for a in self.active.drain(..) {
                     let _ = a.req.events.send(GenEvent::Error(format!("{e:#}")));
                     self.engine.close(a.seq);
                 }
             }
+            self.health_tick();
         }
+    }
+
+    fn step_shape(&self) -> crate::health::StepShape {
+        let decoding = self.active.iter().filter(|a| a.pending.is_some()).count();
+        let prefill = self.active.iter().find(|a| a.pending.is_none()).map(|a| (a.fed, a.req.tokens.len()));
+        crate::health::StepShape { decoding, prefilling: self.active.len() - decoding, prefill, spec: self.cfg.spec_tokens > 0 }
+    }
+
+    fn health_tick(&mut self) {
+        let total = self.engine.info.max_tokens / self.engine.info.page.max(1);
+        self.health.tick(self.active.len(), self.waiting.len(), (self.engine.free_page_count(), total), self.cache.len(), self.spec_stats);
     }
 
     fn publish_stats(&self) {
@@ -565,6 +589,7 @@ impl Loop {
         }
         if n > 0 {
             self.stats.cancelled.fetch_add(n, Ordering::Relaxed);
+            self.health.cur.cancelled += n;
         }
     }
 
@@ -632,6 +657,7 @@ impl Loop {
             }
             if req.tokens.is_empty() || req.tokens.len() + 1 > self.engine.info.ctx_stride {
                 let req = self.waiting.pop_front().unwrap();
+                self.health.cur.errors += 1;
                 let _ = req.events.send(GenEvent::Error(format!(
                     "prompt of {} tokens does not fit the context ({})",
                     req.tokens.len(),
@@ -672,6 +698,7 @@ impl Loop {
                 // alone and still too long for the pool: it would never get its pages
                 let req = self.waiting.pop_front().unwrap();
                 eprintln!("blaze: a prompt of {} tokens needs {need} KV slots, the pool has {}", req.tokens.len(), self.engine.free_slots());
+                self.health.cur.errors += 1;
                 let _ = req.events.send(GenEvent::Error(format!(
                     "the prompt of {} tokens needs {need} KV cache slots; this server's pool holds {} (--kv-tokens)",
                     req.tokens.len(),
@@ -696,6 +723,8 @@ impl Loop {
             let seq = match opened {
                 Ok(s) => s,
                 Err(e) => {
+                    eprintln!("blaze: a request could not open its sequence: {e:#}");
+                    self.health.cur.errors += 1;
                     let _ = req.events.send(GenEvent::Error(format!("{e:#}")));
                     continue;
                 }
@@ -709,6 +738,13 @@ impl Loop {
                 let _ = self.engine.ple_warm(&req.tokens[fed.saturating_sub(2)..fed], &req.tokens[fed..end]);
             }
             let _ = req.events.send(GenEvent::Started { prompt_tokens: req.tokens.len(), cached_tokens: fed });
+            let id = self.health.next_id();
+            self.health.cur.prompt += req.tokens.len() as u64;
+            self.health.cur.cached += fed as u64;
+            if self.health.req_log {
+                eprintln!("blaze req {id}: prompt {} tokens, {fed} from the prompt cache, max {} new, {} running, {} waiting",
+                          req.tokens.len(), req.max_tokens, self.active.len(), self.waiting.len());
+            }
             let rng = req.params.seed.map(Rng::new).unwrap_or_else(Rng::from_time);
             let page = self.engine.info.page;
             let points = req.cache_points.iter().map(|&p| p / page * page).filter(|&p| p > fed && p < req.tokens.len()).collect();
@@ -723,6 +759,8 @@ impl Loop {
             };
             let seen = if self.cfg.draft_cands { seen_set(&req.tokens, &self.cfg.frequent, self.engine.info.vocab) } else { Vec::new() };
             self.active.push(Active {
+                id,
+                t0: Instant::now(),
                 seen,
                 prompt_set,
                 req,
@@ -830,6 +868,7 @@ impl Loop {
         }
         *a.counts.entry(pick).or_insert(0) += 1;
         let _ = a.req.events.send(GenEvent::Token(pick, lp));
+        self.health.cur.tokens += 1;
         let stop = a.req.stop_ids.contains(&pick);
         if let Some(c) = a.req.constraint.as_mut()
             && let Err(e) = c.advance(pick, stop)
@@ -1332,6 +1371,17 @@ impl Loop {
     /// A request that has finished: the conversation so far (prompt + output except the last, unfed token) kept for
     /// the next turn, its end sent, its output kept for suffix decoding, its KV given back.
     fn retire(&mut self, a: Active, reason: Finish) {
+        self.health.cur.requests += 1;
+        match reason {
+            Finish::Length => self.health.cur.lengths += 1,
+            Finish::Cancelled => self.health.cur.cancelled += 1,
+            _ => {}
+        }
+        if self.health.req_log {
+            let secs = a.t0.elapsed().as_secs_f64();
+            eprintln!("blaze req {}: {reason:?} after {} tokens in {secs:.2} s ({:.1} tok/s)", a.id, a.generated.len(),
+                      a.generated.len() as f64 / secs.max(1e-9));
+        }
         if reason != Finish::Cancelled {
             let mut tokens = a.req.tokens.clone();
             tokens.extend(a.generated[..a.generated.len().saturating_sub(1)].iter().map(|&t| t as i64));
@@ -1378,6 +1428,7 @@ impl Loop {
                 a.generated.len()
             );
             self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
+            self.health.cur.kv_full += 1;
             self.retire(a, Finish::Length);
         }
     }
@@ -1432,6 +1483,8 @@ impl Loop {
                 eprintln!("blaze: KV pool full: a prompt of {} tokens stops at {} ({} free pages)", a.req.tokens.len(), a.fed,
                           self.engine.free_page_count());
                 self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
+                self.health.cur.kv_full += 1;
+                self.health.cur.errors += 1;
                 let _ = a.req.events.send(GenEvent::Error(format!(
                     "the KV pool is full: the prompt of {} tokens does not fit next to the running requests",
                     a.req.tokens.len()
