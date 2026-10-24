@@ -272,3 +272,67 @@ pub(super) async fn encode(st: &Arc<AppState>, parts: Vec<Part>, starts: Vec<usi
     .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("image encoding failed: {e}")))?
     .map_err(|e| bad_param("messages", e))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    fn cfg(timeout_ms: u64, max: usize, domains: &[&str]) -> MmConfig {
+        MmConfig::new(None, Overrides::default(), 999, 0, Duration::from_millis(timeout_ms), max, domains.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// A one-shot HTTP server on a free port answering with `body` after `delay_ms`.
+    fn serve_once(body: Vec<u8>, delay_ms: u64) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn data_urls() {
+        let c = cfg(1000, 1 << 20, &[]);
+        assert_eq!(load_url(&c, "data:image/png;base64,aGk=").unwrap(), b"hi");
+        assert_eq!(load_url(&c, "data:image/png;base64,aGk").unwrap(), b"hi");
+        assert!(load_url(&c, "data:image/png,hi").is_err());
+        assert!(load_url(&c, "file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn http_fetch_limits() {
+        let body = vec![7u8; 1000];
+        let port = serve_once(body.clone(), 0);
+        assert_eq!(load_url(&cfg(2000, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).unwrap(), body);
+        // larger than the limit
+        let port = serve_once(body.clone(), 0);
+        assert!(load_url(&cfg(2000, 500, &[]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err().contains("larger"));
+        // too slow
+        let port = serve_once(body.clone(), 1500);
+        assert!(load_url(&cfg(300, 4096, &[]), &format!("http://127.0.0.1:{port}/a.png")).is_err());
+        // domain list
+        let port = serve_once(body, 0);
+        let e = load_url(&cfg(2000, 4096, &["example.com"]), &format!("http://127.0.0.1:{port}/a.png")).unwrap_err();
+        assert!(e.contains("not allowed"), "{e}");
+    }
+
+    #[test]
+    fn limit_option() {
+        assert_eq!(parse_limit("").unwrap(), 999);
+        assert_eq!(parse_limit("image=4").unwrap(), 4);
+        assert_eq!(parse_limit("video=1,image=2").unwrap(), 2);
+        assert_eq!(parse_limit("{\"image\": 3}").unwrap(), 3);
+        assert_eq!(parse_limit("{\"image\": {\"count\": 5, \"width\": 512}}").unwrap(), 5);
+        assert_eq!(parse_limit("{\"video\": 1}").unwrap(), 999);
+        assert!(parse_limit("image=x").is_err());
+    }
+}

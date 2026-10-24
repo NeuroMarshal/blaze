@@ -520,7 +520,26 @@ pub struct GpuEncoder {
     stream: Stream,
     /// activation bytes of the last image
     pub scratch_bytes: std::cell::Cell<usize>,
+    /// activation buffers kept between images (a cudaFree per image would wait for the whole device, the language model's
+    /// kernels included); a big image's are released after it
+    work: std::cell::RefCell<Option<Work>>,
 }
+
+/// Activation buffers for up to `cap` patches.
+struct Work {
+    cap: usize,
+    x: DevBuf,
+    xn: DevBuf,
+    q: DevBuf,
+    k: DevBuf,
+    v: DevBuf,
+    o: DevBuf,
+    big: DevBuf,
+    out: DevBuf,
+}
+
+/// Largest image (patches) whose buffers stay allocated.
+const KEEP_PATCHES: usize = 8192;
 
 // SAFETY: used only behind the Vision mutex; the raw cuBLAS handle is not tied to a thread.
 unsafe impl Send for GpuEncoder {}
@@ -565,6 +584,7 @@ impl GpuEncoder {
             gemm,
             stream: Stream::new()?,
             scratch_bytes: std::cell::Cell::new(0),
+            work: Default::default(),
         })
     }
 
@@ -586,23 +606,38 @@ impl GpuEncoder {
             bail!("{} pixel values for {n} patches", px.len());
         }
         let need = Self::scratch_for(c, n);
-        let free = gpu::mem_info()?.0;
-        if free < need + (64 << 20) {
-            bail!("not enough free VRAM for an image of {n} patches: {:.0} MiB needed, {:.0} MiB free", need as f64 / 1048576.0, free as f64 / 1048576.0);
-        }
         self.scratch_bytes.set(need);
         let s = self.stream.0;
-        let b = |elems: usize| DevBuf::new(elems * 2);
-        let (x, xn, q, k, v, o) = (b(n * h)?, b(n * h)?, b(n * h)?, b(n * h)?, b(n * h)?, b(n * h)?);
-        let big = b(n * (3 * h).max(i))?;
         let nm = n / (c.merge * c.merge);
         let mh = h * c.merge * c.merge;
-        let out = b(nm * c.out_hidden)?;
+        let mut slot = self.work.borrow_mut();
+        if slot.as_ref().is_none_or(|w| w.cap < n) {
+            *slot = None;
+            let free = gpu::mem_info()?.0;
+            if free < need + (64 << 20) {
+                bail!("not enough free VRAM for an image of {n} patches: {:.0} MiB needed, {:.0} MiB free", need as f64 / 1048576.0, free as f64 / 1048576.0);
+            }
+            let b = |elems: usize| DevBuf::new(elems * 2);
+            let cap = n.max(1024);
+            *slot = Some(Work {
+                cap,
+                x: b(cap * h)?,
+                xn: b(cap * h)?,
+                q: b(cap * h)?,
+                k: b(cap * h)?,
+                v: b(cap * h)?,
+                o: b(cap * h)?,
+                big: b(cap * (3 * h).max(i).max(c.patch_dim()))?,
+                out: b(cap / (c.merge * c.merge) * c.out_hidden)?,
+            });
+        }
+        let w_ = slot.as_ref().unwrap();
+        let (x, xn, q, k, v, o, big, out) = (&w_.x, &w_.xn, &w_.q, &w_.k, &w_.v, &w_.o, &w_.big, &w_.out);
         big.upload_async(px, &self.stream)?;
         let g = |a: &DevBuf, lda: usize, w: &DevBuf, dst: &DevBuf, ldo: usize, m: usize, nn: usize, kk: usize| -> Result<()> {
             check(unsafe { sys::blz_gemm_bf16(self.gemm, a.ptr(), lda as i64, w.ptr(), dst.ptr(), ldo as i64, m as i32, nn as i32, kk as i32, s) }, "vision gemm")
         };
-        g(&big, c.patch_dim(), &self.patch_w, &x, h, n, h, c.patch_dim())?;
+        g(big, c.patch_dim(), &self.patch_w, x, h, n, h, c.patch_dim())?;
         check(
             unsafe { sys::blz_vis_embed_pos(x.ptr(), self.patch_b.ptr(), self.pos.ptr(), (c.num_pos as f64).sqrt() as i32, gh as i32, gw as i32, c.merge as i32, h as i32, s) },
             "vision pos embed",
@@ -614,36 +649,40 @@ impl GpuEncoder {
             }
             Ok(())
         };
-        snap(&x, &mut stages)?;
+        snap(x, &mut stages)?;
         let hd = h / c.heads;
         for (li, l) in self.layers.iter().enumerate() {
             let w = &l.w;
             check(unsafe { sys::blz_vis_layernorm(x.ptr(), w[0].ptr(), w[1].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision ln1")?;
-            g(&xn, h, &w[2], &big, 3 * h, n, 3 * h, h)?;
+            g(xn, h, &w[2], big, 3 * h, n, 3 * h, h)?;
             check(
                 unsafe { sys::blz_vis_qkv_rope(big.ptr(), w[3].ptr(), gh as i32, gw as i32, c.merge as i32, c.heads as i32, hd as i32, c.theta, q.ptr(), k.ptr(), v.ptr(), s) },
                 "vision qkv",
             )?;
             check(unsafe { sys::blz_vis_attention(q.ptr(), k.ptr(), v.ptr(), n as i32, c.heads as i32, hd as i32, o.ptr(), s) }, "vision attention")?;
-            g(&o, h, &w[4], &xn, h, n, h, h)?;
+            g(o, h, &w[4], xn, h, n, h, h)?;
             check(unsafe { sys::blz_vis_bias_residual(xn.ptr(), w[5].ptr(), x.ptr(), n as i32, h as i32, x.ptr(), s) }, "vision proj residual")?;
             check(unsafe { sys::blz_vis_layernorm(x.ptr(), w[6].ptr(), w[7].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision ln2")?;
-            g(&xn, h, &w[8], &big, i, n, i, h)?;
+            g(xn, h, &w[8], big, i, n, i, h)?;
             check(unsafe { sys::blz_vis_bias_act(big.ptr(), w[9].ptr(), n as i32, i as i32, if c.act_tanh { 1 } else { 2 }, s) }, "vision gelu")?;
-            g(&big, i, &w[10], &xn, h, n, h, i)?;
+            g(big, i, &w[10], xn, h, n, h, i)?;
             check(unsafe { sys::blz_vis_bias_residual(xn.ptr(), w[11].ptr(), x.ptr(), n as i32, h as i32, x.ptr(), s) }, "vision mlp residual")?;
             if li == 0 || li + 1 == self.layers.len() {
-                snap(&x, &mut stages)?;
+                snap(x, &mut stages)?;
             }
         }
         let m = &self.merger;
         check(unsafe { sys::blz_vis_layernorm(x.ptr(), m[0].ptr(), m[1].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision merger norm")?;
-        g(&xn, mh, &m[2], &big, mh, nm, mh, mh)?;
+        g(xn, mh, &m[2], big, mh, nm, mh, mh)?;
         check(unsafe { sys::blz_vis_bias_act(big.ptr(), m[3].ptr(), nm as i32, mh as i32, 2, s) }, "vision merger gelu")?;
-        g(&big, mh, &m[4], &out, c.out_hidden, nm, c.out_hidden, mh)?;
+        g(big, mh, &m[4], out, c.out_hidden, nm, c.out_hidden, mh)?;
         check(unsafe { sys::blz_vis_bias_act(out.ptr(), m[5].ptr(), nm as i32, c.out_hidden as i32, 0, s) }, "vision merger bias")?;
         self.stream.sync()?;
-        out.download::<u16>(nm * c.out_hidden)
+        let res = out.download::<u16>(nm * c.out_hidden);
+        if n > KEEP_PATCHES {
+            *slot = None;
+        }
+        res
     }
 }
 
