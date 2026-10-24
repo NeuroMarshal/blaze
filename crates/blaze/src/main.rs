@@ -77,6 +77,10 @@ struct EngineArgs {
     /// EAGLE-4 drafter checkpoint (speculative decoding with --spec-method eagle)
     #[arg(long)]
     draft_model: Option<PathBuf>,
+    /// the checkpoint's own MTP head (its `mtp.*` tensors) as the drafter, with a KV ring of this many positions (0: off;
+    /// `serve --spec-method mtp` takes 8192 when this is 0)
+    #[arg(long, default_value_t = 0)]
+    mtp_window: usize,
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
@@ -134,6 +138,7 @@ impl EngineArgs {
                 max_verify: self.max_verify,
                 kv_dtype: self.kv_cache_dtype,
                 draft: self.draft_model.clone(),
+                mtp_window: self.mtp_window,
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
                 tree_levels: if self.draft_tree_width > 1 { self.draft_tree_depth } else { 0 },
@@ -360,7 +365,7 @@ fn main() -> Result<()> {
             let mut e = engine.load(None, false)?;
             let window = e.info.draft_window;
             if window == 0 {
-                anyhow::bail!("eagle-test needs --draft-model");
+                anyhow::bail!("eagle-test needs --draft-model or --mtp-window");
             }
             let ids: Vec<i64> = text.encode(&prompt)?.into_iter().map(i64::from).collect();
             let n = ids.len();
@@ -573,6 +578,10 @@ fn main() -> Result<()> {
             image_fetch_max_mib,
             allowed_media_domains,
         } => {
+            let mut engine = engine;
+            if spec_method == "mtp" && engine.mtp_window == 0 {
+                engine.mtp_window = 8192;
+            }
             let text = blaze::text::Text::load(&engine.model)?;
             let e = engine.load(None, false)?;
             // after the model, so that `auto` sees the VRAM that is left; on the first GPU, whatever the tensor parallelism
@@ -606,9 +615,9 @@ fn main() -> Result<()> {
                     spec_method: match (spec_method.as_str(), drafter) {
                         ("ngram", _) => blaze::sched::SpecMethod::Ngram,
                         ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,
-                        ("draft" | "eagle" | "dflash", true) | ("auto", true) => blaze::sched::SpecMethod::Eagle,
+                        ("draft" | "eagle" | "dflash" | "mtp", true) | ("auto", true) => blaze::sched::SpecMethod::Eagle,
                         ("draft" | "eagle" | "dflash", false) => anyhow::bail!("--spec-method {spec_method} needs --draft-model"),
-                        (m, _) => anyhow::bail!("unknown --spec-method {m} (auto, suffix, ngram, draft)"),
+                        (m, _) => anyhow::bail!("unknown --spec-method {m} (auto, suffix, ngram, draft, mtp)"),
                     },
                 },
             );

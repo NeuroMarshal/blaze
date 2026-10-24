@@ -1,8 +1,8 @@
-//! The drafters a target can run next to it, chosen by the checkpoint's architecture: EAGLE-4 (one layer, a chain of
-//! draft steps) and DFlash2 (a block drafted in one pass).
+//! EAGLE-4, DFlash2 and checkpoint MTP drafters, selected by checkpoint architecture.
 
 use crate::dflash::{DFlash, DFlashConfig};
 use crate::eagle::{Draft, DraftConfig, DraftPlan, DraftTree};
+use crate::mtp::Mtp;
 use crate::gpu::HostMapped;
 use crate::model::Model;
 use anyhow::{Result, bail};
@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub enum Drafter {
     Eagle(Draft),
     DFlash(DFlash),
+    Mtp(Mtp),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,10 +52,16 @@ impl Drafter {
         })
     }
 
+    /// The target's own MTP head, with a KV ring of `window` positions.
+    pub fn load_mtp(dir: &Path, model: &Model, max_items: usize, stride: usize, window: usize) -> Result<Self> {
+        Ok(Self::Mtp(Mtp::load(dir, model, max_items, stride, window)?))
+    }
+
     pub fn run(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<Vec<i64>>> {
         match self {
             Self::Eagle(d) => d.run(model, plan),
             Self::DFlash(d) => d.run(model, plan),
+            Self::Mtp(d) => d.run(model, plan),
         }
     }
 
@@ -62,7 +69,7 @@ impl Drafter {
     pub fn run_tree(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<DraftTree>> {
         match self {
             Self::Eagle(d) => d.run_tree(model, plan),
-            Self::DFlash(_) => bail!("draft trees need an EAGLE-4 drafter"),
+            Self::DFlash(_) | Self::Mtp(_) => bail!("draft trees need an EAGLE-4 drafter"),
         }
     }
 
@@ -71,6 +78,7 @@ impl Drafter {
         match self {
             Self::Eagle(d) => d.cfg.window,
             Self::DFlash(d) => d.cfg.window,
+            Self::Mtp(d) => d.cfg.window,
         }
     }
 
@@ -78,6 +86,7 @@ impl Drafter {
         match self {
             Self::Eagle(d) => d.describe(),
             Self::DFlash(d) => d.describe(),
+            Self::Mtp(d) => d.describe(),
         }
     }
 }

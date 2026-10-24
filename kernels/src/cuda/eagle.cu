@@ -38,6 +38,22 @@ __global__ void __launch_bounds__(kThreads) rmsnorm_ld_kernel(const uint16_t* __
   for (int i = threadIdx.x; i < dim; i += kThreads) o[i] = to_bf(bf(xr[i]) * inv * bf(w[i]));
 }
 
+// the same with the zero-centered weight (1 + w) of the Qwen3.5 norms
+__global__ void __launch_bounds__(kThreads) rmsnorm_ld_zc_kernel(const uint16_t* __restrict__ x, int64_t ldx,
+                                                                 const uint16_t* __restrict__ w, float eps, int dim,
+                                                                 uint16_t* __restrict__ out, int64_t ldo) {
+  __shared__ float red[kThreads / 32];
+  const uint16_t* xr = x + int64_t(blockIdx.x) * ldx;
+  float ss = 0.0f;
+  for (int i = threadIdx.x; i < dim; i += kThreads) {
+    const float v = bf(xr[i]);
+    ss += v * v;
+  }
+  const float inv = rsqrtf(block_sum(ss, red) / float(dim) + eps);
+  uint16_t* o = out + int64_t(blockIdx.x) * ldo;
+  for (int i = threadIdx.x; i < dim; i += kThreads) o[i] = to_bf(bf(xr[i]) * inv * (1.0f + bf(w[i])));
+}
+
 // one thread per (token, head, pair)
 __global__ void rope_neox_kernel(uint16_t* __restrict__ x, int64_t ld, int tokens, int heads, int head_dim,
                                  const int64_t* __restrict__ positions, const float* __restrict__ inv_freq) {
@@ -255,6 +271,24 @@ extern "C" cudaError_t blz_rmsnorm_ld(const uint16_t* x, int64_t ldx, const uint
                                       uint16_t* out, int64_t ldo, cudaStream_t stream) {
   if (rows == 0) return cudaSuccess;
   rmsnorm_ld_kernel<<<rows, kThreads, 0, stream>>>(x, ldx, w, eps, dim, out, ldo);
+  return cudaGetLastError();
+}
+
+__global__ void widen_i32_kernel(const int32_t* __restrict__ src, int64_t* __restrict__ a, int64_t* __restrict__ b, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) a[i] = b[i] = int64_t(src[i]);
+}
+
+extern "C" cudaError_t blz_widen_i32(const int32_t* src, int64_t* a, int64_t* b, int n, cudaStream_t stream) {
+  if (n <= 0) return cudaSuccess;
+  widen_i32_kernel<<<(n + 127) / 128, 128, 0, stream>>>(src, a, b, n);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_rmsnorm_ld_zc(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
+                                         uint16_t* out, int64_t ldo, cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  rmsnorm_ld_zc_kernel<<<rows, kThreads, 0, stream>>>(x, ldx, w, eps, dim, out, ldo);
   return cudaGetLastError();
 }
 

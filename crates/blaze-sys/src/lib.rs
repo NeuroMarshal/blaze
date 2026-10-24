@@ -312,6 +312,9 @@ unsafe extern "C" {
                          n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rmsnorm_ld(x: *const bf16, ldx: i64, w: *const bf16, eps: f32, rows: c_int, dim: c_int, out: *mut bf16,
                           ldo: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_widen_i32(src: *const i32, a: *mut i64, b: *mut i64, n: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_rmsnorm_ld_zc(x: *const bf16, ldx: i64, w: *const bf16, eps: f32, rows: c_int, dim: c_int, out: *mut bf16, ldo: i64,
+                             s: cudaStream_t) -> cudaError_t;
     pub fn blz_rope_neox(x: *mut bf16, ld: i64, tokens: c_int, heads: c_int, head_dim: c_int, positions: *const i64,
                          inv_freq: *const f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_candidate_logits(hidden: *const bf16, ld_hidden: i64, rows: c_int, dim: c_int, table: *const bf16,

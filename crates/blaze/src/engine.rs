@@ -441,6 +441,13 @@ fn worker_main(
                 }
                 Some(dr)
             }
+            None if model.opts.mtp_window > 0 => {
+                let dr = crate::drafter::Drafter::load_mtp(&dir, &model, model.opts.max_seqs, model.ctx_stride(), model.opts.mtp_window)?;
+                if rank == 0 {
+                    eprintln!("blaze: {}", dr.describe());
+                }
+                Some(dr)
+            }
             _ => None,
         };
         let graph_log = std::env::var("BLAZE_GRAPH_LOG").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0 && rank == 0).map(|n| (n, [0; 4]));
@@ -490,6 +497,15 @@ impl Engine {
         if let Some(d) = &opts.draft {
             // the drafter reads the target's hidden states after its aux layers
             opts.capture_layers = crate::drafter::capture_layers(d)?;
+        } else if opts.mtp_window > 0 {
+            // the MTP head reads the final normed hidden state: one captured slot, no layer's input
+            if !crate::mtp::has_head(dir)? {
+                bail!("{}: no MTP head (mtp.* tensors) in the checkpoint", dir.display());
+            }
+            opts.capture_layers = vec![usize::MAX];
+        }
+        if opts.mtp_window > 0 && opts.draft.is_some() {
+            bail!("--mtp-window with --draft-model: one drafter at a time");
         }
         let embed = Arc::new(Model::load_embedding(dir)?);
         // the EAGLE-4 LM head as one pinned table for every rank (DFlash uses the target's head)

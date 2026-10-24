@@ -16,6 +16,13 @@ extern "C" {
 cudaError_t blz_rmsnorm_ld(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
                            uint16_t* out, int64_t ldo, cudaStream_t stream);
 
+/// \brief a[i] = b[i] = (int64) src[i] for i < n (a greedy pick as the next draft input and as the call's record).
+cudaError_t blz_widen_i32(const int32_t* src, int64_t* a, int64_t* b, int n, cudaStream_t stream);
+
+/// \brief blz_rmsnorm_ld with the zero-centered weight: out = x / rms * (1 + w) (the Qwen3.5 / MTP norms).
+cudaError_t blz_rmsnorm_ld_zc(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
+                              uint16_t* out, int64_t ldo, cudaStream_t stream);
+
 /// \brief Rotary embedding in place, halves rotated (neox / Llama): for every token t and head h of
 /// x[t * ld + h * head_dim ...], pairs (i, i + head_dim / 2) rotate by positions[t] * inv_freq[i].
 cudaError_t blz_rope_neox(uint16_t* x, int64_t ld, int tokens, int heads, int head_dim, const int64_t* positions,
