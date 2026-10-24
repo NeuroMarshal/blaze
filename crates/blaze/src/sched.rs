@@ -66,10 +66,49 @@ pub struct ThinkBudget {
     pub force: Vec<i32>,
 }
 
+/// A prompt-cache snapshot. Eviction is GreedyDual-Size: an entry is worth the prefill it saves (its tokens) on top of
+/// the inflation at its last use, the least worth goes first and raises the inflation to its worth. A short side
+/// request (a title, a probe) loses to a long conversation however recent it is, and a long entry nobody uses ages
+/// out as the inflation passes it (plain LRU let two side requests per turn evict an agent's whole conversation).
 struct CacheEntry {
     tokens: Vec<i64>,
     snap: Snapshot,
-    used: u64,
+    worth: f64,
+    kind: SnapKind,
+    hit: bool,
+}
+
+/// Where a prompt-cache snapshot was taken. Its worth is also weighed by how often snapshots of its kind are used
+/// (`SnapStats`): with a template that renders earlier assistant turns differently, only the snapshot at a turn's
+/// boundary ever matches the next prompt, and the longer prompt-end and conversation-end ones would otherwise keep
+/// pushing it out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapKind {
+    Point,
+    Prompt,
+    Finish,
+}
+
+/// Decayed counts per SnapKind: snapshots made, snapshots used at least once.
+#[derive(Default)]
+struct SnapStats {
+    made: [f64; 3],
+    used: [f64; 3],
+}
+
+impl SnapStats {
+    /// Share of the kind's snapshots that are used (prior: one in two).
+    fn useful(&self, k: SnapKind) -> f64 {
+        (self.used[k as usize] + 1.0) / (self.made[k as usize] + 2.0)
+    }
+
+    fn made(&mut self, k: SnapKind) {
+        for i in 0..3 {
+            self.made[i] *= 0.98;
+            self.used[i] *= 0.98;
+        }
+        self.made[k as usize] += 1.0;
+    }
 }
 
 struct Active {
@@ -389,7 +428,8 @@ impl Scheduler {
                     waiting: VecDeque::new(),
                     active: Vec::new(),
                     cache: Vec::new(),
-                    clock: 0,
+                    inflation: 0.0,
+                    snap_stats: SnapStats::default(),
                     spec_stats: (0, 0),
                     spec_log: SpecLog::default(),
                     tree_depth: 0,
@@ -419,7 +459,9 @@ struct Loop {
     waiting: VecDeque<GenRequest>,
     active: Vec<Active>,
     cache: Vec<CacheEntry>,
-    clock: u64,
+    /// GreedyDual-Size inflation of the prompt cache (CacheEntry) and the usefulness of its snapshot kinds
+    inflation: f64,
+    snap_stats: SnapStats,
     /// speculative verifies and the tokens they emitted
     spec_stats: (usize, usize),
     /// BLAZE_SPEC_LOG=n: every n tree rounds, their mean rows, kept rows and times on stderr
@@ -526,13 +568,14 @@ impl Loop {
     }
 
     fn evict_lru(&mut self) -> bool {
-        let Some(i) = self.cache.iter().enumerate().min_by_key(|(_, e)| e.used).map(|(i, _)| i) else { return false };
+        let Some(i) = self.cache.iter().enumerate().min_by(|a, b| a.1.worth.total_cmp(&b.1.worth)).map(|(i, _)| i) else { return false };
         let e = self.cache.swap_remove(i);
+        self.inflation = self.inflation.max(e.worth);
         self.engine.release(e.snap);
         true
     }
 
-    fn remember(&mut self, seq: &Seq, tokens: Vec<i64>) {
+    fn remember(&mut self, seq: &Seq, tokens: Vec<i64>, kind: SnapKind) {
         if !self.cfg.prompt_cache
             || tokens.len() != seq.len()
             || tokens.len() % self.engine.info.page != 0
@@ -543,7 +586,10 @@ impl Loop {
         let snap = match self.engine.snapshot(seq) {
             Ok(Some(s)) => s,
             Ok(None) => {
-                if !self.evict_lru() {
+                // full: a new entry worth no more than the least worth one (a short side request against a
+                // conversation) is not kept rather than pushing that one out
+                let least = self.cache.iter().map(|e| e.worth).fold(f64::INFINITY, f64::min);
+                if self.inflation + tokens.len() as f64 * self.snap_stats.useful(kind) <= least || !self.evict_lru() {
                     return;
                 }
                 match self.engine.snapshot(seq) {
@@ -556,8 +602,9 @@ impl Loop {
                 return;
             }
         };
-        self.clock += 1;
-        self.cache.push(CacheEntry { tokens, snap, used: self.clock });
+        let worth = self.inflation + tokens.len() as f64 * self.snap_stats.useful(kind);
+        self.snap_stats.made(kind);
+        self.cache.push(CacheEntry { tokens, snap, worth, kind, hit: false });
     }
 
     fn admit(&mut self) {
@@ -591,10 +638,11 @@ impl Loop {
                     .iter()
                     .enumerate()
                     .filter(|(_, e)| keep.as_ref() != Some(&e.tokens))
-                    .min_by_key(|(_, e)| e.used)
+                    .min_by(|a, b| a.1.worth.total_cmp(&b.1.worth))
                     .map(|(i, _)| i);
                 let Some(i) = lru else { break };
                 let e = self.cache.swap_remove(i);
+                self.inflation = self.inflation.max(e.worth);
                 self.engine.release(e.snap);
             }
             if self.engine.free_slots() < need && !self.active.is_empty() {
@@ -604,8 +652,12 @@ impl Loop {
             let hit = self.lookup(&req.tokens);
             let opened = match hit {
                 Some(i) => {
-                    self.clock += 1;
-                    self.cache[i].used = self.clock;
+                    let k = self.cache[i].kind;
+                    if !self.cache[i].hit {
+                        self.cache[i].hit = true;
+                        self.snap_stats.used[k as usize] += 1.0;
+                    }
+                    self.cache[i].worth = self.inflation + self.cache[i].tokens.len() as f64 * self.snap_stats.useful(k);
                     self.engine.open_from(Some(&self.cache[i].snap))
                 }
                 None => self.engine.open(),
@@ -757,7 +809,7 @@ impl Loop {
             let tokens = a.req.tokens.clone();
             let seq_ptr: *const Seq = &a.seq;
             // SAFETY: remember() touches the engine and the cache, not the active list.
-            self.remember(unsafe { &*seq_ptr }, tokens);
+            self.remember(unsafe { &*seq_ptr }, tokens, SnapKind::Prompt);
         }
         (pick, None)
     }
@@ -992,7 +1044,7 @@ impl Loop {
             if reason != Finish::Cancelled {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
-                self.remember(&a.seq, tokens);
+                self.remember(&a.seq, tokens, SnapKind::Finish);
             }
             if reason == Finish::Cancelled {
                 self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -1186,7 +1238,7 @@ impl Loop {
             if reason != Finish::Cancelled {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
-                self.remember(&a.seq, tokens);
+                self.remember(&a.seq, tokens, SnapKind::Finish);
             }
             if reason == Finish::Cancelled {
                 self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -1372,7 +1424,7 @@ impl Loop {
                     let tokens = a.req.tokens[..a.fed].to_vec();
                     let seq_ptr: *const Seq = &a.seq;
                     // SAFETY: remember() touches the engine and the cache, not the active list.
-                    self.remember(unsafe { &*seq_ptr }, tokens);
+                    self.remember(unsafe { &*seq_ptr }, tokens, SnapKind::Point);
                 }
                 let a = &mut self.active[i];
                 if a.fed < a.req.tokens.len() {
@@ -1423,7 +1475,7 @@ impl Loop {
             if reason != Finish::Cancelled {
                 let mut tokens = a.req.tokens.clone();
                 tokens.extend(a.generated[..a.generated.len() - 1].iter().map(|&t| t as i64));
-                self.remember(&a.seq, tokens);
+                self.remember(&a.seq, tokens, SnapKind::Finish);
             }
             if reason == Finish::Cancelled {
                 self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
