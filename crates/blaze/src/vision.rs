@@ -837,7 +837,16 @@ impl Vision {
         if mode == VisionMode::Off {
             return Ok(None);
         }
-        let Some(cfg) = VisionConfig::load(dir)? else { return Ok(None) };
+        // auto: a tower this build does not run leaves the server text-only (gpu / cpu asked for it: an error)
+        let cfg = match VisionConfig::load(dir) {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => return Ok(None),
+            Err(e) if mode == VisionMode::Auto => {
+                eprintln!("blaze: image input off: {e:#}");
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
         let settings = ImageSettings::load(dir, &cfg)?;
         let need = vram_need(dir, VisionMode::Gpu, max_pixels);
         let gpu_fits = || -> bool { gpu::set_device(device).is_ok() && gpu::mem_info().map(|(free, _)| free > need).unwrap_or(false) };

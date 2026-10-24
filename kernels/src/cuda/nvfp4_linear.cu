@@ -5,6 +5,7 @@
 // values) in shared memory; each block's 16 products are summed in FP32 and multiplied by the block scale once.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 
@@ -293,6 +294,167 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* 
   }
 }
 
+// FP16 inputs and FP16 accumulation within each 128-wide chunk of K (8 mma steps), FP32 across chunks: GeForce cards run
+// FP16-accumulate mma at twice the FP32-accumulate rate, which the BF16 kernel is bound by from ~16 rows. The codes
+// become FP16 exactly (E2M1 magnitudes have zero low bytes in FP16; times an E4M3 block scale: at most 6 significant
+// bits); the inputs come from nvfp4_f16_rows_kernel, each row scaled by a power of two to max |x| <= 64, so that a
+// chunk's partial sums stay below 128 * 64 * 6 < 65504 for block scales <= 1 (the caller checks the layer's scales).
+__device__ __forceinline__ void mma_f16(uint32_t* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
+                                        uint32_t b1) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+      : "+r"(c[0]), "+r"(c[1])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Four E2M1 codes (16 bits, first code lowest) -> two FP16 pairs.
+__device__ __forceinline__ void e2m1x4_to_f16(uint32_t q, uint32_t& w0, uint32_t& w1) {
+  const uint32_t hi = __byte_perm(0x3E3C3800u, 0x46444240u, q & 0x7777u);  // high bytes of 0, .5, 1, 1.5, 2, 3, 4, 6
+  w0 = __byte_perm(hi, 0u, 0x1404) | ((q & 0x8u) << 12) | ((q & 0x80u) << 24);
+  w1 = __byte_perm(hi, 0u, 0x3424) | ((q & 0x800u) << 4) | ((q & 0x8000u) << 16);
+}
+
+__device__ __forceinline__ uint32_t f16x2_mul(uint32_t a, uint32_t b) {
+  __half2 r = __hmul2(*reinterpret_cast<__half2*>(&a), *reinterpret_cast<__half2*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+
+__device__ __forceinline__ uint32_t f16x2_splat(float v) {
+  const uint32_t h = __half_as_ushort(__float2half_rn(v));
+  return h | (h << 16);
+}
+
+template <int kTiles, int kSplit, bool kHi, int kMT>
+__global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_f16_kernel(const uint16_t* __restrict__ x, int64_t ldx,
+                                                                    const int32_t* __restrict__ shift,
+                                                                    const uint8_t* __restrict__ w,
+                                                                    const uint8_t* __restrict__ scale,
+                                                                    const float* __restrict__ alpha,
+                                                                    uint16_t* __restrict__ y, int64_t ldy, int m, int n,
+                                                                    int k) {
+  constexpr int kTok = 16 * kMT;
+  __shared__ float red[kSplit][kTiles * 8][kTok + 1];
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, t = lane & 3;
+  const int f0 = blockIdx.x * kTiles * 8;
+  const int64_t wrow = k >> 1, srow = k >> 4;
+  const uint8_t* wp[kTiles];
+  const uint8_t* sp[kTiles];
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j) {
+    const int f = min(f0 + 8 * j + g, n - 1);
+    wp[j] = w + f * wrow + 16 * t;
+    sp[j] = scale + f * srow + 2 * t;
+  }
+  float acc[kTiles][kMT][4];
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j)
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) acc[j][mt][0] = acc[j][mt][1] = acc[j][mt][2] = acc[j][mt][3] = 0.0f;
+  const int chunks = k >> 7;
+  uint4 wq[kTiles];
+  uint16_t sq[kTiles];
+  auto load = [&](int c, uint4* dw, uint16_t* ds) {
+#pragma unroll
+    for (int j = 0; j < kTiles; ++j) {
+      dw[j] = ldg_stream(wp[j] + c * 64);
+      ds[j] = __ldg(reinterpret_cast<const uint16_t*>(sp[j] + c * 8));
+    }
+  };
+  if (warp < chunks) load(warp, wq, sq);
+  for (int c = warp; c < chunks; c += kSplit) {
+    uint4 nw[kTiles];
+    uint16_t ns[kTiles];
+    if (c + kSplit < chunks) load(c + kSplit, nw, ns);
+    uint32_t bq[kTiles][8][2];
+#pragma unroll
+    for (int j = 0; j < kTiles; ++j) {
+      const uint32_t s0 = f16x2_splat(e4m3(sq[j] & 0xff)), s1 = f16x2_splat(e4m3(sq[j] >> 8));
+      const uint32_t codes[4] = {wq[j].x, wq[j].y, wq[j].z, wq[j].w};
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        uint32_t b0, b1;
+        e2m1x4_to_f16(codes[s >> 1] >> (16 * (s & 1)), b0, b1);
+        const uint32_t sc = s < 4 ? s0 : s1;
+        bq[j][s][0] = f16x2_mul(b0, sc), bq[j][s][1] = f16x2_mul(b1, sc);
+      }
+      wq[j] = nw[j];
+      sq[j] = ns[j];
+    }
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+      const int rlo = 16 * mt + g, rhi = rlo + 8;
+      const bool lo_ok = rlo < m, hi_ok = kHi && rhi < m;
+      const uint16_t* xlo = x + int64_t(lo_ok ? rlo : 0) * ldx + 32 * t;
+      const uint16_t* xhi = x + int64_t(hi_ok ? rhi : 0) * ldx + 32 * t;
+      uint32_t xa[16], xb[16];
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const uint4 v = lo_ok ? __ldg(reinterpret_cast<const uint4*>(xlo + c * 128) + q) : make_uint4(0, 0, 0, 0);
+        xa[4 * q] = v.x, xa[4 * q + 1] = v.y, xa[4 * q + 2] = v.z, xa[4 * q + 3] = v.w;
+        if (kHi) {
+          const uint4 u = hi_ok ? __ldg(reinterpret_cast<const uint4*>(xhi + c * 128) + q) : make_uint4(0, 0, 0, 0);
+          xb[4 * q] = u.x, xb[4 * q + 1] = u.y, xb[4 * q + 2] = u.z, xb[4 * q + 3] = u.w;
+        } else {
+          xb[4 * q] = xb[4 * q + 1] = xb[4 * q + 2] = xb[4 * q + 3] = 0;
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kTiles; ++j) {
+        uint32_t h[2] = {0u, 0u};
+#pragma unroll
+        for (int s = 0; s < 8; ++s) mma_f16(h, xa[2 * s], xb[2 * s], xa[2 * s + 1], xb[2 * s + 1], bq[j][s][0], bq[j][s][1]);
+        const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&h[0]));
+        const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&h[1]));
+        acc[j][mt][0] += lo.x, acc[j][mt][1] += lo.y, acc[j][mt][2] += hi.x, acc[j][mt][3] += hi.y;
+      }
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < kTiles; ++j)
+#pragma unroll
+    for (int mt = 0; mt < kMT; ++mt) {
+      red[warp][8 * j + 2 * t][16 * mt + g] = acc[j][mt][0];
+      red[warp][8 * j + 2 * t + 1][16 * mt + g] = acc[j][mt][1];
+      red[warp][8 * j + 2 * t][16 * mt + g + 8] = acc[j][mt][2];
+      red[warp][8 * j + 2 * t + 1][16 * mt + g + 8] = acc[j][mt][3];
+    }
+  __syncthreads();
+  for (int i = threadIdx.x; i < kTiles * 8 * kTok; i += blockDim.x) {
+    const int r = i / kTok, tok = i % kTok, f = f0 + r;
+    if (tok >= m || f >= n) continue;
+    float v = 0.0f;
+#pragma unroll
+    for (int q = 0; q < kSplit; ++q) v += red[q][r][tok];
+    y[tok * ldy + f] = __bfloat16_as_ushort(__float2bfloat16(ldexpf(v * alpha[f], shift[tok])));
+  }
+}
+
+// grid: rows, block: 256. Row r of x (BF16) as FP16 times 2^-shift[r], max |x| in (32, 64] (0: shift 0).
+__global__ void nvfp4_f16_rows_kernel(const uint16_t* __restrict__ x, int64_t ldx, int k, uint16_t* __restrict__ out,
+                                      int32_t* __restrict__ shift) {
+  const int r = blockIdx.x;
+  const uint16_t* xr = x + int64_t(r) * ldx;
+  float mx = 0.0f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) mx = fmaxf(mx, fabsf(__bfloat162float(__ushort_as_bfloat16(xr[i]))));
+  __shared__ float red[8];
+#pragma unroll
+  for (int o = 16; o > 0; o /= 2) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = mx;
+  __syncthreads();
+  mx = red[0];
+#pragma unroll
+  for (int i = 1; i < 8; ++i) mx = fmaxf(mx, red[i]);
+  int e = 0;
+  if (mx > 0.0f && isfinite(mx)) {
+    frexpf(mx / 64.0f, &e);  // mx / 64 = f * 2^e, f in [0.5, 1): mx * 2^-e in [32, 64)
+    e = max(-60, min(60, e));
+  }
+  if (threadIdx.x == 0) shift[r] = e;
+  uint16_t* o = out + int64_t(r) * k;
+  for (int i = threadIdx.x; i < k; i += blockDim.x)
+    o[i] = __half_as_ushort(__float2half_rn(ldexpf(__bfloat162float(__ushort_as_bfloat16(xr[i])), -e)));
+}
+
 __global__ void nvfp4_dequant_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ scale,
                                      const float* __restrict__ alpha, int n, int k, uint16_t* __restrict__ out) {
   const int64_t chunks = int64_t(n) * (k >> 5);
@@ -408,6 +570,61 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
                                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
                                           cudaStream_t stream) {
   return blz_nvfp4_gemv_mma_cfg(x, ldx, w, scale, alpha, y, ldy, rows, n, k, 0, 0, stream);
+}
+
+namespace {
+
+template <int T, int S>
+cudaError_t launch_mma_f16(const uint16_t* x, const int32_t* shift, const uint8_t* w, const uint8_t* scale,
+                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k, cudaStream_t stream) {
+  const int blocks = (n + 8 * T - 1) / (8 * T), mt = (rows + 15) / 16;
+  if (mt == 1 && rows <= 8)
+    nvfp4_mma_f16_kernel<T, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+  else if (mt == 1)
+    nvfp4_mma_f16_kernel<T, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+  else if (mt == 2)
+    nvfp4_mma_f16_kernel<T, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+  else if constexpr (mma_cfg_fits(T, S, 4)) {
+    if (mt == 3)
+      nvfp4_mma_f16_kernel<T, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+    else
+      nvfp4_mma_f16_kernel<T, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+  } else {
+    return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+}  // namespace
+
+extern "C" cudaError_t blz_nvfp4_f16_rows(const uint16_t* x, int64_t ldx, int rows, int k, uint16_t* x16, int32_t* shift,
+                                          cudaStream_t stream) {
+  if (rows <= 0) return cudaSuccess;
+  nvfp4_f16_rows_kernel<<<rows, 256, 0, stream>>>(x, ldx, k, x16, shift);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_nvfp4_gemv_mma_f16_cfg(const uint16_t* x16, const int32_t* shift, const uint8_t* w,
+                                                  const uint8_t* scale, const float* alpha, uint16_t* y, int64_t ldy,
+                                                  int rows, int n, int k, int split, int tiles, cudaStream_t stream) {
+  if (rows <= 0 || n <= 0) return cudaSuccess;
+  if (k % 128 != 0 || rows > BLZ_NVFP4_MMA_MAX_ROWS) return cudaErrorInvalidValue;
+  if (split == 0 || tiles == 0) blz_nvfp4_mma_default_cfg(rows, k, &split, &tiles);
+  if (!blz_nvfp4_mma_cfg_valid(rows, split, tiles)) return cudaErrorInvalidValue;
+#define BLZ_MMA16_S(T)                                                                                  \
+  switch (split) {                                                                                      \
+    case 2: return launch_mma_f16<T, 2>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);       \
+    case 4: return launch_mma_f16<T, 4>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);       \
+    default: return launch_mma_f16<T, 8>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);      \
+  }
+  switch (tiles) {
+    case 1: BLZ_MMA16_S(1)
+    case 2: BLZ_MMA16_S(2)
+    default:
+      if (split == 2) return launch_mma_f16<4, 2>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);
+      return launch_mma_f16<4, 4>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);
+  }
+#undef BLZ_MMA16_S
 }
 
 extern "C" cudaError_t blz_nvfp4_weight_dequant(const uint8_t* w, const uint8_t* scale, const float* alpha, int n, int k,

@@ -38,6 +38,9 @@ struct EngineConfig {
   // Items with at least this many columns (MTP verify) use the approximate block-floating-point kernels
   // (row_sums_q8_avx2, ~2x less AVX2 work); 0: always exact.
   int fast_min_cols = 0;
+  // Choose how many of the workers take part, by measurement while serving (the time per task of windows of jobs at a
+  // few counts, the best kept, its neighbours probed now and then); false: all of them, always.
+  bool tune_threads = true;
 };
 
 /// \brief Parse a CPU list such as "0-23,48-55" (ranges and single CPUs, comma separated).
@@ -64,6 +67,8 @@ class Engine {
   /// \brief Telemetry: summed request time (pickup to done) in ns, and items served.
   uint64_t busy_ns() const { return busy_ns_.load(std::memory_order_relaxed); }
   uint64_t items() const { return items_.load(std::memory_order_relaxed); }
+  /// \brief Workers taking part in requests now (all of them unless tune_threads).
+  int active_workers() const { return active_.load(std::memory_order_relaxed); }
 
  private:
   struct Job;
@@ -77,6 +82,17 @@ class Engine {
   bool poll_request(Job& job);
   void run_tasks(Job& job, int index);
   void finalize_item(Job& job, int item);
+  void tune_note(double ns, int tasks);
+
+  // The worker count tuner (tune_threads): candidate counts, the decayed ns per task measured at each (0: not yet),
+  // the current window's sums. Touched only by the worker that completes a job (one at a time).
+  struct Tuner {
+    std::vector<int> counts;
+    std::vector<double> cost;
+    int cur = 0, windows = 0, jobs = 0;
+    double ns = 0, tasks = 0;
+  } tuner_;
+  std::atomic<int> active_{1};
 
   EngineConfig cfg_;
   uint8_t* mail_;

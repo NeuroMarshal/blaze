@@ -58,6 +58,7 @@ pub type cudaGraph_t = *mut c_void;
 pub type cudaGraphExec_t = *mut c_void;
 pub const CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
 pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const ATTR_L2_CACHE_SIZE: c_int = 38;
 pub const ATTR_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const ATTR_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
@@ -387,6 +388,9 @@ unsafe extern "C" {
                            k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_ex(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
                               n: c_int, k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_f16_rows(x: *const u16, ldx: i64, rows: c_int, k: c_int, x16: *mut u16, shift: *mut i32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_gemv_mma_f16_cfg(x16: *const u16, shift: *const i32, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut u16,
+                                      ldy: i64, rows: c_int, n: c_int, k: c_int, split: c_int, tiles: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_bf16_gemv_mma_cfg(x: *const u16, ldx: i64, w: *const u16, y: *mut u16, ldy: i64, rows: c_int, n: c_int, k: c_int,
                                  split: c_int, tiles: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_cfg(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,

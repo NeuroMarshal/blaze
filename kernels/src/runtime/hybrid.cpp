@@ -145,6 +145,7 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   ec.gu_chunk_groups = cfg_.cpu_gu_chunk;
   ec.down_chunk_groups = cfg_.cpu_down_chunk;
   ec.ssd_io_threads = cfg_.ssd_io_threads;
+  ec.tune_threads = cfg_.cpu_tune;
   ec.ssd_direct = cfg_.ssd_direct;
   cpu_ = std::make_unique<cpu::Engine>(ec, mail_, host_records_.data(), mult_host_.data());
   if (cfg_.gpu1 >= 0) {

@@ -114,6 +114,15 @@ Engine::Engine(const EngineConfig& cfg, uint8_t* mail, const uint8_t* const* rec
                  cfg.cores.size());
   auto* hdr = reinterpret_cast<blz_mail_header*>(mail_);
   job_->last_seq = blz_req_seq(__atomic_load_n(&hdr->req, __ATOMIC_ACQUIRE));
+  active_.store(cfg.threads, std::memory_order_relaxed);
+  if (cfg.tune_threads && cfg.threads >= 4) {
+    // eighths of the workers from a quarter up, all of them first
+    for (int e = 8; e >= 2; --e) {
+      const int n = std::max(2, (cfg.threads * e + 4) / 8);
+      if (tuner_.counts.empty() || tuner_.counts.back() != n) tuner_.counts.push_back(n);
+    }
+    tuner_.cost.assign(tuner_.counts.size(), 0.0);
+  }
   for (int i = 0; i < cfg.threads; ++i) threads_.emplace_back([this, i] { worker(i); });
 }
 
@@ -366,11 +375,49 @@ void Engine::run_tasks(Job& job, int index) {
       job.next_task.store(1 << 30, std::memory_order_relaxed);
       __atomic_store_n(&hdr->done, job.seq, __ATOMIC_RELEASE);
       served_.fetch_add(1, std::memory_order_relaxed);
-      busy_ns_.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - job.t_start).count()),
-                         std::memory_order_relaxed);
+      const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - job.t_start).count();
+      busy_ns_.fetch_add(uint64_t(ns), std::memory_order_relaxed);
       items_.fetch_add(uint64_t(job.n_items), std::memory_order_relaxed);
+      if (!tuner_.counts.empty()) tune_note(double(ns), job.total);
     }
   }
+}
+
+// Windows of kTuneJobs jobs (those with at least as many tasks as the larger count would use) at one worker count each:
+// first every count from all workers down, then the cheapest per task, with a neighbour every kTuneProbe-th window.
+// A request's time per task falls with workers until the memory bandwidth or the other host threads are the limit.
+namespace {
+constexpr int kTuneJobs = 192;
+constexpr int kTuneProbe = 8;
+}  // namespace
+
+void Engine::tune_note(double ns, int tasks) {
+  Tuner& t = tuner_;
+  if (tasks < 2) return;
+  t.ns += ns, t.tasks += tasks;
+  if (++t.jobs < kTuneJobs) return;
+  const double c = t.ns / t.tasks;
+  double& m = t.cost[t.cur];
+  m = m == 0 ? c : 0.7 * m + 0.3 * c;
+  t.jobs = 0, t.ns = 0, t.tasks = 0;
+  ++t.windows;
+  const int n = int(t.counts.size());
+  int next;
+  const auto unmeasured = std::find(t.cost.begin(), t.cost.end(), 0.0);
+  if (unmeasured != t.cost.end()) {
+    next = int(unmeasured - t.cost.begin());
+  } else {
+    int best = 0;
+    for (int i = 1; i < n; ++i)
+      if (t.cost[i] < t.cost[best]) best = i;
+    next = best;
+    if (t.windows % kTuneProbe == 0) next = (t.windows / kTuneProbe) % 2 ? std::max(0, best - 1) : std::min(n - 1, best + 1);
+    if (t.windows == n)
+      log("blaze: CPU experts: %d of %d workers (%.1f us per task; all workers %.1f us)", t.counts[best], cfg_.threads,
+          t.cost[best] / 1e3, t.cost[0] / 1e3);
+  }
+  t.cur = next;
+  active_.store(t.counts[next], std::memory_order_relaxed);
 }
 
 void Engine::worker(int index) {
@@ -392,9 +439,11 @@ void Engine::worker(int index) {
         got = true;
       }
     }
-    if (got) {
+    if (got && index < active_.load(std::memory_order_relaxed)) {
       run_tasks(job, index);
       last_work = Clock::now();
+    } else if (got) {
+      // a worker the tuner left out: the job is the others'
     } else if (Clock::now() - last_work < kHotWindow) {
       _mm_pause();
     } else {

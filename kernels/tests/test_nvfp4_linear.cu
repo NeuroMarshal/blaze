@@ -63,16 +63,32 @@ uint16_t bf(float v) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
 float fb(uint16_t v) { return __bfloat162float(__ushort_as_bfloat16(v)); }
 
 // Worst |y - ref| / max |ref| of `rows` rows through the GEMV (rows <= 8) or dequant + cuBLAS.
+// f16: the FP16-accumulate route (blz_nvfp4_f16_rows + blz_nvfp4_gemv_mma_f16_cfg); outliers: a few input channels
+// a thousand times larger (Qwen's massive activations reach the down projections).
 double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm* gemm, bool mma = false, int split = 0,
-           int tiles = 0) {
+           int tiles = 0, bool f16 = false, bool outliers = false) {
   std::normal_distribution<float> d(0.0f, 1.0f);
   std::vector<uint16_t> x(size_t(rows) * ldx);
   for (auto& v : x) v = bf(d(rng));
+  if (outliers)
+    for (int m = 0; m < rows; ++m)
+      for (int c : {3, 77, W.k / 2, W.k - 5}) x[size_t(m) * ldx + c] = bf(d(rng) * 1500.0f);
   uint16_t *dx, *dy, *dw = nullptr;
   check(cudaMalloc(&dx, x.size() * 2), "malloc");
   check(cudaMalloc(&dy, size_t(rows) * W.n * 2), "malloc");
   check(cudaMemcpy(dx, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "copy");
-  if (mma) {
+  if (f16) {
+    uint16_t* x16;
+    int32_t* sh;
+    check(cudaMalloc(&x16, size_t(rows) * W.k * 2), "malloc");
+    check(cudaMalloc(&sh, size_t(rows) * 4), "malloc");
+    check(blz_nvfp4_f16_rows(dx, ldx, rows, W.k, x16, sh, 0), "f16 rows");
+    check(blz_nvfp4_gemv_mma_f16_cfg(x16, sh, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, split, tiles, 0),
+          "gemv_mma_f16");
+    check(cudaDeviceSynchronize(), "f16 sync");
+    cudaFree(x16);
+    cudaFree(sh);
+  } else if (mma) {
     check(blz_nvfp4_gemv_mma_cfg(dx, ldx, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, split, tiles, 0),
           "gemv_mma");
   } else if (rows <= BLZ_NVFP4_GEMV_MAX_ROWS) {
@@ -99,7 +115,7 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
 }
 
 // Cold weights, as in a forward pass: enough copies of the matrix to exceed the L2 cache, used in turn.
-double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
+double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false, bool f16 = false) {
   const double bytes = double(n) * k / 2 + double(n) * k / 16;
   const int copies = std::max(2, int(400e6 / bytes));
   // the copies of a shape are made once (random bytes on the host are slow) and kept for later calls
@@ -113,21 +129,33 @@ double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false) {
   cudaEvent_t a, b;
   cudaEventCreate(&a);
   cudaEventCreate(&b);
-  auto f = mma ? blz_nvfp4_gemv_mma : blz_nvfp4_gemv;
-  for (int i = 0; i < copies; ++i) f(dx, k, ws[i]->d_codes, ws[i]->d_scales, ws[i]->d_alpha, dy, n, rows, n, k, 0);
+  uint16_t* x16;
+  int32_t* sh;
+  check(cudaMalloc(&x16, size_t(rows) * k * 2), "malloc");
+  check(cudaMalloc(&sh, size_t(rows) * 4), "malloc");
+  auto f = [&](const Weights* W) {
+    if (f16) {
+      blz_nvfp4_f16_rows(dx, k, rows, k, x16, sh, 0);
+      blz_nvfp4_gemv_mma_f16_cfg(x16, sh, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0, 0, 0);
+    } else if (mma) {
+      blz_nvfp4_gemv_mma(dx, k, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0);
+    } else {
+      blz_nvfp4_gemv(dx, k, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0);
+    }
+  };
+  for (int i = 0; i < copies; ++i) f(ws[i]);
   const int iters = 20 * copies;
   cudaEventRecord(a);
-  for (int i = 0; i < iters; ++i) {
-    const Weights* W = ws[i % copies];
-    f(dx, k, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0);
-  }
+  for (int i = 0; i < iters; ++i) f(ws[i % copies]);
   cudaEventRecord(b);
   check(cudaEventSynchronize(b), "bench");
   float ms = 0;
   cudaEventElapsedTime(&ms, a, b);
   const double us = 1000.0 * ms / iters;
-  std::printf("  %s %2d x %5d x %5d: %7.1f us, %6.0f GB/s of weights\n", mma ? "mma " : "gemv", rows, n, k, us,
-              bytes / us / 1000.0);
+  std::printf("  %s %2d x %5d x %5d: %7.1f us, %6.0f GB/s of weights\n", f16 ? "f16 " : mma ? "mma " : "gemv", rows, n,
+              k, us, bytes / us / 1000.0);
+  cudaFree(x16);
+  cudaFree(sh);
   cudaFree(dx);
   cudaFree(dy);
   return us;
@@ -139,10 +167,11 @@ int main(int argc, char** argv) {
   std::mt19937 rng(7);
   if (argc > 1 && std::string(argv[1]) == "bench") {
     // quick: the tensor-core route over 8..64 rows on the 27B shapes
-    for (int rows : {8, 10, 12, 16, 24, 32, 48, 64}) {
-      bench(rows, 17408, 5120, rng, true);
-      bench(rows, 5120, 8704, rng, true);
-    }
+    for (int rows : {8, 10, 12, 16, 24, 32, 48, 64})
+      for (bool f16 : {false, true}) {
+        bench(rows, 17408, 5120, rng, true, f16);
+        bench(rows, 5120, 8704, rng, true, f16);
+      }
     return 0;
   }
   blz_gemm* gemm = nullptr;
@@ -179,6 +208,30 @@ int main(int argc, char** argv) {
         }
     ok &= bad == 0;
     std::printf("mma launches: %d checked, %d failed\n", checked, bad);
+  }
+  // FP16 accumulation: every launch, beside the BF16 kernel on the same draws (normal inputs and outliers)
+  {
+    int checked = 0, bad = 0;
+    double worst16 = 0, worst_bf = 0;
+    for (bool outl : {false, true})
+      for (int rows : {1, 8, 9, 16, 17, 32, 33, 48, 64})
+        for (int split : {2, 4, 8})
+          for (int tiles : {1, 2, 4}) {
+            if (!blz_nvfp4_mma_cfg_valid(rows, split, tiles)) continue;
+            std::mt19937 r1(rows * 131 + split * 7 + tiles), r2 = r1;
+            const double e16 = run(mid, rows, 1152, r1, gemm, true, split, tiles, true, outl);
+            const double ebf = run(mid, rows, 1152, r2, gemm, true, split, tiles, false, outl);
+            worst16 = std::fmax(worst16, e16), worst_bf = std::fmax(worst_bf, ebf);
+            ++checked;
+            if (!(e16 < 6e-3)) {
+              ++bad;
+              std::printf("f16 rows %2d split %d tiles %d outliers %d: max rel err %.2e (bf16 %.2e) FAIL\n", rows, split,
+                          tiles, int(outl), e16, ebf);
+            }
+          }
+    ok &= bad == 0;
+    std::printf("f16 mma launches: %d checked, %d failed; worst rel err f16 %.2e, bf16 %.2e\n", checked, bad, worst16,
+                worst_bf);
   }
   Weights big(64, 8704, rng);
   const double e = run(big, 1, 8704, rng, gemm);

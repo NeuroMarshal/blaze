@@ -89,6 +89,7 @@ struct HybridConfig {
   int cpu_gu_chunk = 2;              // CPU engine: gate/up row groups (16 rows) per task
   int cpu_down_chunk = 4;            // CPU engine: down row groups per task (4/8, 2/4, 1/2: same us per item)
   double host_reserve_gib = 6.0;     // MemAvailable that must stay free after the RAM tier is allocated
+  bool cpu_tune = true;              // CPU expert workers taking part chosen by measurement (cpu_engine.h tune_threads)
   int ssd_io_threads = 8;            // reader threads for SSD-tier experts of the CPU engine (chunks in parallel)
   bool ssd_direct = true;            // O_DIRECT for SSD-tier reads (decode, prefill and SSD -> RAM moves)
 };
