@@ -354,7 +354,10 @@ impl Draft {
                 let bytes = shard * h * 2;
                 let (mut free, mut total) = (0usize, 0usize);
                 check(unsafe { sys::cudaMemGetInfo(&mut free, &mut total) }, "cudaMemGetInfo")?;
-                let vram = model.opts.draft_head_vram.unwrap_or(free > bytes + (3usize << 29));
+                // auto: with the KV cache sized around the drafter (--kv-tokens auto) its room is planned, the reserve
+                // stays; else it takes the VRAM only with 1.5 GiB to spare
+                let margin = if model.opts.kv_auto.is_some() { (model.opts.reserve_gib * (1u64 << 30) as f64) as usize / 2 } else { 3usize << 29 };
+                let vram = model.opts.draft_head_vram.unwrap_or(free > bytes + margin);
                 if vram {
                     let b = DevBuf::zeroed(bytes, s)?;
                     check(

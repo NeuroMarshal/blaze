@@ -17,13 +17,15 @@ struct EngineArgs {
     /// checkpoint directory (config.json, *.safetensors, tokenizer.json)
     #[arg(long)]
     model: PathBuf,
-    /// KV cache size in tokens
-    #[arg(long, default_value_t = 65536)]
-    kv_tokens: usize,
+    /// KV cache size in tokens, or auto: the VRAM left once the model is loaded, less what the drafter and the vision
+    /// tower will take and --vram-reserve (a model with routed experts: at most half of it, the rest for expert slots),
+    /// up to the contexts the sequences and prompt-cache snapshots can use
+    #[arg(long, default_value = "auto")]
+    kv_tokens: String,
     /// prefill chunk in tokens
     #[arg(long, default_value_t = 2048)]
     chunk: usize,
-    /// VRAM left free after the expert slots, GiB
+    /// VRAM left free after the KV cache (auto) or the expert slots, GiB
     #[arg(long, default_value_t = 0.8)]
     vram_reserve: f64,
     /// CPU threads serving experts kept in RAM
@@ -97,6 +99,27 @@ struct EngineArgs {
 
 impl EngineArgs {
     fn load(&self, chunk: Option<usize>, full_logits: bool) -> Result<blaze::engine::Engine> {
+        self.load_with(chunk, full_logits, 0)
+    }
+
+    /// `gpu0_later`: VRAM on GPU 0 that something loaded after the engine takes (the vision tower).
+    fn load_with(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize) -> Result<blaze::engine::Engine> {
+        let head_vram = match self.draft_head_vram.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
+        let world = self.tp.max(1);
+        let mut later_vram = vec![0usize; world];
+        if let Some(d) = &self.draft_model {
+            let b = blaze::drafter::vram_estimate(d, world, head_vram)?;
+            later_vram.iter_mut().for_each(|x| *x += b);
+        }
+        later_vram[0] += gpu0_later;
+        let (max_tokens, kv_auto) = match self.kv_tokens.as_str() {
+            "auto" | "" => (0, Some(blaze::model::KvAuto::new(world))),
+            n => (n.parse::<usize>().map_err(|e| anyhow::anyhow!("--kv-tokens {n}: {e} (a number of tokens or auto)"))?, None),
+        };
         let heat = match self.expert_heat.as_deref() {
             Some("none") => None,
             Some(p) => Some(p.to_string()),
@@ -115,7 +138,9 @@ impl EngineArgs {
         let e = blaze::engine::Engine::new(
             &self.model,
             blaze::model::Options {
-                max_tokens: self.kv_tokens,
+                max_tokens,
+                kv_auto,
+                later_vram,
                 max_chunk: chunk.unwrap_or(self.chunk),
                 max_seqs: self.max_seqs,
                 moe_threads: self.expert_threads,
@@ -574,7 +599,7 @@ fn main() -> Result<()> {
             allowed_media_domains,
         } => {
             let text = blaze::text::Text::load(&engine.model)?;
-            let e = engine.load(None, false)?;
+            let e = engine.load_with(None, false, blaze::vision::vram_need(&engine.model, vision))?;
             // after the model, so that `auto` sees the VRAM that is left; on the first GPU, whatever the tensor parallelism
             // (the embeddings go to every rank through host memory)
             let cores = std::thread::available_parallelism().map_or(8, |n| n.get());

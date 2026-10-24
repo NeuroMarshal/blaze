@@ -179,9 +179,32 @@ impl Drop for MoeEngine {
     }
 }
 
+/// --kv-tokens auto: the ranks' agreement on the KV cache size. Every rank measures its free VRAM once the model is
+/// loaded (weights, states, activations, scratch: everything but the KV pools), leaves Options::later_vram for what loads
+/// after the model and reserve_gib, and takes as many KV tokens as the rest holds; the smallest count over the ranks
+/// wins (the pools of a TP model are the same size on every rank).
+pub struct KvAuto {
+    pub barrier: std::sync::Barrier,
+    pub tokens: std::sync::atomic::AtomicUsize,
+}
+
+impl KvAuto {
+    pub fn new(world: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { barrier: std::sync::Barrier::new(world.max(1)), tokens: std::sync::atomic::AtomicUsize::new(usize::MAX) })
+    }
+}
+
+/// KV tokens a model loads with before --kv-tokens auto sizes its pools (the token-sized buffers are made again then).
+const KV_PROBE_TOKENS: usize = 4096;
+
 #[derive(Clone)]
 pub struct Options {
+    /// KV cache size in tokens (with `kv_auto`: set from the free VRAM after the load)
     pub max_tokens: usize,
+    pub kv_auto: Option<std::sync::Arc<KvAuto>>,
+    /// VRAM per rank that what loads after the model takes (drafter, vision tower on GPU 0): left out of the KV cache
+    /// (auto) and of the expert slots
+    pub later_vram: Vec<usize>,
     pub max_chunk: usize,
     pub max_seqs: usize,
     pub moe_threads: usize,
@@ -240,6 +263,40 @@ pub enum KvDtype {
     /// FP8 E4M3, per-layer scale 1
     Fp8,
     Bf16,
+}
+
+/// The KV pools of the `n_full` softmax layers ([K codes, V codes, K scales, V scales] each) and the QSA index keys,
+/// for opts.max_tokens tokens of this rank's heads.
+fn alloc_kv(opts: &Options, cfg: &ModelConfig, dims: &Dims, n_full: usize, s: &Stream) -> Result<(Vec<[DevBuf; 4]>, Vec<DevBuf>)> {
+    let (code_bytes, scale_bytes) = opts.kv_dtype.bytes();
+    let mut kv = Vec::new();
+    for _ in 0..n_full {
+        let values = (opts.max_tokens * dims.kv_heads * cfg.attn.head_dim) as f64;
+        let (codes, scales) = ((values * code_bytes) as usize, ((values * scale_bytes) as usize).max(16));
+        kv.push([DevBuf::zeroed(codes, s)?, DevBuf::zeroed(codes, s)?, DevBuf::zeroed(scales, s)?, DevBuf::zeroed(scales, s)?]);
+    }
+    let mut qsa_comp = Vec::new();
+    if let Some(q) = &cfg.qsa {
+        for _ in 0..n_full {
+            qsa_comp.push(DevBuf::zeroed((opts.max_tokens / q.compress_ratio + 1) * q.head_dim * 2, s)?);
+        }
+    }
+    Ok((kv, qsa_comp))
+}
+
+/// The KV pools as row buffers (rows: slots) for the draft-tree commit's moves.
+fn kv_row_bufs(kv: &[[DevBuf; 4]], values: usize, code_bytes: f64, scale_bytes: f64) -> Vec<sys::blz_row_buf> {
+    let (codes, scales) = ((values as f64 * code_bytes) as i64, (values as f64 * scale_bytes) as i64);
+    let mut kvb = Vec::new();
+    for pool in kv {
+        kvb.push(sys::blz_row_buf { ptr: pool[0].ptr(), row_bytes: codes });
+        kvb.push(sys::blz_row_buf { ptr: pool[1].ptr(), row_bytes: codes });
+        if scales > 0 {
+            kvb.push(sys::blz_row_buf { ptr: pool[2].ptr(), row_bytes: scales });
+            kvb.push(sys::blz_row_buf { ptr: pool[3].ptr(), row_bytes: scales });
+        }
+    }
+    kvb
 }
 
 impl Options {
@@ -648,6 +705,10 @@ impl Model {
     }
 
     pub fn load(dir: &Path, opts: Options, tp: Tp, embed: Arc<HostMapped>) -> Result<Self> {
+        let mut opts = opts;
+        if opts.kv_auto.is_some() {
+            opts.max_tokens = KV_PROBE_TOKENS.max(opts.max_chunk);
+        }
         let mut cfg = ModelConfig::load(dir)?;
         if let Some(f) = opts.yarn_factor.filter(|&f| f > 1.0) {
             if !matches!(cfg.rope.scaling, RopeScaling::None) {
@@ -874,19 +935,13 @@ impl Model {
         mark("weights (no routed experts)", s)?;
 
         // KV pools for every softmax layer, GDN states for every linear layer, this rank's heads.
-        let mut kv = Vec::new();
         let (code_bytes, scale_bytes) = opts.kv_dtype.bytes();
-        for _ in 0..n_full {
-            let values = (opts.max_tokens * dims.kv_heads * hd) as f64;
-            let (codes, scales) = ((values * code_bytes) as usize, ((values * scale_bytes) as usize).max(16));
-            kv.push([DevBuf::zeroed(codes, s)?, DevBuf::zeroed(codes, s)?, DevBuf::zeroed(scales, s)?, DevBuf::zeroed(scales, s)?]);
-        }
+        let (kv, qsa_comp) = alloc_kv(&opts, &cfg, &dims, n_full, s)?;
         let kv_global = DevBuf::from_slice(&[1.0f32])?;
-        let (mut qsa_comp, mut qsa_ring) = (Vec::new(), Vec::new());
+        let mut qsa_ring = Vec::new();
         let (mut qsa_record, mut qsa_ring_save) = (Vec::new(), Vec::new());
         if let Some(q) = &cfg.qsa {
             for _ in 0..n_full {
-                qsa_comp.push(DevBuf::zeroed((opts.max_tokens / q.compress_ratio + 1) * q.head_dim * 2, s)?);
                 qsa_ring.push(DevBuf::zeroed(opts.max_seqs * q.compress_ratio * q.head_dim * 2, s)?);
                 if opts.max_verify > 0 {
                     qsa_record.push(DevBuf::zeroed(opts.verify_rows() * q.head_dim * 2, s)?);
@@ -986,17 +1041,7 @@ impl Model {
                     rows.push(sys::blz_row_buf { ptr: beta.ptr(), row_bytes: (dims.v_heads * 4) as i64 });
                 }
             }
-            let mut kvb: Vec<sys::blz_row_buf> = Vec::new();
-            let per_slot = (dims.kv_heads * hd) as f64;
-            let (codes, scales) = ((per_slot * code_bytes) as i64, (per_slot * scale_bytes) as i64);
-            for pool in &kv {
-                kvb.push(sys::blz_row_buf { ptr: pool[0].ptr(), row_bytes: codes });
-                kvb.push(sys::blz_row_buf { ptr: pool[1].ptr(), row_bytes: codes });
-                if scales > 0 {
-                    kvb.push(sys::blz_row_buf { ptr: pool[2].ptr(), row_bytes: scales });
-                    kvb.push(sys::blz_row_buf { ptr: pool[3].ptr(), row_bytes: scales });
-                }
-            }
+            let kvb = kv_row_bufs(&kv, dims.kv_heads * hd, code_bytes, scale_bytes);
             if rows.iter().chain(&kvb).any(|b| b.row_bytes % 4 != 0) {
                 bail!("draft trees: a row of a moved buffer is not a multiple of 4 bytes");
             }
@@ -1129,15 +1174,103 @@ impl Model {
         if tuned > 0 && model.tp.rank == 0 {
             eprintln!("blaze: tuned the GEMV launches of {tuned} weight shapes in {:.1} s", t0.elapsed().as_secs_f64());
         }
+        if let Some(auto) = model.opts.kv_auto.clone() {
+            model.size_kv(&auto)?;
+        }
         if let MlpConfig::Moe { top_k, .. } = model.cfg.mlp {
             model.moe = Some(model.start_moe(dir, top_k)?);
         }
         Ok(model)
     }
 
+    /// Bytes of KV cache state one token takes on this rank (pools, QSA index keys, its req_to_token entry while the
+    /// context grows, QSA score rows).
+    fn kv_token_bytes(&self) -> usize {
+        let (code_bytes, scale_bytes) = self.opts.kv_dtype.bytes();
+        let values = (self.dims.kv_heads * self.cfg.attn.head_dim) as f64;
+        let n_full = self.kv.len();
+        let mut b = n_full as f64 * 2.0 * values * (code_bytes + scale_bytes);
+        if let Some(q) = &self.cfg.qsa {
+            b += (n_full * q.head_dim * 2) as f64 / q.compress_ratio as f64 + (QSA_SCORE_ROWS * 4) as f64 / q.compress_ratio as f64;
+        }
+        b as usize + self.opts.max_seqs * 4 + 1
+    }
+
+    /// --kv-tokens auto: the KV pools from the VRAM left on this rank (KvAuto), agreed with the other ranks, and the
+    /// token-sized buffers made again at that size. A model with routed experts gives the KV at most half of what is
+    /// left (the experts' slots take the rest; --kv-tokens sets it exactly), capped at the contexts it can serve.
+    fn size_kv(&mut self, auto: &KvAuto) -> Result<()> {
+        let s = &self.stream;
+        s.sync()?;
+        let (free, _) = crate::gpu::mem_info()?;
+        let gib = (1u64 << 30) as f64;
+        let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0);
+        let reserve = (self.opts.reserve_gib * gib) as usize;
+        // the probe pools are given back: they count as free
+        let probe: usize = self.kv.iter().flatten().map(DevBuf::bytes).sum::<usize>() + self.qsa_comp.iter().map(DevBuf::bytes).sum::<usize>();
+        let budget = (free + probe).saturating_sub(later + reserve);
+        let per_token = self.kv_token_bytes();
+        let moe = matches!(self.cfg.mlp, MlpConfig::Moe { .. });
+        let positions = self.cfg.max_positions;
+        // contexts the pools serve at most: every live sequence and every prompt-cache snapshot at full length
+        let cap = (self.opts.max_seqs + self.opts.cache_rows).max(1) * positions;
+        let mut tokens = (if moe { budget / 2 } else { budget }) / per_token;
+        if moe {
+            tokens = tokens.min(self.opts.max_seqs.max(1) * positions);
+        }
+        tokens = tokens.min(cap);
+        auto.tokens.fetch_min(tokens, std::sync::atomic::Ordering::SeqCst);
+        auto.barrier.wait();
+        let page = self.page_size().max(256);
+        let tokens = auto.tokens.load(std::sync::atomic::Ordering::SeqCst) / page * page;
+        if tokens < self.opts.max_chunk.max(page) {
+            bail!(
+                "--kv-tokens auto: {:.2} GiB free on GPU{} after the model, {:.2} GiB left for the drafter / vision tower and {:.2} GiB \
+                 reserved: room for {tokens} KV tokens; lower --vram-reserve or --max-seqs, or set --kv-tokens",
+                free as f64 / gib,
+                self.tp.rank,
+                later as f64 / gib,
+                self.opts.reserve_gib
+            );
+        }
+        self.opts.max_tokens = tokens;
+        self.kv.clear();
+        self.qsa_comp.clear();
+        let n_full = self.layers.iter().filter(|l| l.attn.is_some()).count();
+        let (kv, qsa_comp) = alloc_kv(&self.opts, &self.cfg, &self.dims, n_full, s)?;
+        self.kv = kv;
+        self.qsa_comp = qsa_comp;
+        let ctx = self.ctx_stride();
+        self.req_to_token = DevBuf::zeroed(self.opts.max_seqs * ctx * 4, s)?;
+        if let (Some(q), Some(_)) = (&self.cfg.qsa, &self.work.qsa_scores) {
+            self.work.qsa_scores = Some(DevBuf::zeroed(QSA_SCORE_ROWS * (ctx / q.compress_ratio + 1) * 4, s)?);
+        }
+        if self.tree_kv_bufs.is_some() {
+            let (code_bytes, scale_bytes) = self.opts.kv_dtype.bytes();
+            let kvb = kv_row_bufs(&self.kv, self.dims.kv_heads * self.cfg.attn.head_dim, code_bytes, scale_bytes);
+            self.tree_kv_bufs = Some((DevBuf::from_slice(&kvb)?, kvb.len()));
+        }
+        s.sync()?;
+        if self.tp.rank == 0 {
+            let used = tokens as f64 * per_token as f64 / gib;
+            eprintln!(
+                "blaze: KV cache (auto): {tokens} tokens, {:.1} contexts of {positions}; {used:.2} GiB per GPU of {:.2} GiB free, {:.2} GiB left \
+                 for the drafter / vision tower, {:.2} GiB reserved{}",
+                tokens as f64 / positions as f64,
+                (free + probe) as f64 / gib,
+                later as f64 / gib,
+                self.opts.reserve_gib,
+                if moe { " (routed experts: at most half for the KV, the rest for expert slots)" } else { "" }
+            );
+        }
+        Ok(())
+    }
+
     fn start_moe(&self, dir: &Path, top_k: usize) -> Result<MoeEngine> {
         let (free, _) = crate::gpu::mem_info()?;
-        let gib = (free as f64 / (1u64 << 30) as f64 - self.opts.reserve_gib).max(0.0);
+        // what loads after the model (drafter, vision tower) keeps its room
+        let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0);
+        let gib = ((free.saturating_sub(later)) as f64 / (1u64 << 30) as f64 - self.opts.reserve_gib).max(0.0);
         let model_dir = CString::new(dir.to_string_lossy().as_bytes())?;
         let heat = self.opts.moe_heat.as_ref().map(|h| CString::new(h.as_bytes())).transpose()?;
         let options = CString::new(self.opts.moe_options.as_bytes())?;

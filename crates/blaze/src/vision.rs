@@ -814,7 +814,16 @@ pub struct Vision {
 }
 
 /// Free VRAM kept after the tower's weights are loaded by `VisionMode::Auto`, for the activations of an image.
-const AUTO_HEADROOM: usize = 1536 << 20;
+pub const AUTO_HEADROOM: usize = 1536 << 20;
+
+/// VRAM the tower takes on its GPU in `mode` (its BF16 weights and AUTO_HEADROOM for an image's activations; 0 on the
+/// CPU or without a tower), for the memory plan of the load.
+pub fn vram_need(dir: &Path, mode: VisionMode) -> usize {
+    match (mode, VisionConfig::load(dir)) {
+        (VisionMode::Gpu | VisionMode::Auto, Ok(Some(cfg))) => cfg.weight_bytes() + AUTO_HEADROOM,
+        _ => 0,
+    }
+}
 
 impl Vision {
     /// The tower of the checkpoint in `dir`; None when `mode` is Off or the checkpoint has none.
