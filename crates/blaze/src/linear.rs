@@ -108,6 +108,51 @@ fn to_f32(raw: &[u8], dtype: Dtype) -> Result<Vec<f32>> {
     })
 }
 
+/// An NVFP4 weight part for the tensor-core GEMV.
+pub(crate) struct Nvfp4Ref {
+    pub codes: *const u8,
+    pub scales: *const u8,
+    pub alpha: *const f32,
+    pub f16: bool,
+    pub n: usize,
+    pub k: usize,
+}
+
+/// `m` <= BLZ_NVFP4_MMA_MAX_ROWS rows through the tensor-core GEMV the tuner picked for them (FP16 or FP32
+/// accumulation); `x16`: the FP16 inputs if an earlier call already made them for the same rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn nvfp4_mma(ctx: &LinCtx, w: &Nvfp4Ref, x: *const u16, ldx: usize, m: usize, o: *mut u16, ldo: usize, s: &Stream,
+                        x16: &mut Option<(*const u16, *mut u16, *mut i32)>) -> Result<()> {
+    let (n, k) = (w.n, w.k);
+    let (s16, t16) = if w.f16 && crate::tune::f16_enabled() { ctx.tune.get(crate::tune::Kernel::Nvfp4F16, n, k, m) } else { (0, 0) };
+    if s16 > 0 && m * k + 2 * m + 8 <= ctx.scratch_elems {
+        let (xh, sh) = match *x16 {
+            Some((key, xh, sh)) if key == x => (xh, sh),
+            _ => {
+                let v = (ctx.scratch, unsafe { ctx.scratch.add((m * k).next_multiple_of(8)) }.cast::<i32>());
+                check(unsafe { sys::blz_nvfp4_f16_rows(x, ldx as i64, m as c_int, k as c_int, v.0, v.1, s.0) }, "f16 rows")?;
+                *x16 = Some((x, v.0, v.1));
+                v
+            }
+        };
+        return check(
+            unsafe {
+                sys::blz_nvfp4_gemv_mma_f16_cfg(xh, sh, w.codes, w.scales, w.alpha, o, ldo as i64, m as c_int, n as c_int, k as c_int, s16,
+                                                t16, s.0)
+            },
+            "blz_nvfp4_gemv_mma_f16",
+        );
+    }
+    let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, n, k, m);
+    check(
+        unsafe {
+            sys::blz_nvfp4_gemv_mma_cfg(x, ldx as i64, w.codes, w.scales, w.alpha, o, ldo as i64, m as c_int, n as c_int, k as c_int, split,
+                                        tiles, s.0)
+        },
+        "blz_nvfp4_gemv_mma",
+    )
+}
+
 impl Linear {
     /// Load `modules` (name without `.weight`, cut) stacked in order.
     pub fn load(ckpt: &Checkpoint, quant: &QuantConfig, modules: &[(String, Cut)], s: &Stream) -> Result<Self> {
@@ -389,42 +434,28 @@ impl Linear {
     /// out[m, 0..n] (row stride ldo) = x[m, 0..k] (row stride ldx) . W^T.
     pub fn run(&self, ctx: &LinCtx, x: *const u16, ldx: usize, m: usize, out: *mut u16, ldo: usize, s: &Stream) -> Result<()> {
         let k = self.k;
-        // the FP16 inputs of the FP16-accumulate GEMV, made once for every part that takes it (in the scratch the
-        // prefill's widened weights use; these calls have 64 rows or fewer, which never widen)
-        let mut x16: Option<(*mut u16, *mut i32)> = None;
+        // the FP16 inputs of the FP16-accumulate GEMV, made once per input rows for every part that takes it (in the
+        // scratch the prefill's widened weights use; tensor-core calls never widen)
+        let mut x16: Option<(*const u16, *mut u16, *mut i32)> = None;
         for p in &self.parts {
             let o = unsafe { out.add(p.col) };
             match &p.store {
                 Store::Nvfp4 { codes, scales, alpha, f16 } => {
+                    let w = Nvfp4Ref { codes: codes.ptr(), scales: scales.ptr(), alpha: alpha.ptr(), f16: *f16, n: p.n, k };
+                    let passes = m > sys::BLZ_NVFP4_MMA_MAX_ROWS
+                        && k % 128 == 0
+                        && m <= crate::tune::PASS_MAX_ROWS
+                        && ctx.tune.get(crate::tune::Kernel::Nvfp4Pass, p.n, k, m).0 == 1;
                     if m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 {
-                        let (s16, t16) = if *f16 && crate::tune::f16_enabled() { ctx.tune.get(crate::tune::Kernel::Nvfp4F16, p.n, k, m) } else { (0, 0) };
-                        if s16 > 0 && m * k + 2 * m + 8 <= ctx.scratch_elems {
-                            let (xh, sh) = match x16 {
-                                Some(v) => v,
-                                None => {
-                                    let v = (ctx.scratch, unsafe { ctx.scratch.add((m * k).next_multiple_of(8)) }.cast::<i32>());
-                                    check(unsafe { sys::blz_nvfp4_f16_rows(x, ldx as i64, m as c_int, k as c_int, v.0, v.1, s.0) }, "f16 rows")?;
-                                    x16 = Some(v);
-                                    v
-                                }
-                            };
-                            check(
-                                unsafe {
-                                    sys::blz_nvfp4_gemv_mma_f16_cfg(xh, sh, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
-                                                                    p.n as c_int, k as c_int, s16, t16, s.0)
-                                },
-                                "blz_nvfp4_gemv_mma_f16",
-                            )?;
-                            continue;
+                        nvfp4_mma(ctx, &w, x, ldx, m, o, ldo, s, &mut x16)?;
+                    } else if passes {
+                        // more rows than one launch takes: passes of the tensor-core GEMV, each reading the weights
+                        // once (0.5 byte a value) where widening them reads and writes 4.5 (the tuner measured both)
+                        let step = sys::BLZ_NVFP4_MMA_MAX_ROWS;
+                        for r0 in (0..m).step_by(step) {
+                            let rows = step.min(m - r0);
+                            nvfp4_mma(ctx, &w, unsafe { x.add(r0 * ldx) }, ldx, rows, unsafe { o.add(r0 * ldo) }, ldo, s, &mut x16)?;
                         }
-                        let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, p.n, k, m);
-                        check(
-                            unsafe {
-                                sys::blz_nvfp4_gemv_mma_cfg(x, ldx as i64, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int,
-                                                            p.n as c_int, k as c_int, split, tiles, s.0)
-                            },
-                            "blz_nvfp4_gemv_mma",
-                        )?;
                     } else if m <= sys::BLZ_NVFP4_GEMV_MAX_ROWS {
                         check(
                             unsafe {
