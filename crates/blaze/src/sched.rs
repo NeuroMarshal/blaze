@@ -338,9 +338,8 @@ impl Scheduler {
                     spec_stats: (0, 0),
                     spec_log: SpecLog::default(),
                     tree_depth: 0,
-                    tree_level_s: 0.0,
-                    tree_tokens: 0.0,
-                    tree_round_s: 0.0,
+                    tree_rate: Vec::new(),
+                    tree_rounds: 0,
                     spec_cost: SpecCost::default(),
                     suffix_global: SuffixIndex::default(),
                     suffix_cfg: SuffixConfig::default(),
@@ -369,12 +368,12 @@ struct Loop {
     spec_stats: (usize, usize),
     /// BLAZE_SPEC_LOG=n: every n tree rounds, their mean rows, kept rows and times on stderr
     spec_log: SpecLog,
-    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth), and the decayed means the depth
-    /// rule weighs: seconds of a drafting call per level, tokens kept per round, seconds per round
+    /// EAGLE-4 trees: levels the next drafting call grows (up to the drafter's depth), chosen by measurement: the decayed
+    /// tokens per second of the rounds at each depth, per batch size (sequences 1..), the best taken, a neighbour tried
+    /// every few rounds
     tree_depth: usize,
-    tree_level_s: f64,
-    tree_tokens: f64,
-    tree_round_s: f64,
+    tree_rate: Vec<Vec<f64>>,
+    tree_rounds: usize,
     spec_cost: SpecCost,
     /// suffix decoding: outputs of finished requests
     suffix_global: SuffixIndex,
@@ -1097,32 +1096,14 @@ impl Loop {
             }
             aux_row += rows[i].len();
         }
-        // The depth of the next trees (eagle_harness grows a level while its work delta pays for the draft step): the
-        // deepest level earns its draft step when the tokens expected from its verified nodes g exceed the step's time
-        // at this batch's token rate, g > step * tokens / round. One level deeper when it earns that with margin (the next
-        // level holds less), one shallower when it does not.
         let cur = self.tree_depth.max(2);
-        let gain: f64 = order
-            .iter()
-            .map(|&i| {
-                let a = &self.active[i];
-                let cal = (a.tree_hit + 1.0) / (a.tree_pred + 1.0);
-                rows[i].scores.iter().zip(&rows[i].depth).filter(|(_, d)| **d == cur).map(|(s, _)| *s as f64 * cal).sum::<f64>()
-            })
-            .sum();
         let td = Instant::now();
         self.eagle_extend(items)?;
         let t_draft = td.elapsed().as_secs_f64();
         let total: usize = rows.iter().map(|r| r.len()).sum();
         let kept: usize = paths.iter().map(Vec::len).sum();
         let t_round = t0.elapsed().as_secs_f64();
-        let ema = |x: &mut f64, v: f64| *x = if *x == 0.0 { v } else { 0.9 * *x + 0.1 * v };
-        ema(&mut self.tree_level_s, t_draft / cur as f64);
-        ema(&mut self.tree_tokens, kept as f64);
-        ema(&mut self.tree_round_s, t_round);
-        let pay = self.tree_level_s * self.tree_tokens / self.tree_round_s;
-        let max = self.engine.info.tree_levels;
-        self.tree_depth = if 0.6 * gain > pay { (cur + 1).min(max) } else if gain < pay { (cur - 1).max(2) } else { cur };
+        self.tree_depth = self.next_tree_depth(n, cur, kept as f64 / t_round);
         self.spec_log.note(n, total, kept, t_verify, t_commit, t_draft, t_round, cur);
         SpecCost::note(&mut self.spec_cost.verify, total, t0.elapsed().as_secs_f64());
         finished.sort_by(|a, b| b.0.cmp(&a.0));
@@ -1141,6 +1122,31 @@ impl Loop {
             self.engine.close(a.seq);
         }
         Ok(true)
+    }
+
+    /// The depth of the next trees from measurement (eagle_harness decides it with its cost tables; here the rates are
+    /// measured live): the round just done at depth `cur` with `n` sequences gave `rate` tokens per second; the best
+    /// depth so far for this batch size is taken, and every eighth round one neighbour of it instead, alternately deeper
+    /// and shallower, so that a change of the text's predictability moves the choice.
+    fn next_tree_depth(&mut self, n: usize, cur: usize, rate: f64) -> usize {
+        let max = self.engine.info.tree_levels;
+        if self.tree_rate.len() < n {
+            self.tree_rate.resize(n, vec![0.0; max + 1]);
+        }
+        let r = &mut self.tree_rate[n - 1];
+        r[cur] = if r[cur] == 0.0 { rate } else { 0.8 * r[cur] + 0.2 * rate };
+        // depths never measured count as promising (the deepest first), so that each is tried once
+        let best = (2..=max).max_by(|&a, &b| {
+            let (ra, rb) = (if r[a] == 0.0 { f64::MAX } else { r[a] }, if r[b] == 0.0 { f64::MAX } else { r[b] });
+            ra.total_cmp(&rb).then(a.cmp(&b))
+        });
+        let best = best.unwrap_or(max);
+        self.tree_rounds += 1;
+        if self.tree_rounds % 8 == 0 {
+            let up = self.tree_rounds % 16 == 0;
+            return if up { (best + 1).min(max) } else { best.saturating_sub(1).max(2) };
+        }
+        best
     }
 
     /// Suffix decoding draft of up to `k` tokens for active request `i`: the better of its own prompt and output and
@@ -1251,13 +1257,20 @@ impl Loop {
             for (p, m) in pens.iter_mut().zip(masks) {
                 p.mask = m;
             }
+            let glog = std::env::var_os("BLAZE_GRAMMAR_LOG").is_some();
+            let allowed: Vec<Option<u32>> = pens.iter().map(|p| p.mask.as_ref().map(|m| m.iter().map(|w| w.count_ones()).sum())).collect();
             let cands = self.engine.step_sampled(&mut seqs, &tok_refs, &pens)?;
             order
                 .iter()
                 .zip(cands)
-                .map(|(&i, c)| {
+                .zip(allowed)
+                .map(|((&i, c), allowed)| {
                     let a = &mut self.active[i];
                     let x = sample(&c.top, &a.req.params, &mut a.rng);
+                    if glog && a.req.constraint.is_some() {
+                        let top: Vec<String> = c.top.iter().take(4).map(|(v, t)| format!("{t}:{v:.2}")).collect();
+                        eprintln!("blaze grammar: step {} mask {:?} allowed, pick {x}, top {}", a.generated.len(), allowed, top.join(" "));
+                    }
                     (x, logprob_of(&c, x, a.req.params.logprobs))
                 })
                 .unzip()

@@ -44,6 +44,8 @@ pub struct ServeConfig {
     pub reasoning_parser: Option<String>,
     /// default thinking budget of chat requests (None: unlimited)
     pub thinking_budget: Option<usize>,
+    /// longest whitespace run between JSON tokens of structured outputs (0: unbounded)
+    pub grammar_whitespace: usize,
 }
 
 struct AppState {
@@ -408,7 +410,7 @@ fn think_budget(st: &AppState, body: &Value, starts_inside: bool) -> Option<Thin
 /// `forced`: a grammar of the server's own (tool_choice) used when the request asks for none.
 fn constraint_of(st: &AppState, body: &Value, after: Option<i32>, forced: Option<&str>) -> std::result::Result<Option<Constraint>, String> {
     use llguidance::api::TopLevelGrammar;
-    let g = match grammar_of(body).map_err(|e| e.to_string())? {
+    let g = match grammar_of(body, st.cfg.grammar_whitespace).map_err(|e| e.to_string())? {
         Some(g) => g,
         None => match forced {
             Some(lark) => TopLevelGrammar::from_lark_or_grammar_list(lark).map_err(|e| e.to_string())?,
