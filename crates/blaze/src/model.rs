@@ -196,15 +196,21 @@ impl KvAuto {
 
 /// KV tokens a model loads with before --kv-tokens auto sizes its pools (the token-sized buffers are made again then).
 const KV_PROBE_TOKENS: usize = 4096;
+/// --kv-tokens auto with routed experts: the KV tokens the sequences share (the expert slots take the rest of the VRAM;
+/// a pool shared by KV pages and expert slots would size this by use).
+const MOE_AUTO_CONTEXT: usize = 65536;
 
 #[derive(Clone)]
 pub struct Options {
     /// KV cache size in tokens (with `kv_auto`: set from the free VRAM after the load)
     pub max_tokens: usize,
     pub kv_auto: Option<std::sync::Arc<KvAuto>>,
-    /// VRAM per rank that what loads after the model takes (drafter, vision tower on GPU 0): left out of the KV cache
-    /// (auto) and of the expert slots
+    /// VRAM per rank that what loads after the model takes (the drafter): left out of the KV cache (auto) and of the
+    /// expert slots
     pub later_vram: Vec<usize>,
+    /// VRAM on GPU 0 the vision tower would take there: kept for it by a dense model's KV (auto); a model with routed
+    /// experts gives it to the expert slots (the tower takes the GPU only when room is left, else the CPU)
+    pub vision_vram: usize,
     pub max_chunk: usize,
     pub max_seqs: usize,
     pub moe_threads: usize,
@@ -1204,19 +1210,22 @@ impl Model {
         s.sync()?;
         let (free, _) = crate::gpu::mem_info()?;
         let gib = (1u64 << 30) as f64;
-        let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0);
+        let moe = matches!(self.cfg.mlp, MlpConfig::Moe { .. });
+        let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0)
+            + if self.tp.rank == 0 && !moe { self.opts.vision_vram } else { 0 };
         let reserve = (self.opts.reserve_gib * gib) as usize;
         // the probe pools are given back: they count as free
         let probe: usize = self.kv.iter().flatten().map(DevBuf::bytes).sum::<usize>() + self.qsa_comp.iter().map(DevBuf::bytes).sum::<usize>();
         let budget = (free + probe).saturating_sub(later + reserve);
         let per_token = self.kv_token_bytes();
-        let moe = matches!(self.cfg.mlp, MlpConfig::Moe { .. });
         let positions = self.cfg.max_positions;
         // contexts the pools serve at most: every live sequence and every prompt-cache snapshot at full length
         let cap = (self.opts.max_seqs + self.opts.cache_rows).max(1) * positions;
-        let mut tokens = (if moe { budget / 2 } else { budget }) / per_token;
+        let mut tokens = budget / per_token;
         if moe {
-            tokens = tokens.min(self.opts.max_seqs.max(1) * positions);
+            // every GiB of expert slots speeds up every token, KV beyond the contexts in use none: MOE_AUTO_CONTEXT
+            // tokens shared by the sequences (pages are taken as they grow), within half of what is left
+            tokens = (budget / 2 / per_token).min(positions.min(MOE_AUTO_CONTEXT));
         }
         tokens = tokens.min(cap);
         auto.tokens.fetch_min(tokens, std::sync::atomic::Ordering::SeqCst);
@@ -1260,7 +1269,7 @@ impl Model {
                 (free + probe) as f64 / gib,
                 later as f64 / gib,
                 self.opts.reserve_gib,
-                if moe { " (routed experts: at most half for the KV, the rest for expert slots)" } else { "" }
+                if moe { " (routed experts: the expert slots take the rest; --kv-tokens for longer contexts)" } else { "" }
             );
         }
         Ok(())

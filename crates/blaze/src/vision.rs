@@ -813,29 +813,34 @@ pub struct Vision {
     pub on_gpu: bool,
 }
 
-/// Free VRAM kept after the tower's weights are loaded by `VisionMode::Auto`, for the activations of an image.
-pub const AUTO_HEADROOM: usize = 1536 << 20;
 
-/// VRAM the tower takes on its GPU in `mode` (its BF16 weights and AUTO_HEADROOM for an image's activations; 0 on the
-/// CPU or without a tower), for the memory plan of the load.
-pub fn vram_need(dir: &Path, mode: VisionMode) -> usize {
-    match (mode, VisionConfig::load(dir)) {
-        (VisionMode::Gpu | VisionMode::Auto, Ok(Some(cfg))) => cfg.weight_bytes() + AUTO_HEADROOM,
-        _ => 0,
-    }
+/// Pixels of the largest image the memory plan keeps activations for when the server sets no max_pixels of its own
+/// (2048 x 2048, above a screenshot; a larger image takes the VRAM free at that moment, or gets a clear 400).
+const PLAN_PIXELS: u64 = 2048 * 2048;
+
+/// VRAM the tower takes on its GPU in `mode`, for the memory plan of the load: its BF16 weights and the activations of
+/// an image of `max_pixels` (the server's --mm-processor-kwargs), else of the processor's limit up to PLAN_PIXELS; 0 on
+/// the CPU or without a tower.
+pub fn vram_need(dir: &Path, mode: VisionMode, max_pixels: Option<u64>) -> usize {
+    let (VisionMode::Gpu | VisionMode::Auto) = mode else { return 0 };
+    let Ok(Some(cfg)) = VisionConfig::load(dir) else { return 0 };
+    let limit = ImageSettings::load(dir, &cfg).map(|s| s.max_pixels).unwrap_or(PLAN_PIXELS);
+    let pixels = max_pixels.unwrap_or(limit.min(PLAN_PIXELS));
+    let patches = (pixels / (cfg.patch * cfg.patch).max(1) as u64) as usize;
+    cfg.weight_bytes() + GpuEncoder::scratch_for(&cfg, patches) + (64 << 20)
 }
 
 impl Vision {
-    /// The tower of the checkpoint in `dir`; None when `mode` is Off or the checkpoint has none.
-    pub fn load(dir: &Path, mode: VisionMode, threads: usize, device: i32) -> Result<Option<Self>> {
+    /// The tower of the checkpoint in `dir`; None when `mode` is Off or the checkpoint has none. `max_pixels`: the
+    /// server's own limit (--mm-processor-kwargs), which `auto` plans the activations for (vram_need).
+    pub fn load(dir: &Path, mode: VisionMode, threads: usize, device: i32, max_pixels: Option<u64>) -> Result<Option<Self>> {
         if mode == VisionMode::Off {
             return Ok(None);
         }
         let Some(cfg) = VisionConfig::load(dir)? else { return Ok(None) };
         let settings = ImageSettings::load(dir, &cfg)?;
-        let gpu_fits = || -> bool {
-            gpu::set_device(device).is_ok() && gpu::mem_info().map(|(free, _)| free > cfg.weight_bytes() + AUTO_HEADROOM).unwrap_or(false)
-        };
+        let need = vram_need(dir, VisionMode::Gpu, max_pixels);
+        let gpu_fits = || -> bool { gpu::set_device(device).is_ok() && gpu::mem_info().map(|(free, _)| free > need).unwrap_or(false) };
         let on_gpu = match mode {
             VisionMode::Gpu => true,
             VisionMode::Cpu => false,
