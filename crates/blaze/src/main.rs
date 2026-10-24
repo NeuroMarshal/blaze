@@ -63,8 +63,9 @@ struct EngineArgs {
     /// sequences decoded together (continuous batching)
     #[arg(long, default_value_t = 1)]
     max_seqs: usize,
-    /// prompt-cache snapshots of the recurrent state (each holds the GDN state of one prefix)
-    #[arg(long, default_value_t = 0)]
+    /// prompt-cache snapshots of the recurrent state (each holds the GDN state of one prefix; their KV pages are shared
+    /// with the pool); an agent's conversation needs about one for itself and one per kind of side request; 0: off
+    #[arg(long, default_value_t = 4)]
     prompt_cache_slots: usize,
     /// CPU threads reading PLE n-gram rows from the checkpoint
     #[arg(long, default_value_t = 64)]
@@ -407,7 +408,24 @@ enum Command {
     },
 }
 
+/// A panic of one of blaze's own threads (the scheduler, a GPU rank, the expert workers) ends the process: the server
+/// cannot go on without that thread, and a server that hangs on every request is worse than one that exits (and is
+/// restarted by whatever started it). Request handlers (tokio workers) only drop their request.
+fn exit_on_thread_panic() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        let t = std::thread::current();
+        let name = t.name().unwrap_or("");
+        if name.starts_with("blaze-") || name == "main" {
+            eprintln!("blaze: thread {name} panicked: exiting (the server cannot go on without it)");
+            std::process::exit(101);
+        }
+    }));
+}
+
 fn main() -> Result<()> {
+    exit_on_thread_panic();
     match Cli::parse().command {
         Command::Inspect { model } => blaze::inspect::run(&model),
         Command::VisionCheck { model, reference, gpu, cpu, threads, image } => {

@@ -4,6 +4,7 @@
 # for panics, failed steps, slow steps and server errors. A summary at the end; exit 1 when anything failed.
 #   scripts/check.sh MODEL [serve options...]       e.g. scripts/check.sh ~/models/... --tp 2 --draft-model ...
 # Env: PORT (8100), PY (a python with the openai package), SOAK_MIN (3; 0: no soak), KB (the kernel build directory),
+#      KTIMEOUT (seconds per kernel test, 1800: test_hybrid_graph takes over 15 minutes on the laptop's CPU),
 #      LOGS (where the logs go; default a new directory under /tmp), SKIP_BUILD=1.
 # The GPUs are taken through /tmp/blaze-gpu.lock for the whole run.
 set -uo pipefail
@@ -37,11 +38,12 @@ if [ -z "${SKIP_BUILD:-}" ]; then
   run build cargo build --release
   [ -n "$KB" ] && run kernels-build cmake --build "$KB" -j "$(nproc)"
 fi
-run cargo-test cargo test --release -p blaze
+run cargo-test cargo test --release --workspace
 if [ -n "$KB" ]; then
   for t in "$KB"/test_*; do
     [ -x "$t" ] || continue
-    run "kernel-$(basename "$t")" timeout 900 "$t"
+    # line-buffered: a test that runs out of time still shows how far it got
+    run "kernel-$(basename "$t")" timeout "${KTIMEOUT:-1800}" stdbuf -oL -eL "$t"
   done
 else
   fail "kernel tests (no kernel build directory with test binaries; set KB)"
@@ -79,8 +81,19 @@ else
   fail "serve starts (log: $LOGS/serve.log)"
 fi
 
-# a pool far smaller than the sessions want: the scheduler ends requests early instead of failing them
-if serve serve_small_kv.log "$@" --kv-tokens 8192 --max-seqs 4; then
+# a pool far smaller than the sessions want: the scheduler ends requests early instead of failing them (the serve
+# options without their own --kv-tokens / --max-seqs)
+SMALL=()
+skip=0
+for a in "$@"; do
+  if [ "$skip" = 1 ]; then skip=0; continue; fi
+  case "$a" in
+    --kv-tokens|--max-seqs) skip=1 ;;
+    --kv-tokens=*|--max-seqs=*) ;;
+    *) SMALL+=("$a") ;;
+  esac
+done
+if serve serve_small_kv.log "${SMALL[@]}" --kv-tokens 8192 --max-seqs 4; then
   run kv-pressure python3 scripts/kv_pressure_test.py "$URL" --sessions 4 --max-tokens 4000
   stop
 else

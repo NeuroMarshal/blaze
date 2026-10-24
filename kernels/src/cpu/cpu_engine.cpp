@@ -45,7 +45,10 @@ struct Engine::Job {
     const int I = geo.inter;
     gu_sums = aligned_array<int64_t>(size_t(BLZ_MAIL_ITEMS) * geo.gu_rows() * kMaxCols);
     h_bits = aligned_array<uint16_t>(size_t(BLZ_MAIL_ITEMS) * kMaxCols * I);
-    h_mem = aligned_array<uint8_t>(size_t(BLZ_MAIL_ITEMS) * kMaxCols * (3 * size_t(I) + 4 * size_t(I / 16) + 64));
+    // per column buffer: lo / mid / hi planes and the hi sums, each buffer 64-byte aligned (the stride the loop below
+    // walks, rounded up: 2176 bytes, not 2144, for an intermediate size of 640)
+    const size_t col_bytes = (3 * size_t(I) + 4 * size_t(I / 16) + 64 + 63) & ~size_t(63);
+    h_mem = aligned_array<uint8_t>(size_t(BLZ_MAIL_ITEMS) * kMaxCols * col_bytes);
     xq = aligned_array<int8_t>(size_t(kMaxCols) * geo.hidden);
     xq_shift = aligned_array<uint8_t>(size_t(kMaxCols) * (geo.hidden / 16));
     hq = aligned_array<int8_t>(size_t(BLZ_MAIL_ITEMS) * kMaxCols * I);
@@ -55,8 +58,7 @@ struct Engine::Job {
       ColumnBuffer& b = h_bufs[i];
       b.lo = p, b.mid = p + I, b.hi = reinterpret_cast<int8_t*>(p + 2 * I);
       b.hi_sum = reinterpret_cast<int32_t*>(p + 3 * I);
-      p += 3 * size_t(I) + 4 * size_t(I / 16) + 64;
-      p = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(p) + 63) & ~uintptr_t(63));
+      p += col_bytes;
     }
   }
   ~Job() {

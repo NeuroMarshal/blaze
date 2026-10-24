@@ -9,24 +9,16 @@
 #include <cuda_fp8.h>
 
 
+#include "blaze/nvfp4.h"
 #include "blaze/nvfp4_linear.h"
 
 namespace {
 
 constexpr int kWarps = 4;
 
-__device__ __forceinline__ float e2m1_level(int idx) { return idx < 4 ? 0.5f * idx : (idx < 7 ? float(idx - 2) : 6.0f); }
-
-__device__ __forceinline__ float e2m1(int code) {
-  const float m = e2m1_level(code & 7);
-  return (code & 8) ? -m : m;
-}
-
-__device__ __forceinline__ float e4m3(uint8_t v) {
-  __nv_fp8_e4m3 f;
-  f.__x = v;
-  return float(f);
-}
+// the format's decoders (blaze/nvfp4.h)
+__device__ __forceinline__ float e2m1(int code) { return blaze::e2m1_value(code); }
+__device__ __forceinline__ float e4m3(uint8_t v) { return blaze::e4m3_to_float(v); }
 
 __device__ __forceinline__ uint4 ldg_stream(const void* p) {
   uint4 v;

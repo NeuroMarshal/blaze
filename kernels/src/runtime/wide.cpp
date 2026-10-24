@@ -87,6 +87,11 @@ struct HybridMoe::Wide {
 
 void HybridMoe::init_wide() {
   if (cfg_.wide_tokens <= 0) return;
+  // one expert takes at most one route per token: wide_tokens <= kBatchRoutes keeps every batch within the buffers
+  if (cfg_.wide_tokens > kBatchRoutes) {
+    std::fprintf(stderr, "blaze moe: wide_tokens %d above %d: %d\n", cfg_.wide_tokens, kBatchRoutes, kBatchRoutes);
+    cfg_.wide_tokens = kBatchRoutes;
+  }
   const expert::Geometry geo = store_->geometry();
   const int H = geo.hidden, I = geo.inter, E = num_experts();
   auto* w = new Wide;

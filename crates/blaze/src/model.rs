@@ -1294,6 +1294,14 @@ impl Model {
         }
         if let MlpConfig::Moe { top_k, .. } = model.cfg.mlp {
             model.moe = Some(model.start_moe(dir, top_k)?);
+            // the engine indexes its tables by the model's layer index: it must hold every routed layer
+            let routed = model.layers.iter().rposition(|l| matches!(l.mlp, Mlp::Moe { .. }));
+            let held = unsafe { sys::blz_moe_engine_layers(model.moe.as_ref().unwrap().0) };
+            if let Some(last) = routed
+                && last >= held.max(0) as usize
+            {
+                bail!("the expert engine holds {held} layers (the checkpoint's experts from layer 0 on), the model routes layer {last}");
+            }
         }
         Ok(model)
     }

@@ -110,11 +110,14 @@ void PleService::cache_put(int64_t id, const uint16_t* src) {
 }
 
 PleService::PleService(const std::string& path, int max_ids, int threads, size_t cache_bytes)
-    : max_ids_(max_ids), threads_(threads) {
+    : max_ids_(max_ids), threads_(std::max(threads, 1)) {
   fd_ = open(path.c_str(), O_RDONLY);
   if (fd_ < 0) throw std::runtime_error("cannot open " + path);
   const Bf16Shards t = find_bf16_shards(fd_, path);
   row_dim_ = int(t.dim);
+  // the O_DIRECT readers bounce a row through two 4 KiB blocks, the GPU copy moves 16-byte vectors
+  if (row_dim_ <= 0 || row_dim_ * 2 > 4096 || row_dim_ % 8 != 0)
+    throw std::runtime_error("PLE rows of " + std::to_string(row_dim_) + " values: 8..2048 in steps of 8 supported");
   rows_ = t.rows * t.offset.size();
   table_bytes_ = size_t(lseek(fd_, 0, SEEK_END));
   shard_rows_ = t.rows;
@@ -296,9 +299,12 @@ cudaError_t PleService::fetch(uint16_t* out, int n, cudaStream_t stream) {
 void PleService::gather(uint32_t gen, int n) {
   if (n >= 0) {
     gen = work_gen_.load(std::memory_order_relaxed) + 1;
-    work_n_.store(n, std::memory_order_relaxed);
-    work_chunk_.store(std::clamp((n + 4 * threads_ - 1) / (4 * threads_), 1, kMaxChunk), std::memory_order_relaxed);
-    work_done_.store(0, std::memory_order_relaxed);
+    // close the counter to the last generation first: a helper still in it that reads the new count below then sees
+    // the new generation in the counter and leaves, instead of taking (and counting) a task of the new job
+    work_ctr_.store((uint64_t(gen) << 32) | 0xffffffffu, std::memory_order_release);
+    work_n_.store(n, std::memory_order_release);
+    work_chunk_.store(std::clamp((n + 4 * threads_ - 1) / (4 * threads_), 1, kMaxChunk), std::memory_order_release);
+    work_done_.store(0, std::memory_order_release);
     work_ctr_.store(uint64_t(gen) << 32, std::memory_order_release);
     work_gen_.store(gen, std::memory_order_release);
     work_gen_.notify_all();

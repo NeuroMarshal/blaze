@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <new>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace blaze {
 
@@ -24,6 +26,81 @@ void pread_all(int fd, void* dst, size_t n, uint64_t off) {
 }
 
 constexpr uint64_t kDirectAlign = 4096;
+/// Largest header read (the format's own limit is 100 MB).
+constexpr uint64_t kMaxHeader = 100ull << 20;
+
+/// A JSON reader just big enough for a safetensors header: strings with escapes, nested values skipped whole.
+struct Json {
+  const std::string& s;
+  size_t i = 0;
+
+  [[noreturn]] void fail(const char* what) const {
+    throw std::runtime_error(std::string("safetensors header: ") + what + " at byte " + std::to_string(i));
+  }
+  void ws() {
+    while (i < s.size() && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t')) ++i;
+  }
+  bool eat(char c) {
+    ws();
+    if (i < s.size() && s[i] == c) return ++i, true;
+    return false;
+  }
+  void expect(char c) {
+    if (!eat(c)) fail("unexpected character");
+  }
+  std::string str() {
+    expect('"');
+    std::string out;
+    while (i < s.size() && s[i] != '"') {
+      if (s[i] == '\\') {
+        if (++i >= s.size()) break;
+        // tensor names and dtypes are ASCII: an escape keeps its character (\u sequences are skipped as text)
+      }
+      out += s[i++];
+    }
+    if (i >= s.size()) fail("unterminated string");
+    ++i;
+    return out;
+  }
+  uint64_t num() {
+    ws();
+    const size_t b = i;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') ++i;
+    if (i == b) fail("a number expected");
+    return std::stoull(s.substr(b, i - b));
+  }
+  std::vector<uint64_t> nums() {
+    std::vector<uint64_t> v;
+    expect('[');
+    if (eat(']')) return v;
+    do v.push_back(num());
+    while (eat(','));
+    expect(']');
+    return v;
+  }
+  void skip() {
+    ws();
+    if (i >= s.size()) fail("a value expected");
+    const char c = s[i];
+    if (c == '"') {
+      str();
+    } else if (c == '{' || c == '[') {
+      const char close = c == '{' ? '}' : ']';
+      ++i;
+      if (eat(close)) return;
+      do {
+        if (c == '{') {
+          str();
+          expect(':');
+        }
+        skip();
+      } while (eat(','));
+      expect(close);
+    } else {
+      while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']') ++i;
+    }
+  }
+};
 
 }  // namespace
 
@@ -96,44 +173,58 @@ void SafetensorsDir::add(const std::string& path) {
   if (fd < 0) throw std::runtime_error("cannot open " + path);
   uint64_t n = 0;
   pread_all(fd, &n, 8, 0);
+  if (n == 0 || n > kMaxHeader) {
+    close(fd);
+    throw std::runtime_error(path + ": a safetensors header of " + std::to_string(n) + " bytes");
+  }
   std::string h(n, '\0');
   pread_all(fd, h.data(), n, 8);
   const int file = int(fds_.size());
   fds_.push_back(fd);
   direct_fds_.push_back(open(path.c_str(), O_RDONLY | O_DIRECT));
   const uint64_t base = 8 + n;
-  // Flat object: "name": {"dtype": "...", "shape": [...], "data_offsets": [a, b]}, ... plus "__metadata__".
-  size_t i = h.find('{') + 1;
-  while (true) {
-    const size_t k0 = h.find('"', i);
-    if (k0 == std::string::npos) break;
-    const size_t k1 = h.find('"', k0 + 1);
-    const std::string key = h.substr(k0 + 1, k1 - k0 - 1);
-    const size_t o0 = h.find('{', k1);
-    const size_t o1 = h.find('}', o0);
-    const std::string obj = h.substr(o0, o1 - o0 + 1);
-    i = o1 + 1;
-    if (key == "__metadata__") continue;
-    Tensor t;
-    t.file = file;
-    const size_t d = obj.find("\"dtype\"");
-    const size_t d0 = obj.find('"', obj.find(':', d) + 1);
-    t.dtype = obj.substr(d0 + 1, obj.find('"', d0 + 1) - d0 - 1);
-    const size_t s0 = obj.find('[', obj.find("\"shape\""));
-    const std::string shape = obj.substr(s0 + 1, obj.find(']', s0) - s0 - 1);
-    for (size_t p = 0; p < shape.size();) {
-      const size_t c = shape.find(',', p);
-      const std::string num = shape.substr(p, c == std::string::npos ? std::string::npos : c - p);
-      if (num.find_first_of("0123456789") != std::string::npos) t.shape.push_back(std::stoll(num));
-      if (c == std::string::npos) break;
-      p = c + 1;
-    }
-    const size_t f0 = obj.find('[', obj.find("\"data_offsets\""));
-    const std::string offs = obj.substr(f0 + 1, obj.find(']', f0) - f0 - 1);
-    const size_t comma = offs.find(',');
-    t.begin = base + std::stoull(offs.substr(0, comma));
-    t.end = base + std::stoull(offs.substr(comma + 1));
-    map_[key] = std::move(t);
+  // {"name": {"dtype": "...", "shape": [...], "data_offsets": [a, b]}, ..., "__metadata__": {...}}
+  try {
+    Json j{h};
+    j.expect('{');
+    if (j.eat('}')) return;
+    do {
+      const std::string key = j.str();
+      j.expect(':');
+      if (key == "__metadata__") {
+        j.skip();
+        continue;
+      }
+      Tensor t;
+      t.file = file;
+      bool offsets = false;
+      j.expect('{');
+      if (!j.eat('}')) {
+        do {
+          const std::string field = j.str();
+          j.expect(':');
+          if (field == "dtype") {
+            t.dtype = j.str();
+          } else if (field == "shape") {
+            for (uint64_t d : j.nums()) t.shape.push_back(int64_t(d));
+          } else if (field == "data_offsets") {
+            const std::vector<uint64_t> o = j.nums();
+            if (o.size() != 2 || o[1] < o[0]) j.fail("data_offsets of two ascending numbers expected");
+            t.begin = base + o[0];
+            t.end = base + o[1];
+            offsets = true;
+          } else {
+            j.skip();
+          }
+        } while (j.eat(','));
+        j.expect('}');
+      }
+      if (t.dtype.empty() || !offsets) j.fail(("tensor " + key + " without dtype or data_offsets").c_str());
+      map_[key] = std::move(t);
+    } while (j.eat(','));
+    j.expect('}');
+  } catch (const std::exception& e) {
+    throw std::runtime_error(path + ": " + e.what());
   }
 }
 

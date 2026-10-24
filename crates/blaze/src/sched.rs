@@ -674,7 +674,7 @@ impl Loop {
             let reserved: usize = self
                 .active
                 .iter()
-                .map(|a| if a.pending.is_some() { self.engine.info.max_verify.max(1) } else { a.req.tokens.len() - a.fed } + page)
+                .map(|a| (if a.pending.is_some() { self.engine.info.max_verify.max(1) } else { a.req.tokens.len() - a.fed }) + page)
                 .sum();
             let need = prompt.len() - cached + 16 + reserved;
             while self.engine.free_slots() < need && self.cache.len() > hit.map_or(0, |_| 1) {
@@ -1371,6 +1371,12 @@ impl Loop {
     /// A request that has finished: the conversation so far (prompt + output except the last, unfed token) kept for
     /// the next turn, its end sent, its output kept for suffix decoding, its KV given back.
     fn retire(&mut self, a: Active, reason: Finish) {
+        self.retire_as(a, reason, true)
+    }
+
+    /// `keep`: the conversation goes to the prompt cache (not for a request ended to free KV pages: its snapshot would
+    /// hold them).
+    fn retire_as(&mut self, a: Active, reason: Finish, keep: bool) {
         self.health.cur.requests += 1;
         match reason {
             Finish::Length => self.health.cur.lengths += 1,
@@ -1382,7 +1388,7 @@ impl Loop {
             eprintln!("blaze req {}: {reason:?} after {} tokens in {secs:.2} s ({:.1} tok/s)", a.id, a.generated.len(),
                       a.generated.len() as f64 / secs.max(1e-9));
         }
-        if reason != Finish::Cancelled {
+        if reason != Finish::Cancelled && keep {
             let mut tokens = a.req.tokens.clone();
             tokens.extend(a.generated[..a.generated.len().saturating_sub(1)].iter().map(|&t| t as i64));
             self.remember(&a.seq, tokens, SnapKind::Finish);
@@ -1429,7 +1435,7 @@ impl Loop {
             );
             self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
             self.health.cur.kv_full += 1;
-            self.retire(a, Finish::Length);
+            self.retire_as(a, Finish::Length, false);
         }
     }
 

@@ -23,7 +23,7 @@ def chat(url, messages, max_tokens):
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    t0, first, text, usage = time.perf_counter(), None, "", {}
+    t0, first, last, text, usage = time.perf_counter(), None, None, "", {}
     with urllib.request.urlopen(req, timeout=3600) as r:
         for raw in r:
             line = raw.decode().strip()
@@ -34,9 +34,12 @@ def chat(url, messages, max_tokens):
                 usage = ch["usage"]
             if ch["choices"] and ch["choices"][0]["delta"].get("content"):
                 first = first or time.perf_counter()
+                last = time.perf_counter()
                 text += ch["choices"][0]["delta"]["content"]
     cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    return text, usage.get("prompt_tokens", 0), cached, (first or time.perf_counter()) - t0
+    n = usage.get("completion_tokens", 0)
+    tps = (n - 1) / (last - first) if first and last and last > first and n > 1 else 0.0
+    return text, usage.get("prompt_tokens", 0), cached, (first or time.perf_counter()) - t0, tps
 
 
 def main():
@@ -54,15 +57,15 @@ def main():
     for turn in range(args.turns):
         msgs.append({"role": "user", "content": f"Step {turn + 1}: describe how the {rng.choice(WORDS)} talks to the "
                                                 f"{rng.choice(WORDS)}, in a short paragraph."})
-        text, prompt, cached, ttft = chat(args.url, msgs, args.answer_tokens)
+        text, prompt, cached, ttft, tps = chat(args.url, msgs, args.answer_tokens)
         msgs.append({"role": "assistant", "content": text})
         flag = "" if turn == 0 or cached > 0 else "  MISS"
         misses += bool(flag)
-        print(f"turn {turn + 1}: prompt {prompt}, cached {cached} ({100 * cached / max(prompt, 1):.0f}%), TTFT {ttft:.2f} s{flag}",
-              flush=True)
+        print(f"turn {turn + 1}: prompt {prompt}, cached {cached} ({100 * cached / max(prompt, 1):.0f}%), TTFT {ttft:.2f} s, "
+              f"decode {tps:.1f} tok/s{flag}", flush=True)
         for s in range(args.side):
             side = [{"role": "user", "content": f"Give a five-word title for: {' '.join(rng.choice(WORDS) for _ in range(30))}"}]
-            _, sp, sc, st = chat(args.url, side, 12)
+            _, sp, sc, st, _ = chat(args.url, side, 12)
             print(f"   side {s + 1}: prompt {sp}, cached {sc}, TTFT {st:.2f} s")
     raise SystemExit(1 if misses else 0)
 

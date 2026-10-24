@@ -342,7 +342,17 @@ void HybridMoe::finish_ssd_loads() {
     loading_[l.expert] = 0;
     if (state == 2) {
       log("blaze swap: %s", l.error.c_str());
-      free_[2].push_back(l.slot);  // a failed eviction leaves the expert in VRAM
+      free_[2].push_back(l.slot);
+      if (l.demote) {
+        // the expert leaves VRAM all the same, to the SSD tier (the checkpoint always has it): kept in VRAM, it would
+        // hold the spare slot its replacement took, and every failure would leave one spare fewer for the swaps
+        host_records_[l.expert] = nullptr;
+        cpu_->set_record(int(l.expert / E), int(l.expert % E), nullptr);
+        placement_.tier[l.expert] = Tier::kSsd, placement_.slot[l.expert] = -1;
+        if (l.from_tier == Tier::kGpu1) writes.push_back({slot1_dev_ + l.expert, -1});
+        writes.push_back({slot0_dev_ + l.expert, kSlotSsd});
+        freed.push_back({l.from_tier, l.from_slot, 0, -1});
+      }
       continue;
     }
     host_records_[l.expert] = ram_slot(l.slot);

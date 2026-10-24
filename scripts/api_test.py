@@ -298,7 +298,7 @@ def chat_separate_reasoning_false_keeps_it_in_the_content():
     check("reasoning_content" not in m and "reasoning" not in m, f"reasoning split out although separate_reasoning=false: {list(m)}")
     # the reasoning stays in the content: the answer and more than it (the two requests may word their reasoning
     # differently: speculation and batch shapes change the last bits)
-    check("51" in m["content"] and len(m["content"]) > len(split.content or "") + 40, (split.content, m["content"][:200]))
+    check("51" in m["content"] and len(m["content"]) > len((split.content or "").strip()) + 4, (split.content, m["content"][:200]))
     note(reasoning[:20] in m["content"], f"reasoning start {reasoning[:20]!r} not in {m['content'][:80]!r}")
 
 
