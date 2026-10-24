@@ -114,6 +114,8 @@ impl SnapStats {
 struct Active {
     req: GenRequest,
     seq: Seq,
+    /// bit per token id: the ids of the prompt and the output so far, and the most frequent ones (MTP candidate head)
+    seen: Vec<u64>,
     /// prompt tokens fed so far
     fed: usize,
     generated: Vec<i32>,
@@ -376,6 +378,10 @@ pub struct SchedConfig {
     /// cut or skip drafts by the measured cost of a verify against a decode step (else always verify the full draft)
     pub spec_adaptive: bool,
     pub spec_method: SpecMethod,
+    /// MTP candidate head: every request keeps the set of token ids it has seen, handed to the drafter with its items
+    pub draft_cands: bool,
+    /// the ids every candidate set starts with (a bit per token id; empty: the lowest FREQUENT_IDS)
+    pub frequent: Vec<u64>,
 }
 
 /// Where drafts come from.
@@ -690,7 +696,9 @@ impl Loop {
             } else {
                 Vec::new()
             };
+            let seen = if self.cfg.draft_cands { seen_set(&req.tokens, &self.cfg.frequent, self.engine.info.vocab) } else { Vec::new() };
             self.active.push(Active {
+                seen,
                 prompt_set,
                 req,
                 seq,
@@ -780,6 +788,9 @@ impl Loop {
         }
         a.pending = Some(pick);
         a.generated.push(pick);
+        if let Some(w) = a.seen.get_mut(pick as usize / 64) {
+            *w |= 1 << (pick as usize % 64);
+        }
         if let Some(ix) = a.suffix.as_mut() {
             ix.push(pick);
         }
@@ -866,7 +877,7 @@ impl Loop {
             }
             let shape = (self.engine.info.tree_width, self.tree_depth);
             let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
-            let trees = self.engine.draft_tree(crate::eagle::DraftPlan { items, k: 0, tree: Some(shape) })?;
+            let trees = self.engine.draft_tree(crate::eagle::DraftPlan { items, k: 0, tree: Some(shape), ..Default::default() })?;
             for (i, t) in idx.into_iter().zip(trees) {
                 self.active[i].tree = Some(t);
             }
@@ -874,7 +885,8 @@ impl Loop {
         }
         let k = idx_k(&items, &self.active).min(self.cfg.spec_tokens).min(crate::eagle::MAX_CHAIN).max(1);
         let (idx, items): (Vec<usize>, Vec<_>) = items.into_iter().unzip();
-        let drafts = self.engine.draft(crate::eagle::DraftPlan { items, k, tree: None })?;
+        let cands: Vec<Vec<i32>> = if self.cfg.draft_cands { idx.iter().map(|&i| seen_ids(&self.active[i].seen)).collect() } else { Vec::new() };
+        let drafts = self.engine.draft(crate::eagle::DraftPlan { items, k, tree: None, cands })?;
         for (i, d) in idx.into_iter().zip(drafts) {
             self.active[i].eagle = d;
         }
@@ -1488,6 +1500,40 @@ impl Loop {
     }
 }
 
+/// Token ids every request's candidate set starts with: the lowest ids, the frequent tokens of the BPE vocabulary.
+const FREQUENT_IDS: usize = 4096;
+
+/// The candidate set of a prompt: the frequent ids and the prompt's own (image rows are not tokens).
+fn seen_set(tokens: &[i64], frequent: &[u64], vocab: usize) -> Vec<u64> {
+    let mut seen = vec![0u64; vocab.div_ceil(64)];
+    if frequent.len() == seen.len() {
+        seen.copy_from_slice(frequent);
+    } else {
+        for id in 0..FREQUENT_IDS.min(vocab) {
+            seen[id / 64] |= 1 << (id % 64);
+        }
+    }
+    for &t in tokens {
+        if (0..vocab as i64).contains(&t) {
+            seen[t as usize / 64] |= 1 << (t as usize % 64);
+        }
+    }
+    seen
+}
+
+/// The ids of a candidate set, ascending.
+fn seen_ids(seen: &[u64]) -> Vec<i32> {
+    let mut ids = Vec::with_capacity(seen.iter().map(|w| w.count_ones() as usize).sum());
+    for (wi, &w) in seen.iter().enumerate() {
+        let mut w = w;
+        while w != 0 {
+            ids.push((wi * 64 + w.trailing_zeros() as usize) as i32);
+            w &= w - 1;
+        }
+    }
+    ids
+}
+
 /// Chain length of an EAGLE-4 call: the longest any of its requests wants.
 fn idx_k(items: &[(usize, crate::eagle::DraftItem)], active: &[Active]) -> usize {
     items.iter().map(|(i, _)| active[*i].eagle_k).max().unwrap_or(1)
@@ -1524,4 +1570,22 @@ fn logprob_of(c: &crate::engine::Cands, x: i32, top: Option<usize>) -> Option<To
     let n = top?;
     let lp = c.top.iter().find(|&&(_, t)| t == x).map(|&(l, _)| l - c.lse).unwrap_or(f32::NEG_INFINITY);
     Some(TokenLogprob { logprob: lp, top: c.top.iter().take(n).map(|&(l, t)| (t, l - c.lse)).collect() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_sets() {
+        let vocab = 248320;
+        let mut s = seen_set(&[5, 100_000, 248_319, 1 << 62, -3, 300_000], &[], vocab);
+        let ids = seen_ids(&s);
+        // the frequent ids, the prompt's own (image keys, negatives and out-of-range ids are not tokens)
+        assert_eq!(ids.len(), FREQUENT_IDS + 2);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+        assert!(ids.contains(&100_000) && ids.contains(&248_319) && !ids.contains(&300_000));
+        s[200_000 / 64] |= 1 << (200_000 % 64);
+        assert!(seen_ids(&s).contains(&200_000));
+    }
 }

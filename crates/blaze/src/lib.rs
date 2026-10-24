@@ -11,6 +11,7 @@ pub mod inspect;
 pub mod linear;
 pub mod mm;
 pub mod model;
+pub mod mtp;
 pub mod quant;
 pub mod sampler;
 pub mod sched;

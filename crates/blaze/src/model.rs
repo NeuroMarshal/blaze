@@ -259,6 +259,16 @@ pub struct Options {
     /// EAGLE-4: this rank's vocabulary shard of the drafter's LM head in VRAM (Some(true)), in the pinned host table
     /// (Some(false)), or in VRAM when it fits with room to spare (None)
     pub draft_head_vram: Option<bool>,
+    /// The checkpoint's own MTP head as the drafter (its `mtp.*` weights; Qwen3.5 NextN): the attention window of its KV
+    /// ring in positions (0: no MTP drafter). The target keeps the normed final hidden state of every row for it.
+    pub mtp_window: usize,
+    /// MTP drafter: the draft head scores only the first this many token ids of the vocabulary (the frequent ones; 0: all
+    /// of them, the target's own head). The drafts are only proposals, the verify decides, so the loss is acceptance on
+    /// text whose tokens lie beyond (non-Latin scripts), the gain the share of the head's bandwidth.
+    pub mtp_head_vocab: usize,
+    /// MTP drafter: per sequence the draft head scores only the token ids the request has seen (prompt and output) and the
+    /// most frequent ones, at most this many per rank (0: the whole vocabulary). Needs the target's LM head in BF16.
+    pub mtp_head_cands: usize,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
@@ -1583,6 +1593,11 @@ impl Model {
     }
 
     /// The pinned token embedding table [vocab, hidden] bf16.
+    /// The rotary frequencies of the softmax layers (device, rotary_dim / 2) and their scale.
+    pub fn rope_tables(&self) -> (*const f32, f32) {
+        (self.inv_freq.ptr(), self.rope_scale)
+    }
+
     pub fn embed_table(&self) -> &HostMapped {
         &self.embed
     }
@@ -1881,11 +1896,22 @@ impl Model {
         }
         self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
+        // the MTP drafter reads the final normed hidden state of every row (aux column 0); the head below takes its rows
+        // from there (the sum x + residual is formed here once: the residual stream is updated in place)
+        let kept = self.opts.mtp_window > 0 && matches!(self.final_mix, FinalMix::Norm(_));
+        if kept && let FinalMix::Norm(norm) = &self.final_mix {
+            let aux = self.aux.as_ref().ok_or_else(|| anyhow!("MTP without the captured hidden-state buffer"))?;
+            check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), norm.ptr(), eps, t as c_int, h as c_int, 1, aux.ptr(), s.0) }, "final norm (MTP)")?;
+        }
         if n_logits > 0 {
             // h = x + residual of the listed rows, normed, through the head, greedy pick.
             let n = n_logits;
             let rows: *const i32 = self.meta_ptr(m.logit_rows);
             match &self.final_mix {
+                FinalMix::Norm(_) if kept => {
+                    let aux = self.aux.as_ref().unwrap();
+                    check(unsafe { sys::blz_gather_rows(aux.ptr(), h as i64, rows, n as c_int, h as c_int, w.gnormed.ptr(), s.0) }, "gather")?;
+                }
                 FinalMix::Norm(norm) => {
                     check(unsafe { sys::blz_gather_rows(w.x.ptr(), h as i64, rows, n as c_int, h as c_int, w.gx.ptr(), s.0) }, "gather")?;
                     check(unsafe { sys::blz_gather_rows(w.residual.ptr(), h as i64, rows, n as c_int, h as c_int, w.gres.ptr(), s.0) }, "gather")?;

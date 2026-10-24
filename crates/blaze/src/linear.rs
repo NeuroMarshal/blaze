@@ -373,6 +373,14 @@ impl Linear {
     }
 
     /// The parts the tensor-core GEMVs serve, for the tuner (tune.rs).
+    /// The weights as one row-major BF16 matrix [n, k] on the device, if that is how they are kept.
+    pub fn bf16_rows(&self) -> Option<*const u16> {
+        match self.parts.as_slice() {
+            [Part { store: Store::Bf16(w), col: 0, .. }] => Some(w.ptr()),
+            _ => None,
+        }
+    }
+
     pub fn tune_weights(&self) -> Vec<crate::tune::Weight> {
         let mut v = Vec::new();
         for p in &self.parts {

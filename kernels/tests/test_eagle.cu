@@ -66,6 +66,39 @@ int main() {
     std::printf("rmsnorm_ld: worst rel %.2e %s\n", worst, worst < 1e-2 ? "ok" : "FAIL");
     fails += worst >= 1e-2;
   }
+  // zero-centered strided RMSNorm (the MTP head's norms): x / rms * (1 + w), and widening of the greedy picks
+  {
+    const int rows = 4, dim = 5120, ldx = 2 * dim, ldo = 2 * dim;
+    std::vector<uint16_t> x(size_t(rows) * ldx), w(dim), out(size_t(rows) * ldo, 0);
+    for (auto& v : x) v = bf(n01(rng) * 2.0f);
+    for (auto& v : w) v = bf(0.3f * n01(rng));
+    uint16_t *dx = up(x), *dw = up(w), *dout = up(out);
+    check(blz_rmsnorm_ld_zc(dx, ldx, dw, 1e-6f, rows, dim, dout + dim, ldo, 0), "rmsnorm_ld_zc");
+    const auto got = down(dout, out.size());
+    double worst = 0;
+    for (int r = 0; r < rows; ++r) {
+      double ss = 0;
+      for (int i = 0; i < dim; ++i) ss += double(fb(x[size_t(r) * ldx + i])) * fb(x[size_t(r) * ldx + i]);
+      const double inv = 1.0 / std::sqrt(ss / dim + 1e-6);
+      for (int i = 0; i < dim; ++i) {
+        const double ref = fb(x[size_t(r) * ldx + i]) * inv * (1.0 + fb(w[i]));
+        worst = std::max(worst, std::fabs(fb(got[size_t(r) * ldo + dim + i]) - ref) / (std::fabs(ref) + 1e-2));
+      }
+    }
+    std::printf("rmsnorm_ld_zc: worst rel %.2e %s\n", worst, worst < 1e-2 ? "ok" : "FAIL");
+    fails += worst >= 1e-2;
+    std::vector<int32_t> src = {5, 248319, 0, 77};
+    int32_t* ds = up(src);
+    int64_t *da, *db;
+    check(cudaMalloc(&da, 32), "malloc");
+    check(cudaMalloc(&db, 32), "malloc");
+    check(blz_widen_i32(ds, da, db, 4, 0), "widen");
+    const auto ga = down(da, 4), gb = down(db, 4);
+    int bad = 0;
+    for (int i = 0; i < 4; ++i) bad += ga[i] != src[i] || gb[i] != src[i];
+    std::printf("widen_i32: %s\n", bad ? "FAIL" : "ok");
+    fails += bad;
+  }
   // neox RoPE on q-like rows: 3 tokens, 40 heads of 128, row stride 15360
   {
     const int tokens = 3, heads = 40, hd = 128, ld = 15360;
