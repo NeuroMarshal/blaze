@@ -32,14 +32,21 @@ struct Weights {
   uint8_t *d_codes = nullptr, *d_scales = nullptr;
   float* d_alpha = nullptr;
 
-  Weights(int n_, int k_, std::mt19937& rng) : n(n_), k(k_), codes(size_t(n_) * k_ / 2), scales(size_t(n_) * k_ / 16), alpha(n_) {
+  // modelopt: block scales over the whole E4M3 range (ModelOpt sets the global scale so that the largest block scale
+  // is 448), a small per-row alpha; else scales of about 2^-9 .. 2^-3 and alpha 0.5 .. 2.
+  int wshift = 0;
+  Weights(int n_, int k_, std::mt19937& rng, bool modelopt = false)
+      : n(n_), k(k_), codes(size_t(n_) * k_ / 2), scales(size_t(n_) * k_ / 16), alpha(n_) {
     std::uniform_int_distribution<int> byte(0, 255);
     for (auto& c : codes) c = uint8_t(byte(rng));
-    // E4M3 scales in a checkpoint-like range (about 2^-9 .. 2^-3), never NaN.
-    std::uniform_real_distribution<float> s(0.002f, 0.12f);
+    std::uniform_real_distribution<float> s(modelopt ? 1.0f : 0.002f, modelopt ? 448.0f : 0.12f);
     for (auto& v : scales) v = blaze::float_to_e4m3_host(s(rng));
-    std::uniform_real_distribution<float> a(0.5f, 2.0f);
+    std::uniform_real_distribution<float> a(modelopt ? 0.0002f : 0.5f, modelopt ? 0.0008f : 2.0f);
     for (auto& v : alpha) v = a(rng);
+    // the power of two taking the largest scale to <= 1 (as crates/blaze/src/linear.rs)
+    uint8_t smax = 0;
+    for (auto v : scales) smax = std::max<uint8_t>(smax, v & 0x7f);
+    if (smax > 0x38) wshift = (smax >> 3) - 7 + ((smax & 7) != 0);
     check(cudaMalloc(&d_codes, codes.size()), "malloc");
     check(cudaMalloc(&d_scales, scales.size()), "malloc");
     check(cudaMalloc(&d_alpha, alpha.size() * 4), "malloc");
@@ -83,7 +90,7 @@ double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm*
     check(cudaMalloc(&x16, size_t(rows) * W.k * 2), "malloc");
     check(cudaMalloc(&sh, size_t(rows) * 4), "malloc");
     check(blz_nvfp4_f16_rows(dx, ldx, rows, W.k, x16, sh, 0), "f16 rows");
-    check(blz_nvfp4_gemv_mma_f16_cfg(x16, sh, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, split, tiles, 0),
+    check(blz_nvfp4_gemv_mma_f16_cfg(x16, sh, W.d_codes, W.d_scales, W.d_alpha, dy, W.n, rows, W.n, W.k, W.wshift, split, tiles, 0),
           "gemv_mma_f16");
     check(cudaDeviceSynchronize(), "f16 sync");
     cudaFree(x16);
@@ -136,7 +143,7 @@ double bench(int rows, int n, int k, std::mt19937& rng, bool mma = false, bool f
   auto f = [&](const Weights* W) {
     if (f16) {
       blz_nvfp4_f16_rows(dx, k, rows, k, x16, sh, 0);
-      blz_nvfp4_gemv_mma_f16_cfg(x16, sh, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0, 0, 0);
+      blz_nvfp4_gemv_mma_f16_cfg(x16, sh, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, W->wshift, 0, 0, 0);
     } else if (mma) {
       blz_nvfp4_gemv_mma(dx, k, W->d_codes, W->d_scales, W->d_alpha, dy, n, rows, n, k, 0);
     } else {
@@ -209,8 +216,12 @@ int main(int argc, char** argv) {
     ok &= bad == 0;
     std::printf("mma launches: %d checked, %d failed\n", checked, bad);
   }
-  // FP16 accumulation: every launch, beside the BF16 kernel on the same draws (normal inputs and outliers)
-  {
+  // FP16 accumulation: every launch, beside the BF16 kernel on the same draws (normal inputs and outliers; small
+  // scales and ModelOpt's full E4M3 range)
+  Weights mo(200, 1152, rng, true);
+  std::printf("modelopt-like weights: wshift %d\n", mo.wshift);
+  for (const Weights* W16 : {&mid, &mo}) {
+    const Weights& mid16 = *W16;
     int checked = 0, bad = 0;
     double worst16 = 0, worst_bf = 0;
     for (bool outl : {false, true})
@@ -219,8 +230,8 @@ int main(int argc, char** argv) {
           for (int tiles : {1, 2, 4}) {
             if (!blz_nvfp4_mma_cfg_valid(rows, split, tiles)) continue;
             std::mt19937 r1(rows * 131 + split * 7 + tiles), r2 = r1;
-            const double e16 = run(mid, rows, 1152, r1, gemm, true, split, tiles, true, outl);
-            const double ebf = run(mid, rows, 1152, r2, gemm, true, split, tiles, false, outl);
+            const double e16 = run(mid16, rows, 1152, r1, gemm, true, split, tiles, true, outl);
+            const double ebf = run(mid16, rows, 1152, r2, gemm, true, split, tiles, false, outl);
             worst16 = std::fmax(worst16, e16), worst_bf = std::fmax(worst_bf, ebf);
             ++checked;
             if (!(e16 < 6e-3)) {

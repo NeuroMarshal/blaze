@@ -22,8 +22,8 @@ pub enum Cut {
 
 enum Store {
     Bf16(DevBuf),
-    /// `f16`: every block scale <= 1, so the FP16-accumulate GEMV keeps its partial sums finite
-    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf, f16: bool },
+    /// `f16`: the FP16-accumulate GEMV may take it (no NaN scale), its block scales times 2^-wshift (the largest to <= 1)
+    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf, f16: bool, wshift: i32 },
     /// E4M3 codes [n, k], optional FP32 scales per [block_n, 128] block, FP32 multiplier per row.
     Fp8 { codes: DevBuf, block_scale: Option<DevBuf>, block_n: usize, alpha: DevBuf },
     /// MXFP8: E4M3 codes [n, k], E8M0 scales [n, k / 32].
@@ -114,6 +114,7 @@ pub(crate) struct Nvfp4Ref {
     pub scales: *const u8,
     pub alpha: *const f32,
     pub f16: bool,
+    pub wshift: i32,
     pub n: usize,
     pub k: usize,
 }
@@ -137,8 +138,8 @@ pub(crate) fn nvfp4_mma(ctx: &LinCtx, w: &Nvfp4Ref, x: *const u16, ldx: usize, m
         };
         return check(
             unsafe {
-                sys::blz_nvfp4_gemv_mma_f16_cfg(xh, sh, w.codes, w.scales, w.alpha, o, ldo as i64, m as c_int, n as c_int, k as c_int, s16,
-                                                t16, s.0)
+                sys::blz_nvfp4_gemv_mma_f16_cfg(xh, sh, w.codes, w.scales, w.alpha, o, ldo as i64, m as c_int, n as c_int, k as c_int, w.wshift,
+                                                s16, t16, s.0)
             },
             "blz_nvfp4_gemv_mma_f16",
         );
@@ -218,7 +219,7 @@ impl Linear {
         let scales = DevBuf::new(n * k / 16)?;
         let mut alpha = Vec::with_capacity(n);
         let mut row = 0;
-        let mut f16 = true;
+        let (mut f16, mut smax) = (true, 0u8);
         for m in group {
             let Format::Nvfp4 { global_inverse, .. } = m.format else { unreachable!() };
             if m.cols.start % 32 != 0 {
@@ -229,15 +230,18 @@ impl Linear {
             let sc = cut_rows(ckpt.bytes(m.names.scale.as_ref().unwrap())?, full_k / 16, &m.rows, m.cols.start / 16..m.cols.end / 16);
             codes.upload_at(row * k / 2, &c)?;
             scales.upload_at(row * k / 16, &sc)?;
-            // positive E4M3 bytes order as their values; 1.0 is 0x38
-            f16 &= sc.iter().all(|&b| b & 0x7f <= 0x38);
+            // positive E4M3 bytes order as their values (0x7f: NaN)
+            f16 &= sc.iter().all(|&b| b & 0x7f != 0x7f);
+            smax = smax.max(sc.iter().map(|&b| b & 0x7f).max().unwrap_or(0));
             let g_name = m.names.global.as_ref().unwrap();
             let g = f32::from_le_bytes(ckpt.bytes(g_name)?[..4].try_into()?);
             let a = if global_inverse { 1.0 / g } else { g };
             alpha.extend(std::iter::repeat_n(a, m.n));
             row += m.n;
         }
-        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)?, f16 })
+        // the power of two that takes the largest block scale to <= 1 (E4M3: exponent bits 6..3, bias 7)
+        let wshift = if smax > 0x38 { ((smax >> 3) as i32 - 7) + i32::from(smax & 7 != 0) } else { 0 };
+        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)?, f16, wshift })
     }
 
     fn load_fp8(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, kind: Kind) -> Result<Store> {
@@ -381,8 +385,9 @@ impl Linear {
         let mut v = Vec::new();
         for p in &self.parts {
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha, f16 } => v.push(crate::tune::Weight {
+                Store::Nvfp4 { codes, scales, alpha, f16, wshift } => v.push(crate::tune::Weight {
                     f16: *f16,
+                    wshift: *wshift,
                     kernel: crate::tune::Kernel::Nvfp4,
                     n: p.n,
                     k: self.k,
@@ -392,6 +397,7 @@ impl Linear {
                 }),
                 Store::Mxfp8 { codes, scales } => v.push(crate::tune::Weight {
                     f16: false,
+                    wshift: 0,
                     kernel: crate::tune::Kernel::Mxfp8,
                     n: p.n,
                     k: self.k,
@@ -401,6 +407,7 @@ impl Linear {
                 }),
                 Store::Bf16(w) => v.push(crate::tune::Weight {
                     f16: false,
+                    wshift: 0,
                     kernel: crate::tune::Kernel::Bf16,
                     n: p.n,
                     k: self.k,
@@ -448,8 +455,8 @@ impl Linear {
         for p in &self.parts {
             let o = unsafe { out.add(p.col) };
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha, f16 } => {
-                    let w = Nvfp4Ref { codes: codes.ptr(), scales: scales.ptr(), alpha: alpha.ptr(), f16: *f16, n: p.n, k };
+                Store::Nvfp4 { codes, scales, alpha, f16, wshift } => {
+                    let w = Nvfp4Ref { codes: codes.ptr(), scales: scales.ptr(), alpha: alpha.ptr(), f16: *f16, wshift: *wshift, n: p.n, k };
                     let passes = m > sys::BLZ_NVFP4_MMA_MAX_ROWS
                         && k % 128 == 0
                         && m <= crate::tune::PASS_MAX_ROWS

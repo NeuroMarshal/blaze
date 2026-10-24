@@ -297,8 +297,9 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* 
 // FP16 inputs and FP16 accumulation within each 128-wide chunk of K (8 mma steps), FP32 across chunks: GeForce cards run
 // FP16-accumulate mma at twice the FP32-accumulate rate, which the BF16 kernel is bound by from ~16 rows. The codes
 // become FP16 exactly (E2M1 magnitudes have zero low bytes in FP16; times an E4M3 block scale: at most 6 significant
-// bits); the inputs come from nvfp4_f16_rows_kernel, each row scaled by a power of two to max |x| <= 64, so that a
-// chunk's partial sums stay below 128 * 64 * 6 < 65504 for block scales <= 1 (the caller checks the layer's scales).
+// bits); the inputs come from nvfp4_f16_rows_kernel, each row scaled by a power of two to max |x| <= 64, and the block
+// scales by 2^-wshift (the weight's largest scale to <= 1; ModelOpt's span the whole E4M3 range), so that a chunk's
+// partial sums stay below 128 * 64 * 6 < 65504; both powers of two come back in the epilogue.
 __device__ __forceinline__ void mma_f16(uint32_t* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0,
                                         uint32_t b1) {
   asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
@@ -330,13 +331,14 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_f16_kernel(const uint16
                                                                     const uint8_t* __restrict__ scale,
                                                                     const float* __restrict__ alpha,
                                                                     uint16_t* __restrict__ y, int64_t ldy, int m, int n,
-                                                                    int k) {
+                                                                    int k, int wshift) {
   constexpr int kTok = 16 * kMT;
   __shared__ float red[kSplit][kTiles * 8][kTok + 1];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   const int g = lane >> 2, t = lane & 3;
   const int f0 = blockIdx.x * kTiles * 8;
   const int64_t wrow = k >> 1, srow = k >> 4;
+  const float wscale = ldexpf(1.0f, -wshift);
   const uint8_t* wp[kTiles];
   const uint8_t* sp[kTiles];
 #pragma unroll
@@ -368,7 +370,7 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_f16_kernel(const uint16
     uint32_t bq[kTiles][8][2];
 #pragma unroll
     for (int j = 0; j < kTiles; ++j) {
-      const uint32_t s0 = f16x2_splat(e4m3(sq[j] & 0xff)), s1 = f16x2_splat(e4m3(sq[j] >> 8));
+      const uint32_t s0 = f16x2_splat(e4m3(sq[j] & 0xff) * wscale), s1 = f16x2_splat(e4m3(sq[j] >> 8) * wscale);
       const uint32_t codes[4] = {wq[j].x, wq[j].y, wq[j].z, wq[j].w};
 #pragma unroll
       for (int s = 0; s < 8; ++s) {
@@ -425,7 +427,7 @@ __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_f16_kernel(const uint16
     float v = 0.0f;
 #pragma unroll
     for (int q = 0; q < kSplit; ++q) v += red[q][r][tok];
-    y[tok * ldy + f] = __bfloat16_as_ushort(__float2bfloat16(ldexpf(v * alpha[f], shift[tok])));
+    y[tok * ldy + f] = __bfloat16_as_ushort(__float2bfloat16(ldexpf(v * alpha[f], shift[tok] + wshift)));
   }
 }
 
@@ -576,19 +578,19 @@ namespace {
 
 template <int T, int S>
 cudaError_t launch_mma_f16(const uint16_t* x, const int32_t* shift, const uint8_t* w, const uint8_t* scale,
-                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k, cudaStream_t stream) {
+                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k, int ws, cudaStream_t stream) {
   const int blocks = (n + 8 * T - 1) / (8 * T), mt = (rows + 15) / 16;
   if (mt == 1 && rows <= 8)
-    nvfp4_mma_f16_kernel<T, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+    nvfp4_mma_f16_kernel<T, S, false, 1><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k, ws);
   else if (mt == 1)
-    nvfp4_mma_f16_kernel<T, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+    nvfp4_mma_f16_kernel<T, S, true, 1><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k, ws);
   else if (mt == 2)
-    nvfp4_mma_f16_kernel<T, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+    nvfp4_mma_f16_kernel<T, S, true, 2><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k, ws);
   else if constexpr (mma_cfg_fits(T, S, 4)) {
     if (mt == 3)
-      nvfp4_mma_f16_kernel<T, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+      nvfp4_mma_f16_kernel<T, S, true, 3><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k, ws);
     else
-      nvfp4_mma_f16_kernel<T, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k);
+      nvfp4_mma_f16_kernel<T, S, true, 4><<<blocks, S * 32, 0, stream>>>(x, k, shift, w, scale, alpha, y, ldy, rows, n, k, ws);
   } else {
     return cudaErrorInvalidValue;
   }
@@ -606,23 +608,25 @@ extern "C" cudaError_t blz_nvfp4_f16_rows(const uint16_t* x, int64_t ldx, int ro
 
 extern "C" cudaError_t blz_nvfp4_gemv_mma_f16_cfg(const uint16_t* x16, const int32_t* shift, const uint8_t* w,
                                                   const uint8_t* scale, const float* alpha, uint16_t* y, int64_t ldy,
-                                                  int rows, int n, int k, int split, int tiles, cudaStream_t stream) {
+                                                  int rows, int n, int k, int wshift, int split, int tiles,
+                                                  cudaStream_t stream) {
+  const int ws = wshift;
   if (rows <= 0 || n <= 0) return cudaSuccess;
   if (k % 128 != 0 || rows > BLZ_NVFP4_MMA_MAX_ROWS) return cudaErrorInvalidValue;
   if (split == 0 || tiles == 0) blz_nvfp4_mma_default_cfg(rows, k, &split, &tiles);
   if (!blz_nvfp4_mma_cfg_valid(rows, split, tiles)) return cudaErrorInvalidValue;
 #define BLZ_MMA16_S(T)                                                                                  \
   switch (split) {                                                                                      \
-    case 2: return launch_mma_f16<T, 2>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);       \
-    case 4: return launch_mma_f16<T, 4>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);       \
-    default: return launch_mma_f16<T, 8>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);      \
+    case 2: return launch_mma_f16<T, 2>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, ws, stream);       \
+    case 4: return launch_mma_f16<T, 4>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, ws, stream);       \
+    default: return launch_mma_f16<T, 8>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, ws, stream);      \
   }
   switch (tiles) {
     case 1: BLZ_MMA16_S(1)
     case 2: BLZ_MMA16_S(2)
     default:
-      if (split == 2) return launch_mma_f16<4, 2>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);
-      return launch_mma_f16<4, 4>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, stream);
+      if (split == 2) return launch_mma_f16<4, 2>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, ws, stream);
+      return launch_mma_f16<4, 4>(x16, shift, w, scale, alpha, y, ldy, rows, n, k, ws, stream);
   }
 #undef BLZ_MMA16_S
 }

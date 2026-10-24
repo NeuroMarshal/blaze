@@ -40,7 +40,7 @@ struct EngineConfig {
   int fast_min_cols = 0;
   // Choose how many of the workers take part, by measurement while serving (the time per task of windows of jobs at a
   // few counts, the best kept, its neighbours probed now and then); false: all of them, always.
-  bool tune_threads = true;
+  bool tune_threads = false;
 };
 
 /// \brief Parse a CPU list such as "0-23,48-55" (ranges and single CPUs, comma separated).

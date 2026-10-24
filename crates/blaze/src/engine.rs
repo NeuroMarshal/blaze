@@ -161,6 +161,13 @@ struct Runner {
     staging: HostMapped,
     graphs: HashMap<GraphKey, Graph>,
     warmed: HashSet<GraphKey>,
+    /// The graphs' device memory, measured at each instantiation, within a budget of half the VRAM free at the first
+    /// capture: past it the least recently replayed graphs go (their shapes are captured again when they come back);
+    /// a shape whose graph does not instantiate (out of memory) runs eagerly from then on.
+    graph_bytes: HashMap<GraphKey, (usize, u64)>,
+    graph_budget: Option<usize>,
+    graph_tick: u64,
+    no_graph: HashSet<GraphKey>,
     /// BLAZE_GRAPH_LOG=n (rank 0): how verify steps ran, printed every n of them: [graph replay, first sight (eager),
     /// capture, eager past the graph limit]
     graph_log: Option<(usize, [usize; 4])>,
@@ -263,14 +270,21 @@ impl Runner {
     /// all-reduces stay paired.
     fn run_graph(&mut self, key: GraphKey, n: usize, spans: &[Span]) -> Result<()> {
         let (sample, sparse, verify, tree) = (key.1, key.2, key.3, key.4);
+        self.graph_tick += 1;
         if let Some(g) = self.graphs.get(&key) {
+            if let Some(b) = self.graph_bytes.get_mut(&key) {
+                b.1 = self.graph_tick;
+            }
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
-        if self.warmed.insert(key.clone()) {
+        if self.no_graph.contains(&key) || self.warmed.insert(key.clone()) {
             return self.model.forward(spans, n, verify, sample, sparse, tree);
         }
-        // The step's own metadata copy is already enqueued; capture after it completes.
+        // The step's own metadata copy is already enqueued; capture after it completes (and earlier replays: graphs
+        // may go below).
         self.model.stream.sync()?;
+        let free0 = crate::gpu::mem_info()?.0;
+        let budget = *self.graph_budget.get_or_insert(free0 / 2);
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
         let captured = self.model.forward(spans, n, verify, sample, sparse, tree);
@@ -279,10 +293,27 @@ impl Runner {
         captured?;
         check(end, "cudaStreamEndCapture")?;
         let mut exec = null_mut();
-        check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "cudaGraphInstantiate")?;
+        if unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) } != 0 {
+            // out of memory: this shape runs eagerly (the capture only recorded the step)
+            unsafe { sys::cudaGraphDestroy(graph) };
+            if self.no_graph.is_empty() {
+                eprintln!("blaze: a CUDA graph did not instantiate ({:.0} MiB free): its step shape runs eagerly", free0 as f64 / 1048576.0);
+            }
+            self.no_graph.insert(key);
+            return self.model.forward(spans, n, verify, sample, sparse, tree);
+        }
+        let used = free0.saturating_sub(crate::gpu::mem_info()?.0);
         let g = Graph { exec, graph };
         check(unsafe { sys::cudaGraphLaunch(g.exec, s) }, "cudaGraphLaunch")?;
-        self.graphs.insert(key, g);
+        self.graphs.insert(key.clone(), g);
+        self.graph_bytes.insert(key.clone(), (used, self.graph_tick));
+        // past the budget: the least recently replayed graphs go (all of them finished: the stream was synchronized)
+        let mut total: usize = self.graph_bytes.values().map(|b| b.0).sum();
+        while total > budget {
+            let Some(old) = self.graph_bytes.iter().filter(|(k, _)| **k != key).min_by_key(|(_, b)| b.1).map(|(k, _)| k.clone()) else { break };
+            total -= self.graph_bytes.remove(&old).map_or(0, |b| b.0);
+            self.graphs.remove(&old);
+        }
         Ok(())
     }
 
@@ -478,7 +509,7 @@ fn worker_main(
             _ => None,
         };
         let graph_log = std::env::var("BLAZE_GRAPH_LOG").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0 && rank == 0).map(|n| (n, [0; 4]));
-        Ok(Runner { model, draft, staging, graphs: HashMap::new(), warmed: HashSet::new(), use_graphs, graph_log })
+        Ok(Runner { model, draft, staging, graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
     };
     let mut runner = match start() {
         Ok(r) => {
@@ -739,7 +770,7 @@ impl Engine {
             let kv_len = seq.len() + t.len();
             m.sparse |= kv_len > self.info.qsa_budget;
             let offset = m.tokens.len();
-            m.spans.push(Span { offset, len: t.len() });
+            m.spans.push(Span { offset, len: t.len(), kv_len, row: seq.row });
             let start = seq.len();
             if let Some(mm) = &seq.mm {
                 m.segs.extend(mm.segments(start, t.len(), offset));
@@ -775,9 +806,11 @@ impl Engine {
                 };
                 // an image placeholder (a prefix-cache key outside the vocabulary): any valid row, replaced by the embedding
                 m.tokens.push(if crate::mm::is_image_key(id) { 0 } else { id });
+                // a chain row sits at its own position; a tree node at its root's plus its depth (siblings share one)
+                let q = if tree.is_some() { start } else { p };
                 match &seq.mm {
                     Some(mm) => {
-                        let [pt, ph, pw] = mm.pos3(p);
+                        let [pt, ph, pw] = mm.pos3(q);
                         m.positions.push(pt + depth[j] as i64);
                         if m.mrope {
                             m.pos_h.push(ph + depth[j] as i64);
@@ -785,10 +818,10 @@ impl Engine {
                         }
                     }
                     None => {
-                        m.positions.push((start + depth[j]) as i64);
+                        m.positions.push((q + depth[j]) as i64);
                         if m.mrope {
-                            m.pos_h.push((start + depth[j]) as i64);
-                            m.pos_w.push((start + depth[j]) as i64);
+                            m.pos_h.push((q + depth[j]) as i64);
+                            m.pos_w.push((q + depth[j]) as i64);
                         }
                     }
                 }

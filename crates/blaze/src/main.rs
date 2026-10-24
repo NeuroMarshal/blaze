@@ -100,6 +100,10 @@ struct EngineArgs {
     /// eager decode steps instead of CUDA graphs
     #[arg(long)]
     no_graphs: bool,
+    /// QSA models (Flash Next): KV pools in pinned host memory, read through a device row cache (decode) and a staged
+    /// prefix (prefill), their VRAM left to expert slots
+    #[arg(long)]
+    kv_host: bool,
     /// EAGLE-4 draft trees: frontier rows per depth (each node's top-k children; 0 or 1: chains; default 4 with an
     /// EAGLE-4 drafter: trees verified 164-181 / 273-302 tok/s against chains' 143-149 / 230-238 on the 27B)
     #[arg(long)]
@@ -177,6 +181,7 @@ impl EngineArgs {
                 kv_auto,
                 later_vram,
                 vision_vram: gpu0_later,
+                kv_host: self.kv_host,
                 max_chunk: chunk.unwrap_or(self.chunk),
                 max_seqs: self.max_seqs,
                 moe_threads: self.expert_threads,

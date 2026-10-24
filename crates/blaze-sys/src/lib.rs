@@ -248,6 +248,30 @@ pub struct blz_nvfp4_pool {
     pub format: c_int,
 }
 
+/// Device cache of the rows of a pool kept in host memory (blaze/qsa.h): row `slot` at line slot % lines when
+/// tag[line] == slot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_nvfp4_row_cache {
+    pub tag: *mut i32,
+    pub k_data: *mut u8,
+    pub v_data: *mut u8,
+    pub k_scale: *mut u8,
+    pub v_scale: *mut u8,
+    pub lines: c_int,
+}
+
+unsafe extern "C" {
+    pub fn blz_nvfp4_row_cache_invalidate(cache: blz_nvfp4_row_cache, loc: blz_index_ptr, n: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_qsa_stage(pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64, req_indices: blz_index_ptr, cu_k: *const i32,
+                               batch: c_int, max_k: i64, out: blz_nvfp4_pool, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_kv_host_gather(pool: blz_nvfp4_pool, cache: blz_nvfp4_row_cache, table: *const i32, ldt: i64, counts: *const i32, rows: c_int,
+                              max_count: c_int, out: blz_nvfp4_pool, out_stride: i64, fills: *mut i32, fill_n: *mut i32, fill_cap: c_int,
+                              s: cudaStream_t) -> cudaError_t;
+    pub fn blz_kv_host_fill(cache: blz_nvfp4_row_cache, out: blz_nvfp4_pool, fills: *const i32, fill_n: *const i32, fill_cap: c_int,
+                            s: cudaStream_t) -> cudaError_t;
+}
+
 pub const BLZ_KV_NVFP4: c_int = 0;
 pub const BLZ_KV_FP8: c_int = 1;
 pub const BLZ_KV_BF16: c_int = 2;
@@ -392,7 +416,8 @@ unsafe extern "C" {
                               n: c_int, k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_f16_rows(x: *const u16, ldx: i64, rows: c_int, k: c_int, x16: *mut u16, shift: *mut i32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemv_mma_f16_cfg(x16: *const u16, shift: *const i32, w: *const u8, scale: *const u8, alpha: *const f32, y: *mut u16,
-                                      ldy: i64, rows: c_int, n: c_int, k: c_int, split: c_int, tiles: c_int, s: cudaStream_t) -> cudaError_t;
+                                      ldy: i64, rows: c_int, n: c_int, k: c_int, wshift: c_int, split: c_int, tiles: c_int,
+                                      s: cudaStream_t) -> cudaError_t;
     pub fn blz_bf16_gemv_mma_cfg(x: *const u16, ldx: i64, w: *const u16, y: *mut u16, ldy: i64, rows: c_int, n: c_int, k: c_int,
                                  split: c_int, tiles: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_cfg(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
