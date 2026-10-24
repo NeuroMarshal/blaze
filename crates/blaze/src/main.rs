@@ -609,8 +609,19 @@ fn main() -> Result<()> {
             allowed_media_domains,
         } => {
             let mut engine = engine;
-            if spec_method == "mtp" && engine.mtp_window == 0 {
-                engine.mtp_window = 8192;
+            let mut spec_ngram = spec_ngram;
+            if spec_method == "mtp" {
+                // the checkpoint's own MTP head: chains of 3 unless asked otherwise, verify rows to match
+                if engine.mtp_window == 0 {
+                    engine.mtp_window = 8192;
+                }
+                if spec_ngram == 0 {
+                    spec_ngram = 3;
+                }
+                engine.max_verify = engine.max_verify.max(spec_ngram + 1);
+                if engine.draft_tree_width > 1 {
+                    anyhow::bail!("--spec-method mtp drafts chains: no --draft-tree-width");
+                }
             }
             let text = blaze::text::Text::load(&engine.model)?;
             let mm_kwargs: blaze::vision::Overrides = match mm_processor_kwargs.as_deref().filter(|s| !s.trim().is_empty()) {
