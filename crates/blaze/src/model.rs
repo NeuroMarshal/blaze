@@ -2336,7 +2336,7 @@ impl Model {
             format: kvd.format(),
         };
         // KV in host memory: every row selects (below the budget the selection is every visible token, as dense)
-        let sparse = (sparse || self.host_kv.is_some()) && self.cfg.qsa.is_some();
+        let sparse = (sparse || self.host_kv.is_some() || std::env::var_os("BLAZE_QSA_SPARSE_ALWAYS").is_some()) && self.cfg.qsa.is_some();
         if self.cfg.qsa.is_some() {
             self.qsa_index(layer, t, spans, sparse, verify)?;
         }
