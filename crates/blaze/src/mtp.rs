@@ -229,7 +229,6 @@ impl Mtp {
         let table: Vec<i32> = (0..max_items).flat_map(|row| (0..stride).map(move |p| (row * window + p % window) as i32)).collect();
         let parts_decode = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, 1, 64) } as usize;
         let partial_rows = (ROWS * heads).max(max_items * heads * parts_decode);
-        let meta_bytes = (MAX_CHAIN + 8) * (5 * 8 * ROWS + 256) + 4096;
         let shard = model.dims.vocab;
         // a restricted head: the first `head_vocab` ids split evenly over the ranks (each reads its own rows of the
         // checkpoint's head, whatever the target's cut)
@@ -247,11 +246,17 @@ impl Mtp {
             eprintln!("blaze: MTP candidate head: the target's LM head is not plain BF16 (or --mtp-head-vocab is set): the whole vocabulary");
         }
         let no_pairs: Vec<f32> = (0..max_items).flat_map(|_| [-3.0e38f32, 0.0]).collect();
+        // metadata of one call (prepare): every item's candidate ids, the extend over at most one step's rows (a prefill
+        // chunk and every item's chain plus one) in forwards of ROWS rows, the chain steps
+        let cand_cap = if head_table.is_some() { model.opts.mtp_head_cands } else { 0 };
+        let fwd_meta = 3 * ROWS * 8 + 2 * ((max_items + 1) * 4).next_multiple_of(64);
+        let ext_fwds = (model.opts.max_chunk + max_items * (MAX_CHAIN + 1)).div_ceil(ROWS) + 1;
+        let meta_bytes = (max_items * cand_cap * 4).next_multiple_of(64) + (ext_fwds + MAX_CHAIN) * fwd_meta + 4096;
         let m = Self {
             head_lin,
             head_rows,
             head_first,
-            cand_cap: if head_table.is_some() { model.opts.mtp_head_cands } else { 0 },
+            cand_cap,
             table: head_table,
             cand_logits: b(if head_table.is_some() { max_items * model.opts.mtp_head_cands * 4 } else { 16 })?,
             use_cands: false,

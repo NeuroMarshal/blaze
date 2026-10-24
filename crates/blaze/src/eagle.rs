@@ -311,7 +311,10 @@ impl Draft {
         if tk > 0 && (max_items * tk > ROWS || td < 2 || td > 32 || tk > 16) {
             bail!("draft tree of width {tk} and depth {td} for {max_items} items (K <= 16, 2 <= D <= 32, K * items <= {ROWS})");
         }
-        let meta_bytes = (MAX_CHAIN.max(td) + 8) * (5 * 8 * ROWS + 256) + 4096;
+        // metadata of one call (prepare): the extend over at most one step's rows (a prefill chunk and every item's
+        // kept drafts plus one) in forwards of ROWS rows, then the chain or tree steps
+        let ext_fwds = (model.opts.max_chunk + max_items * (MAX_CHAIN.max(td) + 1)).div_ceil(ROWS) + 1;
+        let meta_bytes = (ext_fwds + MAX_CHAIN.max(td)) * (5 * 8 * ROWS + 256) + 4096;
         let c = cfg.candidates;
         // head rows of one call: an item each, or a tree's frontier rows
         let head_rows = max_items * tk.max(1);
