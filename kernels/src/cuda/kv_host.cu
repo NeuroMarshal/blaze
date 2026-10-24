@@ -16,10 +16,29 @@ __device__ __forceinline__ RowWords row_words(const blz_nvfp4_pool& p) {
   return {p.heads * p.dim / 8, p.heads * p.dim / 64};
 }
 
-// Copy row `src` of pool `a` to row `dst` of pool `b` (K and V, data and scales) with one warp.
+template <typename W>
+__device__ __forceinline__ void copy_words(const uint8_t* a, int64_t src, uint8_t* b, int64_t dst, int bytes, int lane) {
+  const int n = bytes / int(sizeof(W));
+  const W* s = reinterpret_cast<const W*>(a + src * bytes);
+  W* d = reinterpret_cast<W*>(b + dst * bytes);
+  for (int i = lane; i < n; i += 32) d[i] = s[i];
+}
+
+// Copy row `src` of pool `a` to row `dst` of pool `b` (K and V, data and scales) with one warp: 16-byte words when the
+// row sizes allow (a host pool is read over PCIe: 512-byte requests per warp instruction instead of 128), else 4-byte.
 __device__ __forceinline__ void copy_row(const uint8_t* ak, const uint8_t* av, const uint8_t* aks, const uint8_t* avs,
                                          int64_t src, uint8_t* bk, uint8_t* bv, uint8_t* bks, uint8_t* bvs, int64_t dst,
                                          RowWords rw, int lane) {
+  const int db = rw.data * 4, sb = rw.scale * 4;
+  if (db % 16 == 0 && sb % 16 == 0) {
+    copy_words<uint4>(ak, src, bk, dst, db, lane);
+    copy_words<uint4>(av, src, bv, dst, db, lane);
+    if (sb > 0) {
+      copy_words<uint4>(aks, src, bks, dst, sb, lane);
+      copy_words<uint4>(avs, src, bvs, dst, sb, lane);
+    }
+    return;
+  }
   const uint32_t* sk = reinterpret_cast<const uint32_t*>(ak) + src * rw.data;
   const uint32_t* sv = reinterpret_cast<const uint32_t*>(av) + src * rw.data;
   uint32_t* dk = reinterpret_cast<uint32_t*>(bk) + dst * rw.data;

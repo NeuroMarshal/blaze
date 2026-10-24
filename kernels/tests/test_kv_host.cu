@@ -113,5 +113,38 @@ int main() {
       if (tag[l] >= 0 && (tag[l] % lines != l || std::memcmp(&ck[l * data_row], &hk[tag[l] * data_row], data_row))) ++bad;
   }
   std::printf("12 rounds: %d rows filled from host memory, %d mismatches %s\n", filled_total, bad, bad ? "FAIL" : "ok");
+  // bandwidth of gathers from host memory without the cache: 64 rows x 2048 slots of a 200k-slot pool
+  {
+    const int big = 200000, rws = 64, cnt = 2048;
+    uint8_t *bk, *bv, *bks, *bvs;
+    for (uint8_t** p : {&bk, &bv}) check(cudaHostAlloc(p, size_t(big) * data_row, cudaHostAllocMapped), "host alloc");
+    for (uint8_t** p : {&bks, &bvs}) check(cudaHostAlloc(p, size_t(big) * scale_row, cudaHostAllocMapped), "host alloc");
+    blz_nvfp4_pool bp{dev(bk), dev(bv), dev(bks), dev(bvs), nullptr, nullptr, heads, dim, 0};
+    uint8_t *gk, *gv, *gks, *gvs;
+    check(cudaMalloc(&gk, size_t(rws) * cnt * data_row), "malloc");
+    check(cudaMalloc(&gv, size_t(rws) * cnt * data_row), "malloc");
+    check(cudaMalloc(&gks, size_t(rws) * cnt * scale_row), "malloc");
+    check(cudaMalloc(&gvs, size_t(rws) * cnt * scale_row), "malloc");
+    blz_nvfp4_pool go{gk, gv, gks, gvs, nullptr, nullptr, heads, dim, 0};
+    std::vector<int32_t> t(size_t(rws) * cnt), c(rws, cnt);
+    for (auto& v : t) v = int32_t(rng() % big);
+    int32_t *dt, *dc;
+    check(cudaMalloc(&dt, t.size() * 4), "malloc");
+    check(cudaMalloc(&dc, rws * 4), "malloc");
+    check(cudaMemcpy(dt, t.data(), t.size() * 4, cudaMemcpyHostToDevice), "copy");
+    check(cudaMemcpy(dc, c.data(), rws * 4, cudaMemcpyHostToDevice), "copy");
+    blz_nvfp4_row_cache none{};
+    cudaEvent_t a0, a1;
+    cudaEventCreate(&a0), cudaEventCreate(&a1);
+    check(blz_kv_host_gather(bp, none, dt, cnt, dc, rws, cnt, go, cnt, nullptr, nullptr, 0, 0), "gather");
+    cudaEventRecord(a0);
+    for (int i = 0; i < 5; ++i) blz_kv_host_gather(bp, none, dt, cnt, dc, rws, cnt, go, cnt, nullptr, nullptr, 0, 0);
+    cudaEventRecord(a1);
+    check(cudaEventSynchronize(a1), "time");
+    float ms = 0;
+    cudaEventElapsedTime(&ms, a0, a1);
+    const double bytes = double(rws) * cnt * 2 * (data_row + scale_row);
+    std::printf("gather from host memory: %.1f MB in %.2f ms, %.1f GB/s\n", bytes / 1e6, ms / 5, bytes / (ms / 5) / 1e6);
+  }
   return bad ? 1 : 0;
 }
