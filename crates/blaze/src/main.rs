@@ -89,11 +89,11 @@ struct EngineArgs {
     /// vocabulary). Cuts the draft's head bandwidth; drafts of tokens beyond N are never proposed
     #[arg(long, default_value_t = 0)]
     mtp_head_vocab: usize,
-    /// MTP drafter: score only the tokens a request has seen plus the 4096 most frequent ids, at most this many per rank
-    /// (0: the whole vocabulary). The draft step reads those rows of the LM head instead of all of it; proposals are only
-    /// guesses, the verify decides
-    #[arg(long, default_value_t = 0)]
-    mtp_head_cands: usize,
+    /// MTP drafter: its head scores the tokens a request has seen plus the lowest ids of each script (ASCII, Cyrillic, CJK,
+    /// other), at most this many ids per rank (0: the whole vocabulary; default 32768 with `--spec-method mtp`). A draft
+    /// step then reads those rows of the LM head instead of all of it; proposals are only guesses, the verify decides
+    #[arg(long)]
+    mtp_head_cands: Option<usize>,
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
@@ -197,7 +197,7 @@ impl EngineArgs {
                 draft: self.draft_model.clone(),
                 mtp_window: self.mtp_window,
                 mtp_head_vocab: self.mtp_head_vocab,
-                mtp_head_cands: self.mtp_head_cands,
+                mtp_head_cands: self.mtp_head_cands.unwrap_or(0),
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
                 tree_levels: if self.spec_defaults()?.1 > 1 { self.draft_tree_depth } else { 0 },
@@ -644,6 +644,9 @@ fn main() -> Result<()> {
                 if engine.mtp_window == 0 {
                     engine.mtp_window = 8192;
                 }
+                if engine.mtp_head_cands.is_none() && engine.mtp_head_vocab == 0 {
+                    engine.mtp_head_cands = Some(32768);
+                }
                 if engine.draft_tree_width.is_some_and(|w| w > 1) {
                     anyhow::bail!("--spec-method mtp drafts chains: no --draft-tree-width");
                 }
@@ -697,8 +700,8 @@ fn main() -> Result<()> {
                     spec_tokens: spec_ngram.unwrap_or(engine.spec_defaults()?.2),
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
-                    draft_cands: engine.mtp_head_cands > 0 && engine.mtp_window > 0,
-                    frequent: if engine.mtp_head_cands > 0 && engine.mtp_window > 0 { text.frequent_ids(vocab, 12288, 6144, 6144, 3072) } else { Vec::new() },
+                    draft_cands: engine.mtp_head_cands.unwrap_or(0) > 0 && engine.mtp_window > 0,
+                    frequent: if engine.mtp_head_cands.unwrap_or(0) > 0 && engine.mtp_window > 0 { text.frequent_ids(vocab, 12288, 6144, 6144, 3072) } else { Vec::new() },
                     spec_method: match (spec_method.as_str(), drafter) {
                         ("ngram", _) => blaze::sched::SpecMethod::Ngram,
                         ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,
