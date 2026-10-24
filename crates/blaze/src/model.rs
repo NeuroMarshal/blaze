@@ -1446,7 +1446,8 @@ impl Model {
     }
 
     fn alloc_work(cfg: &ModelConfig, d: &Dims, world: usize, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
-        let t = opts.max_chunk;
+        // every forward forward() lets through: a prefill chunk, or a verify step of max_seqs x verify rows
+        let t = meta.max_tokens;
         let h = cfg.hidden;
         let mut proj_cols = 0;
         for l in layers {
