@@ -211,6 +211,9 @@ pub struct Options {
     /// VRAM on GPU 0 the vision tower would take there: kept for it by a dense model's KV (auto); a model with routed
     /// experts gives it to the expert slots (the tower takes the GPU only when room is left, else the CPU)
     pub vision_vram: usize,
+    /// QSA models: KV pools in pinned host memory, read through a device row cache (decode) and a staged prefix
+    /// (prefill); their VRAM goes to expert slots
+    pub kv_host: bool,
     pub max_chunk: usize,
     pub max_seqs: usize,
     pub moe_threads: usize,
@@ -275,11 +278,13 @@ pub enum KvDtype {
 /// for opts.max_tokens tokens of this rank's heads.
 fn alloc_kv(opts: &Options, cfg: &ModelConfig, dims: &Dims, n_full: usize, s: &Stream) -> Result<(Vec<[DevBuf; 4]>, Vec<DevBuf>)> {
     let (code_bytes, scale_bytes) = opts.kv_dtype.bytes();
+    let host = opts.kv_host && cfg.qsa.is_some();
+    let buf = |b: usize| if host { DevBuf::host_mapped(b) } else { DevBuf::zeroed(b, s) };
     let mut kv = Vec::new();
     for _ in 0..n_full {
         let values = (opts.max_tokens * dims.kv_heads * cfg.attn.head_dim) as f64;
         let (codes, scales) = ((values * code_bytes) as usize, ((values * scale_bytes) as usize).max(16));
-        kv.push([DevBuf::zeroed(codes, s)?, DevBuf::zeroed(codes, s)?, DevBuf::zeroed(scales, s)?, DevBuf::zeroed(scales, s)?]);
+        kv.push([buf(codes)?, buf(codes)?, buf(scales)?, buf(scales)?]);
     }
     let mut qsa_comp = Vec::new();
     if let Some(q) = &cfg.qsa {
@@ -462,6 +467,49 @@ const QSA_TABLE_STRIDE: usize = 2056;
 pub struct Span {
     pub offset: usize,
     pub len: usize,
+    /// the sequence's KV length after the span and its row of the KV table
+    pub kv_len: usize,
+    pub row: usize,
+}
+
+/// --kv-host: what reads a KV pool kept in host memory. Decode and verify rows gather their selected slots through a
+/// device row cache per softmax layer into `compact` (row r * QSA_TABLE_STRIDE + j, GATHER_ROWS rows at a time, read
+/// with the `identity` table); a prefill span stages its sequence's whole prefix into `stage` (rows = positions) and its
+/// rows select through `stage_rt` (position -> itself).
+struct HostKv {
+    caches: Vec<[DevBuf; 5]>,
+    lines: usize,
+    compact: [DevBuf; 4],
+    identity: DevBuf,
+    fills: DevBuf,
+    fill_n: DevBuf,
+    stage: [DevBuf; 4],
+    stage_rt: DevBuf,
+}
+
+/// Rows of one gather into the compact pool.
+const GATHER_ROWS: usize = 64;
+
+impl HostKv {
+    /// Row cache of softmax layer `slot` (tag, K / V data, K / V scales).
+    fn cache(&self, slot: usize) -> sys::blz_nvfp4_row_cache {
+        let c = &self.caches[slot];
+        sys::blz_nvfp4_row_cache { tag: c[0].ptr(), k_data: c[1].ptr(), v_data: c[2].ptr(), k_scale: c[3].ptr(), v_scale: c[4].ptr(), lines: self.lines as c_int }
+    }
+}
+
+fn pool_view(b: &[DevBuf; 4], g: &DevBuf, heads: usize, dim: usize, format: c_int) -> sys::blz_nvfp4_pool {
+    sys::blz_nvfp4_pool {
+        k_data: b[0].ptr(),
+        v_data: b[1].ptr(),
+        k_scale: b[2].ptr(),
+        v_scale: b[3].ptr(),
+        k_g: g.ptr(),
+        v_g: g.ptr(),
+        heads: heads as c_int,
+        dim: dim as c_int,
+        format,
+    }
 }
 
 /// Activations of one forward of up to max_chunk tokens.
@@ -611,6 +659,7 @@ pub struct Model {
     qsa_ring_save: Vec<DevBuf>,
     hist_save: std::cell::RefCell<Vec<[i64; 2]>>,
     req_to_token: DevBuf,
+    host_kv: Option<HostKv>,
     // GDN states: conv [seqs, channels, kernel - 1] bf16, recurrent [seqs, v_heads, dk, dv] f32
     conv_state: Vec<DevBuf>,
     rec_state: Vec<DevBuf>,
@@ -1130,6 +1179,7 @@ impl Model {
             qsa_ring_save,
             hist_save: std::cell::RefCell::new(vec![[0, 0]; opts.max_seqs]),
             req_to_token,
+            host_kv: None,
             conv_state,
             rec_state,
             records,
@@ -1183,19 +1233,73 @@ impl Model {
         if let Some(auto) = model.opts.kv_auto.clone() {
             model.size_kv(&auto)?;
         }
+        if model.opts.kv_host && model.cfg.qsa.is_some() {
+            model.init_host_kv()?;
+        }
         if let MlpConfig::Moe { top_k, .. } = model.cfg.mlp {
             model.moe = Some(model.start_moe(dir, top_k)?);
         }
         Ok(model)
     }
 
+    /// The readers of a KV pool in host memory (--kv-host): a row cache per softmax layer of four selections per live
+    /// sequence (decode tokens select mostly the same rows), the compact pool of GATHER_ROWS rows, the staging pool of one
+    /// sequence's prefix.
+    fn init_host_kv(&mut self) -> Result<()> {
+        let s = &self.stream;
+        let q = self.cfg.qsa.as_ref().unwrap();
+        let (code_bytes, scale_bytes) = self.opts.kv_dtype.bytes();
+        let values = (self.dims.kv_heads * self.cfg.attn.head_dim) as f64;
+        let (row_codes, row_scales) = ((values * code_bytes) as usize, (values * scale_bytes) as usize);
+        let lines = (4 * q.budget * self.opts.max_seqs.max(1)).next_power_of_two();
+        let mut caches = Vec::new();
+        for _ in 0..self.kv.len() {
+            let tag = DevBuf::new(lines * 4)?;
+            check(unsafe { sys::cudaMemsetAsync(tag.ptr(), 0xff, lines * 4, s.0) }, "row cache tags")?;
+            caches.push([tag, DevBuf::new(lines * row_codes)?, DevBuf::new(lines * row_codes)?, DevBuf::new(lines * row_scales.max(4))?,
+                         DevBuf::new(lines * row_scales.max(4))?]);
+        }
+        let crow = GATHER_ROWS * QSA_TABLE_STRIDE;
+        let compact = [DevBuf::new(crow * row_codes)?, DevBuf::new(crow * row_codes)?, DevBuf::new(crow * row_scales.max(4))?,
+                       DevBuf::new(crow * row_scales.max(4))?];
+        let identity: Vec<i32> = (0..crow as i32).collect();
+        let ctx = self.ctx_stride();
+        let stage = [DevBuf::new(ctx * row_codes)?, DevBuf::new(ctx * row_codes)?, DevBuf::new(ctx * row_scales.max(4))?,
+                     DevBuf::new(ctx * row_scales.max(4))?];
+        let stage_rt: Vec<i32> = (0..ctx as i32).collect();
+        self.host_kv = Some(HostKv {
+            caches,
+            lines,
+            compact,
+            identity: DevBuf::from_slice(&identity)?,
+            fills: DevBuf::new(crow * 12)?,
+            fill_n: DevBuf::zeroed(4, s)?,
+            stage,
+            stage_rt: DevBuf::from_slice(&stage_rt)?,
+        });
+        s.sync()?;
+        if self.tp.rank == 0 {
+            let gib = (1u64 << 30) as f64;
+            let pool: usize = self.kv.iter().flatten().map(DevBuf::bytes).sum();
+            eprintln!(
+                "blaze: KV in host memory: {:.2} GiB pinned; VRAM {:.2} GiB of row caches ({lines} rows a layer), {:.2} GiB staging, {:.2} GiB compact",
+                pool as f64 / gib,
+                (self.kv.len() * lines * (2 * row_codes + 2 * row_scales + 4)) as f64 / gib,
+                (ctx * 2 * (row_codes + row_scales)) as f64 / gib,
+                (crow * 2 * (row_codes + row_scales)) as f64 / gib
+            );
+        }
+        Ok(())
+    }
+
     /// Bytes of KV cache state one token takes on this rank (pools, QSA index keys, its req_to_token entry while the
-    /// context grows, QSA score rows).
+    /// context grows, QSA score rows; with --kv-host the pools are host memory and count apart, `host_kv_token_bytes`).
     fn kv_token_bytes(&self) -> usize {
         let (code_bytes, scale_bytes) = self.opts.kv_dtype.bytes();
         let values = (self.dims.kv_heads * self.cfg.attn.head_dim) as f64;
         let n_full = self.kv.len();
-        let mut b = n_full as f64 * 2.0 * values * (code_bytes + scale_bytes);
+        let pools = if self.opts.kv_host && self.cfg.qsa.is_some() { 0.0 } else { 1.0 };
+        let mut b = pools * n_full as f64 * 2.0 * values * (code_bytes + scale_bytes);
         if let Some(q) = &self.cfg.qsa {
             b += (n_full * q.head_dim * 2) as f64 / q.compress_ratio as f64 + (QSA_SCORE_ROWS * 4) as f64 / q.compress_ratio as f64;
         }
@@ -1215,14 +1319,25 @@ impl Model {
             + if self.tp.rank == 0 && !moe { self.opts.vision_vram } else { 0 };
         let reserve = (self.opts.reserve_gib * gib) as usize;
         // the probe pools are given back: they count as free
-        let probe: usize = self.kv.iter().flatten().map(DevBuf::bytes).sum::<usize>() + self.qsa_comp.iter().map(DevBuf::bytes).sum::<usize>();
+        let probe: usize = self.kv.iter().flatten().map(DevBuf::owned_bytes).sum::<usize>() + self.qsa_comp.iter().map(DevBuf::bytes).sum::<usize>();
         let budget = (free + probe).saturating_sub(later + reserve);
         let per_token = self.kv_token_bytes();
         let positions = self.cfg.max_positions;
         // contexts the pools serve at most: every live sequence and every prompt-cache snapshot at full length
         let cap = (self.opts.max_seqs + self.opts.cache_rows).max(1) * positions;
         let mut tokens = budget / per_token;
-        if moe {
+        let host = self.opts.kv_host && self.cfg.qsa.is_some();
+        if host {
+            // pools in pinned RAM: every live sequence at full length, within an eighth of the available RAM (the
+            // experts' pinned copies take the most of it)
+            let (code_bytes, scale_bytes) = self.opts.kv_dtype.bytes();
+            let host_token = (self.kv.len() as f64 * 2.0 * (self.dims.kv_heads * self.cfg.attn.head_dim) as f64 * (code_bytes + scale_bytes)) as usize;
+            let avail = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|m| m.lines().find(|l| l.starts_with("MemAvailable:"))?.split_whitespace().nth(1)?.parse::<usize>().ok())
+                .map_or(16usize << 30, |kib| kib << 10);
+            tokens = tokens.min(self.opts.max_seqs.max(1) * positions).min(avail / 8 / host_token.max(1));
+        } else if moe {
             // every GiB of expert slots speeds up every token, KV beyond the contexts in use none: MOE_AUTO_CONTEXT
             // tokens shared by the sequences (pages are taken as they grow), within half of what is left
             tokens = (budget / 2 / per_token).min(positions.min(MOE_AUTO_CONTEXT));
@@ -2125,7 +2240,13 @@ impl Model {
                 }
             }
         }
+        // KV in host memory: a prefill span's rows read its staged prefix, rows = positions (stage_rt)
+        let host_rt = self.host_kv.as_ref().filter(|_| !verify).map(|h| h.stage_rt.ptr::<i32>());
         for (r0, n, same) in passes {
+            let (rt, rt_stride) = match host_rt {
+                Some(p) if same => (p, 0i64),
+                _ => (self.req_to_token.ptr::<i32>(), self.ctx_stride() as i64),
+            };
             check(
                 unsafe {
                     sys::blz_qsa_scores(qbuf.ptr(), q.heads as c_int, q.head_dim as c_int, self.meta_ptr(m.positions), self.meta_ptr(m.tok_row),
@@ -2137,8 +2258,8 @@ impl Model {
             check(
                 unsafe {
                     sys::blz_qsa_select(scores.ptr(), max_blocks as i64, self.meta_ptr(m.positions), self.meta_ptr(m.tok_row), r0 as c_int,
-                                        n as c_int, q.compress_ratio as c_int, block_topk as c_int, self.req_to_token.ptr(),
-                                        self.ctx_stride() as i64, table.ptr(), QSA_TABLE_STRIDE as i64, counts.ptr(), s.0)
+                                        n as c_int, q.compress_ratio as c_int, block_topk as c_int, rt, rt_stride, table.ptr(),
+                                        QSA_TABLE_STRIDE as i64, counts.ptr(), s.0)
                 },
                 "qsa select",
             )?;
@@ -2193,6 +2314,16 @@ impl Model {
             },
             "kv_store",
         )?;
+        if let Some(h) = &self.host_kv {
+            // the rewritten slots' cached rows are stale
+            check(
+                unsafe {
+                    sys::blz_nvfp4_row_cache_invalidate(h.cache(layer.slot), sys::blz_index_ptr { ptr: self.meta_ptr::<i64>(m.locs).cast(), kind: sys::BLZ_I64 },
+                                                        t as i64, s.0)
+                },
+                "row cache invalidate",
+            )?;
+        }
         let view = sys::blz_nvfp4_pool {
             k_data: pool[0].ptr(),
             v_data: pool[1].ptr(),
@@ -2204,7 +2335,8 @@ impl Model {
             dim: hd as c_int,
             format: kvd.format(),
         };
-        let sparse = sparse && self.cfg.qsa.is_some();
+        // KV in host memory: every row selects (below the budget the selection is every visible token, as dense)
+        let sparse = (sparse || self.host_kv.is_some()) && self.cfg.qsa.is_some();
         if self.cfg.qsa.is_some() {
             self.qsa_index(layer, t, spans, sparse, verify)?;
         }
@@ -2212,8 +2344,8 @@ impl Model {
             // every row attends to its selected slots: the selection table is a KV table of one-row "sequences"
             // in groups of SPARSE_ROWS rows: the split-K partials then need room for one group only
             let (table, counts, rows) = (w.qsa_table.as_ref().unwrap(), w.qsa_counts.as_ref().unwrap(), w.qsa_rows.as_ref().unwrap());
-            for r0 in (0..t).step_by(SPARSE_ROWS) {
-                let n = (t - r0).min(SPARSE_ROWS);
+            // rows [r0, r0 + n) attend through `tab` (QSA_TABLE_STRIDE per row) to rows of the pool `pv`
+            let mha = |r0: usize, n: usize, pv: sys::blz_nvfp4_pool, tab: *const i32| -> Result<()> {
                 let splits = (4 * self.num_sms / (n * kvh)).clamp(1, 16);
                 check(
                     unsafe {
@@ -2222,8 +2354,8 @@ impl Model {
                             (heads * hd) as i64,
                             hd as i64,
                             heads as c_int,
-                            view,
-                            table.at::<i32>(r0 * QSA_TABLE_STRIDE),
+                            pv,
+                            tab,
                             QSA_TABLE_STRIDE as i64,
                             sys::blz_index_ptr { ptr: rows.ptr::<i32>().cast(), kind: sys::BLZ_I32 },
                             sys::blz_index_ptr { ptr: counts.at::<i32>(r0).cast(), kind: sys::BLZ_I32 },
@@ -2241,7 +2373,54 @@ impl Model {
                         )
                     },
                     "qsa mha",
-                )?;
+                )
+            };
+            match &self.host_kv {
+                None => {
+                    for r0 in (0..t).step_by(SPARSE_ROWS) {
+                        mha(r0, (t - r0).min(SPARSE_ROWS), view, table.at::<i32>(r0 * QSA_TABLE_STRIDE))?;
+                    }
+                }
+                Some(h) => {
+                    let format = view.format;
+                    let compact = pool_view(&h.compact, &self.kv_global, kvh, hd, format);
+                    let stage = pool_view(&h.stage, &self.kv_global, kvh, hd, format);
+                    let cache = h.cache(layer.slot);
+                    let no_cache = sys::blz_nvfp4_row_cache { tag: null_mut(), k_data: null_mut(), v_data: null_mut(), k_scale: null_mut(), v_scale: null_mut(), lines: 0 };
+                    for (i, sp) in spans.iter().enumerate() {
+                        if sp.len > 1 && !verify {
+                            // a prefill span: its sequence's prefix (this chunk included) staged with sequential reads
+                            check(
+                                unsafe {
+                                    sys::blz_kv_host_gather(view, no_cache, self.req_to_token.at::<i32>(sp.row * self.ctx_stride()), 0,
+                                                            self.meta_ptr::<i32>(m.kv_lens + i * 4), 1, sp.kv_len as c_int, stage, 0,
+                                                            null_mut(), null_mut(), 0, s.0)
+                                },
+                                "kv host stage",
+                            )?;
+                            for r0 in (sp.offset..sp.offset + sp.len).step_by(SPARSE_ROWS) {
+                                mha(r0, (sp.offset + sp.len - r0).min(SPARSE_ROWS), stage, table.at::<i32>(r0 * QSA_TABLE_STRIDE))?;
+                            }
+                            continue;
+                        }
+                        // decode and verify rows: their selections through the row cache into the compact pool
+                        for r0 in (sp.offset..sp.offset + sp.len).step_by(GATHER_ROWS) {
+                            let n = (sp.offset + sp.len - r0).min(GATHER_ROWS);
+                            let cap = (n * QSA_TABLE_STRIDE) as c_int;
+                            check(unsafe { sys::cudaMemsetAsync(h.fill_n.ptr(), 0, 4, s.0) }, "fill count")?;
+                            check(
+                                unsafe {
+                                    sys::blz_kv_host_gather(view, cache, table.at::<i32>(r0 * QSA_TABLE_STRIDE), QSA_TABLE_STRIDE as i64,
+                                                            counts.at::<i32>(r0), n as c_int, QSA_TABLE_STRIDE as c_int, compact,
+                                                            QSA_TABLE_STRIDE as i64, h.fills.ptr(), h.fill_n.ptr(), cap, s.0)
+                                },
+                                "kv host gather",
+                            )?;
+                            check(unsafe { sys::blz_kv_host_fill(cache, compact, h.fills.ptr(), h.fill_n.ptr(), cap, s.0) }, "kv host fill")?;
+                            mha(r0, n, compact, h.identity.ptr())?;
+                        }
+                    }
+                }
             }
             check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
             a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;

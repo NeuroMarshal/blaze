@@ -723,7 +723,7 @@ impl Engine {
             let kv_len = seq.len() + t.len();
             m.sparse |= kv_len > self.info.qsa_budget;
             let offset = m.tokens.len();
-            m.spans.push(Span { offset, len: t.len() });
+            m.spans.push(Span { offset, len: t.len(), kv_len, row: seq.row });
             let start = seq.len();
             if let Some(mm) = &seq.mm {
                 m.segs.extend(mm.segments(start, t.len(), offset));

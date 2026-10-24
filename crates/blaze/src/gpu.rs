@@ -128,6 +128,9 @@ pub struct DevBuf {
     bytes: usize,
     /// false: a view of another buffer's memory (not freed)
     owned: bool,
+    /// pinned host memory mapped into the device (host_mapped): its host address, freed with cudaFreeHost; ptr is
+    /// its device address
+    host: *mut c_void,
 }
 
 // SAFETY: a device allocation is not tied to a host thread.
@@ -138,7 +141,26 @@ impl DevBuf {
     pub fn new(bytes: usize) -> Result<Self> {
         let mut ptr = null_mut();
         check(unsafe { sys::cudaMalloc(&mut ptr, bytes.max(1)) }, &format!("cudaMalloc({bytes} B)"))?;
-        Ok(Self { ptr, bytes, owned: true })
+        Ok(Self { ptr, bytes, owned: true, host: null_mut() })
+    }
+
+    /// Zeroed pinned host memory mapped into the device address space: kernels read and write it over PCIe through
+    /// ptr() (KV pools kept in RAM).
+    pub fn host_mapped(bytes: usize) -> Result<Self> {
+        let mut host = null_mut();
+        check(
+            unsafe { sys::cudaHostAlloc(&mut host, bytes.max(1), sys::HOST_ALLOC_MAPPED | sys::HOST_ALLOC_PORTABLE) },
+            &format!("cudaHostAlloc({bytes} B)"),
+        )?;
+        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
+        let mut ptr = null_mut();
+        check(unsafe { sys::cudaHostGetDevicePointer(&mut ptr, host, 0) }, "cudaHostGetDevicePointer")?;
+        Ok(Self { ptr, bytes, owned: true, host })
+    }
+
+    /// Whether this buffer is host memory (host_mapped).
+    pub fn is_host(&self) -> bool {
+        !self.host.is_null()
     }
 
     pub fn zeroed(bytes: usize, s: &Stream) -> Result<Self> {
@@ -160,12 +182,12 @@ impl DevBuf {
     /// The first `bytes` of this buffer as a buffer that does not own them (scratch reuse between buffers that are
     /// never live at once); the caller keeps this buffer alive longer than the view.
     pub fn view(&self, bytes: usize) -> Option<Self> {
-        (bytes <= self.bytes).then_some(Self { ptr: self.ptr, bytes, owned: false })
+        (bytes <= self.bytes).then_some(Self { ptr: self.ptr, bytes, owned: false, host: null_mut() })
     }
 
-    /// Bytes this buffer owns (0 for a view).
+    /// Device bytes this buffer owns (0 for a view or host memory).
     pub fn owned_bytes(&self) -> usize {
-        if self.owned { self.bytes } else { 0 }
+        if self.owned && self.host.is_null() { self.bytes } else { 0 }
     }
 
     pub fn ptr<T>(&self) -> *mut T {
@@ -218,7 +240,9 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        if self.owned {
+        if !self.host.is_null() {
+            unsafe { sys::cudaFreeHost(self.host) };
+        } else if self.owned {
             unsafe { sys::cudaFree(self.ptr) };
         }
     }

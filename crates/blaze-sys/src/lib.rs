@@ -248,6 +248,30 @@ pub struct blz_nvfp4_pool {
     pub format: c_int,
 }
 
+/// Device cache of the rows of a pool kept in host memory (blaze/qsa.h): row `slot` at line slot % lines when
+/// tag[line] == slot.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_nvfp4_row_cache {
+    pub tag: *mut i32,
+    pub k_data: *mut u8,
+    pub v_data: *mut u8,
+    pub k_scale: *mut u8,
+    pub v_scale: *mut u8,
+    pub lines: c_int,
+}
+
+unsafe extern "C" {
+    pub fn blz_nvfp4_row_cache_invalidate(cache: blz_nvfp4_row_cache, loc: blz_index_ptr, n: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_qsa_stage(pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64, req_indices: blz_index_ptr, cu_k: *const i32,
+                               batch: c_int, max_k: i64, out: blz_nvfp4_pool, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_kv_host_gather(pool: blz_nvfp4_pool, cache: blz_nvfp4_row_cache, table: *const i32, ldt: i64, counts: *const i32, rows: c_int,
+                              max_count: c_int, out: blz_nvfp4_pool, out_stride: i64, fills: *mut i32, fill_n: *mut i32, fill_cap: c_int,
+                              s: cudaStream_t) -> cudaError_t;
+    pub fn blz_kv_host_fill(cache: blz_nvfp4_row_cache, out: blz_nvfp4_pool, fills: *const i32, fill_n: *const i32, fill_cap: c_int,
+                            s: cudaStream_t) -> cudaError_t;
+}
+
 pub const BLZ_KV_NVFP4: c_int = 0;
 pub const BLZ_KV_FP8: c_int = 1;
 pub const BLZ_KV_BF16: c_int = 2;
