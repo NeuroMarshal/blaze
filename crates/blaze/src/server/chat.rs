@@ -64,18 +64,8 @@ pub(super) struct Prepared {
     pub starts_in_reasoning: bool,
     /// tool_choice forces a call: a grammar for the start of the answer
     pub forced_call: Option<String>,
-}
-
-/// Content parts the server cannot read (it has no vision or audio encoder).
-fn reject_media(body: &Value) -> Checked<()> {
-    const MEDIA: [&str; 8] = ["image_url", "image", "input_image", "video_url", "video", "input_audio", "audio_url", "audio"];
-    let parts = body.get("messages").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("content")?.as_array());
-    for part in parts.flatten() {
-        if let Some(t) = part.get("type").and_then(Value::as_str).filter(|t| MEDIA.contains(t)) {
-            return Err(bad_param("messages", format!("content part '{t}' is not supported: this server has no vision or audio encoder")));
-        }
-    }
-    Ok(())
+    /// where each image's rows start in `tokens` (one per image, in prompt order)
+    pub image_starts: Vec<usize>,
 }
 
 /// Text of a message's content (a string, or the text parts of a list).
@@ -112,12 +102,11 @@ fn forced_call_grammar(parser: Option<&str>, names: &[String], single: bool) -> 
 
 /// The prompt of a chat request body (`model` filled in when absent): template, tools, tool_choice, thinking switch,
 /// add_generation_prompt / continue_final_message; its tokens within the context.
-pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool) -> Checked<Prepared> {
+pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool, images: &[super::media::Part]) -> Checked<Prepared> {
     let Some(formatter) = st.formatter.as_ref() else { return Err(error(StatusCode::BAD_REQUEST, "this model has no chat template")) };
     if body.get("model").is_none_or(Value::is_null) {
         body["model"] = json!(st.cfg.served_name);
     }
-    reject_media(body)?;
     let request: CreateChatCompletionRequest = serde_json::from_value(body.clone())
         .map_err(|e| error(StatusCode::BAD_REQUEST, format!("bad request: {e}")))?;
     if request.messages.is_empty() {
@@ -185,14 +174,24 @@ pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool) ->
         prompt.truncate(at + tail.len());
     }
     let mut tokens: Vec<i64> = st.text.encode(&prompt).map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?.into_iter().map(i64::from).collect();
-    truncate_prompt(st, body, &mut tokens);
+    let image_starts = if images.is_empty() {
+        truncate_prompt(st, body, &mut tokens);
+        Vec::new()
+    } else {
+        if body.get("truncate_prompt_tokens").is_some_and(|v| !v.is_null()) {
+            return Err(bad_param("truncate_prompt_tokens", "truncate_prompt_tokens cannot be combined with images"));
+        }
+        let (t, starts) = super::media::expand(st, tokens, images)?;
+        tokens = t;
+        starts
+    };
     if enforce_context {
         check_fits(st, tokens.len())?;
     }
     let starts_in_reasoning = !continue_final
         && matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"))
         && prompt.trim_end_matches('\n').ends_with("<think>");
-    Ok(Prepared { request, tokens, tools_enabled, starts_in_reasoning, forced_call })
+    Ok(Prepared { request, tokens, tools_enabled, starts_in_reasoning, forced_call, image_starts })
 }
 
 fn finish_of(f: Finish) -> ChatFinishReason {
@@ -274,17 +273,25 @@ pub(super) async fn chat(State(st): State<Arc<AppState>>, bytes: Bytes) -> Respo
 
 async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     check_ranges(&st, body)?;
-    let p = prepare(&st, body, true)?;
+    let images = super::media::gather(&st, body).await?;
+    let p = prepare(&st, body, true, &images)?;
     let n = n_of(body);
     #[allow(deprecated)]
     let max_tokens = p.request.max_completion_tokens.or(p.request.max_tokens).map(|x| x as usize).unwrap_or(st.cfg.default_max_tokens);
     let stream = p.request.stream.unwrap_or(false);
     let include_usage = p.request.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let include_reasoning = body.get("include_reasoning").and_then(Value::as_bool).unwrap_or(true);
-    let spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning));
+    let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning));
+    // images: encoded now (the prompt fits the context), their rows in the token list become prefix-cache keys
+    let mut tokens = p.tokens.clone();
+    if !images.is_empty() {
+        let mm = super::media::encode(&st, images, p.image_starts.clone()).await?;
+        mm.keyed(&mut tokens);
+        spec.mm = Some(mm);
+    }
     // with reasoning first, the grammar applies to the answer after </think>
     let after = p.starts_in_reasoning.then(|| st.text.token_id("</think>")).flatten().map(|t| t as i32);
-    let gens = submit_n(&st, &p.tokens, &spec, n, 0, &|| constraint_of(&st, body, after, p.forced_call.as_deref()))?;
+    let gens = submit_n(&st, &tokens, &spec, n, 0, &|| constraint_of(&st, body, after, p.forced_call.as_deref()))?;
     let tools = blaze_chat::chat_tool_definitions(p.request.tools.as_deref(), &p.request.messages)
         .map_err(|e| error(StatusCode::BAD_REQUEST, e.to_string()))?;
     // SGLang's separate_reasoning=false leaves the reasoning in the content

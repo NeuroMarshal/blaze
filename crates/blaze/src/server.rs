@@ -3,7 +3,10 @@
 
 mod chat;
 mod completions;
+mod media;
 mod tokenize;
+
+pub use media::{MmConfig, parse_limit};
 
 use crate::sampler::SamplingParams;
 use crate::sched::{Finish, GenEvent, GenRequest, Scheduler, ThinkBudget, TokenLogprob};
@@ -49,6 +52,7 @@ pub struct ServeConfig {
 }
 
 struct AppState {
+    mm: MmConfig,
     sched: Scheduler,
     text: Arc<Text>,
     formatter: Option<blaze_chat::ChatFormatter>,
@@ -130,7 +134,7 @@ fn parse_body(bytes: &Bytes) -> std::result::Result<Value, Response> {
 }
 
 pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cfg: ServeConfig, max_context: usize,
-                   vocab: usize) -> Result<()> {
+                   vocab: usize, mm: MmConfig) -> Result<()> {
     let template = model_dir.join("chat_template.jinja");
     let config = model_dir.join("tokenizer_config.json");
     let formatter = blaze_chat::load_chat_formatter(
@@ -150,6 +154,7 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
     }
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let state = Arc::new(AppState {
+        mm,
         sched,
         text: Arc::new(text),
         formatter,
@@ -368,6 +373,8 @@ struct Spec {
     skip_special: bool,
     stop_ids: Vec<i32>,
     think: Option<ThinkBudget>,
+    /// the prompt's images (their rows in the token list are prefix-cache keys)
+    mm: Option<Arc<crate::mm::MmInput>>,
 }
 
 impl Spec {
@@ -380,6 +387,7 @@ impl Spec {
             skip_special: body.get("skip_special_tokens").and_then(Value::as_bool).unwrap_or(true),
             stop_ids: stop_ids_of(body, &st.text),
             think,
+            mm: None,
         }
     }
 }
@@ -658,6 +666,7 @@ fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constr
             cache_points,
             think: spec.think.clone(),
             constraint,
+            mm: spec.mm.clone(),
             events: tx,
             cancel: cancel.clone(),
         })

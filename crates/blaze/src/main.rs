@@ -251,6 +251,34 @@ enum Command {
         /// requests override it with whitespace_pattern or disable_any_whitespace)
         #[arg(long, default_value_t = 64)]
         grammar_whitespace: usize,
+        /// image input (models with a vision tower): where the tower runs: gpu (resident BF16 weights, about 1 GiB of
+        /// VRAM on the first GPU), cpu (AVX2 + FMA, no VRAM), off, or auto (the GPU when it has the room after the model
+        /// is loaded, else the CPU)
+        #[arg(long, default_value = "auto")]
+        vision: blaze::vision::VisionMode,
+        /// CPU threads of the CPU vision tower (default: half the cores)
+        #[arg(long)]
+        vision_threads: Option<usize>,
+        /// vLLM's --mm-processor-kwargs: image processor settings over the checkpoint's, as JSON (min_pixels,
+        /// max_pixels, size.shortest_edge / longest_edge, ...); requests override them with mm_processor_kwargs
+        #[arg(long)]
+        mm_processor_kwargs: Option<String>,
+        /// vLLM's --limit-mm-per-prompt: most images per request, as JSON ({"image": 4}) or image=4 (default 999)
+        #[arg(long, default_value = "")]
+        limit_mm_per_prompt: String,
+        /// image_url.detail "low": cap of the image's pixels (OpenAI's low detail is 512 x 512); 0 ignores `detail` as
+        /// vLLM does. "auto" and "high" use the processor's own limits
+        #[arg(long, default_value_t = 512 * 512)]
+        mm_low_detail_pixels: u64,
+        /// seconds an http(s) image URL may take (vLLM's VLLM_IMAGE_FETCH_TIMEOUT)
+        #[arg(long, default_value_t = 5)]
+        image_fetch_timeout: u64,
+        /// largest image fetched from an http(s) URL, MiB
+        #[arg(long, default_value_t = 64)]
+        image_fetch_max_mib: usize,
+        /// vLLM's --allowed-media-domains: hosts http(s) image URLs may name, comma separated (default: any)
+        #[arg(long, default_value = "")]
+        allowed_media_domains: String,
     },
     /// Vision tower check: the encoder on a reference's pixel values (scripts/vision_ref.py) against the Hugging Face
     /// embeddings, with timings; `--image` also checks the image processor and the whole path from the file.
@@ -536,9 +564,35 @@ fn main() -> Result<()> {
             reasoning_parser,
             thinking_budget,
             grammar_whitespace,
+            vision,
+            vision_threads,
+            mm_processor_kwargs,
+            limit_mm_per_prompt,
+            mm_low_detail_pixels,
+            image_fetch_timeout,
+            image_fetch_max_mib,
+            allowed_media_domains,
         } => {
             let text = blaze::text::Text::load(&engine.model)?;
             let e = engine.load(None, false)?;
+            // after the model, so that `auto` sees the VRAM that is left; on the first GPU, whatever the tensor parallelism
+            // (the embeddings go to every rank through host memory)
+            let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+            let tower = blaze::vision::Vision::load(&engine.model, vision, vision_threads.unwrap_or((cores / 2).max(4)), 0)?;
+            let mm_kwargs = match mm_processor_kwargs.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(j) => blaze::vision::Overrides::parse(&serde_json::from_str(j).map_err(|e| anyhow::anyhow!("--mm-processor-kwargs: {e}"))?)
+                    .map_err(|e| anyhow::anyhow!("--mm-processor-kwargs: {e}"))?,
+                None => Default::default(),
+            };
+            let mm = blaze::server::MmConfig::new(
+                tower.map(std::sync::Arc::new),
+                mm_kwargs,
+                blaze::server::parse_limit(&limit_mm_per_prompt).map_err(|e| anyhow::anyhow!(e))?,
+                mm_low_detail_pixels,
+                std::time::Duration::from_secs(image_fetch_timeout),
+                image_fetch_max_mib << 20,
+                allowed_media_domains.split(',').map(str::trim).filter(|d| !d.is_empty()).map(str::to_string).collect(),
+            );
             let max_context = e.info.ctx_stride;
             let drafter = e.info.draft_window > 0;
             let vocab = e.info.vocab;
@@ -581,7 +635,7 @@ fn main() -> Result<()> {
                 grammar_whitespace,
             };
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
-            rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab))
+            rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab, mm))
         }
         Command::Generate { engine, prompt, prompt_file, max_tokens, logits } => {
             let prompt = match prompt_file {

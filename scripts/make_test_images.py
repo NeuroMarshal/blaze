@@ -57,7 +57,7 @@ def cats(path, w=1024, h=768):
 
 
 def tiny(path, w=200, h=150):
-    """Below min_pixels: the processor upscales it to 256 x 192."""
+    """Below min_pixels: the processor upscales it to 320 x 224."""
     im = Image.new("RGB", (w, h), (250, 250, 250))
     d = ImageDraw.Draw(im)
     d.ellipse((20, 20, 100, 100), fill=(230, 30, 30))

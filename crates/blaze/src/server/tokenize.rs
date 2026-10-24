@@ -7,15 +7,17 @@ pub(super) async fn tokenize(State(st): State<Arc<AppState>>, bytes: Bytes) -> R
         Ok(b) => b,
         Err(r) => return r,
     };
-    match run_tokenize(&st, &mut body) {
+    match run_tokenize(&st, &mut body).await {
         Ok(r) | Err(r) => r,
     }
 }
 
-fn run_tokenize(st: &AppState, body: &mut Value) -> Checked<Response> {
+async fn run_tokenize(st: &Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let tokens: Vec<i64> = if body.get("messages").is_some() {
-        // the chat template's prompt, whatever its length (the point is to learn that it does not fit)
-        super::chat::prepare(st, body, false)?.tokens
+        // the chat template's prompt, whatever its length (the point is to learn that it does not fit); images count
+        // with their tokens
+        let images = super::media::gather(st, body).await?;
+        super::chat::prepare(st, body, false, &images)?.tokens
     } else {
         let Some(prompt) = body.get("prompt").and_then(Value::as_str) else {
             return Err(bad_param("prompt", "give a prompt (string) or messages"));

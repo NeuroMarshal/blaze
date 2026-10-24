@@ -111,6 +111,11 @@ impl MmInput {
     }
 }
 
+/// Is `id` a prefix-cache key of an image row (see `MmInput::keyed`) rather than a vocabulary id?
+pub fn is_image_key(id: i64) -> bool {
+    id >= 1 << 62
+}
+
 /// FNV-1a over bytes (an image's content hash; collisions only cost a wrong prefix-cache hit between two different
 /// images of the same size, so 64 bits of a simple hash are enough together with the position mix in `keyed`).
 pub fn hash_bytes(data: &[u8]) -> u64 {

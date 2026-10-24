@@ -978,7 +978,7 @@ mod tests {
     fn smart_resize_matches_the_reference_sizes() {
         let s = settings();
         // sizes printed by the HF processor for the test images (grids 14x20, 20x28, 30x40, 48x64 patches)
-        assert_eq!(s.target_size(200, 150), Ok((192, 256)));
+        assert_eq!(s.target_size(200, 150), Ok((224, 320)));
         assert_eq!(s.target_size(448, 336), Ok((320, 448)));
         assert_eq!(s.target_size(640, 480), Ok((480, 640)));
         assert_eq!(s.target_size(1024, 768), Ok((768, 1024)));
