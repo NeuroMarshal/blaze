@@ -53,8 +53,9 @@ struct EngineArgs {
     expert_options: String,
     /// decode: MiB of the next linear layer's weights pulled into L2 while waiting on the all-reduce / small
     /// kernels (0: off)
-    #[arg(long, default_value_t = 4)]
-    l2_prefetch_mib: usize,
+    /// (default: a twelfth of the GPU's L2, 4 MiB on the 48 MiB of an RTX 5070 Ti, where 4 was measured best)
+    #[arg(long)]
+    l2_prefetch_mib: Option<usize>,
     /// most rows of a speculative verify (0: no speculation buffers; default: what was measured best for the draft
     /// source: 16 for EAGLE-4 trees, 9 for DFlash2 and for suffix decoding)
     #[arg(long)]
@@ -167,7 +168,7 @@ impl EngineArgs {
                 moe_gpu1_gib: self.expert_gpu1_gib,
                 moe_ram_gib: self.expert_ram_gib,
                 moe_cores: self.expert_cores.clone(),
-                l2_prefetch_mib: self.l2_prefetch_mib,
+                l2_prefetch_mib: self.l2_prefetch_mib.unwrap_or_else(|| blaze::gpu::l2_bytes().map_or(4, |b| (b / 12 + (1 << 19)) >> 20)),
                 full_logits,
                 capture_layers: Vec::new(),
                 cache_rows: self.prompt_cache_slots,
@@ -639,6 +640,21 @@ fn main() -> Result<()> {
             );
             let max_context = e.info.ctx_stride;
             let drafter = e.info.draft_window > 0;
+            {
+                let (_, _, drafts) = engine.spec_defaults()?;
+                let drafts = spec_ngram.unwrap_or(drafts);
+                let source = if !drafter { "suffix decoding" } else if e.info.tree_width > 1 { "EAGLE-4 trees" } else { "the drafter" };
+                let tree = if e.info.tree_width > 1 { format!(" (width {}, depth up to {})", e.info.tree_width, e.info.tree_levels) } else { String::new() };
+                eprintln!(
+                    "blaze: speculation: {}; L2 prefetch {} MiB",
+                    if drafts == 0 || e.info.max_verify == 0 {
+                        "off".to_string()
+                    } else {
+                        format!("{source}{tree}, {drafts} drafts, {} verify rows", e.info.max_verify)
+                    },
+                    engine.l2_prefetch_mib.unwrap_or_else(|| blaze::gpu::l2_bytes().map_or(4, |b| (b / 12 + (1 << 19)) >> 20))
+                );
+            }
             let vocab = e.info.vocab;
             let sched = blaze::sched::Scheduler::start(
                 e,

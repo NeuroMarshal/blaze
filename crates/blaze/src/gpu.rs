@@ -25,6 +25,13 @@ pub fn mem_info() -> Result<(usize, usize)> {
     Ok((free, total))
 }
 
+/// L2 cache size of GPU 0 in bytes.
+pub fn l2_bytes() -> Option<usize> {
+    let mut v = 0;
+    let e = unsafe { sys::cudaDeviceGetAttribute(&mut v, sys::ATTR_L2_CACHE_SIZE, 0) };
+    (e == 0 && v > 0).then_some(v as usize)
+}
+
 /// Start or stop the CUDA profiler's capture range (all GPUs of the process).
 pub fn profiler(start: bool) -> Result<()> {
     unsafe extern "C" {

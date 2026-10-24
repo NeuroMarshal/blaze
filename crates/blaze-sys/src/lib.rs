@@ -58,6 +58,7 @@ pub type cudaGraph_t = *mut c_void;
 pub type cudaGraphExec_t = *mut c_void;
 pub const CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
 pub const ATTR_MULTIPROCESSOR_COUNT: c_int = 16;
+pub const ATTR_L2_CACHE_SIZE: c_int = 38;
 pub const ATTR_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub const ATTR_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
