@@ -453,7 +453,8 @@ void attention(Pool& pool, std::vector<Scratch>& sc, const AttnLayout& L, const 
 
 }  // namespace
 
-extern "C" int blz_vis_cpu_encode(const blz_vis_weights* w, const uint16_t* pixels, int gh, int gw, int threads, uint16_t* out) {
+extern "C" int blz_vis_cpu_encode(const blz_vis_weights* w, const uint16_t* pixels, int gh, int gw, int threads, uint16_t* out,
+                                  float* stages) {
   const blz_vis_cfg& c = w->cfg;
   const int H = c.hidden, heads = c.heads, hd = H / heads, merge = c.merge;
   if (H % heads || hd % 4 || hd > 128 || gh % merge || gw % merge || c.intermediate % 16 || H % 16 || c.out_hidden % 16) return 1;
@@ -484,6 +485,7 @@ extern "C" int blz_vis_cpu_encode(const blz_vis_weights* w, const uint16_t* pixe
     gemm(pool, sc, px.data(), kpatch, w->patch_w, n, H, kpatch, x.data(), H);
     embed_pos(pool, x.data(), w->patch_b, w->pos_table, c.side, gh, gw, merge, H);
   }
+  if (stages) std::memcpy(stages, x.data(), sizeof(float) * nh);
   for (int l = 0; l < c.depth; ++l) {
     const blz_vis_layer& y = w->layers[l];
     layernorm(pool, x.data(), y.n1_w, y.n1_b, c.eps, n, H, xn.data());
@@ -497,6 +499,8 @@ extern "C" int blz_vis_cpu_encode(const blz_vis_weights* w, const uint16_t* pixe
     bias_act(pool, hbuf.data(), y.fc1_b, n, c.intermediate, c.act_tanh ? 1 : 2);
     gemm(pool, sc, hbuf.data(), c.intermediate, y.fc2_w, n, H, c.intermediate, xn.data(), H);
     bias_residual(pool, x.data(), xn.data(), y.fc2_b, n, H);
+    if (stages && l == 0) std::memcpy(stages + nh, x.data(), sizeof(float) * nh);
+    if (stages && l == c.depth - 1) std::memcpy(stages + 2 * nh, x.data(), sizeof(float) * nh);
   }
   // patch merger: norm per patch, merge x merge neighbours side by side, MLP with the exact GELU
   layernorm(pool, x.data(), w->mrg_norm_w, w->mrg_norm_b, c.eps, n, H, xn.data());

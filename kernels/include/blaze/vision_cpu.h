@@ -34,8 +34,10 @@ typedef struct blz_vis_weights {
 
 /// \brief Encode one image: `pixels` [grid_h * grid_w, channels * temporal * patch * patch] bf16 (normalized, patches in
 /// spatial-merge order, the still image repeated over the temporal patch) -> `out` [grid_h * grid_w / merge^2,
-/// out_hidden] bf16. Returns 0, or a nonzero code for unsupported shapes.
-int blz_vis_cpu_encode(const blz_vis_weights* w, const uint16_t* pixels, int grid_h, int grid_w, int threads, uint16_t* out);
+/// out_hidden] bf16. `stages` (NULL, or 3 * patches * hidden floats): the activations after the position embedding, after
+/// the first block and after the last block (debugging). Returns 0, or a nonzero code for unsupported shapes.
+int blz_vis_cpu_encode(const blz_vis_weights* w, const uint16_t* pixels, int grid_h, int grid_w, int threads, uint16_t* out,
+                       float* stages);
 
 #ifdef __cplusplus
 }

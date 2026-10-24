@@ -192,7 +192,7 @@ pub struct blz_vis_weights {
 
 unsafe extern "C" {
     pub fn blz_vis_cpu_encode(w: *const blz_vis_weights, pixels: *const bf16, grid_h: c_int, grid_w: c_int, threads: c_int,
-                              out: *mut bf16) -> c_int;
+                              out: *mut bf16, stages: *mut f32) -> c_int;
 }
 
 // KV cache, attention

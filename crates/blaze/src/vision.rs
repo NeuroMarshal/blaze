@@ -574,6 +574,11 @@ impl GpuEncoder {
     }
 
     pub fn encode(&self, px: &[u16], gh: usize, gw: usize) -> Result<Vec<u16>> {
+        self.encode_stages(px, gh, gw, None)
+    }
+
+    /// `stages`: receives the activations after the position embedding, the first block and the last block (bf16, debugging).
+    pub fn encode_stages(&self, px: &[u16], gh: usize, gw: usize, mut stages: Option<&mut Vec<Vec<u16>>>) -> Result<Vec<u16>> {
         let c = &self.cfg;
         gpu::set_device(self.device)?;
         let (n, h, i) = (gh * gw, c.hidden, c.intermediate);
@@ -602,8 +607,16 @@ impl GpuEncoder {
             unsafe { sys::blz_vis_embed_pos(x.ptr(), self.patch_b.ptr(), self.pos.ptr(), (c.num_pos as f64).sqrt() as i32, gh as i32, gw as i32, c.merge as i32, h as i32, s) },
             "vision pos embed",
         )?;
+        let snap = |x: &DevBuf, stages: &mut Option<&mut Vec<Vec<u16>>>| -> Result<()> {
+            if let Some(st) = stages.as_deref_mut() {
+                self.stream.sync()?;
+                st.push(x.download::<u16>(n * h)?);
+            }
+            Ok(())
+        };
+        snap(&x, &mut stages)?;
         let hd = h / c.heads;
-        for l in &self.layers {
+        for (li, l) in self.layers.iter().enumerate() {
             let w = &l.w;
             check(unsafe { sys::blz_vis_layernorm(x.ptr(), w[0].ptr(), w[1].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision ln1")?;
             g(&xn, h, &w[2], &big, 3 * h, n, 3 * h, h)?;
@@ -619,6 +632,9 @@ impl GpuEncoder {
             check(unsafe { sys::blz_vis_bias_act(big.ptr(), w[9].ptr(), n as i32, i as i32, if c.act_tanh { 1 } else { 2 }, s) }, "vision gelu")?;
             g(&big, i, &w[10], &xn, h, n, h, i)?;
             check(unsafe { sys::blz_vis_bias_residual(xn.ptr(), w[11].ptr(), x.ptr(), n as i32, h as i32, x.ptr(), s) }, "vision mlp residual")?;
+            if li == 0 || li + 1 == self.layers.len() {
+                snap(&x, &mut stages)?;
+            }
         }
         let m = &self.merger;
         check(unsafe { sys::blz_vis_layernorm(x.ptr(), m[0].ptr(), m[1].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision merger norm")?;
@@ -695,12 +711,24 @@ impl CpuEncoder {
     }
 
     pub fn encode(&self, px: &[u16], gh: usize, gw: usize) -> Result<Vec<u16>> {
+        self.encode_stages(px, gh, gw, None)
+    }
+
+    /// `stages`: receives the activations after the position embedding, the first block and the last block (fp32).
+    pub fn encode_stages(&self, px: &[u16], gh: usize, gw: usize, stages: Option<&mut Vec<f32>>) -> Result<Vec<u16>> {
         let c = &self.cfg;
         if px.len() != gh * gw * c.patch_dim() {
             bail!("{} pixel values for {} patches", px.len(), gh * gw);
         }
         let mut out = vec![0u16; gh * gw / (c.merge * c.merge) * c.out_hidden];
-        let rc = unsafe { sys::blz_vis_cpu_encode(&self.w, px.as_ptr(), gh as i32, gw as i32, self.threads as i32, out.as_mut_ptr()) };
+        let dbg = match stages {
+            Some(v) => {
+                v.resize(3 * gh * gw * c.hidden, 0.0);
+                v.as_mut_ptr()
+            }
+            None => std::ptr::null_mut(),
+        };
+        let rc = unsafe { sys::blz_vis_cpu_encode(&self.w, px.as_ptr(), gh as i32, gw as i32, self.threads as i32, out.as_mut_ptr(), dbg) };
         if rc != 0 {
             bail!("CPU vision encoder: unsupported shape (code {rc})");
         }
@@ -862,12 +890,25 @@ pub fn check_reference(model: &Path, refdir: &Path, gpu: bool, cpu: bool, thread
         report(label, &out, t0.elapsed().as_secs_f64());
         Ok(())
     };
+    // intermediate activations of the HF bf16 tower: after the position embedding, the first block, the last block
+    let stage_ref: Vec<(&str, Vec<f32>)> = ["pos_embed", "block0", "last_hidden"].iter().filter_map(|n| f32_tensor(&r, n).ok().map(|v| (*n, v))).collect();
+    let hh = cfg.hidden;
+    let report_stages = |label: &str, got: Vec<Vec<f32>>| {
+        for ((name, want), g) in stage_ref.iter().zip(got) {
+            let a: Vec<u16> = g.iter().map(|&x| to_bf16(x)).collect();
+            let (c, mn, mx, rl) = compare(&a, want, hh);
+            println!("  {label} stage {name}: cos mean {c:.5} min {mn:.4}, max abs {mx:.4}, rel L2 {rl:.4}");
+        }
+    };
     if gpu {
         let ckpt = Checkpoint::open(model)?;
         let free0 = gpu::mem_info()?.0;
         let e = GpuEncoder::load(&ckpt, &cfg, 0)?;
         let loaded = free0.saturating_sub(gpu::mem_info()?.0);
         run("GPU", &|p| e.encode(p, gh, gw))?;
+        let mut st = Vec::new();
+        e.encode_stages(&pixels, gh, gw, Some(&mut st))?;
+        report_stages("GPU", st.iter().map(|v| v.iter().map(|&b| f32::from_bits(u32::from(b) << 16)).collect()).collect());
         println!(
             "GPU VRAM: weights {:.0} MiB, activations of this image {:.0} MiB (the cuBLAS workspace and context come on top)",
             loaded as f64 / 1048576.0,
@@ -880,6 +921,10 @@ pub fn check_reference(model: &Path, refdir: &Path, gpu: bool, cpu: bool, thread
     if cpu {
         let e = CpuEncoder::load(model, &cfg, threads)?;
         run(&format!("CPU ({threads} threads)"), &|p| e.encode(p, gh, gw))?;
+        let mut st = Vec::new();
+        e.encode_stages(&pixels, gh, gw, Some(&mut st))?;
+        let n = gh * gw * hh;
+        report_stages("CPU", st.chunks(n).map(<[f32]>::to_vec).collect());
         if let (Some(path), false) = (image, gpu) {
             check_image(path, &settings, &pv, gh, gw, &|p: &Patches| e.encode(&p.pixels, p.grid_h, p.grid_w), &hf_bf16, w)?;
         }
