@@ -89,6 +89,11 @@ struct EngineArgs {
     /// vocabulary). Cuts the draft's head bandwidth; drafts of tokens beyond N are never proposed
     #[arg(long, default_value_t = 0)]
     mtp_head_vocab: usize,
+    /// MTP drafter: score only the tokens a request has seen plus the 4096 most frequent ids, at most this many per rank
+    /// (0: the whole vocabulary). The draft step reads those rows of the LM head instead of all of it; proposals are only
+    /// guesses, the verify decides
+    #[arg(long, default_value_t = 0)]
+    mtp_head_cands: usize,
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
@@ -192,6 +197,7 @@ impl EngineArgs {
                 draft: self.draft_model.clone(),
                 mtp_window: self.mtp_window,
                 mtp_head_vocab: self.mtp_head_vocab,
+                mtp_head_cands: self.mtp_head_cands,
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
                 tree_levels: if self.spec_defaults()?.1 > 1 { self.draft_tree_depth } else { 0 },
@@ -450,9 +456,9 @@ fn main() -> Result<()> {
                     let item = blaze::eagle::DraftItem { row: seq.row, aux_row: lo - c0, tokens, pos0: lo };
                     let k = if c1 == n { draft } else { 0 };
                     if c1 == n && shape.is_some() {
-                        tree = Some(e.draft_tree(blaze::eagle::DraftPlan { items: vec![item], k: 0, tree: shape })?.remove(0));
+                        tree = Some(e.draft_tree(blaze::eagle::DraftPlan { items: vec![item], k: 0, tree: shape, ..Default::default() })?.remove(0));
                     } else {
-                        drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k, tree: None })?.remove(0);
+                        drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k, tree: None, ..Default::default() })?.remove(0);
                     }
                 }
             }
@@ -496,7 +502,7 @@ fn main() -> Result<()> {
                 accepted_total += path.len() - 1;
                 let item = blaze::eagle::DraftItem { row: seq.row, aux_row: 0, tokens: emitted, pos0: start };
                 let td = Instant::now();
-                tree = Some(e.draft_tree(blaze::eagle::DraftPlan { items: vec![item], k: 0, tree: shape })?.remove(0));
+                tree = Some(e.draft_tree(blaze::eagle::DraftPlan { items: vec![item], k: 0, tree: shape, ..Default::default() })?.remove(0));
                 t_draft += td.elapsed().as_secs_f64();
             }
             while out.len() < max_tokens {
@@ -523,7 +529,7 @@ fn main() -> Result<()> {
                 accepted_total += m;
                 let item = blaze::eagle::DraftItem { row: seq.row, aux_row: 0, tokens: emitted, pos0: start };
                 let td = Instant::now();
-                drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k: draft, tree: None })?.remove(0);
+                drafts = e.draft(blaze::eagle::DraftPlan { items: vec![item], k: draft, tree: None, ..Default::default() })?.remove(0);
                 t_draft += td.elapsed().as_secs_f64();
             }
             let spec = (out.len() - 1) as f64 / t1.elapsed().as_secs_f64();
@@ -691,6 +697,7 @@ fn main() -> Result<()> {
                     spec_tokens: spec_ngram.unwrap_or(engine.spec_defaults()?.2),
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
+                    draft_cands: engine.mtp_head_cands > 0 && engine.mtp_window > 0,
                     spec_method: match (spec_method.as_str(), drafter) {
                         ("ngram", _) => blaze::sched::SpecMethod::Ngram,
                         ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,

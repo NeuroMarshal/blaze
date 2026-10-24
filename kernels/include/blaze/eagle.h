@@ -16,6 +16,10 @@ extern "C" {
 cudaError_t blz_rmsnorm_ld(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
                            uint16_t* out, int64_t ldo, cudaStream_t stream);
 
+/// \brief The best candidate of every row: pairs[r] = (max logit, id + col0) over logits[r][0..c) with ids[r][j] >= 0 (ties:
+/// the lower id; no candidate: (-3e38, 0)), the (value, index) pairs of blz_argmax_merge.
+cudaError_t blz_cand_argmax(const float* logits, const int32_t* ids, int rows, int c, int col0, float* pairs, cudaStream_t stream);
+
 /// \brief a[i] = b[i] = (int64) src[i] for i < n (a greedy pick as the next draft input and as the call's record).
 cudaError_t blz_widen_i32(const int32_t* src, int64_t* a, int64_t* b, int n, cudaStream_t stream);
 

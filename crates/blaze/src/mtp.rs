@@ -76,6 +76,12 @@ pub struct Mtp {
     /// token id of this rank's first head row
     head_first: usize,
     no_pairs: DevBuf,
+    /// candidate head: ids per item and rank (cap per call), the target's BF16 head shard, logits of the candidates
+    cand_cap: usize,
+    table: Option<*const u16>,
+    cand_logits: DevBuf,
+    /// this call scores the candidates (the plan carries them) rather than the whole shard
+    use_cands: bool,
     /// this rank's heads, KV heads and MLP rows
     heads: usize,
     kv_heads: usize,
@@ -115,8 +121,8 @@ pub struct Mtp {
     record: DevBuf,
     staging: HostMapped,
     meta: DevBuf,
-    graphs: std::collections::HashMap<(usize, usize), Graph>,
-    warmed: std::collections::HashSet<(usize, usize)>,
+    graphs: std::collections::HashMap<(usize, usize, bool), Graph>,
+    warmed: std::collections::HashSet<(usize, usize, bool)>,
     dumped: bool,
 }
 
@@ -236,11 +242,19 @@ impl Mtp {
         } else {
             None
         };
+        let head_table = model.lm_head().bf16_rows().filter(|_| head_vocab == 0 && model.opts.mtp_head_cands > 0);
+        if model.opts.mtp_head_cands > 0 && head_table.is_none() && model.tp.rank == 0 {
+            eprintln!("blaze: MTP candidate head: the target's LM head is not plain BF16 (or --mtp-head-vocab is set): the whole vocabulary");
+        }
         let no_pairs: Vec<f32> = (0..max_items).flat_map(|_| [-3.0e38f32, 0.0]).collect();
         let m = Self {
             head_lin,
             head_rows,
             head_first,
+            cand_cap: if head_table.is_some() { model.opts.mtp_head_cands } else { 0 },
+            table: head_table,
+            cand_logits: b(if head_table.is_some() { max_items * model.opts.mtp_head_cands * 4 } else { 16 })?,
+            use_cands: false,
             no_pairs: DevBuf::from_slice(&no_pairs)?,
             pre_emb: vec("mtp.pre_fc_norm_embedding.weight", h)?,
             pre_hid: vec("mtp.pre_fc_norm_hidden.weight", h)?,
@@ -343,6 +357,9 @@ impl Mtp {
             let n = spans.len();
             Fwd { pos: alloc(rows, 8), loc: alloc(rows, 8), tok: alloc(rows, 8), req: alloc(n, 4), kvl: alloc(n, 4), spans }
         };
+        // the candidate ids of every item at the start of the metadata: their address depends on the shape only
+        self.use_cands = self.cand_cap > 0 && plan.k > 0 && plan.cands.len() == n_items && plan.cands.iter().all(|c| !c.is_empty());
+        let cand_at = if self.use_cands { alloc(n_items * self.cand_cap, 4) } else { 0 };
         let steps: Vec<Fwd> = (1..plan.k).map(|_| layout((0..n_items).map(|i| (i, 1)).collect(), &mut alloc)).collect();
         let mut cur: Vec<(usize, usize)> = Vec::new();
         let mut cur_rows = 0;
@@ -371,6 +388,18 @@ impl Mtp {
         fwds.extend(steps);
         if off > self.meta.bytes() {
             bail!("MTP metadata of {off} bytes exceeds the staging buffer");
+        }
+        if self.use_cands {
+            // this rank's share: the ids of its vocabulary shard, as row numbers of its head, padded with -1
+            let (r, shard, cap) = (model.tp.rank, model.dims.vocab, self.cand_cap);
+            let mut ids = vec![-1i32; n_items * cap];
+            for (i, c) in plan.cands.iter().enumerate() {
+                let (lo, hi) = (c.partition_point(|&t| (t as usize) < r * shard), c.partition_point(|&t| (t as usize) < (r + 1) * shard));
+                for (d, &t) in ids[i * cap..(i + 1) * cap].iter_mut().zip(&c[lo..hi]) {
+                    *d = t - (r * shard) as i32;
+                }
+            }
+            self.put(cand_at, &ids);
         }
         for (f, fwd) in fwds.iter().enumerate() {
             let (mut pos, mut loc, mut tok, mut req, mut kvl) = (vec![], vec![], vec![], vec![], vec![]);
@@ -427,7 +456,7 @@ impl Mtp {
             self.dumped = true;
             return self.run_dump(model, plan, &fwds[n_ext..], Path::new(&dir));
         }
-        let key = (plan.k, n_items);
+        let key = (plan.k, n_items, self.use_cands);
         if model.opts.draft_graphs {
             self.graphed(model, key, |d| d.chain(model, n_items, &fwds[n_ext..]))?;
         } else {
@@ -500,7 +529,7 @@ impl Mtp {
     }
 
     /// Run `body` through a CUDA graph per `key`: one eager run, then the capture, then replays.
-    fn graphed(&mut self, model: &Model, key: (usize, usize), body: impl Fn(&Self) -> Result<()>) -> Result<()> {
+    fn graphed(&mut self, model: &Model, key: (usize, usize, bool), body: impl Fn(&Self) -> Result<()>) -> Result<()> {
         let s = &model.stream;
         if let Some(g) = self.graphs.get(&key) {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "MTP graph launch");
@@ -687,9 +716,38 @@ impl Mtp {
         check(unsafe { sys::blz_rmsnorm(x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 1, out, s.0) }, "MTP norm")
     }
 
+    /// The candidate head: the logits of every item's candidate ids (rows of this rank's head shard, the metadata's first
+    /// region), the best of them as this rank's pair, the pairs merged over the ranks.
+    fn head_cands(&self, model: &Model, items: usize, step: usize) -> Result<()> {
+        let (s, h, c) = (&model.stream, self.cfg.hidden, self.cand_cap);
+        let (rank, world, shard) = (model.tp.rank, model.tp.world, model.dims.vocab);
+        let ids: *const i32 = self.meta.ptr();
+        let bytes = (world * items * 8).next_multiple_of(16);
+        check(unsafe { sys::cudaMemsetAsync(self.pairs.ptr(), 0, bytes, s.0) }, "MTP memset pairs")?;
+        check(
+            unsafe {
+                sys::blz_candidate_logits(self.last_normed.ptr(), h as i64, items as c_int, h as c_int, self.table.unwrap(), ids, c as c_int,
+                                          self.cand_logits.ptr(), s.0)
+            },
+            "MTP candidate logits",
+        )?;
+        check(
+            unsafe { sys::blz_cand_argmax(self.cand_logits.ptr(), ids, items as c_int, c as c_int, (rank * shard) as c_int, self.pairs.at::<f32>(rank * items * 2), s.0) },
+            "MTP candidate argmax",
+        )?;
+        if !self.ar.is_null() {
+            check(unsafe { sys::blz_host_ar_all_reduce(self.ar, self.pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "MTP head all-reduce")?;
+        }
+        check(unsafe { sys::blz_argmax_merge(self.pairs.ptr(), world as c_int, items as c_int, self.pick.ptr(), s.0) }, "MTP argmax merge")?;
+        check(unsafe { sys::blz_widen_i32(self.pick.ptr(), self.tok.ptr(), self.record.at::<i64>(step * items), items as c_int, s.0) }, "MTP pick")
+    }
+
     /// The target's LM head on `last_normed` (this rank's vocabulary shard, the (value, index) pairs merged over the
     /// ranks): the greedy draft token of every item in `tok` and in the record at `step`.
     fn head(&self, model: &Model, items: usize, step: usize) -> Result<()> {
+        if self.use_cands {
+            return self.head_cands(model, items, step);
+        }
         let (s, h) = (&model.stream, self.cfg.hidden);
         let (rank, world, shard) = (model.tp.rank, model.tp.world, model.dims.vocab);
         let rows = self.head_rows;

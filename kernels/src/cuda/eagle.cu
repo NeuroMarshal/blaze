@@ -274,9 +274,48 @@ extern "C" cudaError_t blz_rmsnorm_ld(const uint16_t* x, int64_t ldx, const uint
   return cudaGetLastError();
 }
 
+// one block per row: the best of c candidate logits as a (value, id + col0) pair (ties: the lower id); ids < 0 are padding
+__global__ void __launch_bounds__(256) cand_argmax_kernel(const float* __restrict__ logits, const int32_t* __restrict__ ids, int c,
+                                                          int col0, float* __restrict__ pairs) {
+  const int64_t r = blockIdx.x;
+  float best = -FLT_MAX;
+  int best_id = 0x7fffffff;
+  for (int j = threadIdx.x; j < c; j += blockDim.x) {
+    const int id = ids[r * c + j];
+    if (id < 0) continue;
+    const float v = logits[r * c + j];
+    if (v > best || (v == best && id < best_id)) best = v, best_id = id;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+    const int oi = __shfl_xor_sync(0xffffffffu, best_id, o);
+    if (ov > best || (ov == best && oi < best_id)) best = ov, best_id = oi;
+  }
+  __shared__ float sv[8];
+  __shared__ int si[8];
+  if (threadIdx.x % 32 == 0) sv[threadIdx.x / 32] = best, si[threadIdx.x / 32] = best_id;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float b = sv[0];
+    int bi = si[0];
+    for (int w = 1; w < int(blockDim.x) / 32; ++w)
+      if (sv[w] > b || (sv[w] == b && si[w] < bi)) b = sv[w], bi = si[w];
+    // no candidate on this rank: a pair no pick can beat
+    pairs[r * 2] = bi == 0x7fffffff ? -3.0e38f : b;
+    pairs[r * 2 + 1] = bi == 0x7fffffff ? 0.0f : float(bi + col0);
+  }
+}
+
 __global__ void widen_i32_kernel(const int32_t* __restrict__ src, int64_t* __restrict__ a, int64_t* __restrict__ b, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) a[i] = b[i] = int64_t(src[i]);
+}
+
+extern "C" cudaError_t blz_cand_argmax(const float* logits, const int32_t* ids, int rows, int c, int col0, float* pairs,
+                                       cudaStream_t stream) {
+  if (rows == 0) return cudaSuccess;
+  cand_argmax_kernel<<<rows, 256, 0, stream>>>(logits, ids, c, col0, pairs);
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t blz_widen_i32(const int32_t* src, int64_t* a, int64_t* b, int n, cudaStream_t stream) {

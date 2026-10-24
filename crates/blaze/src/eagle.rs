@@ -99,6 +99,9 @@ pub struct DraftPlan {
     pub items: Vec<DraftItem>,
     pub k: usize,
     pub tree: Option<(usize, usize)>,
+    /// MTP head: per item the token ids its draft head may propose (ascending; empty: the whole vocabulary). Parallel to
+    /// `items` or empty.
+    pub cands: Vec<Vec<i32>>,
 }
 
 /// One item's draft tree (eagle_harness core/draft_tree.py): node n's token, path probability (the product of the

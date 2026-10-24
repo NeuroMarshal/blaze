@@ -263,6 +263,9 @@ pub struct Options {
     /// of them, the target's own head). The drafts are only proposals, the verify decides, so the loss is acceptance on
     /// text whose tokens lie beyond (non-Latin scripts), the gain the share of the head's bandwidth.
     pub mtp_head_vocab: usize,
+    /// MTP drafter: per sequence the draft head scores only the token ids the request has seen (prompt and output) and the
+    /// most frequent ones, at most this many per rank (0: the whole vocabulary). Needs the target's LM head in BF16.
+    pub mtp_head_cands: usize,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).

@@ -313,6 +313,8 @@ unsafe extern "C" {
                          n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rmsnorm_ld(x: *const bf16, ldx: i64, w: *const bf16, eps: f32, rows: c_int, dim: c_int, out: *mut bf16,
                           ldo: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_cand_argmax(logits: *const f32, ids: *const i32, rows: c_int, c: c_int, col0: c_int, pairs: *mut f32, s: cudaStream_t)
+                           -> cudaError_t;
     pub fn blz_widen_i32(src: *const i32, a: *mut i64, b: *mut i64, n: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rmsnorm_ld_zc(x: *const bf16, ldx: i64, w: *const bf16, eps: f32, rows: c_int, dim: c_int, out: *mut bf16, ldo: i64,
                              s: cudaStream_t) -> cudaError_t;
