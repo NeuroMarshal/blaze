@@ -73,6 +73,8 @@ pub struct Mtp {
     /// whole shard) and the pairs a rank without rows contributes
     head_lin: Option<Linear>,
     head_rows: usize,
+    /// token id of this rank's first head row
+    head_first: usize,
     no_pairs: DevBuf,
     /// this rank's heads, KV heads and MLP rows
     heads: usize,
@@ -199,11 +201,14 @@ impl Mtp {
         let partial_rows = (ROWS * heads).max(max_items * heads * parts_decode);
         let meta_bytes = (MAX_CHAIN + 8) * (5 * 8 * ROWS + 256) + 4096;
         let shard = model.dims.vocab;
-        // a restricted head: this rank's rows among the first `head_vocab` ids
-        let head_vocab = model.opts.mtp_head_vocab;
-        let head_rows = if head_vocab == 0 { shard } else { head_vocab.saturating_sub(r * shard).min(shard) };
+        // a restricted head: the first `head_vocab` ids split evenly over the ranks (each reads its own rows of the
+        // checkpoint's head, whatever the target's cut)
+        let head_vocab = model.opts.mtp_head_vocab.min(tc.vocab);
+        let per_rank = head_vocab.div_ceil(world);
+        let head_first = if head_vocab == 0 { r * shard } else { r * per_rank };
+        let head_rows = if head_vocab == 0 { shard } else { head_vocab.saturating_sub(r * per_rank).min(per_rank) };
         let head_lin = if head_vocab > 0 && head_rows > 0 {
-            Some(lin(vec![("lm_head", Cut::Rows(vec![r * shard..r * shard + head_rows]))])?)
+            Some(lin(vec![("lm_head", Cut::Rows(vec![head_first..head_first + head_rows]))])?)
         } else {
             None
         };
@@ -211,6 +216,7 @@ impl Mtp {
         let m = Self {
             head_lin,
             head_rows,
+            head_first,
             no_pairs: DevBuf::from_slice(&no_pairs)?,
             pre_emb: vec("mtp.pre_fc_norm_embedding.weight", h)?,
             pre_hid: vec("mtp.pre_fc_norm_hidden.weight", h)?,
@@ -278,7 +284,7 @@ impl Mtp {
     }
 
     pub fn describe(&self) -> String {
-        let head = if self.head_lin.is_some() { format!(", head over {} rows of this rank's vocabulary", self.head_rows) } else { String::new() };
+        let head = if self.head_lin.is_some() { format!(", head over {} vocabulary rows on this rank", self.head_rows) } else { String::new() };
         format!(
             "MTP head: window {}{head}, BF16 weights {:.0} MiB on this rank, KV ring {:.0} MiB",
             self.cfg.window,
@@ -678,7 +684,7 @@ impl Mtp {
             }
             check(
                 unsafe {
-                    sys::blz_argmax_part(self.logits.ptr(), items as c_int, rows as c_int, rows as i64, (rank * shard) as c_int,
+                    sys::blz_argmax_part(self.logits.ptr(), items as c_int, rows as c_int, rows as i64, self.head_first as c_int,
                                          self.pairs.at::<f32>(rank * items * 2), s.0)
                 },
                 "MTP argmax part",
