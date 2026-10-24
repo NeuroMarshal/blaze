@@ -356,6 +356,13 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int for
 int main() {
   std::mt19937 rng(11);
   test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 1, rng);
+  // Flash Next (24 q heads on 2 KV heads) and its sparse prefill rows: one-row sequences of lengths 1 .. 19
+  {
+    std::vector<int> lens;
+    for (int l = 1; l <= 19; ++l) lens.push_back(l);
+    for (int sp : {1, 7, 16}) test_case("decode, GQA 12, lengths 1 .. 19", 2, 12, 1, lens, sp, rng);
+    test_case("decode, GQA 12, lengths 1 / 37 / 3000", 2, 12, 1, {1, 37, 3000}, 16, rng);
+  }
   test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 16, rng);
   test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
   test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
