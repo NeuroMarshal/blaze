@@ -435,10 +435,12 @@ dependencies = [
  "anyhow",
  "async-stream",
  "axum",
+ "base64 0.22.1",
  "blaze-sys",
  "clap",
  "futures",
  "half",
+ "image",
  "llguidance",
  "memmap2",
  "minijinja",
@@ -449,6 +451,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "tokio",
  "toktrie_hf_tokenizers",
+ "ureq",
  "uuid",
 ]
 

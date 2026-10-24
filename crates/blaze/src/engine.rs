@@ -17,6 +17,8 @@ use std::thread::JoinHandle;
 pub struct Seq {
     pub row: usize,
     pub slots: Vec<u32>,
+    /// the images of the prompt (set by the scheduler after the sequence is opened): positions and embeddings of their rows
+    pub mm: Option<Arc<crate::mm::MmInput>>,
 }
 
 impl Seq {
@@ -58,6 +60,12 @@ struct StepMeta {
     tree_mask: Vec<u64>,
     tree_parent: Vec<i32>,
     tree_prog: Vec<i32>,
+    /// image rows in the step: M-RoPE height / width positions of every token and the embeddings that replace the
+    /// placeholder rows (empty / false for text-only steps)
+    mrope: bool,
+    pos_h: Vec<i64>,
+    pos_w: Vec<i64>,
+    segs: Vec<crate::mm::ImgSeg>,
 }
 
 /// One sequence's commit after a verify: its row, the accepted rows, its first position, the kept tokens, its verify
@@ -183,6 +191,12 @@ impl Runner {
             self.put(m.tree_prog, &meta.tree_prog);
             tail.extend([(m.tree_mask, meta.tree_mask.len() * 8), (m.tree_parent, meta.tree_parent.len() * 4), (m.tree_prog, meta.tree_prog.len() * 4)]);
         }
+        if meta.mrope {
+            self.put(m.pos_h, &meta.pos_h);
+            self.put(m.pos_w, &meta.pos_w);
+            tail.extend([(m.pos_h, meta.pos_h.len() * 8), (m.pos_w, meta.pos_w.len() * 8)]);
+        }
+        self.model.set_image_rows(meta.mrope, &meta.segs);
         let s = self.model.stream.0;
         let dev = self.model.meta_buffer().ptr::<u8>();
         let host = self.staging.host_ptr().cast::<u8>();
@@ -200,7 +214,7 @@ impl Runner {
             // verify shapes repeat (the draft lengths), each captured on its second sight
             self.graphs.contains_key(&key) || self.graphs.keys().filter(|k| k.3).count() < MAX_VERIFY_GRAPHS
         } else {
-            meta.spans.iter().all(|sp| sp.len == 1)
+            meta.spans.iter().all(|sp| sp.len == 1) && !meta.mrope && meta.segs.is_empty()
         };
         if verify && let Some((every, c)) = self.graph_log.as_mut() {
             let i = if !(allow_graph && self.use_graphs) || !graphable {
@@ -618,7 +632,7 @@ impl Engine {
         match prefix {
             None => {
                 self.broadcast(|| Cmd::Reset(row))?;
-                Ok(Seq { row, slots: Vec::new() })
+                Ok(Seq { row, slots: Vec::new(), mm: None })
             }
             Some(snap) => {
                 self.broadcast(|| Cmd::CopyState(snap.row, row))?;
@@ -627,7 +641,7 @@ impl Engine {
                 for pg in self.pages_of(&snap.slots) {
                     self.page_refs[pg as usize] += 1;
                 }
-                Ok(Seq { row, slots: snap.slots.clone() })
+                Ok(Seq { row, slots: snap.slots.clone(), mm: None })
             }
         }
     }
@@ -670,6 +684,8 @@ impl Engine {
             bail!("KV cache full: {} free pages for {pages}", self.free_pages.len());
         }
         let mut m = StepMeta { seq_start: vec![0], tree: tree.is_some(), ..Default::default() };
+        // image rows in the step need the three M-RoPE position streams for every row
+        m.mrope = seqs.iter().zip(tokens).any(|(s, t)| s.mm.as_ref().is_some_and(|mm| mm.touches_image(s.len(), t.len())));
         for (si, (seq, t)) in seqs.iter_mut().zip(tokens).enumerate() {
             if seq.len() + t.len() > stride {
                 bail!("sequence of {} tokens exceeds the context ({stride})", seq.len() + t.len());
@@ -679,6 +695,9 @@ impl Engine {
             let offset = m.tokens.len();
             m.spans.push(Span { offset, len: t.len() });
             let start = seq.len();
+            if let Some(mm) = &seq.mm {
+                m.segs.extend(mm.segments(start, t.len(), offset));
+            }
             let mut depth = vec![0usize; t.len()];
             if let Some(tr) = tree {
                 let parent = tr[si];
@@ -708,8 +727,25 @@ impl Engine {
                 } else {
                     seq.slots[p - 1] + 1
                 };
-                m.tokens.push(id);
-                m.positions.push((start + depth[j]) as i64);
+                // an image placeholder (a prefix-cache key outside the vocabulary): any valid row, replaced by the embedding
+                m.tokens.push(if crate::mm::is_image_key(id) { 0 } else { id });
+                match &seq.mm {
+                    Some(mm) => {
+                        let [pt, ph, pw] = mm.pos3(p);
+                        m.positions.push(pt + depth[j] as i64);
+                        if m.mrope {
+                            m.pos_h.push(ph + depth[j] as i64);
+                            m.pos_w.push(pw + depth[j] as i64);
+                        }
+                    }
+                    None => {
+                        m.positions.push((start + depth[j]) as i64);
+                        if m.mrope {
+                            m.pos_h.push((start + depth[j]) as i64);
+                            m.pos_w.push((start + depth[j]) as i64);
+                        }
+                    }
+                }
                 m.locs.push(slot as i64);
                 m.rt_index.push((seq.row * stride + p) as i64);
                 m.tok_row.push(seq.row as i32);

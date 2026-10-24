@@ -47,6 +47,9 @@ pub struct GenRequest {
     pub think: Option<ThinkBudget>,
     /// structured outputs: the grammar the output follows
     pub constraint: Option<crate::structured::Constraint>,
+    /// the images of the prompt: their rows in `tokens` are prefix-cache keys (MmInput::keyed), their embeddings and
+    /// M-RoPE positions come from here
+    pub mm: Option<Arc<crate::mm::MmInput>>,
     pub events: UnboundedSender<GenEvent>,
     /// set by the client side (stop string seen, connection closed)
     pub cancel: Arc<AtomicBool>,
@@ -560,6 +563,8 @@ impl Loop {
                     continue;
                 }
             };
+            let mut seq = seq;
+            seq.mm = req.mm.clone();
             let fed = seq.len();
             // read-ahead of the first prefill chunk
             {
@@ -572,7 +577,7 @@ impl Loop {
             let points = req.cache_points.iter().map(|&p| p / page * page).filter(|&p| p > fed && p < req.tokens.len()).collect();
             let in_think = req.think.as_ref().is_some_and(|t| t.starts_inside);
             let prompt_set = if req.params.repetition_penalty != 1.0 {
-                let mut v: Vec<i32> = req.tokens.iter().map(|&t| t as i32).collect();
+                let mut v: Vec<i32> = req.tokens.iter().filter(|&&t| !crate::mm::is_image_key(t)).map(|&t| t as i32).collect();
                 v.sort_unstable();
                 v.dedup();
                 v
@@ -726,18 +731,26 @@ impl Loop {
         if k == 0 {
             return Vec::new();
         }
-        match self.cfg.spec_method {
+        let mm = a.req.mm.is_some();
+        let mut d = match self.cfg.spec_method {
             SpecMethod::Ngram => {
                 let ctx: Vec<i64> = a.req.tokens.iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
                 propose(&ctx, 4, 1, k)
             }
             SpecMethod::Suffix => self.suffix_draft(i, k),
             SpecMethod::Eagle => a.eagle.iter().copied().take(k).collect(),
+        };
+        if mm {
+            // a draft may run into the prompt's image rows (they are keys, not tokens): it ends before them
+            d.truncate(d.iter().position(|&t| t < 0 || crate::mm::is_image_key(t)).unwrap_or(d.len()));
         }
+        d
     }
 
     /// EAGLE-4: extend the drafter over the rows the last step kept (`items`) and keep its next drafts per request.
-    fn eagle_extend(&mut self, items: Vec<(usize, crate::eagle::DraftItem)>) -> Result<()> {
+    fn eagle_extend(&mut self, mut items: Vec<(usize, crate::eagle::DraftItem)>) -> Result<()> {
+        // the drafter has no image embeddings or M-RoPE positions: requests with images decode without its drafts
+        items.retain(|(i, _)| self.active[*i].req.mm.is_none());
         if items.is_empty() {
             return Ok(());
         }

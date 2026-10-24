@@ -314,6 +314,9 @@ pub struct MetaLayout {
     pub tree_mask: usize,
     pub tree_parent: usize,
     pub tree_prog: usize,
+    /// M-RoPE height / width positions per token (int64; copied on steps with image rows only)
+    pub pos_h: usize,
+    pub pos_w: usize,
     pub bytes: usize,
 }
 
@@ -350,6 +353,8 @@ impl MetaLayout {
         let tree_mask = take(max_tokens * 8);
         let tree_parent = take(max_tokens * 4);
         let tree_prog = take(max_tokens * 12);
+        let pos_h = take(max_tokens * 8);
+        let pos_w = take(max_tokens * 8);
         Self {
             max_tokens,
             max_seqs,
@@ -375,6 +380,8 @@ impl MetaLayout {
             tree_mask,
             tree_parent,
             tree_prog,
+            pos_h,
+            pos_w,
             bytes: o,
         }
     }
@@ -570,6 +577,34 @@ pub struct Model {
     pf_active: Cell<bool>,
     pub opts: Options,
     num_sms: usize,
+    /// image rows of the step being enqueued (set by the engine's runner): the M-RoPE streams differ, and these
+    /// embeddings replace the gathered token rows
+    mrope_step: Cell<bool>,
+    img_segs: std::cell::RefCell<Vec<crate::mm::ImgSeg>>,
+    /// which position stream (0 temporal, 1 height, 2 width) each rotary frequency takes (M-RoPE)
+    mrope_comp: DevBuf,
+}
+
+/// The stream of each of the `half` rotary frequencies: Qwen3-VL interleaves them (t h w t h w ... then t), earlier
+/// Qwen-VL models give each stream a contiguous section.
+fn mrope_components(rope: &crate::config::RopeConfig) -> Vec<u8> {
+    let half = rope.rotary_dim / 2;
+    let sec = &rope.mrope_section;
+    (0..half)
+        .map(|j| {
+            if sec.len() != 3 {
+                0
+            } else if rope.mrope_interleaved {
+                if j % 3 == 1 && j < 3 * sec[1] { 1 } else if j % 3 == 2 && j < 3 * sec[2] { 2 } else { 0 }
+            } else if j < sec[0] {
+                0
+            } else if j < sec[0] + sec[1] {
+                1
+            } else {
+                2
+            }
+        })
+        .collect()
 }
 
 fn inv_freq(cfg: &ModelConfig) -> (Vec<f32>, f32) {
@@ -834,6 +869,7 @@ impl Model {
         let lm_head = Linear::load(&ckpt, &quant, &[rows(lm_name, vec![part(cfg.vocab, r, w)])], s)?;
 
         let (freqs, rope_scale) = inv_freq(&cfg);
+        let mrope_comp = DevBuf::from_slice(&mrope_components(&cfg.rope))?;
         let inv_freq = DevBuf::from_slice(&freqs)?;
         mark("weights (no routed experts)", s)?;
 
@@ -1063,6 +1099,9 @@ impl Model {
             pf_active: Cell::new(false),
             opts,
             num_sms: num_sms.max(1) as usize,
+            mrope_step: Cell::new(false),
+            img_segs: Default::default(),
+            mrope_comp,
         };
         // the tensor-core GEMVs' launches for this device and these shapes (cached; measured once per new shape)
         let mut weights = model.lm_head.tune_weights();
@@ -1470,6 +1509,13 @@ impl Model {
         )
     }
 
+    /// The image rows of the next forward: whether the M-RoPE streams differ (positions in the metadata's pos_h / pos_w)
+    /// and the embeddings that replace the gathered rows. Steps with image rows are never captured into a graph.
+    pub fn set_image_rows(&self, mrope: bool, segs: &[crate::mm::ImgSeg]) {
+        self.mrope_step.set(mrope);
+        *self.img_segs.borrow_mut() = segs.to_vec();
+    }
+
     /// Enqueue the forward of a step whose metadata is already in the device buffer (MetaLayout). `spans`: decode
     /// sequences (len 1) first, then prefill chunks. The head runs on the first `n_logits` rows listed in
     /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
@@ -1505,6 +1551,20 @@ impl Model {
             },
             "embed",
         )?;
+        for seg in self.img_segs.borrow().iter() {
+            let bytes = seg.count * h * 2;
+            if (seg.row0 + seg.count) * h > seg.emb.len() || seg.at + seg.count > t {
+                bail!("image rows {}..{} do not fit their embedding or the step", seg.row0, seg.row0 + seg.count);
+            }
+            // pageable host memory: the copy is staged before the call returns, so the embedding may be dropped after
+            check(
+                unsafe {
+                    sys::cudaMemcpyAsync(w.residual.at::<u16>(seg.at * h).cast(), seg.emb.as_ptr().add(seg.row0 * h).cast(), bytes,
+                                         sys::MEMCPY_H2D, s.0)
+                },
+                "image embeddings",
+            )?;
+        }
         let eps = cfg.rms_eps;
         self.ple_request(t, n, verify)?;
         for (li, layer) in self.layers.iter().enumerate() {
@@ -1953,15 +2013,27 @@ impl Model {
         self.prefetch(&a.o, t)?;
         let k: *mut u16 = w.proj.at(heads * 2 * hd);
         let v: *const u16 = w.proj.at(heads * 2 * hd + kvh * hd);
-        check(
-            unsafe {
-                sys::blz_attn_prep(w.proj.ptr(), ld as i64, k, ld as i64, self.meta_ptr(m.positions), a.q_norm.ptr(), a.k_norm.ptr(),
-                                   cfg.rms_eps, 1, t as c_int, heads as c_int, kvh as c_int, hd as c_int,
-                                   cfg.rope.rotary_dim as c_int, self.inv_freq.ptr(), self.rope_scale, w.q.ptr(),
-                                   w.gate.ptr(), s.0)
-            },
-            "attn_prep",
-        )?;
+        if self.mrope_step.get() {
+            check(
+                unsafe {
+                    sys::blz_attn_prep_mrope(w.proj.ptr(), ld as i64, k, ld as i64, self.meta_ptr(m.positions), self.meta_ptr(m.pos_h),
+                                             self.meta_ptr(m.pos_w), self.mrope_comp.ptr(), a.q_norm.ptr(), a.k_norm.ptr(), cfg.rms_eps,
+                                             1, t as c_int, heads as c_int, kvh as c_int, hd as c_int, cfg.rope.rotary_dim as c_int,
+                                             self.inv_freq.ptr(), self.rope_scale, w.q.ptr(), w.gate.ptr(), s.0)
+                },
+                "attn_prep (mrope)",
+            )?;
+        } else {
+            check(
+                unsafe {
+                    sys::blz_attn_prep(w.proj.ptr(), ld as i64, k, ld as i64, self.meta_ptr(m.positions), a.q_norm.ptr(), a.k_norm.ptr(),
+                                       cfg.rms_eps, 1, t as c_int, heads as c_int, kvh as c_int, hd as c_int,
+                                       cfg.rope.rotary_dim as c_int, self.inv_freq.ptr(), self.rope_scale, w.q.ptr(),
+                                       w.gate.ptr(), s.0)
+                },
+                "attn_prep",
+            )?;
+        }
         let pool = &self.kv[layer.slot];
         let kvd = self.opts.kv_dtype;
         check(

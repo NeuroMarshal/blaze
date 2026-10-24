@@ -77,6 +77,11 @@ unsafe extern "C" {
                          eps: f32, zero_centered: c_int, tokens: c_int, heads: c_int, kv_heads: c_int, head_dim: c_int,
                          rotary_dim: c_int, inv_freq: *const f32, rope_scale: f32, q_out: *mut bf16, gate: *mut bf16,
                          s: cudaStream_t) -> cudaError_t;
+    pub fn blz_attn_prep_mrope(qg: *const bf16, ld_qg: i64, k: *mut bf16, ld_k: i64, positions: *const i64, pos_h: *const i64,
+                               pos_w: *const i64, freq_comp: *const u8, q_norm: *const bf16, k_norm: *const bf16, eps: f32,
+                               zero_centered: c_int, tokens: c_int, heads: c_int, kv_heads: c_int, head_dim: c_int,
+                               rotary_dim: c_int, inv_freq: *const f32, rope_scale: f32, q_out: *mut bf16, gate: *mut bf16,
+                               s: cudaStream_t) -> cudaError_t;
     pub fn blz_mul_sigmoid(x: *mut bf16, gate: *const bf16, n: i64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_silu_mul(gate: *const bf16, ld_gate: i64, up: *const bf16, ld_up: i64, rows: c_int, n: c_int,
                         out: *mut bf16, s: cudaStream_t) -> cudaError_t;
@@ -116,6 +121,78 @@ unsafe extern "C" {
     pub fn blz_gemm_destroy(g: *mut blz_gemm);
     pub fn blz_gemm_bf16(g: *mut blz_gemm, x: *const bf16, ldx: i64, w: *const bf16, out: *mut bf16, ldo: i64,
                          m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
+}
+
+// blaze/vision.h
+unsafe extern "C" {
+    pub fn blz_vis_layernorm(x: *const bf16, gamma: *const bf16, beta: *const bf16, eps: f32, rows: c_int, dim: c_int,
+                             out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_embed_pos(x: *mut bf16, bias: *const bf16, table: *const bf16, side: c_int, grid_h: c_int, grid_w: c_int,
+                             merge: c_int, dim: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_qkv_rope(qkv: *const bf16, bias: *const bf16, grid_h: c_int, grid_w: c_int, merge: c_int, heads: c_int,
+                            head_dim: c_int, theta: f32, q: *mut bf16, k: *mut bf16, v: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_attention(q: *const bf16, k: *const bf16, v: *const bf16, n: c_int, heads: c_int, head_dim: c_int,
+                             o: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_bias_residual(g: *const bf16, bias: *const bf16, res: *const bf16, rows: c_int, dim: c_int, out: *mut bf16,
+                                 s: cudaStream_t) -> cudaError_t;
+    pub fn blz_vis_bias_act(x: *mut bf16, bias: *const bf16, rows: c_int, dim: c_int, act: c_int, s: cudaStream_t) -> cudaError_t;
+}
+
+// blaze/vision_cpu.h
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_vis_cfg {
+    pub depth: c_int,
+    pub hidden: c_int,
+    pub heads: c_int,
+    pub intermediate: c_int,
+    pub patch: c_int,
+    pub temporal: c_int,
+    pub merge: c_int,
+    pub channels: c_int,
+    pub side: c_int,
+    pub out_hidden: c_int,
+    pub eps: f32,
+    pub theta: f32,
+    pub act_tanh: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_vis_layer {
+    pub n1_w: *const bf16,
+    pub n1_b: *const bf16,
+    pub qkv_w: *const bf16,
+    pub qkv_b: *const bf16,
+    pub proj_w: *const bf16,
+    pub proj_b: *const bf16,
+    pub n2_w: *const bf16,
+    pub n2_b: *const bf16,
+    pub fc1_w: *const bf16,
+    pub fc1_b: *const bf16,
+    pub fc2_w: *const bf16,
+    pub fc2_b: *const bf16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_vis_weights {
+    pub cfg: blz_vis_cfg,
+    pub patch_w: *const bf16,
+    pub patch_b: *const bf16,
+    pub pos_table: *const bf16,
+    pub layers: *const blz_vis_layer,
+    pub mrg_norm_w: *const bf16,
+    pub mrg_norm_b: *const bf16,
+    pub mrg_fc1_w: *const bf16,
+    pub mrg_fc1_b: *const bf16,
+    pub mrg_fc2_w: *const bf16,
+    pub mrg_fc2_b: *const bf16,
+}
+
+unsafe extern "C" {
+    pub fn blz_vis_cpu_encode(w: *const blz_vis_weights, pixels: *const bf16, grid_h: c_int, grid_w: c_int, threads: c_int,
+                              out: *mut bf16, stages: *mut f32) -> c_int;
 }
 
 // KV cache, attention

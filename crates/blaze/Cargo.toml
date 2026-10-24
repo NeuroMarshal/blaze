@@ -24,3 +24,8 @@ uuid.workspace = true
 minijinja = { version = "2.24.0", features = ["unstable_machinery"] }
 llguidance = { version = "1.9.1", default-features = false, features = ["lark", "referencing", "ahash"] }
 toktrie_hf_tokenizers = "1.9.1"
+# image input: decoders only (no encoders, no color management beyond the format's own)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+base64 = "0.22"
+# http(s) image URLs (already in the lock through hf-hub: rustls, no extra crates)
+ureq = { version = "2", default-features = false, features = ["tls"] }

@@ -95,9 +95,14 @@ __global__ void gated_rmsnorm_kernel(const uint16_t* __restrict__ x, int64_t ld_
 // One warp per (token, head) row of q or k. Rows are staged in shared memory (head_dim <= 512).
 constexpr int kPrepWarps = 4;
 
+// MROPE: multimodal rotary positions. Every rotary frequency j takes its angle from one of three position streams
+// (temporal = `positions`, height, width), picked by freq_comp[j] in {0, 1, 2}; the text variant (MROPE false) is the
+// same code with one stream.
+template <bool MROPE>
 __global__ void __launch_bounds__(32 * kPrepWarps) attn_prep_kernel(
     const uint16_t* __restrict__ qg, int64_t ld_qg, uint16_t* __restrict__ k, int64_t ld_k,
-    const int64_t* __restrict__ positions,
+    const int64_t* __restrict__ positions, const int64_t* __restrict__ pos_h, const int64_t* __restrict__ pos_w,
+    const uint8_t* __restrict__ freq_comp,
     const uint16_t* __restrict__ q_norm, const uint16_t* __restrict__ k_norm, float eps, int zero_centered, int tokens,
     int heads, int kv_heads, int head_dim, int rotary_dim, const float* __restrict__ inv_freq, float rope_scale,
     uint16_t* __restrict__ q_out, uint16_t* __restrict__ gate) {
@@ -135,7 +140,13 @@ __global__ void __launch_bounds__(32 * kPrepWarps) attn_prep_kernel(
     if (i < rotary_dim) {
       const int j = i < half ? i : i - half;
       float s, c;
-      sincosf(pos * inv_freq[j], &s, &c);
+      if constexpr (MROPE) {
+        const int comp = freq_comp[j];
+        const float p = comp == 0 ? pos : float(comp == 1 ? pos_h[t] : pos_w[t]);
+        sincosf(p * inv_freq[j], &s, &c);
+      } else {
+        sincosf(pos * inv_freq[j], &s, &c);
+      }
       c *= rope_scale, s *= rope_scale;
       v = i < half ? r[i] * c - r[i + half] * s : r[i] * c + r[i - half] * s;
     }
@@ -402,19 +413,45 @@ extern "C" cudaError_t blz_gated_rmsnorm(const uint16_t* x, int64_t ld_x, const 
   return cudaGetLastError();
 }
 
+static cudaError_t attn_prep_launch(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_t ld_k, const int64_t* positions,
+                                    const int64_t* pos_h, const int64_t* pos_w, const uint8_t* freq_comp,
+                                    const uint16_t* q_norm, const uint16_t* k_norm, float eps, int zero_centered, int tokens,
+                                    int heads, int kv_heads, int head_dim, int rotary_dim, const float* inv_freq,
+                                    float rope_scale, uint16_t* q_out, uint16_t* gate, cudaStream_t stream) {
+  if (tokens == 0) return cudaSuccess;
+  if (head_dim > 512 || rotary_dim > head_dim || rotary_dim % 2) return cudaErrorInvalidValue;
+  const int64_t items = int64_t(tokens) * (heads + kv_heads);
+  const unsigned grid = unsigned((items + kPrepWarps - 1) / kPrepWarps);
+  const size_t smem = size_t(kPrepWarps) * head_dim * sizeof(float);
+  if (pos_h) {
+    attn_prep_kernel<true><<<grid, 32 * kPrepWarps, smem, stream>>>(
+        qg, ld_qg, k, ld_k, positions, pos_h, pos_w, freq_comp, q_norm, k_norm, eps, zero_centered, tokens, heads, kv_heads,
+        head_dim, rotary_dim, inv_freq, rope_scale, q_out, gate);
+  } else {
+    attn_prep_kernel<false><<<grid, 32 * kPrepWarps, smem, stream>>>(
+        qg, ld_qg, k, ld_k, positions, nullptr, nullptr, nullptr, q_norm, k_norm, eps, zero_centered, tokens, heads, kv_heads,
+        head_dim, rotary_dim, inv_freq, rope_scale, q_out, gate);
+  }
+  return cudaGetLastError();
+}
+
 extern "C" cudaError_t blz_attn_prep(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_t ld_k,
                                      const int64_t* positions, const uint16_t* q_norm,
                                      const uint16_t* k_norm, float eps, int zero_centered, int tokens, int heads,
                                      int kv_heads, int head_dim, int rotary_dim, const float* inv_freq,
                                      float rope_scale, uint16_t* q_out, uint16_t* gate, cudaStream_t stream) {
-  if (tokens == 0) return cudaSuccess;
-  if (head_dim > 512 || rotary_dim > head_dim || rotary_dim % 2) return cudaErrorInvalidValue;
-  const int64_t items = int64_t(tokens) * (heads + kv_heads);
-  const unsigned grid = unsigned((items + kPrepWarps - 1) / kPrepWarps);
-  attn_prep_kernel<<<grid, 32 * kPrepWarps, size_t(kPrepWarps) * head_dim * sizeof(float), stream>>>(
-      qg, ld_qg, k, ld_k, positions, q_norm, k_norm, eps, zero_centered, tokens, heads, kv_heads, head_dim, rotary_dim, inv_freq,
-      rope_scale, q_out, gate);
-  return cudaGetLastError();
+  return attn_prep_launch(qg, ld_qg, k, ld_k, positions, nullptr, nullptr, nullptr, q_norm, k_norm, eps, zero_centered, tokens,
+                          heads, kv_heads, head_dim, rotary_dim, inv_freq, rope_scale, q_out, gate, stream);
+}
+
+extern "C" cudaError_t blz_attn_prep_mrope(const uint16_t* qg, int64_t ld_qg, uint16_t* k, int64_t ld_k,
+                                           const int64_t* positions, const int64_t* pos_h, const int64_t* pos_w,
+                                           const uint8_t* freq_comp, const uint16_t* q_norm, const uint16_t* k_norm,
+                                           float eps, int zero_centered, int tokens, int heads, int kv_heads, int head_dim,
+                                           int rotary_dim, const float* inv_freq, float rope_scale, uint16_t* q_out,
+                                           uint16_t* gate, cudaStream_t stream) {
+  return attn_prep_launch(qg, ld_qg, k, ld_k, positions, pos_h, pos_w, freq_comp, q_norm, k_norm, eps, zero_centered, tokens,
+                          heads, kv_heads, head_dim, rotary_dim, inv_freq, rope_scale, q_out, gate, stream);
 }
 
 extern "C" cudaError_t blz_mul_sigmoid(uint16_t* x, const uint16_t* gate, int64_t n, cudaStream_t stream) {
