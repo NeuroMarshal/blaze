@@ -2355,7 +2355,8 @@ impl Model {
             // rows [r0, r0 + n) attend through `tab` (QSA_TABLE_STRIDE per row) to rows of the pool `pv`
             let forced_splits: Option<usize> = std::env::var("BLAZE_QSA_SPLITS").ok().and_then(|v| v.parse().ok());
             let mha = |r0: usize, n: usize, pv: sys::blz_nvfp4_pool, tab: *const i32| -> Result<()> {
-                let splits = forced_splits.unwrap_or((4 * self.num_sms / (n * kvh)).clamp(1, 16));
+                // as the dense calls (within the partial-result workspace), at most 16
+                let splits = forced_splits.unwrap_or_else(|| self.attn_splits(n, 1).min(16));
                 check(
                     unsafe {
                         sys::blz_nvfp4_mha_decode(

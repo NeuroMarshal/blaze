@@ -790,9 +790,11 @@ impl Engine {
                 };
                 // an image placeholder (a prefix-cache key outside the vocabulary): any valid row, replaced by the embedding
                 m.tokens.push(if crate::mm::is_image_key(id) { 0 } else { id });
+                // a chain row sits at its own position; a tree node at its root's plus its depth (siblings share one)
+                let q = if tree.is_some() { start } else { p };
                 match &seq.mm {
                     Some(mm) => {
-                        let [pt, ph, pw] = mm.pos3(p);
+                        let [pt, ph, pw] = mm.pos3(q);
                         m.positions.push(pt + depth[j] as i64);
                         if m.mrope {
                             m.pos_h.push(ph + depth[j] as i64);
@@ -800,10 +802,10 @@ impl Engine {
                         }
                     }
                     None => {
-                        m.positions.push((start + depth[j]) as i64);
+                        m.positions.push((q + depth[j]) as i64);
                         if m.mrope {
-                            m.pos_h.push((start + depth[j]) as i64);
-                            m.pos_w.push((start + depth[j]) as i64);
+                            m.pos_h.push((q + depth[j]) as i64);
+                            m.pos_w.push((q + depth[j]) as i64);
                         }
                     }
                 }

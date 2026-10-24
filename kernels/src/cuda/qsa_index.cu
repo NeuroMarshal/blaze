@@ -600,10 +600,13 @@ extern "C" cudaError_t blz_qsa_scores(const uint16_t* q, int heads, int dim, con
   if (same_seq && heads == kTcHeads && rows >= 16) {
     const dim3 grid(unsigned((max_blocks + kTcBlocks - 1) / kTcBlocks), unsigned((rows + kTcRows - 1) / kTcRows));
     const size_t smem = size_t(kTcRows * kTcHeads + kTcBlocks) * kTcStride * 2;
-    static bool attr = false;
-    if (!attr) {
+    // per device: the opt-in to the large shared memory is a property of the kernel on each GPU
+    static bool attr[16] = {};
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 16 || !attr[dev]) {
       cudaFuncSetAttribute(scores_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
-      attr = true;
+      if (dev < 16) attr[dev] = true;
     }
     scores_tc_kernel<<<grid, 128, smem, stream>>>(q, positions, tok_row, row0, rows, ratio, req_to_token, rt_stride,
                                                   comp, max_blocks, scores, ld_scores);
