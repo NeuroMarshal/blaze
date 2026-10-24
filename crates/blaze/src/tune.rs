@@ -1,11 +1,5 @@
-//! Launch configurations of the GEMV kernels, measured on this GPU for the model's own weight shapes and kept per
-//! device in ~/.cache/blaze, instead of constants tuned by hand on one GPU.
-//!
-//! An entry is the fastest configuration for a weight shape [n, k] and a bucket of input rows: for the tensor-core
-//! NVFP4 / MXFP8 GEMVs (warps along K, weight tiles per block); for BF16 weights the kernel itself (the skinny kernel
-//! with 1, 2 or 4 columns per block, the wide GEMV of a few rows, or cuBLAS). It is measured over the layers of that
-//! shape in turn, so that large weights come from DRAM as in a forward pass, not from L2. Missing shapes are measured
-//! at load (a fraction of a second each); BLAZE_TUNE=0 keeps the built-in rules.
+//! GEMV launch tuning cached per GPU, weight shape and input-row bucket.
+//! Measurements cycle through layers so large weights are read from DRAM; BLAZE_TUNE=0 disables tuning.
 
 use crate::gpu::{DevBuf, Stream, Timer};
 use anyhow::Result;
@@ -37,10 +31,17 @@ impl Kernel {
     }
 }
 
-/// BF16 entries (variant, columns per block): the skinny kernel, the wide GEMV, cuBLAS.
+/// BF16 entries (variant, parameter): the skinny kernel (columns per block), the wide GEMV, cuBLAS, the tensor-core
+/// GEMV (split * 8 + tiles).
 pub const BF16_SKINNY: c_int = 1;
 pub const BF16_WIDE: c_int = 2;
 pub const BF16_CUBLAS: c_int = 3;
+pub const BF16_MMA: c_int = 4;
+
+/// Whether blz_bf16_gemv_mma_cfg takes a call (the alignment of x and w is checked by the caller).
+pub fn mma_fits(rows: usize, k: usize, ldx: usize) -> bool {
+    rows <= sys::BLZ_MXFP8_MMA_MAX_ROWS && k % 128 == 0 && ldx % 8 == 0
+}
 
 /// Whether blz_skinny_gemm_cfg takes a call (the alignment of x and w is checked by the caller).
 pub fn skinny_fits(rows: usize, k: usize, ldx: usize) -> bool {
@@ -81,6 +82,7 @@ fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, y: *mut u16, rows
                 BF16_SKINNY => sys::blz_skinny_gemm_cfg(x.cast(), w.k as i64, w.codes.cast(), y.cast(), w.n as i64, rows as c_int, n, k,
                                                         sys::BLZ_BF16, b, s.0),
                 BF16_WIDE => sys::blz_gemv_wide(x.cast(), w.k as i64, w.codes.cast(), y.cast(), w.n as i64, rows as c_int, n, k, s.0),
+                BF16_MMA => sys::blz_bf16_gemv_mma_cfg(x, w.k as i64, w.codes.cast(), y, w.n as i64, rows as c_int, n, k, b / 8, b % 8, s.0),
                 _ => sys::blz_gemm_bf16(gemm, x, w.k as i64, w.codes.cast(), y, w.n as i64, rows as c_int, n, k, s.0),
             },
         }
@@ -114,6 +116,15 @@ fn candidates(kernel: Kernel, rows: usize, k: usize) -> Vec<(c_int, c_int)> {
             }
             if wide_fits(rows, k, k) {
                 v.push((BF16_WIDE, 0));
+            }
+            if mma_fits(rows, k, k) {
+                for split in [2, 4, 8] {
+                    for tiles in [1, 2, 4] {
+                        if unsafe { sys::blz_mxfp8_mma_cfg_valid(rows as c_int, split, tiles) } != 0 {
+                            v.push((BF16_MMA, split * 8 + tiles));
+                        }
+                    }
+                }
             }
             v
         }

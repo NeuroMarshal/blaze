@@ -307,6 +307,8 @@ unsafe extern "C" {
                            k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_ex(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
                               n: c_int, k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_bf16_gemv_mma_cfg(x: *const u16, ldx: i64, w: *const u16, y: *mut u16, ldy: i64, rows: c_int, n: c_int, k: c_int,
+                                 split: c_int, tiles: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_cfg(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
                                n: c_int, k: c_int, dtype: c_int, cols_per_block: c_int, s: cudaStream_t) -> cudaError_t;
 }
