@@ -85,6 +85,7 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--images", default=None, help="directory with words.png sunset.png door.jpg tiny.png")
     ap.add_argument("--cache", action="store_true", help="the server has --prompt-cache-slots: the follow-up turn must hit the cache")
+    ap.add_argument("--skip-big", action="store_true", help="skip the check that encodes a 3000-token image (slow on the CPU)")
     ap.add_argument("--limit", type=int, default=None, help="the server's --limit-mm-per-prompt image count, to test the 400")
     a = ap.parse_args()
     base = a.base.rstrip("/")
@@ -141,8 +142,9 @@ def main():
     t.check("mm_processor_kwargs max_pixels", isinstance(small, int) and small < full and small <= 100 + 60, f"{small} tokens with max_pixels = 100 tokens")
     small2 = tokens(kw={"size": {"longest_edge": 100 * 32 * 32}})
     t.check("mm_processor_kwargs size.longest_edge", small2 == small, f"{small2}")
-    big = tokens(kw={"min_pixels": 3000 * 32 * 32, "max_pixels": 4000 * 32 * 32})
-    t.check("mm_processor_kwargs min_pixels", isinstance(big, int) and big > full, f"{big} tokens with min_pixels = 3000 tokens")
+    if not a.skip_big:
+        big = tokens(kw={"min_pixels": 3000 * 32 * 32, "max_pixels": 4000 * 32 * 32})
+        t.check("mm_processor_kwargs min_pixels", isinstance(big, int) and big > full, f"{big} tokens with min_pixels = 3000 tokens")
     t.error("bad mm_processor_kwargs", [user(image_part(p("words.png")), text("hi"))], 400, "max_pixels", mm_processor_kwargs={"max_pixels": -1})
 
     # errors
