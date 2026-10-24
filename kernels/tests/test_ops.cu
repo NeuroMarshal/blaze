@@ -142,6 +142,59 @@ static void test_attn_prep() {
   std::printf("attn_prep (qk norm, rope 64/256 incl. position 123456): max abs err q %.2e, k %.2e\n", eq, ek);
 }
 
+// M-RoPE: with the three position streams equal the kernel is the text kernel bit for bit; with different streams every
+// frequency rotates by its own stream (interleaved t h w t h w ... as Qwen3-VL: sections [11, 11, 10] of 32).
+static void test_attn_prep_mrope() {
+  const int T = 5, H = 4, KVH = 2, D = 256, RD = 64;
+  auto qg = rand_bf(T * H * 2 * D, 2.0f), k = rand_bf(T * KVH * D, 2.0f), qn = rand_bf(D, 0.1f), kn = rand_bf(D, 0.1f);
+  std::vector<int64_t> pos = {0, 7, 100, 101, 5000}, ph = {0, 7, 103, 105, 5000}, pw = {0, 7, 100, 108, 5003};
+  std::vector<float> inv(RD / 2);
+  std::vector<uint8_t> comp(RD / 2);
+  const int sec[3] = {11, 11, 10};
+  for (int i = 0; i < RD / 2; ++i) {
+    inv[i] = float(1.0 / std::pow(1e7, 2.0 * i / RD));
+    comp[i] = (i % 3 == 1 && i < 3 * sec[1]) ? 1 : (i % 3 == 2 && i < 3 * sec[2]) ? 2 : 0;
+  }
+  Dev<uint16_t> dqg(qg), dk(k), dk2(k), dqn(qn), dkn(kn), dq(T * H * D), dg(T * H * D), dq2(T * H * D), dg2(T * H * D);
+  Dev<int64_t> dpos(pos), dph(ph), dpw(pw);
+  Dev<float> dinv(inv);
+  Dev<uint8_t> dcomp(comp);
+  CHECK_CUDA(blz_attn_prep(dqg.p, int64_t(H) * 2 * D, dk.p, int64_t(KVH) * D, dpos.p, dqn.p, dkn.p, 1e-6f, 1, T, H, KVH, D, RD, dinv.p, 1.0f, dq.p, dg.p, 0));
+  // equal streams
+  CHECK_CUDA(blz_attn_prep_mrope(dqg.p, int64_t(H) * 2 * D, dk2.p, int64_t(KVH) * D, dpos.p, dpos.p, dpos.p, dcomp.p, dqn.p, dkn.p, 1e-6f, 1, T, H, KVH, D, RD, dinv.p, 1.0f, dq2.p, dg2.p, 0));
+  const auto a = dq.down(), b = dq2.down(), ka = dk.down(), kb = dk2.down();
+  int diff = 0;
+  for (size_t i = 0; i < a.size(); ++i) diff += a[i] != b[i];
+  for (size_t i = 0; i < ka.size(); ++i) diff += ka[i] != kb[i];
+  EXPECT(diff == 0, "attn_prep_mrope with equal streams differs from attn_prep in %d values", diff);
+  // different streams against the host reference
+  Dev<uint16_t> dk3(k), dq3(T * H * D), dg3(T * H * D);
+  CHECK_CUDA(blz_attn_prep_mrope(dqg.p, int64_t(H) * 2 * D, dk3.p, int64_t(KVH) * D, dpos.p, dph.p, dpw.p, dcomp.p, dqn.p, dkn.p, 1e-6f, 1, T, H, KVH, D, RD, dinv.p, 1.0f, dq3.p, dg3.p, 0));
+  const auto gq = dq3.down();
+  double eq = 0;
+  for (int t = 0; t < T; ++t) {
+    const int64_t p3[3] = {pos[t], ph[t], pw[t]};
+    for (int h = 0; h < H; ++h) {
+      const uint16_t* src = &qg[(t * H + h) * 2 * D];
+      double ss = 0;
+      for (int i = 0; i < D; ++i) ss += double(bf(src[i])) * bf(src[i]);
+      const double invn = 1.0 / std::sqrt(ss / D + 1e-6);
+      std::vector<float> n(D), out(D);
+      for (int i = 0; i < D; ++i) n[i] = rbf(float(bf(src[i]) * invn * (1.0 + bf(qn[i]))));
+      out = n;
+      for (int i = 0; i < RD / 2; ++i) {
+        const float f = float(p3[comp[i]]) * inv[i];
+        const float c = std::cos(f), s = std::sin(f);
+        out[i] = n[i] * c - n[i + RD / 2] * s;
+        out[i + RD / 2] = n[i + RD / 2] * c + n[i] * s;
+      }
+      for (int i = 0; i < D; ++i) eq = std::max(eq, double(std::fabs(bf(gq[(t * H + h) * D + i]) - out[i])));
+    }
+  }
+  EXPECT(eq < 0.05, "attn_prep_mrope: q err %.3e", eq);
+  std::printf("attn_prep_mrope (streams t h w interleaved, 11/11/10): equal streams bit-identical, max abs err q %.2e\n", eq);
+}
+
 static void test_router() {
   const int T = 9, E = 256, K = 8;
   auto logits = rand_bf(T * E, 2.0f);
@@ -291,6 +344,7 @@ static void test_fp8_dequant() {
 int main() {
   test_rmsnorm();
   test_attn_prep();
+  test_attn_prep_mrope();
   test_router();
   test_gdn();
   test_gemm();
