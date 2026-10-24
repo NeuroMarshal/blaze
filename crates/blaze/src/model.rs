@@ -2345,8 +2345,9 @@ impl Model {
             // in groups of SPARSE_ROWS rows: the split-K partials then need room for one group only
             let (table, counts, rows) = (w.qsa_table.as_ref().unwrap(), w.qsa_counts.as_ref().unwrap(), w.qsa_rows.as_ref().unwrap());
             // rows [r0, r0 + n) attend through `tab` (QSA_TABLE_STRIDE per row) to rows of the pool `pv`
+            let forced_splits: Option<usize> = std::env::var("BLAZE_QSA_SPLITS").ok().and_then(|v| v.parse().ok());
             let mha = |r0: usize, n: usize, pv: sys::blz_nvfp4_pool, tab: *const i32| -> Result<()> {
-                let splits = (4 * self.num_sms / (n * kvh)).clamp(1, 16);
+                let splits = forced_splits.unwrap_or((4 * self.num_sms / (n * kvh)).clamp(1, 16));
                 check(
                     unsafe {
                         sys::blz_nvfp4_mha_decode(
