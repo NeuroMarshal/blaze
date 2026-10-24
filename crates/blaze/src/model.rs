@@ -2385,10 +2385,13 @@ impl Model {
                     let format = view.format;
                     let compact = pool_view(&h.compact, &self.kv_global, kvh, hd, format);
                     let stage = pool_view(&h.stage, &self.kv_global, kvh, hd, format);
-                    let cache = h.cache(layer.slot);
                     let no_cache = sys::blz_nvfp4_row_cache { tag: null_mut(), k_data: null_mut(), v_data: null_mut(), k_scale: null_mut(), v_scale: null_mut(), lines: 0 };
+                    // BLAZE_KV_HOST_NOCACHE / BLAZE_KV_HOST_STAGE_ALL (checks): gathers without the row cache, every span staged
+                    let dbg = |k: &str| std::env::var_os(k).is_some();
+                    let cache = if dbg("BLAZE_KV_HOST_NOCACHE") { no_cache } else { h.cache(layer.slot) };
+                    let stage_all = dbg("BLAZE_KV_HOST_STAGE_ALL");
                     for (i, sp) in spans.iter().enumerate() {
-                        if sp.len > 1 && !verify {
+                        if (sp.len > 1 && !verify) || stage_all {
                             // a prefill span: its sequence's prefix (this chunk included) staged with sequential reads
                             check(
                                 unsafe {
