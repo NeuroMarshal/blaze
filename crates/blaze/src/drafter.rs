@@ -32,6 +32,29 @@ pub fn kind(dir: &Path) -> Result<Kind> {
     }
 }
 
+/// VRAM one of `world` ranks gives a drafter, from its checkpoint: the tensors it keeps on the GPU (the shared ones whole,
+/// the rest by its shard; not the embedding, which it shares with the target, nor an EAGLE-4 LM head, which stays in
+/// pinned RAM), the EAGLE-4 head shard when it goes to VRAM (`head_vram` on or auto), and its KV ring and buffers.
+pub fn vram_estimate(dir: &Path, world: usize, head_vram: Option<bool>) -> Result<usize> {
+    let ckpt = crate::weights::Checkpoint::open(dir)?;
+    let world = world.max(1);
+    // modules every rank holds whole (Cut::All in eagle.rs / dflash.rs)
+    let whole = ["fc.", "efficient_lm_head_down_proj", "kernel_projection", "candidate_selector", "norm"];
+    let mut bytes = 0usize;
+    for (name, t) in &ckpt.tensors {
+        if name.contains("embed_tokens") || name == "lm_head.weight" {
+            continue;
+        }
+        bytes += if whole.iter().any(|w| name.contains(w)) { t.bytes() } else { t.bytes().div_ceil(world) };
+    }
+    if matches!(kind(dir)?, Kind::Eagle) && head_vram != Some(false)
+        && let Some(lm) = ckpt.get("lm_head.weight")
+    {
+        bytes += lm.bytes().div_ceil(world);
+    }
+    Ok(bytes + (256 << 20))
+}
+
 /// Target layers whose input the drafter reads.
 pub fn capture_layers(dir: &Path) -> Result<Vec<usize>> {
     Ok(match kind(dir)? {
