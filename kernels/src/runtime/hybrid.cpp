@@ -40,7 +40,12 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   const expert::Geometry geo = store_->geometry();
   const size_t n = size_t(L) * E;
   stride_ = store_->record_stride();
-  if (cfg_.defer_last == -2) cfg_.defer_last = store_->main_layers() - 1;
+  // a pipeline stage's layers: the others are never placed nor routed here
+  if (cfg_.layer_end < 0 || cfg_.layer_end > L) cfg_.layer_end = L;
+  cfg_.layer_begin = std::clamp(cfg_.layer_begin, 0, cfg_.layer_end);
+  const size_t held = size_t(cfg_.layer_end - cfg_.layer_begin) * E;
+  // the last routed layer here always waits for its CPU experts (its output goes on: the next stage, the head)
+  if (cfg_.defer_last == -2) cfg_.defer_last = std::min(store_->main_layers(), cfg_.layer_end) - 1;
   capacity_[0] = int(cfg_.gpu0_bytes / stride_);
   capacity_[1] = cfg_.gpu1 >= 0 ? int(cfg_.gpu1_bytes / stride_) : 0;
   int spare[3] = {0, 0, 0};
@@ -48,9 +53,9 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
     for (int t = 0; t < 2; ++t) spare[t] = std::min(cfg_.swap.spare_slots, capacity_[t] / 2);
   if (cfg_.ram_bytes == HybridConfig::kRamAuto) {
     // RAM takes every expert the GPUs do not hold: nothing is left on SSD.
-    const size_t on_gpu = std::min(n, size_t(capacity_[0] - spare[0]) + size_t(capacity_[1] - spare[1]));
+    const size_t on_gpu = std::min(held, size_t(capacity_[0] - spare[0]) + size_t(capacity_[1] - spare[1]));
     spare[2] = cfg_.swap.enabled ? cfg_.swap.spare_slots : 0;
-    capacity_[2] = int(n - on_gpu) + spare[2];
+    capacity_[2] = int(held - on_gpu) + spare[2];
   } else {
     capacity_[2] = int(cfg_.ram_bytes / stride_);
     if (cfg_.swap.enabled) spare[2] = std::min(cfg_.swap.spare_slots, capacity_[2] / 2);
@@ -62,7 +67,7 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   }
   if (heat_long.size() != n) heat_long = heat;
   placement_ = place_experts(L, E, heat, capacity_[0] - spare[0], capacity_[1] - spare[1], capacity_[2] - spare[2],
-                             heat_long);
+                             heat_long, cfg_.layer_begin, cfg_.layer_end);
   log("blaze: %d layers x %d experts (%s%s) -> GPU0 %d, GPU1 %d, RAM %d%s", L, E, store_->prefix().c_str(),
       heat.empty() ? "" : ", placement from the routing profile", placement_.used[0], placement_.used[1],
       placement_.used[2], placement_.used[3] ? (", SSD " + std::to_string(placement_.used[3])).c_str() : "");

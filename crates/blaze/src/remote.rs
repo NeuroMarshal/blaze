@@ -296,6 +296,9 @@ fn recv_frame(s: &mut impl Read) -> Result<Vec<u8>> {
 }
 
 /// The header words of a link (flag, bytes of the rows).
+/// The header word of the first receiver's last step taken (blaze/pp_link.h).
+const PP_ACK: usize = 8;
+
 fn header(link: &HostMapped) -> *mut u64 {
     link.host_ptr().cast::<u64>().cast_mut()
 }
@@ -356,7 +359,7 @@ pub(super) fn connect(addr: &str, rank: &crate::model::PpRank, prev: Arc<HostMap
                     f.0.extend_from_slice(rows);
                     // the rows are in the frame: the slot goes back to the GPU
                     std::sync::atomic::fence(Ordering::SeqCst);
-                    unsafe { std::ptr::write_volatile(h.add(1), v) };
+                    unsafe { std::ptr::write_volatile(h.add(PP_ACK), v) };
                     if send_frame(&mut dw, &f.0).is_err() {
                         broken = true;
                         break;
@@ -427,7 +430,7 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
     let mut link = HostMapped::new(crate::model::pp_link_bytes(rows, width).max(peer_link))?;
     link.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
     let link = Arc::new(link);
-    opts.pp = Some(crate::model::PpRank { stage, stages, layers: l0..l1, prev: Some(link.clone()), next: None });
+    opts.pp = Some(crate::model::PpRank { stage, stages, layers: l0..l1, prev: Some(link.clone()), next: None, tp_rank: 0, tp: 1 });
     opts.kv_auto = None;
     // rows from the coordinator into the link, then its flag for the GPU
     {
@@ -444,7 +447,7 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
                 let slot = ((flag.max(1) - 1) % 2) as usize;
                 // the slot held step flag - 2: the GPU gives it back once it copied those rows out
                 let t0 = Instant::now();
-                while unsafe { std::ptr::read_volatile(h.add(1)) } + 2 < flag {
+                while unsafe { std::ptr::read_volatile(h.add(PP_ACK)) } + 2 < flag {
                     if t0.elapsed() < Duration::from_micros(200) { std::hint::spin_loop() } else { std::thread::sleep(Duration::from_micros(20)) }
                 }
                 std::sync::atomic::fence(Ordering::SeqCst);

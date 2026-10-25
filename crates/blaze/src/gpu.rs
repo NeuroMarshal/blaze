@@ -18,6 +18,13 @@ pub fn set_device(device: i32) -> Result<()> {
     check(unsafe { sys::cudaSetDevice(device) }, "cudaSetDevice")
 }
 
+/// The current device.
+pub fn device() -> Result<i32> {
+    let mut d = 0;
+    check(unsafe { sys::cudaGetDevice(&mut d) }, "cudaGetDevice")?;
+    Ok(d)
+}
+
 /// (free, total) bytes of the current device.
 pub fn mem_info() -> Result<(usize, usize)> {
     let (mut free, mut total) = (0usize, 0usize);

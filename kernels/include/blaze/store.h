@@ -89,8 +89,10 @@ struct Placement {
 /// \brief Exclusive placement: hottest experts to GPU0, then GPU1, then RAM; the rest stay on SSD.
 /// `heat` is [layer * E + expert] (e.g. routing counts from a profile); empty means uniform heat, in which case
 /// experts are spread evenly over the layers (expert ids interleaved), so every layer gets its share of each tier.
-/// `ram_heat` (same shape, optional) ranks the experts left after the GPUs for RAM vs SSD instead of `heat`.
+/// `ram_heat` (same shape, optional) ranks the experts left after the GPUs for RAM vs SSD instead of `heat`. Only the
+/// layers [layer_begin, layer_end) are placed (a pipeline stage's; layer_end < 0: all), the others stay on SSD unread.
 Placement place_experts(int num_layers, int num_experts, const std::vector<double>& heat, int gpu0_slots,
-                        int gpu1_slots, int ram_slots, const std::vector<double>& ram_heat = {});
+                        int gpu1_slots, int ram_slots, const std::vector<double>& ram_heat = {}, int layer_begin = 0,
+                        int layer_end = -1);
 
 }  // namespace blaze

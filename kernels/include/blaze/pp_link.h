@@ -1,12 +1,13 @@
 // Pipeline-parallel hand-off between the GPUs of two stages through pinned, mapped host memory (no P2P). The link is
-// a 256-byte header (u64 words: the last step signaled, the last step the receiver took, the bytes of slot 0 and of
-// slot 1) and two slots of rows: step v's rows go to slot (v - 1) % 2, so the sender fills the next step's slot while
-// the receiver still reads the last one (a split prefill chunk runs on both stages at once). The sender waits until
-// the slot it fills was taken (blz_pp_wait_ack), copies the rows in (blz_pp_copy) and raises the flag (blz_pp_signal);
-// the receiver waits for the flag on the GPU (a spin kernel: graph-capturable, no host round trip), copies the rows out
-// and gives the slot back (blz_pp_ack). The step's number is set into the device counters before each step
-// (blz_pp_set: the host counts the steps every stage is sent, so a step that failed on one stage leaves none a step
-// behind); a captured step reads it there, slots included.
+// a 256-byte header (u64 words: 0 the last step signaled, 2 and 3 the bytes of slot 0 and of slot 1, from 8 the last
+// step each receiver took: the tensor-parallel ranks of the next stage all read the rows) and two slots of rows: step
+// v's rows go to slot (v - 1) % 2, so the sender fills the next step's slot while the receivers still read the last one
+// (a split prefill chunk runs on both stages at once). The sender waits until the slot it fills was taken
+// (blz_pp_wait_ack), copies the rows in (blz_pp_copy) and raises the flag (blz_pp_signal); a receiver waits for the
+// flag on the GPU (a spin kernel: graph-capturable, no host round trip), copies the rows out and gives the slot back
+// (blz_pp_ack). The step's number is set into the device counters before each step (blz_pp_set: the host counts the
+// steps every stage is sent, so a step that failed on one stage leaves none a step behind); a captured step reads it
+// there, slots included.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -26,11 +27,11 @@ cudaError_t blz_pp_signal(uint64_t* flag, uint64_t* counter, uint64_t bytes, cud
 /// \brief counter += 1, then wait until the host-mapped flag reaches it (before the copy out of the link).
 cudaError_t blz_pp_wait(const uint64_t* flag, uint64_t* counter, cudaStream_t stream);
 
-/// \brief The receiver took the rows of step `*counter` (after its copies): their slot is free.
-cudaError_t blz_pp_ack(uint64_t* flag, const uint64_t* counter, cudaStream_t stream);
+/// \brief Receiver `receiver` (< 16) took the rows of step `*counter` (after its copies).
+cudaError_t blz_pp_ack(uint64_t* flag, const uint64_t* counter, int receiver, cudaStream_t stream);
 
-/// \brief The sender waits until the slot of its next step (`*counter + 1`) was given back.
-cudaError_t blz_pp_wait_ack(const uint64_t* flag, const uint64_t* counter, cudaStream_t stream);
+/// \brief The sender waits until every one of `receivers` gave back the slot of its next step (`*counter + 1`).
+cudaError_t blz_pp_wait_ack(const uint64_t* flag, const uint64_t* counter, int receivers, cudaStream_t stream);
 
 /// \brief Copy `bytes` between `dev` and the link at `offset` within the step's slot of `slot_bytes`: send (1) into the
 /// slot of the next step to signal (`*counter + 1`), else out of the slot of the step received (`*counter`). offset,

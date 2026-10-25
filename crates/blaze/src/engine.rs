@@ -515,11 +515,22 @@ pub struct Engine {
     free_cache_rows: Vec<usize>,
     /// commands sent ahead of the next broadcast
     deferred: std::cell::RefCell<Vec<Deferred>>,
-    /// the rank whose replies count (the last pipeline stage: it holds the head)
+    /// the rank whose replies count (the last pipeline stage: it holds the head) and the shards of the head's vocabulary
     lead: usize,
+    head_shards: usize,
     /// pipeline stages: rows of a step's parts (0: one forward a step)
     pp_chunk: usize,
     pub info: Info,
+}
+
+/// The GPU of a rank: BLAZE_RANK_GPUS (a list, e.g. "0,0,1,1": two ranks a GPU, to test a pipeline of tensor-parallel
+/// stages on fewer GPUs), else the rank.
+fn rank_gpu(rank: usize) -> usize {
+    static MAP: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    let map = MAP.get_or_init(|| {
+        std::env::var("BLAZE_RANK_GPUS").map(|v| v.split(',').filter_map(|g| g.trim().parse().ok()).collect()).unwrap_or_default()
+    });
+    map.get(rank).copied().unwrap_or(rank)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -537,26 +548,29 @@ fn worker_main(
 ) {
     let kv_auto = opts.kv_auto.clone();
     let start = || -> Result<Runner> {
-        gpu::set_device(rank as i32)?;
+        gpu::set_device(rank_gpu(rank) as i32)?;
         let cfg = crate::config::ModelConfig::load(&dir)?;
         let tokens = opts.max_chunk.max(opts.max_seqs);
         let ar_bytes = (tokens * cfg.hidden * 2).max(opts.max_seqs * cfg.vocab * 2).next_multiple_of(16);
         let mut ar = null_mut();
-        // pipeline stages hold whole layers: no tensor-parallel group, no all-reduce
-        let (tp_rank, tp_world) = if opts.pp.is_some() { (0, 1) } else { (rank, world) };
+        // pipeline stages: the tensor-parallel group of the stage (its own all-reduce buffer)
+        let (tp_rank, tp_world, group) = match &opts.pp {
+            Some(p) => (p.tp_rank, p.tp.max(1), p.stage),
+            None => (rank, world, 0),
+        };
         if tp_world > 1 {
-            // Rank 0 creates the shared buffer before the others map it; every rank passes both barriers.
-            let name = CString::new(format!("/blaze_ar_{}", std::process::id()))?;
+            // the group's rank 0 creates the shared buffer before the others map it; every rank passes both barriers
+            let name = CString::new(format!("/blaze_ar_{}_{group}", std::process::id()))?;
             let mut err = 0;
-            if rank == 0 {
-                err = unsafe { sys::blz_host_ar_open(name.as_ptr(), 0, world as i32, ar_bytes as i64, 1, &mut ar) };
+            if tp_rank == 0 {
+                err = unsafe { sys::blz_host_ar_open(name.as_ptr(), 0, tp_world as i32, ar_bytes as i64, 1, &mut ar) };
             }
             barrier.wait()?;
-            if rank != 0 {
-                err = unsafe { sys::blz_host_ar_open(name.as_ptr(), rank as i32, world as i32, ar_bytes as i64, 0, &mut ar) };
+            if tp_rank != 0 {
+                err = unsafe { sys::blz_host_ar_open(name.as_ptr(), tp_rank as i32, tp_world as i32, ar_bytes as i64, 0, &mut ar) };
             }
             barrier.wait()?;
-            if rank == 0 {
+            if tp_rank == 0 {
                 unsafe { sys::blz_host_ar_unlink(name.as_ptr()) };
             }
             check(err, "host all-reduce buffer")?;
@@ -659,9 +673,13 @@ impl Engine {
         let stages = opts.pp_stages.max(1);
         let opts_pp_chunk = opts.pp_chunk;
         let mut ranks: Vec<Option<crate::model::PpRank>> = vec![None; world];
+        let tp = if stages > 1 { opts.pp_tp.max(1) } else { world };
         if stages > 1 {
-            if stages != world {
-                bail!("--pp {stages} needs one GPU per stage ({world} given; tensor parallelism inside a stage is not supported)");
+            if stages * tp != world {
+                bail!("--pp {stages} with --tp {tp} needs {} GPUs ({world} given)", stages * tp);
+            }
+            if tp > 16 {
+                bail!("--tp {tp} inside a pipeline stage: at most 16 ranks read a link");
             }
             let cfg = crate::config::ModelConfig::load(dir)?;
             let layers = cfg.layers.len();
@@ -676,18 +694,29 @@ impl Engine {
                 l.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
                 links.push(Arc::new(l));
             }
-            for (s, r) in ranks.iter_mut().enumerate() {
+            // rank = stage * tp + its rank in the stage's tensor-parallel group
+            for (rank, r) in ranks.iter_mut().enumerate() {
+                let s = rank / tp;
                 *r = Some(crate::model::PpRank {
                     stage: s,
                     stages,
                     layers: s * layers / stages..(s + 1) * layers / stages,
                     prev: (s > 0).then(|| links[s - 1].clone()),
                     next: (s + 1 < stages).then(|| links[s].clone()),
+                    tp_rank: rank % tp,
+                    tp,
                 });
             }
             eprintln!(
                 "blaze: pipeline of {stages} stages: layers {}",
-                ranks.iter().flatten().map(|r| format!("{}..{} on GPU {}", r.layers.start, r.layers.end, r.stage)).collect::<Vec<_>>().join(", ")
+                (0..stages)
+                    .map(|s| {
+                        let r = ranks[s * tp].as_ref().unwrap();
+                        let gpus: Vec<String> = (s * tp..(s + 1) * tp).map(|k| rank_gpu(k).to_string()).collect();
+                        format!("{}..{} on GPU {}", r.layers.start, r.layers.end, gpus.join("+"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         }
         let mut workers = Vec::with_capacity(world);
@@ -695,8 +724,8 @@ impl Engine {
             // a stage on another machine: a relay to its stage worker
             if let Some((_, addr)) = opts.pp_remote.iter().find(|(s, _)| *s == rank) {
                 let r = ranks[rank].as_ref().ok_or_else(|| anyhow!("--pp-remote without --pp"))?;
-                if rank + 1 != world {
-                    bail!("--pp-remote {rank}: a remote stage must be the last one for now");
+                if rank + 1 != world || tp > 1 {
+                    bail!("--pp-remote {rank}: a remote stage must be the last one, without --tp, for now");
                 }
                 if opts.kv_auto.is_some() {
                     bail!("--pp-remote: give --kv-tokens (the stages on two machines must hold the same pool)");
@@ -776,9 +805,11 @@ impl Engine {
             return Err(e);
         }
         let info = info.unwrap();
-        let lead = if stages > 1 { world - 1 } else { 0 };
+        // the first rank of the last stage: its group holds the head
+        let lead = if stages > 1 { world - tp } else { 0 };
         let mut engine = Self {
             lead,
+            head_shards: tp,
             pp_chunk: if stages > 1 { opts_pp_chunk } else { 0 },
             workers,
             last_verify: Vec::new(),
@@ -1188,8 +1219,8 @@ impl Engine {
     }
 
     fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Cands> {
-        // the shards of the vocabulary: the tensor-parallel group (pipeline stages: the last one has it whole)
-        let (k, world) = (sys::BLZ_TOPK_MAX, if self.lead > 0 { 1 } else { self.workers.len() });
+        // the shards of the vocabulary: the tensor-parallel group (pipeline stages: the last stage's)
+        let (k, world) = (sys::BLZ_TOPK_MAX, self.head_shards);
         (0..n)
             .map(|r| {
                 let mut top = Vec::with_capacity(world * k);

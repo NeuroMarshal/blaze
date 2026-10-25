@@ -62,6 +62,8 @@ struct HybridConfig {
 
   std::string model_dir;          // checkpoint directory (compressed-tensors NVFP4 safetensors)
   std::string mtp_dir;            // a checkpoint whose MTP layer's experts follow the decoder layers (option mtp_dir)
+  int layer_begin = 0;            // the layers this engine serves (a pipeline stage's; option layers=A-B), the rest
+  int layer_end = -1;             // never placed; -1: every layer
   int topk = 10;
   int gpu0 = 0;
   int gpu1 = -1;                  // helper GPU ordinal, -1: none

@@ -89,6 +89,11 @@ void apply_hybrid_options(const std::string& options, HybridConfig& cfg) {
     else if (key == "cpu_tune") cfg.cpu_tune = std::stoi(val) != 0;
     else if (key == "ssd_direct") cfg.ssd_direct = std::stoi(val) != 0;
     else if (key == "mtp_dir") cfg.mtp_dir = val;
+    else if (key == "layers") {
+      const size_t dash = val.find('-');
+      if (dash == std::string::npos) throw std::invalid_argument("option layers=A-B: " + val);
+      cfg.layer_begin = std::stoi(val.substr(0, dash)), cfg.layer_end = std::stoi(val.substr(dash + 1));
+    }
     else throw std::invalid_argument("unknown blaze option: " + key);
   }
 }
@@ -141,7 +146,17 @@ void save_heat(const std::string& path, int num_layers, int num_experts, const H
 void HybridMoe::save_profile() const {
   if (cfg_.swap.heat_path.empty()) return;
   try {
-    save_heat(cfg_.swap.heat_path, num_layers(), num_experts(), {score_, score_long_});
+    HeatProfile h{score_, score_long_};
+    if (cfg_.layer_begin > 0 || cfg_.layer_end < num_layers()) {
+      // a pipeline stage's layers into the profile the other stages write too (theirs as the file has them)
+      HeatProfile old = load_heat(cfg_.swap.heat_path, num_layers(), num_experts());
+      const size_t n = size_t(num_layers()) * num_experts(), a = size_t(cfg_.layer_begin) * num_experts(),
+                   b = size_t(cfg_.layer_end) * num_experts();
+      if (old.recent.size() == n && old.longterm.size() == n)
+        for (size_t i = 0; i < n; ++i)
+          if (i < a || i >= b) h.recent[i] = old.recent[i], h.longterm[i] = old.longterm[i];
+    }
+    save_heat(cfg_.swap.heat_path, num_layers(), num_experts(), h);
   } catch (const std::exception& e) {
     log("blaze swap: %s", e.what());
   }

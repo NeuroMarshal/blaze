@@ -6,8 +6,8 @@
 
 namespace {
 
-// header words: the last step signaled, the last step the receiver took, the bytes of slot 0 and 1
-constexpr int kFlag = 0, kAck = 1, kBytes = 2;
+// header words: the last step signaled, the bytes of slot 0 and 1, from word 8 the last step each receiver took
+constexpr int kFlag = 0, kBytes = 2, kAck = 8, kMaxReceivers = 16;
 constexpr int64_t kHeader = 256;
 
 __global__ void set_kernel(uint64_t* counters, uint64_t v) {
@@ -33,15 +33,17 @@ __global__ void wait_kernel(const uint64_t* hdr, uint64_t* counter) {
   __threadfence_system();
 }
 
-__global__ void ack_kernel(uint64_t* hdr, const uint64_t* counter) {
+__global__ void ack_kernel(uint64_t* hdr, const uint64_t* counter, int receiver) {
   __threadfence_system();  // the rows are read before the slot is given back
-  reinterpret_cast<volatile uint64_t*>(hdr)[kAck] = *counter;
+  reinterpret_cast<volatile uint64_t*>(hdr)[kAck + receiver] = *counter;
 }
 
-__global__ void wait_ack_kernel(const uint64_t* hdr, const uint64_t* counter) {
-  // the slot of step v held step v - 2: the receiver must have taken it
+__global__ void wait_ack_kernel(const uint64_t* hdr, const uint64_t* counter, int receivers) {
+  // the slot of step v held step v - 2: every receiver must have taken it
   const uint64_t v = *counter + 1;
-  while (reinterpret_cast<const volatile uint64_t*>(hdr)[kAck] + 2 < v) __nanosleep(200);
+  const volatile uint64_t* h = hdr;
+  for (int r = 0; r < receivers; ++r)
+    while (h[kAck + r] + 2 < v) __nanosleep(200);
   __threadfence_system();
 }
 
@@ -76,13 +78,15 @@ extern "C" cudaError_t blz_pp_wait(const uint64_t* flag, uint64_t* counter, cuda
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_pp_ack(uint64_t* flag, const uint64_t* counter, cudaStream_t stream) {
-  ack_kernel<<<1, 1, 0, stream>>>(flag, counter);
+extern "C" cudaError_t blz_pp_ack(uint64_t* flag, const uint64_t* counter, int receiver, cudaStream_t stream) {
+  if (receiver < 0 || receiver >= kMaxReceivers) return cudaErrorInvalidValue;
+  ack_kernel<<<1, 1, 0, stream>>>(flag, counter, receiver);
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_pp_wait_ack(const uint64_t* flag, const uint64_t* counter, cudaStream_t stream) {
-  wait_ack_kernel<<<1, 1, 0, stream>>>(flag, counter);
+extern "C" cudaError_t blz_pp_wait_ack(const uint64_t* flag, const uint64_t* counter, int receivers, cudaStream_t stream) {
+  if (receivers < 1 || receivers > kMaxReceivers) return cudaErrorInvalidValue;
+  wait_ack_kernel<<<1, 1, 0, stream>>>(flag, counter, receivers);
   return cudaGetLastError();
 }
 

@@ -153,17 +153,21 @@ void ExpertStore::read_chunk(int layer, int expert, int c, void* dst, bool direc
 }
 
 Placement place_experts(int num_layers, int num_experts, const std::vector<double>& heat, int gpu0_slots,
-                        int gpu1_slots, int ram_slots, const std::vector<double>& ram_heat) {
+                        int gpu1_slots, int ram_slots, const std::vector<double>& ram_heat, int layer_begin,
+                        int layer_end) {
   Placement p;
   p.num_layers = num_layers, p.num_experts = num_experts;
-  const size_t n = size_t(num_layers) * num_experts;
-  p.tier.assign(n, Tier::kSsd);
-  p.slot.assign(n, -1);
+  const size_t all = size_t(num_layers) * num_experts;
+  p.tier.assign(all, Tier::kSsd);
+  p.slot.assign(all, -1);
+  const int l1 = layer_end < 0 ? num_layers : std::min(layer_end, num_layers), l0 = std::clamp(layer_begin, 0, l1);
+  // the held layers' experts only (a contiguous range of the [layer * E + expert] index)
+  const size_t n = size_t(l1 - l0) * num_experts;
   std::vector<size_t> order(n);
-  std::iota(order.begin(), order.end(), 0);
+  std::iota(order.begin(), order.end(), size_t(l0) * num_experts);
   // Experts are ranked by heat (ties in expert-major order, so a uniform profile gives each tier the same expert
   // ids from every layer).
-  if (heat.size() == n) {
+  if (heat.size() == all) {
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
       return heat[a] != heat[b] ? heat[a] > heat[b] : a % num_experts < b % num_experts;
     });
@@ -173,7 +177,7 @@ Placement place_experts(int num_layers, int num_experts, const std::vector<doubl
                      [&](size_t a, size_t b) { return a % num_experts < b % num_experts; });
   }
   const int cap[3] = {gpu0_slots, gpu1_slots, ram_slots};
-  if (ram_heat.size() == n) {
+  if (ram_heat.size() == all) {
     const size_t on_gpu = std::min(n, size_t(std::max(0, gpu0_slots)) + size_t(std::max(0, gpu1_slots)));
     std::stable_sort(order.begin() + on_gpu, order.end(), [&](size_t a, size_t b) {
       return ram_heat[a] != ram_heat[b] ? ram_heat[a] > ram_heat[b] : a % num_experts < b % num_experts;

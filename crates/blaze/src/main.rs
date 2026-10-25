@@ -197,10 +197,11 @@ impl EngineArgs {
             _ => None,
         };
         // GPUs: the tensor-parallel group, or one per pipeline stage
-        if self.pp > 1 && (self.tp > 1 || self.draft_model.is_some() || self.mtp_window > 0) {
-            anyhow::bail!("--pp {}: pipeline stages run without --tp and without a drafter for now", self.pp);
+        if self.pp > 1 && (self.draft_model.is_some() || self.mtp_window > 0) {
+            anyhow::bail!("--pp {}: pipeline stages run without a drafter for now", self.pp);
         }
-        let world = if self.pp > 1 { self.pp } else { self.tp.max(1) };
+        // pipeline stages of --tp ranks each
+        let world = self.pp.max(1) * self.tp.max(1);
         let mut later_vram = vec![0usize; world];
         if let Some(d) = &self.draft_model {
             let b = blaze::drafter::vram_estimate(d, world, head_vram)?;
@@ -262,6 +263,7 @@ impl EngineArgs {
                 kv_dtype: self.kv_cache_dtype,
                 gemm: self.gemm,
                 pp_stages: self.pp,
+                pp_tp: self.tp.max(1),
                 pp: None,
                 pp_chunk: self.pp_chunk,
                 pp_remote: self

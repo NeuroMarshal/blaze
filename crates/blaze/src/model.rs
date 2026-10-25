@@ -50,6 +50,26 @@ pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
     })
 }
 
+/// Stage `stage` of `stages`'s share of a CPU list ("3-4,6,9-17"): a contiguous part of its cores, as a list.
+fn stage_cores(list: &str, stage: usize, stages: usize) -> String {
+    let cores: Vec<usize> = list
+        .split(',')
+        .filter_map(|p| {
+            let p = p.trim();
+            match p.split_once('-') {
+                Some((a, b)) => Some((a.parse().ok()?..=b.parse().ok()?).collect::<Vec<usize>>()),
+                None => p.parse().ok().map(|c| vec![c]),
+            }
+        })
+        .flatten()
+        .collect();
+    if cores.is_empty() {
+        return String::new();
+    }
+    let per = cores.len().div_ceil(stages.max(1));
+    cores.iter().skip(stage * per).take(per).map(|c| c.to_string()).collect::<Vec<_>>().join(",")
+}
+
 fn load_vec(ckpt: &Checkpoint, name: &str) -> Result<DevBuf> {
     load_rows(ckpt, name, None)
 }
@@ -253,6 +273,10 @@ pub struct PpRank {
     pub layers: Range<usize>,
     pub prev: Option<Arc<HostMapped>>,
     pub next: Option<Arc<HostMapped>>,
+    /// this rank within its stage's tensor-parallel group, and the group's size (every stage the same): rank 0 hands
+    /// the rows on, every rank of the next stage reads them
+    pub tp_rank: usize,
+    pub tp: usize,
 }
 
 /// Bytes of a pipeline link's header (the flag) before its rows.
@@ -318,6 +342,8 @@ pub struct Options {
     pub gemm: crate::linear::GemmRoute,
     /// pipeline parallelism (`--pp`): the stages (1: none), and this rank's stage (set by the engine for each rank)
     pub pp_stages: usize,
+    /// tensor-parallel ranks of each pipeline stage
+    pub pp_tp: usize,
     pub pp: Option<PpRank>,
     /// pipeline stages on other machines: (stage, address of its `blaze stage-worker`)
     pub pp_remote: Vec<(usize, String)>,
@@ -907,11 +933,8 @@ impl Model {
         if w > 1 && matches!(cfg.mlp, MlpConfig::Moe { .. }) {
             bail!("tensor parallelism of MoE models is not supported yet");
         }
-        if opts.pp.is_some() && matches!(cfg.mlp, MlpConfig::Moe { .. }) {
-            bail!("pipeline stages of MoE models are not supported yet (the expert engine spans both GPUs)");
-        }
-        if opts.pp.is_some() && cfg.ple.is_some() {
-            bail!("pipeline stages of per-layer-embedding models are not supported yet (one table serves every layer)");
+        if opts.pp.is_some() && opts.mtp_window > 0 {
+            bail!("pipeline stages with the MTP head: not supported yet");
         }
         let dims = Dims {
             heads: cfg.attn.heads / w,
@@ -1152,7 +1175,10 @@ impl Model {
         mark("KV table, GDN states, verify records", s)?;
         // PLE: the n-gram table stays in its safetensors file, rows read on demand by CPU threads.
         let (mut ple_table, mut ple_state) = (None, None);
-        if let (Some(pc), Some(hc)) = (&cfg.ple, &cfg.hc) {
+        // a pipeline stage without the PLE layer has none of it
+        if let (Some(pc), Some(hc)) = (&cfg.ple, &cfg.hc)
+            && pc.layers.iter().all(|l| held.contains(l))
+        {
             if pc.layers.len() != 1 {
                 bail!("PLE on {} layers (one supported)", pc.layers.len());
             }
@@ -1563,18 +1589,34 @@ impl Model {
             }
             moe_options = [moe_options, format!("mtp_dir={}", mtp.display())].into_iter().filter(|o| !o.is_empty()).collect::<Vec<_>>().join(",");
         }
+        // a pipeline stage: an engine of its own on its GPU over its layers (no helper GPU), with its share of the CPU
+        // workers and their cores
+        let (mut threads, mut core_list) = (self.opts.moe_threads, self.opts.moe_cores.clone());
+        let (gpu0, gpu1) = match self.pp.as_ref() {
+            Some((p, _)) => {
+                moe_options = [moe_options, format!("layers={}-{}", p.layers.start, p.layers.end)]
+                    .into_iter()
+                    .filter(|o| !o.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                threads = (threads / p.stages).max(1);
+                core_list = stage_cores(&core_list, p.stage, p.stages);
+                (crate::gpu::device()?, -1)
+            }
+            None => (0, if self.opts.moe_gpu1_gib > 0.0 { 1 } else { -1 }),
+        };
         let options = CString::new(moe_options.as_bytes())?;
-        let cores = CString::new(self.opts.moe_cores.as_bytes())?;
+        let cores = CString::new(core_list.as_bytes())?;
         let cfg = sys::blz_moe_engine_config {
             model_dir: model_dir.as_ptr(),
             topk: top_k as c_int,
-            gpu0: 0,
-            gpu1: if self.opts.moe_gpu1_gib > 0.0 { 1 } else { -1 },
+            gpu0,
+            gpu1,
             gpu0_gib: gib,
-            gpu1_gib: self.opts.moe_gpu1_gib,
+            gpu1_gib: if gpu1 >= 0 { self.opts.moe_gpu1_gib } else { 0.0 },
             ram_gib: self.opts.moe_ram_gib,
-            cpu_threads: self.opts.moe_threads as c_int,
-            cpu_cores: if self.opts.moe_cores.is_empty() { null() } else { cores.as_ptr() },
+            cpu_threads: threads as c_int,
+            cpu_cores: if core_list.is_empty() { null() } else { cores.as_ptr() },
             heat_path: heat.as_ref().map_or(null(), |h| h.as_ptr()),
             swap_options: null(),
             options: options.as_ptr(),
@@ -1864,7 +1906,7 @@ impl Model {
     /// its start) into the page cache: the same hash as blz_ngram_hash, on the host.
     pub fn ple_warm(&self, prev: &[i64], tokens: &[i64]) {
         let (Some(table), Some(pc)) = (&self.ple_table, &self.cfg.ple) else { return };
-        let ple = self.layers[pc.layers[0]].ple.as_ref().unwrap();
+        let ple = self.layers[pc.layers[0] - self.layer0].ple.as_ref().unwrap();
         let (mult, sizes, offsets) = &ple.host_hash;
         let eos = self.cfg.eos.unwrap_or(0);
         let mut win: Vec<i64> = vec![eos, eos];
@@ -1892,7 +1934,7 @@ impl Model {
     /// n-gram row ids of the step's tokens and the table request (the CPU reads them while the first layers run).
     fn ple_request(&self, t: usize, seqs: usize, verify: bool) -> Result<()> {
         let (Some(table), Some((_, hist)), Some(pc)) = (&self.ple_table, &self.ple_state, &self.cfg.ple) else { return Ok(()) };
-        let ple = self.layers[pc.layers[0]].ple.as_ref().unwrap();
+        let ple = self.layers[pc.layers[0] - self.layer0].ple.as_ref().unwrap();
         let (w, s, m) = (&self.work, &self.stream, &self.meta);
         let ids = w.ple_ids.as_ref().unwrap();
         check(
@@ -1956,13 +1998,13 @@ impl Model {
 
     /// BLAZE_PP_FAULT=N: this is the first stage's step N, to fail before its hand-off.
     pub fn pp_fault_now(&self) -> bool {
-        self.pp.as_ref().is_some_and(|(p, _)| p.stage == 0) && self.pp_fault == Some(self.pp_seq.get())
+        self.pp.as_ref().is_some_and(|(p, _)| p.stage == 0 && p.tp_rank == 0) && self.pp_fault == Some(self.pp_seq.get())
     }
 
     /// A step that failed on this stage before it handed its rows on: the next stage's wait is released (bytes
     /// u64::MAX, no rows) instead of spinning forever; the step's error is this stage's.
     pub fn pp_abort(&self) {
-        if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages) {
+        if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages && p.tp_rank == 0) {
             let link = p.next.as_ref().unwrap();
             let v = self.pp_seq.get().saturating_sub(1);
             unsafe {
@@ -1988,8 +2030,9 @@ impl Model {
         }
         // the sender's counter: the steps signaled (its next one's slot); the receiver's: the step received
         let counter: *const u64 = counters.at::<u64>(if send { 0 } else { 1 });
+        let (receiver, receivers) = self.pp.as_ref().map_or((0, 1), |(p, _)| (p.tp_rank, p.tp.max(1)));
         if send {
-            check(unsafe { sys::blz_pp_wait_ack(hdr, counter, s.0) }, "pipeline slot")?;
+            check(unsafe { sys::blz_pp_wait_ack(hdr, counter, receivers as c_int, s.0) }, "pipeline slot")?;
         }
         let mut off = 0;
         for (buf, elems) in bufs {
@@ -2000,7 +2043,7 @@ impl Model {
             off += elems * 2;
         }
         if !send {
-            check(unsafe { sys::blz_pp_ack(hdr, counter, s.0) }, "pipeline slot back")?;
+            check(unsafe { sys::blz_pp_ack(hdr, counter, receiver as c_int, s.0) }, "pipeline slot back")?;
         }
         Ok(off)
     }
@@ -2129,8 +2172,12 @@ impl Model {
         }
         self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
-        // a pipeline stage before the last hands its rows on and is done
+        // a pipeline stage before the last hands its rows on and is done (its first tensor-parallel rank: the rows
+        // are the same on every one after the all-reduce)
         if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages) {
+            if p.tp_rank > 0 {
+                return Ok(());
+            }
             let link = p.next.as_ref().unwrap();
             let bytes = self.pp_rows(link, counters, t, true)?;
             check(unsafe { sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), bytes as u64, s.0) }, "pipeline send")?;
@@ -2896,7 +2943,7 @@ impl Model {
             }
         }
         if let (Some((conv, hist)), Some(rec), Some(pc), Some(hc)) = (&self.ple_state, &self.ple_record, &self.cfg.ple, &self.cfg.hc) {
-            let ple = self.layers[pc.layers[0]].ple.as_ref().unwrap();
+            let ple = self.layers[pc.layers[0] - self.layer0].ple.as_ref().unwrap();
             let ch = hc.count * self.cfg.hidden;
             self.commit_meta.upload_at(k * 16, &[0i32, accepted as i32, row as i32])?;
             let dummy = self.work.ple_key.as_ref().unwrap();
@@ -3066,7 +3113,7 @@ impl Model {
                 let moe = self.moe.as_ref().ok_or_else(|| anyhow!("MoE engine not started"))?;
                 check(
                     unsafe {
-                        sys::blz_moe_engine_forward(moe.0, li as c_int, w.normed.ptr(), t as c_int, w.ids.ptr(), w.weights.ptr(),
+                        sys::blz_moe_engine_forward(moe.0, (self.layer0 + li) as c_int, w.normed.ptr(), t as c_int, w.ids.ptr(), w.weights.ptr(),
                                                     w.moe_out.ptr(), s.0)
                     },
                     "moe",
@@ -3129,4 +3176,14 @@ impl Drop for Model {
 pub fn describe_load(path: &Path) -> Result<String> {
     let cfg = ModelConfig::load(path).with_context(|| format!("loading {}", path.display()))?;
     Ok(format!("{} layers, hidden {}", cfg.layers.len(), cfg.hidden))
+}
+
+#[cfg(test)]
+mod stage_tests {
+    #[test]
+    fn stage_cores_split_a_cpu_list() {
+        assert_eq!(super::stage_cores("3-4,6,9-12", 0, 2), "3,4,6,9");
+        assert_eq!(super::stage_cores("3-4,6,9-12", 1, 2), "10,11,12");
+        assert_eq!(super::stage_cores("", 1, 2), "");
+    }
 }
