@@ -117,6 +117,9 @@ struct Active {
     /// health-log id and admission time
     id: u64,
     t0: Instant,
+    /// tokens of the request's prompt; `req.tokens` holds more after a preemption (the prompt and the output it had,
+    /// read again when it resumes)
+    orig_len: usize,
     /// bit per token id: the ids of the prompt and the output so far, and the most frequent ones (MTP candidate head)
     seen: Vec<u64>,
     /// prompt tokens fed so far
@@ -415,6 +418,8 @@ pub struct SchedStats {
     pub cancelled: AtomicU64,
     /// requests ended early because the KV pool could not hold them
     pub kv_full: AtomicU64,
+    /// requests that gave their KV pages up and resumed later (the pool was full)
+    pub preempted: AtomicU64,
 }
 
 /// Handle of the scheduler thread.
@@ -454,6 +459,7 @@ impl Scheduler {
                     suffix_cfg: SuffixConfig::default(),
                     stats: loop_stats,
                     health: crate::health::Health::from_env(),
+                    preempted: VecDeque::new(),
                 };
                 s.run();
             })
@@ -496,13 +502,15 @@ struct Loop {
     suffix_cfg: SuffixConfig,
     stats: Arc<SchedStats>,
     health: crate::health::Health,
+    /// requests that gave their KV pages up (the pool was full): they resume before new requests are admitted
+    preempted: VecDeque<Active>,
 }
 
 impl Loop {
     fn run(&mut self) {
         loop {
             // intake: block while idle, poll while busy
-            if self.active.is_empty() && self.waiting.is_empty() {
+            if self.active.is_empty() && self.waiting.is_empty() && self.preempted.is_empty() {
                 self.publish_stats();
                 self.health_tick();
                 match self.rx.recv_timeout(Duration::from_secs(5)) {
@@ -516,7 +524,7 @@ impl Loop {
                     Ok(r) => self.waiting.push_back(r),
                     Err(RecvTimeoutError::Timeout) => break,
                     Err(RecvTimeoutError::Disconnected) => {
-                        if self.active.is_empty() && self.waiting.is_empty() {
+                        if self.active.is_empty() && self.waiting.is_empty() && self.preempted.is_empty() {
                             return;
                         }
                         break;
@@ -555,12 +563,13 @@ impl Loop {
 
     fn health_tick(&mut self) {
         let total = self.engine.info.max_tokens / self.engine.info.page.max(1);
-        self.health.tick(self.active.len(), self.waiting.len(), (self.engine.free_page_count(), total), self.cache.len(), self.spec_stats);
+        self.health.tick(self.active.len(), self.waiting.len() + self.preempted.len(), (self.engine.free_page_count(), total), self.cache.len(),
+                         self.spec_stats);
     }
 
     fn publish_stats(&self) {
         self.stats.running.store(self.active.len(), Ordering::Relaxed);
-        self.stats.waiting.store(self.waiting.len(), Ordering::Relaxed);
+        self.stats.waiting.store(self.waiting.len() + self.preempted.len(), Ordering::Relaxed);
     }
 
     /// Requests whose client is gone (cancel flag set, event channel closed) leave at once, also while they wait or
@@ -646,6 +655,9 @@ impl Loop {
     }
 
     fn admit(&mut self) {
+        if !self.resume_preempted() {
+            return;
+        }
         while let Some(req) = self.waiting.front() {
             if req.cancel.load(Ordering::Relaxed) {
                 let req = self.waiting.pop_front().unwrap();
@@ -761,6 +773,7 @@ impl Loop {
             self.active.push(Active {
                 id,
                 t0: Instant::now(),
+                orig_len: req.tokens.len(),
                 seen,
                 prompt_set,
                 req,
@@ -924,7 +937,7 @@ impl Loop {
         let mm = a.req.mm.is_some();
         let mut d = match self.cfg.spec_method {
             SpecMethod::Ngram => {
-                let ctx: Vec<i64> = a.req.tokens.iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
+                let ctx: Vec<i64> = a.req.tokens[..a.orig_len].iter().copied().chain(a.generated.iter().map(|&t| t as i64)).collect();
                 propose(&ctx, 4, 1, k)
             }
             SpecMethod::Suffix => self.suffix_draft(i, k),
@@ -1353,14 +1366,14 @@ impl Loop {
         let a = &mut self.active[i];
         let ix = a.suffix.get_or_insert_with(|| {
             let mut ix = SuffixIndex::default();
-            ix.extend(a.req.tokens.iter().map(|&t| t as i32));
+            ix.extend(a.req.tokens[..a.orig_len].iter().map(|&t| t as i32));
             ix.extend(a.generated.iter().copied());
             ix
         });
-        let n = a.req.tokens.len() + a.generated.len();
+        let n = a.orig_len + a.generated.len();
         let skip = n.saturating_sub(cfg.max_depth + 1);
         let tail: Vec<i32> =
-            a.req.tokens.iter().map(|&t| t as i32).chain(a.generated.iter().copied()).skip(skip).collect();
+            a.req.tokens[..a.orig_len].iter().map(|&t| t as i32).chain(a.generated.iter().copied()).skip(skip).collect();
         let own = ix.draft(&tail, k, &cfg);
         let global = self.suffix_global.draft(&tail, k, &cfg);
         let best = if global.1 > own.1 { global.0 } else { own.0 };
@@ -1389,7 +1402,7 @@ impl Loop {
                       a.generated.len() as f64 / secs.max(1e-9));
         }
         if reason != Finish::Cancelled && keep {
-            let mut tokens = a.req.tokens.clone();
+            let mut tokens = a.req.tokens[..a.orig_len].to_vec();
             tokens.extend(a.generated[..a.generated.len().saturating_sub(1)].iter().map(|&t| t as i64));
             self.remember(&a.seq, tokens, SnapKind::Finish);
         }
@@ -1427,16 +1440,114 @@ impl Loop {
                 return;
             }
             let Some(i) = (0..self.active.len()).rev().find(|&i| self.active[i].pending.is_some()) else { return };
-            let a = self.active.remove(i);
-            eprintln!(
-                "blaze: KV pool full ({} free pages for {need}): a request ends at {} tokens of output (finish length)",
-                self.engine.free_page_count(),
-                a.generated.len()
-            );
-            self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
-            self.health.cur.kv_full += 1;
-            self.retire_as(a, Finish::Length, false);
+            if self.active.iter().filter(|a| a.pending.is_some()).count() == 1 && self.active.len() == 1 {
+                // alone and still without room: the pool holds less than its context (admission let it in when it
+                // fit); it ends rather than waiting for pages nobody frees
+                let a = self.active.remove(i);
+                eprintln!("blaze: KV pool full ({} free pages for {need}) with one request: it ends at {} tokens of output",
+                          self.engine.free_page_count(), a.generated.len());
+                self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
+                self.health.cur.kv_full += 1;
+                self.retire_as(a, Finish::Length, false);
+                continue;
+            }
+            self.preempt(i, need);
         }
+    }
+
+    /// Active request `i` gives its KV pages up: its prompt and output so far become the tokens it reads again when it
+    /// resumes (before new requests), its pending token among them; sampling state, grammar and thinking budget stay.
+    fn preempt(&mut self, i: usize, need: usize) {
+        let mut a = self.active.remove(i);
+        let seq = std::mem::replace(&mut a.seq, Seq { row: usize::MAX, slots: Vec::new(), mm: None });
+        self.engine.close(seq);
+        let orig = a.orig_len;
+        a.req.tokens.truncate(orig);
+        a.req.tokens.extend(a.generated.iter().map(|&t| t as i64));
+        a.pending = None;
+        a.fed = 0;
+        a.points.clear();
+        a.eagle.clear();
+        a.tree = None;
+        a.shadow = None;
+        eprintln!(
+            "blaze: KV pool full ({} free pages for {need}): a request with {} tokens of output waits for room and \
+             reads its {} tokens again",
+            self.engine.free_page_count(),
+            a.generated.len(),
+            a.req.tokens.len()
+        );
+        self.stats.preempted.fetch_add(1, Ordering::Relaxed);
+        self.health.cur.preempted += 1;
+        self.preempted.push_back(a);
+    }
+
+    /// Preempted requests back into the batch while their tokens fit (the oldest first; new requests wait for them).
+    fn resume_preempted(&mut self) -> bool {
+        while let Some(a) = self.preempted.front() {
+            if a.req.cancel.load(Ordering::Relaxed) || a.req.events.is_closed() {
+                let a = self.preempted.pop_front().unwrap();
+                let _ = a.req.events.send(GenEvent::Done(Finish::Cancelled));
+                self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
+                self.health.cur.cancelled += 1;
+                continue;
+            }
+            if self.engine.free_rows() == 0 {
+                return false;
+            }
+            let tokens = a.req.tokens.clone();
+            let hit = self.lookup(&tokens);
+            let cached = hit.map_or(0, |i| self.cache[i].tokens.len());
+            let page = self.engine.info.page;
+            let reserved: usize = self
+                .active
+                .iter()
+                .map(|x| (if x.pending.is_some() { self.engine.info.max_verify.max(1) } else { x.req.tokens.len() - x.fed }) + page)
+                .sum();
+            let need = tokens.len() - cached + 16 + reserved + self.engine.info.max_verify.max(1);
+            let keep = hit.map(|i| self.cache[i].tokens.clone());
+            while self.engine.free_slots() < need && self.cache.len() > usize::from(keep.is_some()) {
+                let lru = self
+                    .cache
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| keep.as_ref() != Some(&e.tokens))
+                    .min_by(|a, b| a.1.worth.total_cmp(&b.1.worth))
+                    .map(|(i, _)| i);
+                let Some(i) = lru else { break };
+                let e = self.cache.swap_remove(i);
+                self.inflation = self.inflation.max(e.worth);
+                self.engine.release(e.snap);
+            }
+            if self.engine.free_slots() < need {
+                return false; // the running requests free pages first
+            }
+            let mut a = self.preempted.pop_front().unwrap();
+            let hit = self.lookup(&a.req.tokens);
+            let opened = match hit {
+                Some(i) => self.engine.open_from(Some(&self.cache[i].snap)),
+                None => self.engine.open(),
+            };
+            match opened {
+                Ok(mut seq) => {
+                    seq.mm = a.req.mm.clone();
+                    a.fed = seq.len();
+                    a.seq = seq;
+                    let (fed, end) = (a.fed, (a.fed + self.engine.info.max_chunk).min(a.req.tokens.len()));
+                    let _ = self.engine.ple_warm(&a.req.tokens[fed.saturating_sub(2)..fed], &a.req.tokens[fed..end]);
+                    if self.health.req_log {
+                        eprintln!("blaze req {}: resumes, {} of {} tokens from the prompt cache", a.id, a.fed, a.req.tokens.len());
+                    }
+                    self.active.push(a);
+                }
+                Err(e) => {
+                    eprintln!("blaze: a preempted request could not resume: {e:#}");
+                    self.health.cur.errors += 1;
+                    let _ = a.req.events.send(GenEvent::Error(format!("{e:#}")));
+                }
+            }
+        }
+        true
     }
 
     fn keep_output(&mut self, a: &Active) {
@@ -1482,9 +1593,13 @@ impl Loop {
             let need = decode + self.engine.pages_for(self.active[i].seq.len(), chunk_len);
             if self.make_room(need) {
                 order.push(i);
+            } else if order.is_empty() && self.active.len() > 1 {
+                // other prompts hold pages and nothing decodes: this one waits for room (its prompt is read again)
+                self.preempt(i, need);
+                return Ok(());
             } else if order.is_empty() {
-                // nothing decodes that would free pages: the prompt cannot go on (admit keeps room for the prompts it
-                // lets in, so only page rounding gets here)
+                // alone and without room: the prompt cannot go on (admit keeps room for the prompts it lets in, so
+                // only page rounding gets here)
                 let a = self.active.remove(i);
                 eprintln!("blaze: KV pool full: a prompt of {} tokens stops at {} ({} free pages)", a.req.tokens.len(), a.fed,
                           self.engine.free_page_count());

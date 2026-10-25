@@ -1,6 +1,6 @@
 """KV pool pressure: more long generations at once than a small KV pool holds (start the server with a small
 --kv-tokens, e.g. 8192, and --max-seqs 4). Every request must end with an answer (finish "stop" or "length": the
-scheduler ends the newest request early rather than failing the step for all), none with an error, and the server
+scheduler preempts the newest request and resumes it when pages are free), none early or with an error, and the server
 must still answer afterwards.
 
     python3 scripts/kv_pressure_test.py http://127.0.0.1:8100 [--sessions 4] [--max-tokens 3000]
@@ -47,8 +47,13 @@ def main():
             print(f"session {i}: HTTP {status}: {body.get('error', body)}")
             continue
         c = body["choices"][0]
-        print(f"session {i}: finish {c['finish_reason']}, {body['usage']['completion_tokens']} tokens")
+        n = body["usage"]["completion_tokens"]
+        print(f"session {i}: finish {c['finish_reason']}, {n} tokens")
         bad += c["finish_reason"] not in ("stop", "length")
+        # preempted requests resume: none ends early at "length" before max_tokens
+        if c["finish_reason"] == "length" and n < args.max_tokens:
+            print(f"session {i}: ended early at {n} of {args.max_tokens} tokens")
+            bad += 1
     status, body = post(args.url, {"model": "default", "messages": [{"role": "user", "content": "Say ok."}], "max_tokens": 8,
                                    "chat_template_kwargs": {"enable_thinking": False}}, timeout=120)
     if status != 200:

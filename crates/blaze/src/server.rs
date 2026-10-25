@@ -239,6 +239,7 @@ async fn metrics(State(st): State<Arc<AppState>>) -> Response {
         ("blaze_requests_dropped_total", "counter", "Generations dropped before their end (client gone or stop string)", m.dropped.load(Ordering::Relaxed) as f64),
         ("blaze_requests_cancelled_total", "counter", "Requests the scheduler dropped because their client was gone", s.cancelled.load(Ordering::Relaxed) as f64),
         ("blaze_requests_kv_full_total", "counter", "Requests ended early because the KV pool could not hold them", s.kv_full.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_preempted_total", "counter", "Requests that gave their KV pages up and resumed later", s.preempted.load(Ordering::Relaxed) as f64),
         ("blaze_requests_open", "gauge", "Generations open on the HTTP side", m.open.load(Ordering::Relaxed) as f64),
         ("blaze_requests_running", "gauge", "Requests prefilling or decoding", s.running.load(Ordering::Relaxed) as f64),
         ("blaze_requests_waiting", "gauge", "Requests waiting for a free row or KV room", s.waiting.load(Ordering::Relaxed) as f64),

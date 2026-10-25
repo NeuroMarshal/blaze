@@ -17,6 +17,7 @@ pub struct Interval {
     pub cancelled: u64,
     pub lengths: u64,
     pub kv_full: u64,
+    pub preempted: u64,
     pub tokens: u64,
     pub prompt: u64,
     pub cached: u64,
@@ -112,7 +113,7 @@ impl Health {
         }
         let secs = dt.as_secs_f64();
         let mut line = format!(
-            "blaze stats: {secs:.0} s: {} requests done ({} errors, {} cancelled, {} at length, {} KV full), {} tokens out \
+            "blaze stats: {secs:.0} s: {} requests done ({} errors, {} cancelled, {} at length, {} KV full, {} preempted), {} tokens out \
              ({:.1} tok/s), prompts {} tokens ({:.0}% cached), {} steps (mean {:.1} ms, max {:.0} ms), KV {} of {} pages \
              free, {snapshots} prompt-cache snapshots, running {running}, waiting {waiting} (max {})",
             c.requests,
@@ -120,6 +121,7 @@ impl Health {
             c.cancelled,
             c.lengths,
             c.kv_full,
+            c.preempted,
             c.tokens,
             c.tokens as f64 / secs,
             c.prompt,
