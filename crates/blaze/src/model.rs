@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use blaze_sys as sys;
 use std::ffi::{CString, c_int};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ fn part(total: usize, rank: usize, world: usize) -> Range<usize> {
     rank * n..(rank + 1) * n
 }
 
-fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
+pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
     let inject = format!("{prefix}block_inject_weight.weight");
     Ok(HcBlock {
         norm: load_vec(ckpt, &format!("{prefix}hc_norm.weight"))?,
@@ -100,10 +100,10 @@ pub enum Mlp {
 /// Low-rank gated hyper-connection of one block (Qwen4-Exp GatedResidual): per-stream norm, mix down to one input,
 /// gated injection of the block's output back into every stream.
 pub struct HcBlock {
-    norm: DevBuf,
-    down: DevBuf,
-    up: DevBuf,
-    inject: Option<DevBuf>,
+    pub(crate) norm: DevBuf,
+    pub(crate) down: DevBuf,
+    pub(crate) up: DevBuf,
+    pub(crate) inject: Option<DevBuf>,
 }
 
 /// How a layer reads and updates the residual stream.
@@ -336,6 +336,9 @@ pub struct Options {
     /// MTP drafter: per sequence the draft head scores only the token ids the request has seen (prompt and output) and the
     /// most frequent ones, at most this many per rank (0: the whole vocabulary). Needs the target's LM head in BF16.
     pub mtp_head_cands: usize,
+    /// The checkpoint of the MTP head (its `mtp.*` tensors; None: the target's own). A routed MTP layer's experts join the
+    /// expert engine after the decoder layers (NVFP4, as the target's).
+    pub mtp_model: Option<PathBuf>,
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
@@ -725,6 +728,8 @@ pub struct Model {
     ple_state: Option<(DevBuf, DevBuf)>,
     embed: Arc<HostMapped>,
     moe: Option<MoeEngine>,
+    /// the expert engine's layer of the MTP head's routed experts
+    pub mtp_moe_layer: Option<usize>,
     lin: LinCtx,
     _scratch: DevBuf,
     inv_freq: DevBuf,
@@ -1168,11 +1173,12 @@ impl Model {
             cfg.vocab,
         );
         mark("PLE", s)?;
-        let aux = if opts.capture_layers.is_empty() {
-            None
-        } else {
-            Some(DevBuf::zeroed(meta.max_tokens * opts.capture_layers.len() * cfg.hidden * 2, s)?)
+        // the MTP head of a hyper-connection model reads the final streams (every one), else hidden-wide slots
+        let aux_width = match &cfg.hc {
+            Some(hc) if opts.mtp_window > 0 => hc.count * cfg.hidden,
+            _ => opts.capture_layers.len() * cfg.hidden,
         };
+        let aux = if opts.capture_layers.is_empty() { None } else { Some(DevBuf::zeroed(meta.max_tokens * aux_width * 2, s)?) };
         mark("captured hidden states", s)?;
         let (mut tree_scratch, mut tree_row_bufs, mut tree_kv_bufs) = (None, None, None);
         if opts.tree_levels > 0 && opts.max_verify > 0 {
@@ -1272,6 +1278,7 @@ impl Model {
             ple_state,
             embed,
             moe: None,
+            mtp_moe_layer: None,
             lin: LinCtx {
                 gemm,
                 scratch: scratch.ptr(),
@@ -1354,9 +1361,14 @@ impl Model {
         }
         if let MlpConfig::Moe { top_k, .. } = model.cfg.mlp {
             model.moe = Some(model.start_moe(dir, top_k)?);
-            // the engine indexes its tables by the model's layer index: it must hold every routed layer
+            // the engine indexes its tables by the model's layer index: it must hold every routed layer (an MTP
+            // head's layer comes after them)
             let routed = model.layers.iter().rposition(|l| matches!(l.mlp, Mlp::Moe { .. }));
-            let held = unsafe { sys::blz_moe_engine_layers(model.moe.as_ref().unwrap().0) };
+            let mut held = unsafe { sys::blz_moe_engine_layers(model.moe.as_ref().unwrap().0) };
+            if model.opts.mtp_window > 0 {
+                held -= 1;
+                model.mtp_moe_layer = Some(held as usize);
+            }
             if let Some(last) = routed
                 && last >= held.max(0) as usize
             {
@@ -1529,7 +1541,16 @@ impl Model {
         let gib = ((free.saturating_sub(later)) as f64 / (1u64 << 30) as f64 - self.opts.reserve_gib).max(0.0);
         let model_dir = CString::new(dir.to_string_lossy().as_bytes())?;
         let heat = self.opts.moe_heat.as_ref().map(|h| CString::new(h.as_bytes())).transpose()?;
-        let options = CString::new(self.opts.moe_options.as_bytes())?;
+        // an MTP head's routed layer: its experts from its checkpoint, after the decoder layers
+        let mut moe_options = self.opts.moe_options.clone();
+        if self.opts.mtp_window > 0 {
+            let mtp = self.opts.mtp_model.clone().unwrap_or_else(|| dir.to_path_buf());
+            if mtp.to_string_lossy().contains(',') {
+                bail!("--mtp-model {}: a path with a comma", mtp.display());
+            }
+            moe_options = [moe_options, format!("mtp_dir={}", mtp.display())].into_iter().filter(|o| !o.is_empty()).collect::<Vec<_>>().join(",");
+        }
+        let options = CString::new(moe_options.as_bytes())?;
         let cores = CString::new(self.opts.moe_cores.as_bytes())?;
         let cfg = sys::blz_moe_engine_config {
             model_dir: model_dir.as_ptr(),
@@ -1717,6 +1738,12 @@ impl Model {
 
     /// The pinned token embedding table [vocab, hidden] bf16.
     /// The rotary frequencies of the softmax layers (device, rotary_dim / 2) and their scale.
+    /// The routed experts of `layer` (the expert engine's index) for `t` rows of x.
+    pub fn moe_forward(&self, layer: usize, x: *const u16, t: usize, ids: *const i32, weights: *const f32, out: *mut u16) -> Result<()> {
+        let moe = self.moe.as_ref().ok_or_else(|| anyhow!("MoE engine not started"))?;
+        check(unsafe { sys::blz_moe_engine_forward(moe.0, layer as c_int, x, t as c_int, ids, weights, out, self.stream.0) }, "moe")
+    }
+
     pub fn rope_tables(&self) -> (*const f32, f32) {
         (self.inv_freq.ptr(), self.rope_scale)
     }
@@ -2092,6 +2119,11 @@ impl Model {
         // the MTP drafter reads the final normed hidden state of every row (aux column 0); the head below takes its rows
         // from there (the sum x + residual is formed here once: the residual stream is updated in place)
         let kept = self.opts.mtp_window > 0 && matches!(self.final_mix, FinalMix::Norm(_));
+        // a hyper-connection model's MTP head reads the final streams
+        if self.opts.mtp_window > 0 && let (FinalMix::Hyper(_), Some(streams), Some(hc)) = (&self.final_mix, &w.streams, &cfg.hc) {
+            let aux = self.aux.as_ref().ok_or_else(|| anyhow!("MTP without the captured hidden-state buffer"))?;
+            check(unsafe { sys::cudaMemcpyAsync(aux.ptr(), streams.ptr::<u16>().cast(), t * hc.count * h * 2, sys::MEMCPY_D2D, s.0) }, "final streams (MTP)")?;
+        }
         if kept && let FinalMix::Norm(norm) = &self.final_mix {
             let aux = self.aux.as_ref().ok_or_else(|| anyhow!("MTP without the captured hidden-state buffer"))?;
             check(unsafe { sys::blz_rmsnorm(w.x.ptr(), w.residual.ptr(), norm.ptr(), eps, t as c_int, h as c_int, 1, aux.ptr(), s.0) }, "final norm (MTP)")?;

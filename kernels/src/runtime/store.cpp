@@ -25,7 +25,8 @@ constexpr Format kFormats[] = {{"weight_packed", "weight_scale", "weight_global_
 
 }  // namespace
 
-ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix_hint, size_t chunk_bytes)
+ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix_hint, size_t chunk_bytes,
+                         const std::string& extra_dir)
     : st_(std::make_unique<SafetensorsDir>(model_dir)) {
   // Find "<prefix>0.mlp.experts.0.gate_proj.<codes>" with U8 codes: the prefix of the decoder layers (the MTP block's
   // "mtp." layers are not served) and the exporter's naming.
@@ -56,6 +57,25 @@ ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix
   if (!geo_.valid()) throw std::runtime_error("blaze: expert geometry is not a multiple of 16");
   while (st_->find(name(0, experts_, "gate", fmt->codes))) ++experts_;
   while (st_->find(name(layers_, 0, "gate", fmt->codes))) ++layers_;
+  main_layers_ = layers_;
+  // the extra directory's MTP layers: ModelOpt or compressed-tensors names under "mtp.layers."
+  const Format* xfmt = nullptr;
+  int extra_layers = 0;
+  auto xname = [&](int l, int e, const char* proj, const char* part) {
+    return "mtp.layers." + std::to_string(l) + ".mlp.experts." + std::to_string(e) + "." + proj + "_proj." + part;
+  };
+  if (!extra_dir.empty()) {
+    extra_ = std::make_unique<SafetensorsDir>(extra_dir);
+    for (const Format& f : kFormats)
+      if (const auto* t = extra_->find(xname(0, 0, "gate", f.codes)); t && t->dtype == "U8") xfmt = &f;
+    if (!xfmt) throw std::runtime_error("blaze: no NVFP4 MTP experts (mtp.layers.0.mlp.experts.*) in " + extra_dir);
+    const auto* xg = extra_->find(xname(0, 0, "gate", xfmt->codes));
+    if (xg->shape != g0->shape) throw std::runtime_error("blaze: the MTP experts of " + extra_dir + " differ in shape");
+    while (extra_->find(xname(extra_layers, 0, "gate", xfmt->codes))) ++extra_layers;
+    if (!extra_->find(xname(0, experts_ - 1, "gate", xfmt->codes)) || extra_->find(xname(0, experts_, "gate", xfmt->codes)))
+      throw std::runtime_error("blaze: the MTP layer of " + extra_dir + " has another expert count");
+    layers_ += extra_layers;
+  }
   prefix_ = prefix;
   stride_ = (geo_.record_bytes() + 255) / 256 * 256;
   // Chunks of ~chunk_bytes of checkpoint bytes (codes and scales of 16 rows per group).
@@ -72,16 +92,21 @@ ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix
       for (int m = 0; m < 3; ++m) {
         const size_t i = (size_t(l) * experts_ + e) * 3 + m;
         const size_t rows = m == 2 ? H : I, k = m == 2 ? I : H;
+        const bool x = l >= main_layers_;
+        const SafetensorsDir* dir = x ? extra_.get() : st_.get();
+        const Format* f = x ? xfmt : fmt;
+        auto nm = [&](const char* part) { return x ? xname(l - main_layers_, e, proj[m], part) : name(l, e, proj[m], part); };
         Mat& mt = mats_[i];
-        mt.codes = &st_->at(name(l, e, proj[m], fmt->codes));
-        mt.scales = &st_->at(name(l, e, proj[m], fmt->scales));
+        mt.dir = dir;
+        mt.codes = &dir->at(nm(f->codes));
+        mt.scales = &dir->at(nm(f->scales));
         if (mt.codes->bytes() != rows * k / 2 || mt.scales->bytes() != rows * k / 16 || mt.scales->dtype != "F8_E4M3")
-          throw std::runtime_error("blaze: unexpected NVFP4 layout at " + name(l, e, proj[m], ""));
-        const auto& gs = st_->at(name(l, e, proj[m], fmt->global));
+          throw std::runtime_error("blaze: unexpected NVFP4 layout at " + nm(""));
+        const auto& gs = dir->at(nm(f->global));
         float g = 0;
-        st_->read(gs, &g, 4);
-        if (!(g > 0)) throw std::runtime_error("blaze: bad global scale at " + name(l, e, proj[m], fmt->global));
-        mult_[i] = fmt->reciprocal ? 1.0f / g : g;
+        dir->read(gs, &g, 4);
+        if (!(g > 0)) throw std::runtime_error("blaze: bad global scale at " + nm(f->global));
+        mult_[i] = f->reciprocal ? 1.0f / g : g;
       }
 }
 
@@ -109,9 +134,9 @@ void ExpertStore::read_chunk(int layer, int expert, int c, void* dst, bool direc
     const int r0 = 8 * ch.g0, rows = 8 * (ch.g1 - ch.g0);
     src.code_stride = size_t(H) / 2, src.scale_stride = size_t(H) / 16;
     for (int k = 0; k < 2; ++k) {
-      src.codes[k] = st_->read_range(*m[k].codes, r0 * src.code_stride, rows * src.code_stride, bounce[2 * k], direct);
+      src.codes[k] = m[k].dir->read_range(*m[k].codes, r0 * src.code_stride, rows * src.code_stride, bounce[2 * k], direct);
       src.scales[k] =
-          st_->read_range(*m[k].scales, r0 * src.scale_stride, rows * src.scale_stride, bounce[2 * k + 1], direct);
+          m[k].dir->read_range(*m[k].scales, r0 * src.scale_stride, rows * src.scale_stride, bounce[2 * k + 1], direct);
     }
     src.row0 = r0, src.interleaved = true;
     expert::pack_groups(src, H, ch.g0, ch.g1, out);
@@ -119,9 +144,9 @@ void ExpertStore::read_chunk(int layer, int expert, int c, void* dst, bool direc
     const int r0 = 16 * ch.g0, rows = 16 * (ch.g1 - ch.g0);
     src.code_stride = size_t(I) / 2, src.scale_stride = size_t(I) / 16;
     src.codes[0] = src.codes[1] =
-        st_->read_range(*m[2].codes, r0 * src.code_stride, rows * src.code_stride, bounce[0], direct);
+        m[2].dir->read_range(*m[2].codes, r0 * src.code_stride, rows * src.code_stride, bounce[0], direct);
     src.scales[0] = src.scales[1] =
-        st_->read_range(*m[2].scales, r0 * src.scale_stride, rows * src.scale_stride, bounce[1], direct);
+        m[2].dir->read_range(*m[2].scales, r0 * src.scale_stride, rows * src.scale_stride, bounce[1], direct);
     src.row0 = r0, src.interleaved = false;
     expert::pack_groups(src, I, ch.g0, ch.g1, out + geo_.gu_bytes());
   }

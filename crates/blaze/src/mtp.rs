@@ -1,5 +1,6 @@
 //! The checkpoint's own MTP head as a drafter (Qwen3.5 / Qwen3-Next NextN: the `mtp.*` tensors of the target, one
-//! full-attention decoder layer with its own KV, sharing the target's embedding and LM head).
+//! full-attention decoder layer with its own KV, sharing the target's embedding and LM head; Qwen4-Exp's routed one
+//! between hyper-connection mixes, see `Hyper`).
 //!
 //! A draft row at position p takes the target's final normed hidden state of p and the token at p + 1 and predicts the
 //! token at p + 2 (vLLM qwen3_5_mtp / SGLang Qwen3_5ForCausalLMMTP):
@@ -18,7 +19,7 @@
 use crate::eagle::{DraftPlan, MAX_CHAIN};
 use crate::gpu::{DevBuf, HostMapped, check};
 use crate::linear::{Cut, Linear};
-use crate::model::Model;
+use crate::model::{HcBlock, Model, load_hc};
 use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, anyhow, bail};
@@ -55,20 +56,89 @@ struct Fwd {
     kvl: usize,
 }
 
-pub struct Mtp {
-    pub cfg: MtpConfig,
+/// The layer between the target's hidden state and the head.
+enum Body {
+    Dense(Box<Dense>),
+    Hyper(Box<Hyper>),
+}
+
+/// Qwen3.5: x = fc(concat(norm_e(embed), norm_h(hidden))), pre-norm attention and MLP, the final norm.
+struct Dense {
     pre_emb: DevBuf,
     pre_hid: DevBuf,
     input_ln: DevBuf,
     post_ln: DevBuf,
     norm: DevBuf,
-    q_norm: DevBuf,
-    k_norm: DevBuf,
     fc: Linear,
-    qkv: Linear,
-    o: Linear,
     gu: Linear,
     down: Linear,
+    /// this rank's MLP rows
+    inter: usize,
+    // work [ROWS, ...]
+    emb: DevBuf,
+    cat: DevBuf,
+    hin: DevBuf,
+    normed1: DevBuf,
+    x2: DevBuf,
+    gu_out: DevBuf,
+    act: DevBuf,
+    mlp: DevBuf,
+}
+
+/// Qwen4-Exp (SGLang qwen4_exp_mtp, its residual_linear_shared fusion): each stream s of the target's final streams H
+/// (normed together, over all of them) through fc_hidden, plus fc_embedding of the normed embedding of the token,
+///   S_s = fc_hidden(norm_h(H)_s) + fc_embedding(norm_e(embed(token)))
+/// then the decoder layer on S: the attention and the routed MLP, each between its hyper-connection mix and combine. The
+/// final mixer's mix of the streams is the head's input, the streams after the layer the next draft row's hidden input.
+/// The routed experts run in the target's expert engine (its layer `moe_layer`, from the MTP checkpoint).
+struct Hyper {
+    pre_emb: DevBuf,
+    pre_hid: DevBuf,
+    fc_emb: Linear,
+    fc_hid: Linear,
+    attn_hc: HcBlock,
+    mlp_hc: HcBlock,
+    mixer: HcBlock,
+    /// the router's logits, then the shared expert's gate logit
+    gate: Linear,
+    shared_gu: Linear,
+    shared_down: Linear,
+    has_shared_gate: bool,
+    moe_layer: usize,
+    experts: usize,
+    top_k: usize,
+    norm_topk: bool,
+    shared_inter: usize,
+    count: usize,
+    lowrank: usize,
+    // work [ROWS, ...]
+    emb: DevBuf,
+    eproj: DevBuf,
+    hnorm: DevBuf,
+    hproj: DevBuf,
+    streams: DevBuf,
+    block: DevBuf,
+    hc_t: DevBuf,
+    hc_ws: DevBuf,
+    router: DevBuf,
+    ids: DevBuf,
+    weights: DevBuf,
+    moe_out: DevBuf,
+    sgu: DevBuf,
+    sact: DevBuf,
+    shared: DevBuf,
+    x: DevBuf,
+    /// [max_items, count * hidden]: each item's streams for its next draft row
+    last_streams: DevBuf,
+}
+
+pub struct Mtp {
+    pub cfg: MtpConfig,
+    body: Body,
+    q_norm: DevBuf,
+    k_norm: DevBuf,
+    qkv: Linear,
+    o: Linear,
     /// the head over the first `head_rows` rows of this rank's vocabulary shard (None: the target's own head over the
     /// whole shard) and the pairs a rank without rows contributes
     head_lin: Option<Linear>,
@@ -82,10 +152,9 @@ pub struct Mtp {
     cand_logits: DevBuf,
     /// this call scores the candidates (the plan carries them) rather than the whole shard
     use_cands: bool,
-    /// this rank's heads, KV heads and MLP rows
+    /// this rank's heads and KV heads
     heads: usize,
     kv_heads: usize,
-    inter: usize,
     ar: *mut sys::blz_host_ar,
     one: DevBuf,
     no_scales: DevBuf,
@@ -94,21 +163,13 @@ pub struct Mtp {
     r2t: DevBuf,
     stride: usize,
     max_items: usize,
-    // work [ROWS, ...]
+    // work [ROWS, ...]: the hidden inputs (width()), the attention's, the head's inputs
     hid: DevBuf,
-    emb: DevBuf,
-    cat: DevBuf,
-    hin: DevBuf,
-    normed1: DevBuf,
     qkv_out: DevBuf,
     q_out: DevBuf,
     gate: DevBuf,
     attn: DevBuf,
     o_out: DevBuf,
-    x2: DevBuf,
-    gu_out: DevBuf,
-    act: DevBuf,
-    mlp: DevBuf,
     normed: DevBuf,
     partial_o: DevBuf,
     partial_ml: DevBuf,
@@ -143,13 +204,14 @@ impl Drop for Graph {
 // The all-reduce handle is used only by the rank's own thread.
 unsafe impl Send for Mtp {}
 
-/// VRAM of the MTP head on each rank beyond the target (weights, KV ring, work buffers), for `--kv-tokens auto`.
-pub fn vram_estimate(dir: &Path, world: usize, window: usize, max_items: usize, head_vocab: usize) -> Result<usize> {
-    let ckpt = Checkpoint::open(dir)?;
+/// VRAM of the MTP head on each rank beyond the target (weights, KV ring, work buffers), for `--kv-tokens auto`. `mtp`:
+/// the MTP checkpoint (None: the target's); routed experts go to the expert engine's tiers, not counted here.
+pub fn vram_estimate(dir: &Path, mtp: Option<&Path>, world: usize, window: usize, max_items: usize, head_vocab: usize) -> Result<usize> {
+    let ckpt = Checkpoint::open(mtp.unwrap_or(dir))?;
     let world = world.max(1);
     let mut bytes = 0usize;
     for (name, t) in &ckpt.tensors {
-        if name.starts_with("mtp.") {
+        if name.starts_with("mtp.") && !name.contains(".mlp.experts.") {
             // fc and the norms are on every rank, the layer's projections split
             bytes += if name == "mtp.fc.weight" || name.contains("norm") { t.bytes() } else { t.bytes().div_ceil(world) };
         }
@@ -162,8 +224,10 @@ pub fn vram_estimate(dir: &Path, world: usize, window: usize, max_items: usize, 
     let cfg = crate::config::ModelConfig::load(dir)?;
     let kv = cfg.attn.kv_heads.div_ceil(world) * cfg.attn.head_dim * 2;
     let h = cfg.hidden;
-    // two BF16 pools, the metadata and the work buffers of ROWS rows (about 14 hidden-wide buffers, the qkv and MLP ones)
-    let work = ROWS * (14 * h + 3 * cfg.attn.heads * cfg.attn.head_dim + 4 * 17408usize.min(h * 4)) * 2 / world.max(1);
+    // two BF16 pools, the metadata and the work buffers of ROWS rows (about 14 hidden-wide buffers, the qkv and MLP ones;
+    // five of the streams' width with hyper-connections)
+    let streams = cfg.hc.as_ref().map_or(0, |hc| 5 * hc.count * h);
+    let work = ROWS * (14 * h + streams + 3 * cfg.attn.heads * cfg.attn.head_dim + 4 * 17408usize.min(h * 4)) * 2 / world.max(1);
     Ok(bytes + 2 * max_items * window * kv + work + (96 << 20))
 }
 
@@ -173,15 +237,17 @@ pub fn has_head(dir: &Path) -> Result<bool> {
 }
 
 impl Mtp {
-    /// Load this rank's part of the target's MTP head on the current GPU, for `max_items` sequence rows and contexts of
-    /// `stride` positions, with a KV ring of `window` positions per row.
+    /// Load this rank's part of the MTP head in `dir` (the target's checkpoint or an MTP one) on the current GPU, for
+    /// `max_items` sequence rows and contexts of `stride` positions, with a KV ring of `window` positions per row.
     pub fn load(dir: &Path, model: &Model, max_items: usize, stride: usize, window: usize) -> Result<Self> {
         let ckpt = Checkpoint::open(dir)?;
         let tc = &model.cfg;
         let (h, hd) = (tc.hidden, tc.attn.head_dim);
-        let inter = match tc.mlp {
-            crate::config::MlpConfig::Dense { intermediate } => intermediate,
-            _ => bail!("MTP head with an MoE target is not supported (the Qwen3.5 dense MTP layer only)"),
+        let hyper = tc.hc.is_some();
+        let inter = match (&tc.mlp, hyper) {
+            (crate::config::MlpConfig::Dense { intermediate }, false) => *intermediate,
+            (crate::config::MlpConfig::Moe { shared_intermediate, .. }, true) => *shared_intermediate,
+            _ => bail!("MTP head: the Qwen3.5 dense layer or the Qwen4-Exp routed one between hyper-connection streams only"),
         };
         let cfg = MtpConfig {
             hidden: h,
@@ -202,7 +268,15 @@ impl Mtp {
         if cfg.heads % world != 0 || cfg.kv_heads % world != 0 || inter % world != 0 {
             bail!("MTP: heads / KV heads / MLP rows do not split {world} ways");
         }
-        for name in ["mtp.fc.weight", "mtp.layers.0.self_attn.q_proj.weight", "mtp.norm.weight"] {
+        if hyper && world > 1 {
+            bail!("MTP head of a hyper-connection model with tensor parallelism: not supported");
+        }
+        let need: &[&str] = if hyper {
+            &["mtp.fc_hidden.weight", "mtp.fc_embedding.weight", "mtp.layers.0.self_attn.q_proj.weight", "mtp.hyper_connection_mixer.hc_norm.weight"]
+        } else {
+            &["mtp.fc.weight", "mtp.layers.0.self_attn.q_proj.weight", "mtp.norm.weight"]
+        };
+        for name in need {
             if ckpt.get(name).is_none() {
                 bail!("{}: no MTP head (tensor {name} missing)", dir.display());
             }
@@ -216,7 +290,8 @@ impl Mtp {
             b.upload(ckpt.bytes(name)?)?;
             Ok(b)
         };
-        // the MTP tensors are BF16 in the NVFP4 checkpoints (hf_quant_config excludes `mtp*`): no quantization rules
+        // the MTP tensors are BF16 in the NVFP4 checkpoints (hf_quant_config excludes `mtp*`; an MTP checkpoint's routed
+        // experts are the expert engine's): no quantization rules
         let quant = QuantConfig::from_model_config(&serde_json::json!({}), None)?;
         let lin = |mods: Vec<(&str, Cut)>| Linear::load(&ckpt, &quant, &mods.into_iter().map(|(n, c)| (n.to_string(), c)).collect::<Vec<_>>(), s);
         let part = |n: usize| Cut::Rows(vec![r * n..(r + 1) * n]);
@@ -252,6 +327,78 @@ impl Mtp {
         let fwd_meta = 3 * ROWS * 8 + 2 * ((max_items + 1) * 4).next_multiple_of(64);
         let ext_fwds = (model.opts.max_chunk + max_items * (MAX_CHAIN + 1)).div_ceil(ROWS) + 1;
         let meta_bytes = (max_items * cand_cap * 4).next_multiple_of(64) + (ext_fwds + MAX_CHAIN) * fwd_meta + 4096;
+        let body = if let Some(hc) = &tc.hc {
+            let crate::config::MlpConfig::Moe { experts, top_k, norm_topk, .. } = tc.mlp else { unreachable!() };
+            let moe_layer = model.mtp_moe_layer.ok_or_else(|| anyhow!("MTP head with routed experts: the expert engine holds no MTP layer"))?;
+            let (count, lowrank) = (hc.count, hc.lowrank);
+            let hw = count * h;
+            let m = "mtp.layers.0.mlp.";
+            let has_shared_gate = ckpt.get(&format!("{m}shared_expert_gate.weight")).is_some();
+            let mut gate_mods = vec![(format!("{m}gate"), Cut::All)];
+            if has_shared_gate {
+                gate_mods.push((format!("{m}shared_expert_gate"), Cut::All));
+            }
+            let gate = Linear::load(&ckpt, &quant, &gate_mods, s)?;
+            let ws = unsafe { sys::blz_hc_mix_workspace_bytes(ROWS as c_int, count as c_int, h as c_int, lowrank as c_int) };
+            Body::Hyper(Box::new(Hyper {
+                pre_emb: vec("mtp.pre_fc_norm_embedding.weight", h)?,
+                pre_hid: vec("mtp.pre_fc_norm_hidden.weight", hw)?,
+                fc_emb: lin(vec![("mtp.fc_embedding", Cut::All)])?,
+                fc_hid: lin(vec![("mtp.fc_hidden", Cut::All)])?,
+                attn_hc: load_hc(&ckpt, "mtp.layers.0.attn_hyper_connection.")?,
+                mlp_hc: load_hc(&ckpt, "mtp.layers.0.mlp_hyper_connection.")?,
+                mixer: load_hc(&ckpt, "mtp.hyper_connection_mixer.")?,
+                router: b(ROWS * gate.n * 2)?,
+                gate,
+                shared_gu: lin(vec![(&format!("{m}shared_expert.gate_proj"), Cut::All), (&format!("{m}shared_expert.up_proj"), Cut::All)])?,
+                shared_down: lin(vec![(&format!("{m}shared_expert.down_proj"), Cut::All)])?,
+                has_shared_gate,
+                moe_layer,
+                experts,
+                top_k,
+                norm_topk,
+                shared_inter: inter,
+                count,
+                lowrank,
+                emb: b(ROWS * h * 2)?,
+                eproj: b(ROWS * h * 2)?,
+                hnorm: b(ROWS * hw * 2)?,
+                hproj: b(ROWS * hw * 2)?,
+                streams: b(ROWS * hw * 2)?,
+                block: b(ROWS * h * 2)?,
+                hc_t: b(ROWS * lowrank * 2)?,
+                hc_ws: b(ws.max(16))?,
+                ids: b(ROWS * top_k * 4)?,
+                weights: b(ROWS * top_k * 4)?,
+                moe_out: b(ROWS * h * 2)?,
+                sgu: b(ROWS * 2 * inter * 2)?,
+                sact: b(ROWS * inter * 2)?,
+                shared: b(ROWS * h * 2)?,
+                x: b(ROWS * h * 2)?,
+                last_streams: b(max_items * hw * 2)?,
+            }))
+        } else {
+            Body::Dense(Box::new(Dense {
+                pre_emb: vec("mtp.pre_fc_norm_embedding.weight", h)?,
+                pre_hid: vec("mtp.pre_fc_norm_hidden.weight", h)?,
+                input_ln: vec("mtp.layers.0.input_layernorm.weight", h)?,
+                post_ln: vec("mtp.layers.0.post_attention_layernorm.weight", h)?,
+                norm: vec("mtp.norm.weight", h)?,
+                fc: lin(vec![("mtp.fc", Cut::All)])?,
+                gu: lin(vec![("mtp.layers.0.mlp.gate_proj", part(inter_r)), ("mtp.layers.0.mlp.up_proj", part(inter_r))])?,
+                down: lin(vec![("mtp.layers.0.mlp.down_proj", Cut::Cols(r * inter_r..(r + 1) * inter_r))])?,
+                inter: inter_r,
+                emb: b(ROWS * h * 2)?,
+                cat: b(ROWS * 2 * h * 2)?,
+                hin: b(ROWS * h * 2)?,
+                normed1: b(ROWS * h * 2)?,
+                x2: b(ROWS * h * 2)?,
+                gu_out: b(ROWS * 2 * inter_r * 2)?,
+                act: b(ROWS * inter_r * 2)?,
+                mlp: b(ROWS * h * 2)?,
+            }))
+        };
+        let width = tc.hc.as_ref().map_or(h, |hc| hc.count * h);
         let m = Self {
             head_lin,
             head_rows,
@@ -261,25 +408,17 @@ impl Mtp {
             cand_logits: b(if head_table.is_some() { max_items * model.opts.mtp_head_cands * 4 } else { 16 })?,
             use_cands: false,
             no_pairs: DevBuf::from_slice(&no_pairs)?,
-            pre_emb: vec("mtp.pre_fc_norm_embedding.weight", h)?,
-            pre_hid: vec("mtp.pre_fc_norm_hidden.weight", h)?,
-            input_ln: vec("mtp.layers.0.input_layernorm.weight", h)?,
-            post_ln: vec("mtp.layers.0.post_attention_layernorm.weight", h)?,
-            norm: vec("mtp.norm.weight", h)?,
+            body,
             q_norm: vec("mtp.layers.0.self_attn.q_norm.weight", hd)?,
             k_norm: vec("mtp.layers.0.self_attn.k_norm.weight", hd)?,
-            fc: lin(vec![("mtp.fc", Cut::All)])?,
             qkv: lin(vec![
                 ("mtp.layers.0.self_attn.q_proj", part(2 * qd)),
                 ("mtp.layers.0.self_attn.k_proj", part(kvd)),
                 ("mtp.layers.0.self_attn.v_proj", part(kvd)),
             ])?,
             o: lin(vec![("mtp.layers.0.self_attn.o_proj", Cut::Cols(r * qd..(r + 1) * qd))])?,
-            gu: lin(vec![("mtp.layers.0.mlp.gate_proj", part(inter_r)), ("mtp.layers.0.mlp.up_proj", part(inter_r))])?,
-            down: lin(vec![("mtp.layers.0.mlp.down_proj", Cut::Cols(r * inter_r..(r + 1) * inter_r))])?,
             heads,
             kv_heads,
-            inter: inter_r,
             ar: if world > 1 { model.tp.ar } else { std::ptr::null_mut() },
             one: DevBuf::from_slice(&[1.0f32])?,
             no_scales: b(16)?,
@@ -288,20 +427,12 @@ impl Mtp {
             r2t: DevBuf::from_slice(&table)?,
             stride,
             max_items,
-            hid: b(ROWS * h * 2)?,
-            emb: b(ROWS * h * 2)?,
-            cat: b(ROWS * 2 * h * 2)?,
-            hin: b(ROWS * h * 2)?,
-            normed1: b(ROWS * h * 2)?,
+            hid: b(ROWS * width * 2)?,
             qkv_out: b(ROWS * ldq * 2)?,
             q_out: b(ROWS * qd * 2)?,
             gate: b(ROWS * qd * 2)?,
             attn: b(ROWS * qd * 2)?,
             o_out: b(ROWS * h * 2)?,
-            x2: b(ROWS * h * 2)?,
-            gu_out: b(ROWS * 2 * inter_r * 2)?,
-            act: b(ROWS * inter_r * 2)?,
-            mlp: b(ROWS * h * 2)?,
             normed: b(ROWS * h * 2)?,
             partial_o: b(partial_rows * hd * 4)?,
             partial_ml: b(partial_rows * 2 * 4)?,
@@ -319,19 +450,41 @@ impl Mtp {
             cfg,
         };
         let mut weights = Vec::new();
-        for l in [&m.fc, &m.qkv, &m.o, &m.gu, &m.down] {
+        for l in m.linears() {
             weights.extend(l.tune_weights());
         }
         model.lin_ctx().tune.tune(&weights, model.lin_ctx().gemm, s)?;
         Ok(m)
     }
 
+    /// The layer's projections (the head's aside).
+    fn linears(&self) -> Vec<&Linear> {
+        let mut v = vec![&self.qkv, &self.o];
+        match &self.body {
+            Body::Dense(d) => v.extend([&d.fc, &d.gu, &d.down]),
+            Body::Hyper(y) => v.extend([&y.fc_emb, &y.fc_hid, &y.gate, &y.shared_gu, &y.shared_down]),
+        }
+        v
+    }
+
+    /// Values of a draft row's hidden input: the target's final normed hidden state, or its final streams.
+    fn width(&self) -> usize {
+        match &self.body {
+            Body::Dense(_) => self.cfg.hidden,
+            Body::Hyper(y) => y.count * self.cfg.hidden,
+        }
+    }
+
     pub fn describe(&self) -> String {
         let head = if self.head_lin.is_some() { format!(", head over {} vocabulary rows on this rank", self.head_rows) } else { String::new() };
+        let routed = match &self.body {
+            Body::Hyper(y) => format!(", its routed experts in the expert engine (layer {})", y.moe_layer),
+            Body::Dense(_) => String::new(),
+        };
         format!(
-            "MTP head: window {}{head}, BF16 weights {:.0} MiB on this rank, KV ring {:.0} MiB",
+            "MTP head: window {}{head}, BF16 weights {:.0} MiB on this rank{routed}, KV ring {:.0} MiB",
             self.cfg.window,
-            [&self.fc, &self.qkv, &self.o, &self.gu, &self.down].iter().flat_map(|l| l.regions()).map(|r| r.1).sum::<usize>() as f64 / (1u64 << 20) as f64,
+            self.linears().iter().flat_map(|l| l.regions()).map(|r| r.1).sum::<usize>() as f64 / (1u64 << 20) as f64,
             (self.k_pool.bytes() * 2) as f64 / (1u64 << 20) as f64,
         )
     }
@@ -456,7 +609,7 @@ impl Mtp {
         if plan.k == 0 {
             return Ok(vec![Vec::new(); n_items]);
         }
-        let dump = std::env::var_os("BLAZE_MTP_DUMP").filter(|_| !self.dumped && model.tp.rank == 0);
+        let dump = std::env::var_os("BLAZE_MTP_DUMP").filter(|_| !self.dumped && model.tp.rank == 0 && matches!(self.body, Body::Dense(_)));
         if let Some(dir) = dump {
             self.dumped = true;
             return self.run_dump(model, plan, &fwds[n_ext..], Path::new(&dir));
@@ -488,7 +641,7 @@ impl Mtp {
         s.sync()?;
         let mut normed = vec![self.last_normed.download::<u16>(n_items * h)?[..h].to_vec()];
         for (j, fwd) in steps.iter().enumerate() {
-            check(unsafe { sys::cudaMemcpyAsync(self.hid.ptr(), self.last_normed.ptr(), n_items * h * 2, sys::MEMCPY_D2D, s.0) }, "MTP chain hidden")?;
+            self.next_hidden(n_items, s)?;
             self.layer(model, fwd, self.tok.ptr())?;
             for i in 0..n_items {
                 self.keep_last(i, i, s)?;
@@ -511,13 +664,13 @@ impl Mtp {
     /// The extend forwards: the target's final hidden states of the items' rows and their next tokens through the layer;
     /// the last row of every item feeds the head and the chain.
     fn extend(&self, model: &Model, plan: &DraftPlan, fwds: &[Fwd], ext_start: &[Vec<usize>]) -> Result<()> {
-        let (h, s) = (self.cfg.hidden, &model.stream);
+        let (wd, s) = (self.width(), &model.stream);
         let aux = model.aux.as_ref().ok_or_else(|| anyhow!("MTP without captured hidden states"))?;
         for (f, fwd) in fwds.iter().enumerate() {
             let mut row = 0;
             for (si, &(i, len)) in fwd.spans.iter().enumerate() {
-                let a: *const u16 = aux.at((plan.items[i].aux_row + ext_start[f][si]) * h);
-                check(unsafe { sys::cudaMemcpyAsync(self.hid.at::<u16>(row * h).cast(), a.cast(), len * h * 2, sys::MEMCPY_D2D, s.0) }, "MTP extend hidden")?;
+                let a: *const u16 = aux.at((plan.items[i].aux_row + ext_start[f][si]) * wd);
+                check(unsafe { sys::cudaMemcpyAsync(self.hid.at::<u16>(row * wd).cast(), a.cast(), len * wd * 2, sys::MEMCPY_D2D, s.0) }, "MTP extend hidden")?;
                 row += len;
             }
             let tok: *const i64 = self.meta.at::<u8>(fwd.tok).cast();
@@ -560,10 +713,10 @@ impl Mtp {
     /// The head on the extend's last rows, then every chain step: the previous row's output and the token just picked
     /// through the layer, the head again.
     fn chain(&self, model: &Model, items: usize, steps: &[Fwd]) -> Result<()> {
-        let (h, s) = (self.cfg.hidden, &model.stream);
+        let s = &model.stream;
         self.head(model, items, 0)?;
         for (j, fwd) in steps.iter().enumerate() {
-            check(unsafe { sys::cudaMemcpyAsync(self.hid.ptr(), self.last_normed.ptr(), items * h * 2, sys::MEMCPY_D2D, s.0) }, "MTP chain hidden")?;
+            self.next_hidden(items, s)?;
             self.layer(model, fwd, self.tok.ptr())?;
             for i in 0..items {
                 self.keep_last(i, i, s)?;
@@ -573,18 +726,170 @@ impl Mtp {
         Ok(())
     }
 
-    /// Row `r` of the forward's normed output becomes item `i`'s head input and next hidden.
+    /// Row `r` of the forward's head input becomes item `i`'s, its output (the normed row, or the streams) the item's
+    /// next hidden input.
     fn keep_last(&self, i: usize, r: usize, s: &crate::gpu::Stream) -> Result<()> {
         let h = self.cfg.hidden;
         check(
             unsafe { sys::cudaMemcpyAsync(self.last_normed.at::<u16>(i * h).cast(), self.normed.at::<u16>(r * h).cast(), h * 2, sys::MEMCPY_D2D, s.0) },
             "MTP keep",
+        )?;
+        if let Body::Hyper(y) = &self.body {
+            let hw = y.count * h;
+            check(
+                unsafe { sys::cudaMemcpyAsync(y.last_streams.at::<u16>(i * hw).cast(), y.streams.at::<u16>(r * hw).cast(), hw * 2, sys::MEMCPY_D2D, s.0) },
+                "MTP keep streams",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The hidden inputs of a chain step: every item's kept output.
+    fn next_hidden(&self, items: usize, s: &crate::gpu::Stream) -> Result<()> {
+        let (src, wd) = match &self.body {
+            Body::Dense(_) => (self.last_normed.ptr::<u16>(), self.cfg.hidden),
+            Body::Hyper(y) => (y.last_streams.ptr::<u16>(), y.count * self.cfg.hidden),
+        };
+        check(unsafe { sys::cudaMemcpyAsync(self.hid.ptr(), src.cast_const().cast(), items * wd * 2, sys::MEMCPY_D2D, s.0) }, "MTP chain hidden")
+    }
+
+    /// The draft layer over the forward's rows: hidden inputs in `hid`, tokens at `tok`; every row's head input in
+    /// `normed` (and its streams in the hyper body's `streams`).
+    fn layer(&self, model: &Model, fwd: &Fwd, tok: *const i64) -> Result<()> {
+        match &self.body {
+            Body::Dense(d) => self.layer_dense(model, d, fwd, tok),
+            Body::Hyper(y) => self.layer_hyper(model, y, fwd, tok),
+        }
+    }
+
+    fn layer_dense(&self, model: &Model, d: &Dense, fwd: &Fwd, tok: *const i64) -> Result<()> {
+        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+        let h = c.hidden;
+        let n: usize = fwd.spans.iter().map(|s| s.1).sum();
+        // x = fc(concat(norm(embed(token)), norm(hidden)))
+        check(
+            unsafe { sys::blz_embed_gather(tok, n as i64, model.embed_table().dev_ptr(), c.vocab as i64, (h * 2) as i64, d.emb.ptr(), s.0) },
+            "MTP embed",
+        )?;
+        check(
+            unsafe { sys::blz_rmsnorm_ld_zc(d.emb.ptr(), h as i64, d.pre_emb.ptr(), c.eps, n as c_int, h as c_int, d.cat.ptr(), (2 * h) as i64, s.0) },
+            "MTP embedding norm",
+        )?;
+        check(
+            unsafe { sys::blz_rmsnorm_ld_zc(self.hid.ptr(), h as i64, d.pre_hid.ptr(), c.eps, n as c_int, h as c_int, d.cat.at::<u16>(h), (2 * h) as i64, s.0) },
+            "MTP hidden norm",
+        )?;
+        d.fc.run(lin, d.cat.ptr(), 2 * h, n, d.hin.ptr(), h, s)?;
+        check(
+            unsafe { sys::blz_rmsnorm(d.hin.ptr(), std::ptr::null_mut(), d.input_ln.ptr(), c.eps, n as c_int, h as c_int, 1, d.normed1.ptr(), s.0) },
+            "MTP input norm",
+        )?;
+        self.attention(model, fwd, d.normed1.ptr())?;
+        // x += attention (summed over the ranks); x2 = norm(x)
+        self.add_norm(d, self.o_out.ptr(), d.post_ln.ptr(), d.x2.ptr(), n, s)?;
+        d.gu.run(lin, d.x2.ptr(), h, n, d.gu_out.ptr(), 2 * d.inter, s)?;
+        check(
+            unsafe { sys::blz_silu_mul(d.gu_out.ptr(), (2 * d.inter) as i64, d.gu_out.at(d.inter), (2 * d.inter) as i64, n as c_int, d.inter as c_int, d.act.ptr(), s.0) },
+            "MTP silu",
+        )?;
+        d.down.run(lin, d.act.ptr(), d.inter, n, d.mlp.ptr(), h, s)?;
+        // x += mlp; normed = mtp.norm(x)
+        self.add_norm(d, d.mlp.ptr(), d.norm.ptr(), self.normed.ptr(), n, s)
+    }
+
+    /// The streams' mix for a block: their grouped norm into `hnorm` (the combine's gates read it), the block's input in
+    /// `out`.
+    fn hc_mix(&self, y: &Hyper, hc: &HcBlock, n: usize, out: *mut u16, s: &crate::gpu::Stream) -> Result<()> {
+        let h = self.cfg.hidden;
+        check(
+            unsafe { sys::blz_grouped_rmsnorm(y.streams.ptr(), hc.norm.ptr(), self.cfg.eps, n as c_int, y.count as c_int, h as c_int, y.hnorm.ptr(), s.0) },
+            "MTP hc norm",
+        )?;
+        check(
+            unsafe {
+                sys::blz_hc_mix(y.hnorm.ptr(), hc.down.ptr(), hc.up.ptr(), y.hc_t.ptr(), out, n as c_int, y.count as c_int, h as c_int,
+                                y.lowrank as c_int, y.hc_ws.ptr(), s.0)
+            },
+            "MTP hc mix",
         )
     }
 
-    /// The draft layer over the forward's rows: hidden inputs in `hid`, tokens at `tok`; the final normed output of every
-    /// row in `normed`.
-    fn layer(&self, model: &Model, fwd: &Fwd, tok: *const i64) -> Result<()> {
+    /// A block's output back into the streams (gated injection, gates from the mix's norm).
+    fn hc_combine(&self, y: &Hyper, hc: &HcBlock, out: *const u16, n: usize, s: &crate::gpu::Stream) -> Result<()> {
+        let h = self.cfg.hidden;
+        let inject = hc.inject.as_ref().ok_or_else(|| anyhow!("MTP: a hyper-connection block without block_inject_weight"))?;
+        check(
+            unsafe {
+                sys::blz_hc_combine(y.streams.ptr(), y.hnorm.ptr(), inject.ptr(), out, h as i64, n as c_int, y.count as c_int, h as c_int, s.0)
+            },
+            "MTP hc combine",
+        )
+    }
+
+    fn layer_hyper(&self, model: &Model, y: &Hyper, fwd: &Fwd, tok: *const i64) -> Result<()> {
+        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+        let h = c.hidden;
+        let hw = y.count * h;
+        let n: usize = fwd.spans.iter().map(|s| s.1).sum();
+        // S_s = fc_hidden(norm_h(H)_s) + fc_embedding(norm_e(embed(token)))
+        check(
+            unsafe { sys::blz_embed_gather(tok, n as i64, model.embed_table().dev_ptr(), c.vocab as i64, (h * 2) as i64, y.emb.ptr(), s.0) },
+            "MTP embed",
+        )?;
+        check(
+            unsafe { sys::blz_rmsnorm_ld_zc(y.emb.ptr(), h as i64, y.pre_emb.ptr(), c.eps, n as c_int, h as c_int, y.block.ptr(), h as i64, s.0) },
+            "MTP embedding norm",
+        )?;
+        y.fc_emb.run(lin, y.block.ptr(), h, n, y.eproj.ptr(), h, s)?;
+        check(
+            unsafe { sys::blz_rmsnorm_ld_zc(self.hid.ptr(), hw as i64, y.pre_hid.ptr(), c.eps, n as c_int, hw as c_int, y.hnorm.ptr(), hw as i64, s.0) },
+            "MTP hidden norm",
+        )?;
+        // every stream a row of fc_hidden
+        y.fc_hid.run(lin, y.hnorm.ptr(), h, n * y.count, y.hproj.ptr(), h, s)?;
+        check(unsafe { sys::blz_hc_widen(y.eproj.ptr(), n as c_int, y.count as c_int, h as c_int, y.streams.ptr(), s.0) }, "MTP widen")?;
+        check(unsafe { sys::blz_add(y.streams.ptr(), y.hproj.ptr(), (n * hw) as i64, y.streams.ptr(), s.0) }, "MTP fusion")?;
+        // attention between its mix and combine
+        self.hc_mix(y, &y.attn_hc, n, y.block.ptr(), s)?;
+        self.attention(model, fwd, y.block.ptr())?;
+        self.hc_combine(y, &y.attn_hc, self.o_out.ptr(), n, s)?;
+        // the routed MLP (the experts in the expert engine) and the shared expert, gated
+        self.hc_mix(y, &y.mlp_hc, n, y.block.ptr(), s)?;
+        y.gate.run(lin, y.block.ptr(), h, n, y.router.ptr(), y.gate.n, s)?;
+        check(
+            unsafe {
+                sys::blz_router_topk(y.router.ptr(), y.gate.n as i64, n as c_int, y.experts as c_int, y.top_k as c_int, y.norm_topk as c_int,
+                                     y.ids.ptr(), y.weights.ptr(), s.0)
+            },
+            "MTP router",
+        )?;
+        model.moe_forward(y.moe_layer, y.block.ptr(), n, y.ids.ptr(), y.weights.ptr(), y.moe_out.ptr())?;
+        let si = y.shared_inter;
+        y.shared_gu.run(lin, y.block.ptr(), h, n, y.sgu.ptr(), 2 * si, s)?;
+        check(
+            unsafe { sys::blz_silu_mul(y.sgu.ptr(), (2 * si) as i64, y.sgu.at(si), (2 * si) as i64, n as c_int, si as c_int, y.sact.ptr(), s.0) },
+            "MTP shared silu",
+        )?;
+        y.shared_down.run(lin, y.sact.ptr(), si, n, y.shared.ptr(), h, s)?;
+        if y.has_shared_gate {
+            check(
+                unsafe {
+                    sys::blz_add_sigmoid_scaled(y.moe_out.ptr(), y.shared.ptr(), y.router.at(y.experts), y.gate.n as i64, n as c_int, h as c_int,
+                                                y.x.ptr(), s.0)
+                },
+                "MTP shared gate",
+            )?;
+        } else {
+            check(unsafe { sys::blz_add(y.moe_out.ptr(), y.shared.ptr(), (n * h) as i64, y.x.ptr(), s.0) }, "MTP shared add")?;
+        }
+        self.hc_combine(y, &y.mlp_hc, y.x.ptr(), n, s)?;
+        // the head's input: the final mixer's mix (the streams stay for the next draft row)
+        self.hc_mix(y, &y.mixer, n, self.normed.ptr(), s)
+    }
+
+    /// The layer's attention on x (its rows of the forward): gated query, q / k norms, partial rotary, KV into the ring;
+    /// the output projection in `o_out` (this rank's partial sums).
+    fn attention(&self, model: &Model, fwd: &Fwd, x: *const u16) -> Result<()> {
         let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
         let (h, hd) = (c.hidden, c.head_dim);
         let (heads, kv_heads) = (self.heads, self.kv_heads);
@@ -594,26 +899,8 @@ impl Mtp {
         let pos: *const i64 = self.meta.at::<u8>(fwd.pos).cast();
         let loc: *const i64 = self.meta.at::<u8>(fwd.loc).cast();
         let (inv_freq, rope_scale) = model.rope_tables();
-        // x = fc(concat(norm(embed(token)), norm(hidden)))
-        check(
-            unsafe { sys::blz_embed_gather(tok, n as i64, model.embed_table().dev_ptr(), c.vocab as i64, (h * 2) as i64, self.emb.ptr(), s.0) },
-            "MTP embed",
-        )?;
-        check(
-            unsafe { sys::blz_rmsnorm_ld_zc(self.emb.ptr(), h as i64, self.pre_emb.ptr(), c.eps, n as c_int, h as c_int, self.cat.ptr(), (2 * h) as i64, s.0) },
-            "MTP embedding norm",
-        )?;
-        check(
-            unsafe { sys::blz_rmsnorm_ld_zc(self.hid.ptr(), h as i64, self.pre_hid.ptr(), c.eps, n as c_int, h as c_int, self.cat.at::<u16>(h), (2 * h) as i64, s.0) },
-            "MTP hidden norm",
-        )?;
-        self.fc.run(lin, self.cat.ptr(), 2 * h, n, self.hin.ptr(), h, s)?;
-        check(
-            unsafe { sys::blz_rmsnorm(self.hin.ptr(), std::ptr::null_mut(), self.input_ln.ptr(), c.eps, n as c_int, h as c_int, 1, self.normed1.ptr(), s.0) },
-            "MTP input norm",
-        )?;
         // attention: gated query, q / k norms, partial rotary, KV into the ring
-        self.qkv.run(lin, self.normed1.ptr(), h, n, self.qkv_out.ptr(), ldq, s)?;
+        self.qkv.run(lin, x, h, n, self.qkv_out.ptr(), ldq, s)?;
         let k: *mut u16 = self.qkv_out.at(2 * qd);
         let v: *const u16 = self.qkv_out.at(2 * qd + kvd);
         check(
@@ -697,28 +984,19 @@ impl Mtp {
         }
         check(unsafe { sys::blz_mul_sigmoid(self.attn.ptr(), self.gate.ptr(), (n * qd) as i64, s.0) }, "MTP attention gate")?;
         self.o.run(lin, self.attn.ptr(), qd, n, self.o_out.ptr(), h, s)?;
-        // x += attention (summed over the ranks); x2 = norm(x)
-        self.add_norm(self.o_out.ptr(), self.post_ln.ptr(), self.x2.ptr(), n, s)?;
-        self.gu.run(lin, self.x2.ptr(), h, n, self.gu_out.ptr(), 2 * self.inter, s)?;
-        check(
-            unsafe { sys::blz_silu_mul(self.gu_out.ptr(), (2 * self.inter) as i64, self.gu_out.at(self.inter), (2 * self.inter) as i64, n as c_int, self.inter as c_int, self.act.ptr(), s.0) },
-            "MTP silu",
-        )?;
-        self.down.run(lin, self.act.ptr(), self.inter, n, self.mlp.ptr(), h, s)?;
-        // x += mlp; normed = mtp.norm(x)
-        self.add_norm(self.mlp.ptr(), self.norm.ptr(), self.normed.ptr(), n, s)
+        Ok(())
     }
 
     /// hin += x (all-reduced over the ranks first), out = rmsnorm(hin, w) with the zero-centered weight.
-    fn add_norm(&self, x: *mut u16, w: *const u16, out: *mut u16, n: usize, s: &crate::gpu::Stream) -> Result<()> {
+    fn add_norm(&self, d: &Dense, x: *mut u16, w: *const u16, out: *mut u16, n: usize, s: &crate::gpu::Stream) -> Result<()> {
         let (h, eps) = (self.cfg.hidden, self.cfg.eps);
         if !self.ar.is_null() && n <= 64 {
-            return check(unsafe { sys::blz_host_ar_rmsnorm(self.ar, x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 1, out, s.0) }, "MTP all-reduce norm");
+            return check(unsafe { sys::blz_host_ar_rmsnorm(self.ar, x, d.hin.ptr(), w, eps, n as c_int, h as c_int, 1, out, s.0) }, "MTP all-reduce norm");
         }
         if !self.ar.is_null() {
             check(unsafe { sys::blz_host_ar_all_reduce(self.ar, x.cast(), (n * h * 2) as i64, sys::BLZ_AR_BF16, s.0) }, "MTP all-reduce")?;
         }
-        check(unsafe { sys::blz_rmsnorm(x, self.hin.ptr(), w, eps, n as c_int, h as c_int, 1, out, s.0) }, "MTP norm")
+        check(unsafe { sys::blz_rmsnorm(x, d.hin.ptr(), w, eps, n as c_int, h as c_int, 1, out, s.0) }, "MTP norm")
     }
 
     /// The candidate head: the logits of every item's candidate ids (rows of this rank's head shard, the metadata's first

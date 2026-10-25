@@ -88,6 +88,7 @@ void apply_hybrid_options(const std::string& options, HybridConfig& cfg) {
     else if (key == "ssd_io") cfg.ssd_io_threads = std::stoi(val);
     else if (key == "cpu_tune") cfg.cpu_tune = std::stoi(val) != 0;
     else if (key == "ssd_direct") cfg.ssd_direct = std::stoi(val) != 0;
+    else if (key == "mtp_dir") cfg.mtp_dir = val;
     else throw std::invalid_argument("unknown blaze option: " + key);
   }
 }
@@ -100,13 +101,18 @@ HeatProfile load_heat(const std::string& path, int num_layers, int num_experts) 
   const size_t n = size_t(num_layers) * num_experts;
   HeatProfile h;
   h.recent.resize(n);
+  // a profile of other layers (an MTP layer added or left out): its layers that exist here, the rest cold
   bool ok = std::fread(magic, 1, 8, f) == 8 &&
             (std::memcmp(magic, kHeatMagic, 8) == 0 || std::memcmp(magic, kHeatMagicV1, 8) == 0) &&
-            std::fread(dims, 4, 2, f) == 2 && dims[0] == uint32_t(num_layers) && dims[1] == uint32_t(num_experts) &&
-            std::fread(h.recent.data(), 8, n, f) == n;
+            std::fread(dims, 4, 2, f) == 2 && dims[1] == uint32_t(num_experts) && dims[0] > 0;
+  const size_t stored = ok ? size_t(dims[0]) * num_experts : 0, keep = std::min(n, stored);
+  std::vector<double> buf(stored);
+  ok = ok && std::fread(buf.data(), 8, stored, f) == stored;
+  if (ok) std::copy(buf.begin(), buf.begin() + keep, h.recent.begin());
   if (ok && std::memcmp(magic, kHeatMagic, 8) == 0) {
-    h.longterm.resize(n);
-    ok = std::fread(h.longterm.data(), 8, n, f) == n;
+    h.longterm.assign(n, 0.0);
+    ok = std::fread(buf.data(), 8, stored, f) == stored;
+    if (ok) std::copy(buf.begin(), buf.begin() + keep, h.longterm.begin());
   } else {
     h.longterm = h.recent;
   }

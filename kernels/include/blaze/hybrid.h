@@ -61,6 +61,7 @@ struct HybridConfig {
   static constexpr size_t kRamAuto = ~size_t(0);
 
   std::string model_dir;          // checkpoint directory (compressed-tensors NVFP4 safetensors)
+  std::string mtp_dir;            // a checkpoint whose MTP layer's experts follow the decoder layers (option mtp_dir)
   int topk = 10;
   int gpu0 = 0;
   int gpu1 = -1;                  // helper GPU ordinal, -1: none

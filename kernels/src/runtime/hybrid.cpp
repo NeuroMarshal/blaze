@@ -35,12 +35,12 @@ size_t mem_available() {
 }  // namespace
 
 HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
-  store_ = std::make_unique<ExpertStore>(cfg_.model_dir);
+  store_ = std::make_unique<ExpertStore>(cfg_.model_dir, "", 192 << 10, cfg_.mtp_dir);
   const int L = store_->num_layers(), E = store_->num_experts();
   const expert::Geometry geo = store_->geometry();
   const size_t n = size_t(L) * E;
   stride_ = store_->record_stride();
-  if (cfg_.defer_last == -2) cfg_.defer_last = L - 1;
+  if (cfg_.defer_last == -2) cfg_.defer_last = store_->main_layers() - 1;
   capacity_[0] = int(cfg_.gpu0_bytes / stride_);
   capacity_[1] = cfg_.gpu1 >= 0 ? int(cfg_.gpu1_bytes / stride_) : 0;
   int spare[3] = {0, 0, 0};

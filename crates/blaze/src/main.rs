@@ -95,6 +95,10 @@ struct EngineArgs {
     /// step then reads those rows of the LM head instead of all of it; proposals are only guesses, the verify decides
     #[arg(long)]
     mtp_head_cands: Option<usize>,
+    /// MTP drafter: the checkpoint of its `mtp.*` tensors (default: the target's own). A routed MTP layer needs its
+    /// experts in NVFP4 (Flash Next: an NVFP4 MTP checkpoint; its own MTP experts are BF16)
+    #[arg(long)]
+    mtp_model: Option<PathBuf>,
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
@@ -186,7 +190,8 @@ impl EngineArgs {
             let b = blaze::drafter::vram_estimate(d, world, head_vram)?;
             later_vram.iter_mut().for_each(|x| *x += b);
         } else if self.mtp_window > 0 {
-            let b = blaze::mtp::vram_estimate(&self.model, world, self.mtp_window, self.max_seqs, self.mtp_head_vocab)?;
+            let b = blaze::mtp::vram_estimate(&self.model, self.mtp_model.as_deref(), world, self.mtp_window, self.max_seqs,
+                                              self.mtp_head_vocab)?;
             later_vram.iter_mut().for_each(|x| *x += b);
         }
         let (max_tokens, kv_auto) = match self.kv_tokens.as_str() {
@@ -254,6 +259,7 @@ impl EngineArgs {
                 mtp_window: self.mtp_window,
                 mtp_head_vocab: self.mtp_head_vocab,
                 mtp_head_cands: self.mtp_head_cands.unwrap_or(0),
+                mtp_model: self.mtp_model.clone(),
                 draft_graphs: !self.no_graphs,
                 yarn_factor: self.yarn_factor,
                 tree_levels: if self.spec_defaults()?.1 > 1 { self.draft_tree_depth } else { 0 },

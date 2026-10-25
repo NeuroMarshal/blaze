@@ -16,19 +16,23 @@ namespace blaze {
 /// \brief The routed experts of an NVFP4 checkpoint directory, exported by llm-compressor (compressed-tensors:
 /// weight_packed / weight_scale / weight_global_scale) or ModelOpt (weight / weight_scale / weight_scale_2), one
 /// tensor set per `<prefix><layer>.mlp.experts.<e>.<gate|up|down>_proj`. The layer prefix is found in the checkpoint
-/// (MTP blocks excluded). read() lays one expert out in the kernels' rg16 record in memory (codes and block scales
+/// (MTP blocks excluded). An extra directory adds its `mtp.layers.<l>` experts after the decoder layers (an MTP head's
+/// MoE layer from its own NVFP4 checkpoint, same geometry). read() lays one expert out in the kernels' rg16 record in memory (codes and block scales
 /// copied, nothing requantized); mult() holds the per-matrix multiplier of value = e2m1 * e4m3 * mult.
 class ExpertStore {
  public:
   /// \param prefix_hint  decoder layer prefix to use (e.g. "model.layers."); empty: found in the checkpoint
   /// \param chunk_bytes  checkpoint bytes per read chunk (see Chunk)
+  /// \param extra_dir    a checkpoint whose `mtp.layers.*` experts follow the decoder layers (empty: none)
   explicit ExpertStore(const std::string& model_dir, const std::string& prefix_hint = "",
-                       size_t chunk_bytes = 192 << 10);
+                       size_t chunk_bytes = 192 << 10, const std::string& extra_dir = "");
   ExpertStore(const ExpertStore&) = delete;
   ExpertStore& operator=(const ExpertStore&) = delete;
 
   expert::Geometry geometry() const { return geo_; }
   int num_layers() const { return layers_; }
+  /// \brief The decoder layers (the extra MTP layers come after them).
+  int main_layers() const { return main_layers_; }
   int num_experts() const { return experts_; }
   const std::string& prefix() const { return prefix_; }
   /// \brief Bytes between records in the tier pools (record bytes rounded up to 256).
@@ -55,12 +59,13 @@ class ExpertStore {
 
  private:
   struct Mat {
+    const SafetensorsDir* dir;
     const SafetensorsDir::Tensor* codes;
     const SafetensorsDir::Tensor* scales;
   };
-  std::unique_ptr<SafetensorsDir> st_;
+  std::unique_ptr<SafetensorsDir> st_, extra_;
   expert::Geometry geo_{};
-  int layers_ = 0, experts_ = 0;
+  int layers_ = 0, experts_ = 0, main_layers_ = 0;
   std::string prefix_;
   size_t stride_ = 0;
   int gu_chunk_groups_ = 1, down_chunk_groups_ = 1, gu_chunks_ = 0, down_chunks_ = 0;

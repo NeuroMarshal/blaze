@@ -530,7 +530,8 @@ fn worker_main(
                 Some(dr)
             }
             None if model.opts.mtp_window > 0 => {
-                let dr = crate::drafter::Drafter::load_mtp(&dir, &model, model.opts.max_seqs, model.ctx_stride(), model.opts.mtp_window)?;
+                let mtp = model.opts.mtp_model.clone().unwrap_or_else(|| dir.clone());
+                let dr = crate::drafter::Drafter::load_mtp(&mtp, &model, model.opts.max_seqs, model.ctx_stride(), model.opts.mtp_window)?;
                 if rank == 0 {
                     eprintln!("blaze: {}", dr.describe());
                 }
@@ -592,9 +593,10 @@ impl Engine {
             // the drafter reads the target's hidden states after its aux layers
             opts.capture_layers = crate::drafter::capture_layers(d)?;
         } else if opts.mtp_window > 0 {
-            // the MTP head reads the final normed hidden state: one captured slot, no layer's input
-            if !crate::mtp::has_head(dir)? {
-                bail!("{}: no MTP head (mtp.* tensors) in the checkpoint", dir.display());
+            // the MTP head reads the final normed hidden state (or the final streams): one captured slot, no layer's input
+            let mtp = opts.mtp_model.clone().unwrap_or_else(|| dir.to_path_buf());
+            if !crate::mtp::has_head(&mtp)? {
+                bail!("{}: no MTP head (mtp.* tensors) in the checkpoint", mtp.display());
             }
             opts.capture_layers = vec![usize::MAX];
         }
