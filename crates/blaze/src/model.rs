@@ -1914,6 +1914,11 @@ impl Model {
         Ok(())
     }
 
+    /// BLAZE_PP_FAULT=N: this is the first stage's step N, to fail before its hand-off.
+    pub fn pp_fault_now(&self) -> bool {
+        self.pp.as_ref().is_some_and(|(p, _)| p.stage == 0) && self.pp_fault == Some(self.pp_seq.get())
+    }
+
     /// A step that failed on this stage before it handed its rows on: the next stage's wait is released (bytes
     /// u64::MAX, no rows) instead of spinning forever; the step's error is this stage's.
     pub fn pp_abort(&self) {
@@ -1988,9 +1993,6 @@ impl Model {
             },
             "set_req_to_token",
         )?;
-        if self.pp.as_ref().is_some_and(|(p, _)| p.stage == 0) && self.pp_fault == Some(self.pp_seq.get()) {
-            bail!("BLAZE_PP_FAULT: step {} fails on the first stage", self.pp_seq.get());
-        }
         // a later pipeline stage starts from the hidden rows of the stage before it
         if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage > 0) {
             let link = p.prev.as_ref().unwrap();

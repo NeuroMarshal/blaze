@@ -201,6 +201,9 @@ impl Runner {
 
     /// `handed`: set once the forward is enqueued (a pipeline stage's rows handed on).
     fn step_on(&mut self, meta: &StepMeta, allow_graph: bool, verify: bool, handed: &mut bool) -> Result<Reply> {
+        if self.model.pp_fault_now() {
+            bail!("BLAZE_PP_FAULT: this step fails on the first stage");
+        }
         let m = self.model.meta;
         self.put(m.tokens, &meta.tokens);
         self.put(m.positions, &meta.positions);
