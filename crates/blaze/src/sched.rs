@@ -1463,6 +1463,7 @@ impl Loop {
     /// resumes (before new requests), its pending token among them; sampling state, grammar and thinking budget stay.
     fn preempt(&mut self, i: usize, need: usize) {
         let mut a = self.active.remove(i);
+        let free = self.engine.free_page_count();
         let seq = std::mem::replace(&mut a.seq, Seq { row: usize::MAX, slots: Vec::new(), mm: None });
         self.engine.close(seq);
         let orig = a.orig_len;
@@ -1475,9 +1476,8 @@ impl Loop {
         a.tree = None;
         a.shadow = None;
         eprintln!(
-            "blaze: KV pool full ({} free pages for {need}): a request with {} tokens of output waits for room and \
+            "blaze: KV pool full ({free} free pages for {need}): a request with {} tokens of output waits for room and \
              reads its {} tokens again",
-            self.engine.free_page_count(),
             a.generated.len(),
             a.req.tokens.len()
         );
