@@ -101,6 +101,9 @@ struct EngineArgs {
     /// pipeline stages: the model's layers split over this many GPUs (one GPU a stage; instead of --tp)
     #[arg(long, default_value_t = 1)]
     pp: usize,
+    /// a pipeline stage on another machine: STAGE=HOST:PORT of its `blaze stage-worker` (the last stage for now)
+    #[arg(long)]
+    pp_remote: Vec<String>,
     /// NVFP4 layers on many rows (prefill): auto (W4A4 on FP4 tensor cores where the GPU has them and the checkpoint
     /// calibrated NVFP4 activations, else BF16), nvfp4 (W4A4 wherever the GPU can), bf16 (weights widened, cuBLAS)
     #[arg(long, default_value = "auto")]
@@ -159,6 +162,15 @@ impl EngineArgs {
     /// `gpu0_later`: VRAM on GPU 0 the vision tower loaded after the engine would take there.
     /// `vision_gpu`: --vision gpu, the tower's VRAM is kept from the expert slots of a model with routed experts too.
     fn load_with(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize, vision_gpu: bool) -> Result<blaze::engine::Engine> {
+        let (opts, world) = self.options(chunk, full_logits, gpu0_later, vision_gpu)?;
+        let t0 = Instant::now();
+        let e = blaze::engine::Engine::new(&self.model, opts, world, !self.no_graphs)?;
+        eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());
+        Ok(e)
+    }
+
+    /// The engine options of these arguments and the GPUs they take.
+    fn options(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize, vision_gpu: bool) -> Result<(blaze::model::Options, usize)> {
         let head_vram = match self.draft_head_vram.as_str() {
             "on" => Some(true),
             "off" => Some(false),
@@ -202,9 +214,7 @@ impl EngineArgs {
         if self.expert_defer >= 0 {
             options = format!("defer={},{options}", self.expert_defer);
         }
-        let t0 = Instant::now();
-        let e = blaze::engine::Engine::new(
-            &self.model,
+        Ok((
             blaze::model::Options {
                 max_tokens,
                 kv_auto,
@@ -232,6 +242,14 @@ impl EngineArgs {
                 gemm: self.gemm,
                 pp_stages: self.pp,
                 pp: None,
+                pp_remote: self
+                    .pp_remote
+                    .iter()
+                    .map(|s| {
+                        let (st, addr) = s.split_once('=').ok_or_else(|| anyhow::anyhow!("--pp-remote {s}: STAGE=HOST:PORT"))?;
+                        Ok((st.parse::<usize>().map_err(|e| anyhow::anyhow!("--pp-remote {s}: {e}"))?, addr.to_string()))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
                 draft: self.draft_model.clone(),
                 mtp_window: self.mtp_window,
                 mtp_head_vocab: self.mtp_head_vocab,
@@ -248,15 +266,21 @@ impl EngineArgs {
                 },
             },
             world,
-            !self.no_graphs,
-        )?;
-        eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());
-        Ok(e)
+        ))
     }
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// One pipeline stage on this machine's GPU for a coordinator elsewhere (its `--pp-remote STAGE=HOST:PORT`): the
+    /// same engine options as the coordinator, until it quits.
+    StageWorker {
+        #[command(flatten)]
+        engine: EngineArgs,
+        /// address to listen on (HOST:PORT)
+        #[arg(long)]
+        listen: String,
+    },
     /// Describe a checkpoint: architecture, layers, weight formats per module.
     Inspect { model: PathBuf },
     /// Teacher-forced scoring of a text file: per position the log-probability of the next token and the argmax,
@@ -448,6 +472,10 @@ fn exit_on_thread_panic() {
 fn main() -> Result<()> {
     exit_on_thread_panic();
     match Cli::parse().command {
+        Command::StageWorker { engine, listen } => {
+            let (opts, _) = engine.options(None, false, 0, false)?;
+            blaze::engine::remote::serve(&listen, &engine.model, opts, !engine.no_graphs)
+        }
         Command::Inspect { model } => blaze::inspect::run(&model),
         Command::VisionCheck { model, reference, gpu, cpu, threads, image } => {
             blaze::vision::check_reference(&model, &reference, gpu, cpu, threads, image.as_deref())

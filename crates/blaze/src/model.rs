@@ -309,6 +309,8 @@ pub struct Options {
     /// pipeline parallelism (`--pp`): the stages (1: none), and this rank's stage (set by the engine for each rank)
     pub pp_stages: usize,
     pub pp: Option<PpRank>,
+    /// pipeline stages on other machines: (stage, address of its `blaze stage-worker`)
+    pub pp_remote: Vec<(usize, String)>,
     /// EAGLE-4 drafter checkpoint (run on every rank; the layers it reads are captured)
     pub draft: Option<std::path::PathBuf>,
     /// CUDA graphs of the drafter's chain
@@ -1895,7 +1897,7 @@ impl Model {
 
     /// The hidden rows of a step between this stage and a pipeline link (`send`: into it, else out of it): the
     /// residual stream and the last layer's output, or the hyper-connection streams.
-    fn pp_rows(&self, link: &HostMapped, t: usize, send: bool) -> Result<()> {
+    fn pp_rows(&self, link: &HostMapped, t: usize, send: bool) -> Result<usize> {
         let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
         let data = unsafe { link.dev_ptr::<u8>().add(PP_LINK_HEADER).cast_mut() };
         let bufs: Vec<(*mut u16, usize)> = match (&w.streams, &self.cfg.hc) {
@@ -1916,7 +1918,7 @@ impl Model {
             check(unsafe { sys::cudaMemcpyAsync(dst, src, elems * 2, kind, s.0) }, "pipeline rows")?;
             off += elems * 2;
         }
-        Ok(())
+        Ok(off)
     }
 
     /// The image rows of the next forward: whether the M-RoPE streams differ (positions in the metadata's pos_h / pos_w)
@@ -2046,8 +2048,8 @@ impl Model {
         // a pipeline stage before the last hands its rows on and is done
         if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages) {
             let link = p.next.as_ref().unwrap();
-            self.pp_rows(link, t, true)?;
-            check(unsafe { sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), s.0) }, "pipeline send")?;
+            let bytes = self.pp_rows(link, t, true)?;
+            check(unsafe { sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), bytes as u64, s.0) }, "pipeline send")?;
             return Ok(());
         }
         // the MTP drafter reads the final normed hidden state of every row (aux column 0); the head below takes its rows

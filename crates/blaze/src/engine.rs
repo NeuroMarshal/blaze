@@ -13,6 +13,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
 
 use crate::model::RankBarrier;
+
+#[path = "remote.rs"]
+pub mod remote;
 use std::thread::JoinHandle;
 
 /// A sequence in the KV cache: its row (KV table row and GDN state slot) and the KV slot of every position.
@@ -627,6 +630,18 @@ impl Engine {
         }
         let mut workers = Vec::with_capacity(world);
         for rank in 0..world {
+            // a stage on another machine: a relay to its stage worker
+            if let Some((_, addr)) = opts.pp_remote.iter().find(|(s, _)| *s == rank) {
+                let r = ranks[rank].as_ref().ok_or_else(|| anyhow!("--pp-remote without --pp"))?;
+                if rank + 1 != world {
+                    bail!("--pp-remote {rank}: a remote stage must be the last one for now");
+                }
+                if opts.kv_auto.is_some() {
+                    bail!("--pp-remote: give --kv-tokens (the stages on two machines must hold the same pool)");
+                }
+                workers.push(remote::connect(addr, r, r.prev.clone().unwrap())?);
+                continue;
+            }
             let (ctx, crx) = channel();
             let (rtx, rrx) = channel();
             let (dir, mut opts, embed, barrier) = (dir.to_path_buf(), opts.clone(), embed.clone(), barrier.clone());
@@ -663,6 +678,16 @@ impl Engine {
             pending.swap_remove(pi);
             match reply {
                 Ok(Reply::Logits(v)) => {
+                    // every rank (a stage on another machine with its own options too) holds the same pool and context
+                    if let Some(i) = &info {
+                        let i: &Info = i;
+                        if (i.max_tokens, i.max_seqs, i.ctx_stride, i.page, i.cache_rows) != (v[0] as usize, v[1] as usize, v[3] as usize, v[6] as usize, v[5] as usize) {
+                            first_err.get_or_insert(anyhow!(
+                                "ranks disagree: KV {} / {} tokens, sequences {} / {}, context {} / {} (give every stage the same options)",
+                                i.max_tokens, v[0], i.max_seqs, v[1], i.ctx_stride, v[3]
+                            ));
+                        }
+                    }
                     info.get_or_insert(Info {
                         max_tokens: v[0] as usize,
                         max_seqs: v[1] as usize,

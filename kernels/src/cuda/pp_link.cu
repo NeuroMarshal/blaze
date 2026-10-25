@@ -4,9 +4,10 @@
 
 namespace {
 
-__global__ void signal_kernel(uint64_t* flag, uint64_t* counter) {
+__global__ void signal_kernel(uint64_t* flag, uint64_t* counter, uint64_t bytes) {
   const uint64_t v = *counter + 1;
   *counter = v;
+  reinterpret_cast<volatile uint64_t*>(flag)[1] = bytes;
   __threadfence_system();  // the copy before this kernel is complete; the flag goes out after it
   *reinterpret_cast<volatile uint64_t*>(flag) = v;
 }
@@ -20,8 +21,8 @@ __global__ void wait_kernel(const uint64_t* flag, uint64_t* counter) {
 
 }  // namespace
 
-extern "C" cudaError_t blz_pp_signal(uint64_t* flag, uint64_t* counter, cudaStream_t stream) {
-  signal_kernel<<<1, 1, 0, stream>>>(flag, counter);
+extern "C" cudaError_t blz_pp_signal(uint64_t* flag, uint64_t* counter, uint64_t bytes, cudaStream_t stream) {
+  signal_kernel<<<1, 1, 0, stream>>>(flag, counter, bytes);
   return cudaGetLastError();
 }
 
