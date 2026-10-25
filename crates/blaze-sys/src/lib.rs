@@ -414,6 +414,8 @@ unsafe extern "C" {
     pub fn blz_nvfp4_quant_rows(x: *const u16, ldx: i64, m: c_int, k: c_int, codes: *mut u8, scales: *mut u8, row_scale: *mut f32,
                                 s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_w4a4_supported() -> c_int;
+    pub fn blz_nvfp4_gemm_f16(x16: *const u16, shift: *const i32, w_codes: *const u8, w_scales: *const u8, w_alpha: *const f32,
+                              wshift: c_int, y: *mut u16, ldy: i64, m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_w4a4(x_codes: *const u8, x_scales: *const u8, x_row_scale: *const f32, w_codes: *const u8, w_scales: *const u8,
                                w_alpha: *const f32, y: *mut u16, ldy: i64, m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,

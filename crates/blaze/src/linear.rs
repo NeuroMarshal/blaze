@@ -77,6 +77,8 @@ pub enum GemmRoute {
     Auto,
     /// W4A4 wherever the GPU has FP4 tensor cores (activations quantized whatever the calibration)
     Nvfp4,
+    /// W4A16 on FP16 tensor cores (FP16 accumulation within 128 values of K), every GPU since SM80
+    Fp16,
     /// weights widened to BF16, cuBLAS (exact for the stored weight)
     Bf16,
 }
@@ -87,8 +89,9 @@ impl std::str::FromStr for GemmRoute {
         match s {
             "auto" => Ok(Self::Auto),
             "nvfp4" | "w4a4" => Ok(Self::Nvfp4),
+            "fp16" | "w4a16" => Ok(Self::Fp16),
             "bf16" => Ok(Self::Bf16),
-            other => Err(format!("--gemm {other}: auto, nvfp4 or bf16")),
+            other => Err(format!("--gemm {other}: auto, nvfp4, fp16 or bf16")),
         }
     }
 }
@@ -99,7 +102,17 @@ impl LinCtx {
         self.w4a4 && match self.route {
             GemmRoute::Auto => act4,
             GemmRoute::Nvfp4 => true,
+            GemmRoute::Fp16 | GemmRoute::Bf16 => false,
+        }
+    }
+
+    /// The W4A16 GEMM for an NVFP4 weight of shape [n, k] (`f16`: its scales allow it): asked for, or measured faster
+    /// than widening (tune.rs) under auto, or the fallback of nvfp4 on a GPU without FP4 tensor cores.
+    fn use_gemm16(&self, f16: bool, n: usize, k: usize) -> bool {
+        f16 && k % 128 == 0 && match self.route {
+            GemmRoute::Fp16 => true,
             GemmRoute::Bf16 => false,
+            GemmRoute::Auto | GemmRoute::Nvfp4 => self.tune.get(crate::tune::Kernel::Nvfp4Gemm16, n, k, 0).0 == 1,
         }
     }
 
@@ -107,9 +120,12 @@ impl LinCtx {
     pub fn describe(&self) -> String {
         match (self.route, self.w4a4) {
             (GemmRoute::Bf16, _) => "BF16 (weights widened, cuBLAS): --gemm bf16".into(),
-            (_, false) => "BF16 (weights widened, cuBLAS): this GPU / build has no FP4 tensor cores (SM120a)".into(),
+            (GemmRoute::Fp16, _) => "W4A16 on the FP16 tensor cores: --gemm fp16".into(),
+            (_, false) => "W4A16 on the FP16 tensor cores where the tuner measured it faster than BF16 (no FP4 tensor cores: SM120a)".into(),
             (GemmRoute::Nvfp4, true) => "W4A4 on the FP4 tensor cores for every NVFP4 weight: --gemm nvfp4".into(),
-            (GemmRoute::Auto, true) => "W4A4 on the FP4 tensor cores where the checkpoint calibrated NVFP4 activations, else BF16".into(),
+            (GemmRoute::Auto, true) => {
+                "W4A4 on the FP4 tensor cores where the checkpoint calibrated NVFP4 activations, else W4A16 or BF16 as measured".into()
+            }
         }
     }
 }
@@ -509,6 +525,8 @@ impl Linear {
         let mut x16: Option<(*const u16, *mut u16, *mut i32)> = None;
         // the NVFP4 rows of x for the W4A4 GEMM, quantized once for every part (in the scratch)
         let mut xq: Option<(*const u8, *const u8, *const f32)> = None;
+        // the FP16 rows of all of x for the W4A16 GEMM (key, rows, values, shifts)
+        let mut x16g: Option<(*const u16, usize, *mut u16, *mut i32)> = None;
         for p in &self.parts {
             let o = unsafe { out.add(p.col) };
             match &p.store {
@@ -537,7 +555,7 @@ impl Linear {
                     )?;
                 }
                 Store::Nvfp4 { codes, scales, alpha, f16, wshift, .. } => {
-                    // its FP16 inputs or widened weights take the scratch
+                    // its FP16 inputs or widened weights take the scratch (the W4A16 rows stay for its own GEMM)
                     xq = None;
                     let w = Nvfp4Ref { codes: codes.ptr(), scales: scales.ptr(), alpha: alpha.ptr(), f16: *f16, wshift: *wshift, n: p.n, k };
                     let passes = m > sys::BLZ_NVFP4_MMA_MAX_ROWS
@@ -562,6 +580,25 @@ impl Linear {
                             },
                             "blz_nvfp4_gemv",
                         )?;
+                    } else if ctx.use_gemm16(*f16, p.n, k) && m * k + 2 * m + 8 <= ctx.scratch_elems {
+                        // W4A16: the FP16 rows of x once for every part (x16 keyed by x and its rows)
+                        let (xh, sh) = match x16g {
+                            Some((key, rows, xh, sh)) if key == x && rows == m => (xh, sh),
+                            _ => {
+                                x16 = None;
+                                let v = (ctx.scratch, unsafe { ctx.scratch.add((m * k).next_multiple_of(8)) }.cast::<i32>());
+                                check(unsafe { sys::blz_nvfp4_f16_rows(x, ldx as i64, m as c_int, k as c_int, v.0, v.1, s.0) }, "f16 rows")?;
+                                x16g = Some((x, m, v.0, v.1));
+                                v
+                            }
+                        };
+                        check(
+                            unsafe {
+                                sys::blz_nvfp4_gemm_f16(xh, sh, codes.ptr(), scales.ptr(), alpha.ptr(), *wshift, o, ldo as i64, m as c_int,
+                                                        p.n as c_int, k as c_int, s.0)
+                            },
+                            "blz_nvfp4_gemm_f16",
+                        )?;
                     } else {
                         if p.n * k > ctx.scratch_elems {
                             bail!("NVFP4 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
@@ -569,6 +606,7 @@ impl Linear {
                         // the widened weights overwrite the FP16 or NVFP4 inputs an earlier part left in the scratch
                         x16 = None;
                         xq = None;
+                        x16g = None;
                         check(
                             unsafe {
                                 sys::blz_nvfp4_weight_dequant(codes.ptr(), scales.ptr(), alpha.ptr(), p.n as c_int, k as c_int,
@@ -602,6 +640,7 @@ impl Linear {
                         // the widened weights overwrite the FP16 or NVFP4 inputs an earlier part left in the scratch
                         x16 = None;
                         xq = None;
+                        x16g = None;
                         check(
                             unsafe {
                                 sys::blz_fp8_weight_dequant(codes.ptr(), bs, *block_n as c_int, alpha.ptr(), p.n as c_int, k as c_int,
@@ -635,6 +674,7 @@ impl Linear {
                         // the widened weights overwrite the FP16 or NVFP4 inputs an earlier part left in the scratch
                         x16 = None;
                         xq = None;
+                        x16g = None;
                         check(unsafe { sys::blz_mxfp8_weight_dequant(codes.ptr(), scales.ptr(), p.n as c_int, k as c_int, ctx.scratch, s.0) },
                               "blz_mxfp8_weight_dequant")?;
                         check(

@@ -13,6 +13,7 @@
 // of a fragment load fall in different banks.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
 #include "blaze/nvfp4.h"
@@ -211,7 +212,184 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
 #endif
 }
 
+// W4A16, FP16 cores
+//
+// x as FP16 rows times 2^-shift (blz_nvfp4_f16_rows: max |x| <= 64), the weight decoded from its NVFP4 codes at the
+// fragment loads (code times block scale times 2^-wshift: exact in FP16), mma.sync m16n8k16 with FP16 accumulation
+// within each 128 values of K (partial sums below 128 * 64 * 6 < 65504) and FP32 across them; the epilogue gives
+// back alpha and both powers of two. 128 x 128 tiles of 8 warps (64 x 32), 64-wide K tiles in three stages.
+
+constexpr int FBM = 128, FBN = 128, FBK = 64, kFStages = 3;
+constexpr int kARow = FBK * 2 + 16;  // bytes of an A row in shared memory (144: ldmatrix rows in distinct banks)
+constexpr int kBRow = FBK / 2 + 16;  // bytes of a B code row (48)
+constexpr int kFTile = FBM * kARow + FBN * kBRow + FBN * 4;
+constexpr int kFSmem = kFStages * kFTile;
+
+__device__ __forceinline__ void cp_async4(void* dst, const void* src, bool valid) {
+  const uint32_t d = uint32_t(__cvta_generic_to_shared(dst));
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(d), "l"(src), "r"(valid ? 4 : 0));
+}
+
+// Four E2M1 codes (16 bits, first code lowest) -> two FP16 pairs (as in nvfp4_linear.cu).
+__device__ __forceinline__ void f16_codes(uint32_t q, uint32_t& w0, uint32_t& w1) {
+  const uint32_t hi = __byte_perm(0x3E3C3800u, 0x46444240u, q & 0x7777u);
+  w0 = __byte_perm(hi, 0u, 0x1404) | ((q & 0x8u) << 12) | ((q & 0x80u) << 24);
+  w1 = __byte_perm(hi, 0u, 0x3424) | ((q & 0x800u) << 4) | ((q & 0x8000u) << 16);
+}
+
+__device__ __forceinline__ uint32_t hmul2(uint32_t a, uint32_t b) {
+  __half2 r = __hmul2(*reinterpret_cast<__half2*>(&a), *reinterpret_cast<__half2*>(&b));
+  return *reinterpret_cast<uint32_t*>(&r);
+}
+
+__global__ void __launch_bounds__(kThreads) w4a16_kernel(const uint16_t* __restrict__ x16, const int32_t* __restrict__ shift,
+                                                         const uint8_t* __restrict__ wc, const uint8_t* __restrict__ ws,
+                                                         const float* __restrict__ walpha, int wshift,
+                                                         uint16_t* __restrict__ y, int64_t ldy, int m, int n, int k) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  extern __shared__ __align__(16) uint8_t smem[];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int wm = warp >> 2, wn = warp & 3, g = lane >> 2, t = lane & 3;
+  const int m0 = blockIdx.y * FBM, n0 = blockIdx.x * FBN;
+  const int kc = k / 2, ks = k / 16, tiles = k / FBK;
+  const float wscale = ldexpf(1.0f, -wshift);
+  auto stage = [&](int s) { return smem + s * kFTile; };
+  auto load = [&](int kt, int s) {
+    uint8_t* A = stage(s);
+    uint8_t* B = A + FBM * kARow;
+    uint8_t* SB = B + FBN * kBRow;
+#pragma unroll
+    for (int c = tid; c < FBM * 8; c += kThreads) {  // 8 chunks of 16 bytes per A row
+      const int r = c >> 3, ch = c & 7;
+      const bool v = m0 + r < m;
+      cp_async(A + r * kARow + ch * 16, x16 + int64_t(v ? m0 + r : 0) * k + kt * FBK + ch * 8, 16, v);
+    }
+    {
+      const int r = tid >> 1, ch = tid & 1;  // 2 chunks per B row
+      const bool v = n0 + r < n;
+      cp_async(B + r * kBRow + ch * 16, wc + int64_t(v ? n0 + r : 0) * kc + kt * (FBK / 2) + ch * 16, 16, v);
+    }
+    if (tid < FBN) {
+      const bool v = n0 + tid < n;
+      cp_async4(SB + tid * 4, ws + int64_t(v ? n0 + tid : 0) * ks + kt * (FBK / 16), v);
+    }
+  };
+  float acc[4][4][4];
+  uint32_t h[4][4][2];
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+      h[i][j][0] = h[i][j][1] = 0u;
+    }
+#pragma unroll
+  for (int s = 0; s < kFStages - 1; ++s) {
+    if (s < tiles) load(s, s);
+    asm volatile("cp.async.commit_group;\n");
+  }
+  for (int kt = 0; kt < tiles; ++kt) {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(kFStages - 2));
+    __syncthreads();
+    const uint8_t* A = stage(kt % kFStages);
+    const uint8_t* B = A + FBM * kARow;
+    const uint8_t* SB = B + FBN * kBRow;
+#pragma unroll
+    for (int kk = 0; kk < FBK / 16; ++kk) {  // one 16-wide step = one block scale
+      uint32_t b[4][2];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int c = wn * 32 + j * 8 + g;
+        const uint8_t* row = B + c * kBRow + kk * 8;
+        const uint32_t q = uint32_t(row[t]) | (uint32_t(row[t + 4]) << 8);
+        uint32_t w0, w1;
+        f16_codes(q, w0, w1);
+        const __nv_fp8_e4m3 sc = *reinterpret_cast<const __nv_fp8_e4m3*>(SB + c * 4 + kk);
+        const __half hs = __float2half_rn(float(sc) * wscale);
+        const uint32_t s2 = uint32_t(__half_as_ushort(hs)) * 0x10001u;
+        b[j][0] = hmul2(w0, s2);
+        b[j][1] = hmul2(w1, s2);
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int r = wm * 64 + i * 16 + (lane & 15);
+        const uint32_t addr = uint32_t(__cvta_generic_to_shared(A + r * kARow + kk * 32 + (lane >> 4) * 16));
+        uint32_t a0, a1, a2, a3;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+                     : "r"(addr));
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};\n"
+                       : "+r"(h[i][j][0]), "+r"(h[i][j][1])
+                       : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b[j][0]), "r"(b[j][1]));
+      }
+    }
+    if ((kt & 1) || kt + 1 == tiles) {  // every 128 values of K: the FP16 sums into FP32
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+#pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h[i][j][e]));
+            acc[i][j][2 * e] += f.x;
+            acc[i][j][2 * e + 1] += f.y;
+            h[i][j][e] = 0u;
+          }
+        }
+    }
+    const int next = kt + kFStages - 1;
+    if (next < tiles) load(next, next % kFStages);
+    asm volatile("cp.async.commit_group;\n");
+  }
+  asm volatile("cp.async.wait_group 0;\n");
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int r0 = m0 + wm * 64 + i * 16 + g;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int c = n0 + wn * 32 + j * 8 + 2 * t;
+      if (c >= n) continue;
+      const float a0 = walpha[c], a1 = c + 1 < n ? walpha[c + 1] : 0.0f;
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const int r = r0 + half * 8;
+        if (r >= m) continue;
+        const int e = shift[r] + wshift;
+        const float v0 = ldexpf(acc[i][j][2 * half] * a0, e), v1 = ldexpf(acc[i][j][2 * half + 1] * a1, e);
+        uint16_t* out = y + int64_t(r) * ldy + c;
+        if (c + 1 < n && (ldy & 1) == 0) {
+          *reinterpret_cast<__nv_bfloat162*>(out) = __floats2bfloat162_rn(v0, v1);
+        } else {
+          out[0] = __bfloat16_as_ushort(__float2bfloat16(v0));
+          if (c + 1 < n) out[1] = __bfloat16_as_ushort(__float2bfloat16(v1));
+        }
+      }
+    }
+  }
+#endif
+}
+
 }  // namespace
+
+extern "C" cudaError_t blz_nvfp4_gemm_f16(const uint16_t* x16, const int32_t* shift, const uint8_t* w_codes,
+                                          const uint8_t* w_scales, const float* w_alpha, int wshift, uint16_t* y,
+                                          int64_t ldy, int m, int n, int k, cudaStream_t stream) {
+  if (m <= 0 || n <= 0) return cudaSuccess;
+  if (k % 128 != 0) return cudaErrorInvalidValue;
+  static bool attr[16] = {};
+  int dev = 0;
+  cudaGetDevice(&dev);
+  if (dev >= 16 || !attr[dev]) {
+    cudaFuncSetAttribute(w4a16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kFSmem);
+    if (dev < 16) attr[dev] = true;
+  }
+  const dim3 grid((n + FBN - 1) / FBN, (m + FBM - 1) / FBM);
+  w4a16_kernel<<<grid, kThreads, kFSmem, stream>>>(x16, shift, w_codes, w_scales, w_alpha, wshift, y, ldy, m, n, k);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_nvfp4_quant_rows(const uint16_t* x, int64_t ldx, int m, int k, uint8_t* codes, uint8_t* scales,
                                             float* row_scale, cudaStream_t stream) {

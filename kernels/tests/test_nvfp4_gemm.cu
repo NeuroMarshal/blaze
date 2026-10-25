@@ -3,6 +3,7 @@
 // time against the BF16 route (weights widened + cuBLAS) at prefill shapes of the 27B.
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -68,13 +69,101 @@ float wval(const Weight& w, int j, int i) {
 
 }  // namespace
 
-int main() {
-  if (!blz_nvfp4_gemm_w4a4_supported()) {
-    std::printf("W4A4 GEMM: not available on this GPU / build (needs SM120a): skipped\nPASSED\n");
-    return 0;
-  }
-  std::mt19937 rng(11);
+// The W4A16 route (FP16 cores): against FP64 of the exact weight and the BF16 input, and its time against the BF16
+// route. Returns the failures.
+int test_f16(std::mt19937& rng, blz_gemm* gemm) {
   int bad = 0;
+  for (auto [m, n, k] : {std::tuple{300, 200, 1024}, std::tuple{1, 72, 256}, std::tuple{129, 131, 512}}) {
+    Weight W = random_weight(n, k, rng);
+    int smax = 0;
+    for (uint8_t sc : W.scales) smax = std::max(smax, int(sc & 0x7f));
+    const int wshift = smax > 0x38 ? ((smax >> 3) - 7) + int((smax & 7) != 0) : 0;
+    std::vector<uint16_t> x(size_t(m) * k);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int r = 0; r < m; ++r) {
+      const float mag = std::exp(std::uniform_real_distribution<float>(-3.0f, 3.0f)(rng));
+      for (int i = 0; i < k; ++i) x[size_t(r) * k + i] = bf(nd(rng) * mag);
+    }
+    uint16_t *dx = dev(x), *x16, *dy;
+    int32_t* sh;
+    check(cudaMalloc(&x16, size_t(m) * k * 2), "malloc");
+    check(cudaMalloc(&sh, m * 4), "malloc");
+    check(cudaMalloc(&dy, size_t(m) * n * 2), "malloc");
+    uint8_t *wc = dev(W.codes), *ws = dev(W.scales);
+    float* wa = dev(W.alpha);
+    check(blz_nvfp4_f16_rows(dx, k, m, k, x16, sh, 0), "f16 rows");
+    check(blz_nvfp4_gemm_f16(x16, sh, wc, ws, wa, wshift, dy, n, m, n, k, 0), "gemm f16");
+    check(cudaDeviceSynchronize(), "sync");
+    std::vector<uint16_t> y(size_t(m) * n);
+    check(cudaMemcpy(y.data(), dy, y.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    double err = 0, norm = 0;
+    std::vector<double> wrow(k);
+    for (int j = 0; j < n; ++j) {
+      for (int i = 0; i < k; ++i) wrow[i] = wval(W, j, i);
+      for (int r = 0; r < m; ++r) {
+        double e = 0;
+        for (int i = 0; i < k; ++i) e += double(fb(x[size_t(r) * k + i])) * wrow[i];
+        const double got = fb(y[size_t(r) * n + j]);
+        err += (got - e) * (got - e);
+        norm += e * e;
+      }
+    }
+    const double rel = std::sqrt(err / norm);
+    const bool ok = rel < 5e-3;  // FP16 inputs (2^-11), FP16 partial sums of 128, BF16 output
+    bad += !ok;
+    std::printf("W4A16 m %d n %d k %d (wshift %d): vs FP64 rel L2 %.2e %s\n", m, n, k, wshift, rel, ok ? "ok" : "FAIL");
+    cudaFree(dx), cudaFree(x16), cudaFree(sh), cudaFree(dy), cudaFree(wc), cudaFree(ws), cudaFree(wa);
+  }
+  const int m = 2048;
+  for (auto [n, k] : {std::pair{5120, 5120}, std::pair{8704, 5120}, std::pair{2048, 2048}}) {
+    Weight W = random_weight(n, k, rng);
+    std::vector<uint16_t> x(size_t(m) * k);
+    for (auto& v : x) v = bf(std::normal_distribution<float>(0.0f, 1.0f)(rng));
+    uint16_t *dx = dev(x), *x16, *dy, *wide;
+    int32_t* sh;
+    uint8_t *wc = dev(W.codes), *ws = dev(W.scales);
+    float* wa = dev(W.alpha);
+    check(cudaMalloc(&x16, size_t(m) * k * 2), "malloc");
+    check(cudaMalloc(&sh, m * 4), "malloc");
+    check(cudaMalloc(&dy, size_t(m) * n * 2), "malloc");
+    check(cudaMalloc(&wide, size_t(n) * k * 2), "malloc");
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0), cudaEventCreate(&e1);
+    auto time = [&](auto f) {
+      f();
+      cudaEventRecord(e0);
+      for (int i = 0; i < 10; ++i) f();
+      cudaEventRecord(e1);
+      check(cudaEventSynchronize(e1), "time");
+      float ms = 0;
+      cudaEventElapsedTime(&ms, e0, e1);
+      return ms / 10;
+    };
+    const float tf = time([&] {
+      blz_nvfp4_f16_rows(dx, k, m, k, x16, sh, 0);
+      blz_nvfp4_gemm_f16(x16, sh, wc, ws, wa, 8, dy, n, m, n, k, 0);
+    });
+    const float tb = time([&] {
+      blz_nvfp4_weight_dequant(wc, ws, wa, n, k, wide, 0);
+      blz_gemm_bf16(gemm, dx, k, wide, dy, n, m, n, k, 0);
+    });
+    const double flop = 2.0 * m * n * k;
+    std::printf("W4A16 m %d n %d k %d: %.3f ms (%.0f TFLOPS) | widen + cuBLAS BF16 %.3f ms (%.0f TFLOPS): %.2fx\n", m, n, k, tf,
+                flop / tf / 1e9, tb, flop / tb / 1e9, tb / tf);
+    cudaFree(dx), cudaFree(x16), cudaFree(sh), cudaFree(dy), cudaFree(wide), cudaFree(wc), cudaFree(ws), cudaFree(wa);
+  }
+  return bad;
+}
+
+int main() {
+  std::mt19937 rng(11);
+  blz_gemm* gemm0 = nullptr;
+  if (blz_gemm_create(&gemm0) != 0) return 1;
+  int bad = test_f16(rng, gemm0);
+  if (!blz_nvfp4_gemm_w4a4_supported()) {
+    std::printf("W4A4 GEMM: not available on this GPU / build (needs SM120a): skipped\n%s\n", bad ? "FAILED" : "PASSED");
+    return bad ? 1 : 0;
+  }
   for (auto [m, n, k] : {std::tuple{300, 200, 1024}, std::tuple{1, 72, 256}, std::tuple{129, 131, 512}}) {
     Weight W = random_weight(n, k, rng);
     std::vector<uint16_t> x(size_t(m) * k);

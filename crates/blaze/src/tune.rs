@@ -22,6 +22,8 @@ pub enum Kernel {
     /// NVFP4 calls of more rows than one tensor-core launch takes (PASS_BUCKETS): (1, 0) passes of the GEMV beat
     /// widening the weights for cuBLAS, (0, 0) they do not
     Nvfp4Pass,
+    /// NVFP4 inputs of many rows (GEMM16_ROWS): (1, 0) the W4A16 GEMM on FP16 cores beats widening + cuBLAS
+    Nvfp4Gemm16,
     Mxfp8,
     Bf16,
 }
@@ -32,6 +34,7 @@ impl Kernel {
             Kernel::Nvfp4 => "nvfp4",
             Kernel::Nvfp4F16 => "nvfp4f16",
             Kernel::Nvfp4Pass => "nvfp4pass",
+            Kernel::Nvfp4Gemm16 => "nvfp4gemm16",
             Kernel::Mxfp8 => "mxfp8",
             Kernel::Bf16 => "bf16",
         }
@@ -83,6 +86,8 @@ fn bucket(m: usize) -> usize {
 /// are measured for (beyond: widening + cuBLAS, as a prefill chunk).
 pub const PASS_BUCKETS: [usize; 4] = [96, 128, 192, 256];
 pub const PASS_MAX_ROWS: usize = 256;
+/// Rows the W4A16 GEMM is measured at against the widened route (a prefill chunk's order of size).
+pub const GEMM16_ROWS: usize = 1024;
 
 fn pass_bucket(m: usize) -> usize {
     PASS_BUCKETS.iter().position(|&b| b >= m).unwrap_or(PASS_BUCKETS.len() - 1)
@@ -100,8 +105,8 @@ fn launch(w: &Weight, gemm: *mut sys::blz_gemm, x: *const u16, x16: (*mut u16, *
                 let e = sys::blz_nvfp4_f16_rows(x, w.k as i64, rows as c_int, k, x16.0, x16.1, s.0);
                 if e != 0 { e } else { sys::blz_nvfp4_gemv_mma_f16_cfg(x16.0, x16.1, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k, w.wshift, a, b, s.0) }
             }
-            Kernel::Nvfp4 | Kernel::Nvfp4Pass => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y, w.n as i64, rows as c_int, n, k,
-                                                        a, b, s.0),
+            Kernel::Nvfp4 | Kernel::Nvfp4Pass | Kernel::Nvfp4Gemm16 => sys::blz_nvfp4_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, w.alpha, y,
+                                                                                           w.n as i64, rows as c_int, n, k, a, b, s.0),
             Kernel::Mxfp8 => sys::blz_mxfp8_gemv_mma_cfg(x, w.k as i64, w.codes, w.scales, y, w.n as i64, rows as c_int, n, k, a, b, s.0),
             Kernel::Bf16 => match a {
                 BF16_SKINNY => sys::blz_skinny_gemm_cfg(x.cast(), w.k as i64, w.codes.cast(), y.cast(), w.n as i64, rows as c_int, n, k,
@@ -123,6 +128,8 @@ pub fn f16_enabled() -> bool {
 /// The configurations to measure for `rows` rows of a weight of `kernel` with `k` columns.
 fn candidates(kernel: Kernel, rows: usize, k: usize) -> Vec<(c_int, c_int)> {
     match kernel {
+        // decided by tune_gemm16, not by launch configurations
+        Kernel::Nvfp4Gemm16 => Vec::new(),
         Kernel::Nvfp4 | Kernel::Nvfp4F16 | Kernel::Nvfp4Pass | Kernel::Mxfp8 => {
             let mut v = Vec::new();
             for split in [2, 4, 8] {
@@ -200,6 +207,7 @@ impl Tuning {
                     Some(&"nvfp4") => Kernel::Nvfp4,
                     Some(&"nvfp4f16") => Kernel::Nvfp4F16,
                     Some(&"nvfp4pass") => Kernel::Nvfp4Pass,
+                    Some(&"nvfp4gemm16") => Kernel::Nvfp4Gemm16,
                     Some(&"mxfp8") => Kernel::Mxfp8,
                     Some(&"bf16") => Kernel::Bf16,
                     _ => continue,
@@ -221,7 +229,11 @@ impl Tuning {
         if !self.enabled {
             return (0, 0);
         }
-        let b = if kernel == Kernel::Nvfp4Pass { pass_bucket(m) } else { bucket(m) };
+        let b = match kernel {
+            Kernel::Nvfp4Pass => pass_bucket(m),
+            Kernel::Nvfp4Gemm16 => 0,
+            _ => bucket(m),
+        };
         self.table.read().unwrap().get(&(kernel, n, k, b)).copied().unwrap_or((0, 0))
     }
 
@@ -235,7 +247,7 @@ impl Tuning {
         let mut shapes: HashMap<(Kernel, usize, usize), Vec<Weight>> = HashMap::new();
         for w in weights {
             let fits = match w.kernel {
-                Kernel::Nvfp4 | Kernel::Nvfp4F16 | Kernel::Nvfp4Pass | Kernel::Mxfp8 => w.k % 128 == 0,
+                Kernel::Nvfp4 | Kernel::Nvfp4F16 | Kernel::Nvfp4Pass | Kernel::Nvfp4Gemm16 | Kernel::Mxfp8 => w.k % 128 == 0,
                 Kernel::Bf16 => w.k % 8 == 0 && w.codes as usize % 16 == 0,
             };
             if fits {
@@ -253,7 +265,7 @@ impl Tuning {
             shapes.into_iter().filter(|(key, _)| (0..BUCKETS.len()).any(|b| !t.contains_key(&(key.0, key.1, key.2, b)))).collect()
         };
         if missing.is_empty() {
-            return self.tune_passes(&nvfp4, gemm, s);
+            return Ok(self.tune_passes(&nvfp4, gemm, s)? + self.tune_gemm16(&nvfp4, gemm, s)?);
         }
         let max_k = missing.iter().map(|(k, _)| k.2).max().unwrap();
         let max_n = missing.iter().map(|(k, _)| k.1).max().unwrap();
@@ -338,7 +350,7 @@ impl Tuning {
             t.extend(found);
         }
         self.save();
-        Ok(shapes_tuned + self.tune_passes(&nvfp4, gemm, s)?)
+        Ok(shapes_tuned + self.tune_passes(&nvfp4, gemm, s)? + self.tune_gemm16(&nvfp4, gemm, s)?)
     }
 
     /// One NVFP4 call of `rows` <= 64 rows as Linear::run makes it with this table (FP16 or FP32 accumulation).
@@ -410,6 +422,62 @@ impl Tuning {
                 let (tp, tw) = (time(&passes)?, time(&widen)?);
                 found.push(((Kernel::Nvfp4Pass, *n, *k, b), if tp < tw { (1, 0) } else { (0, 0) }));
             }
+        }
+        let tuned = missing.len();
+        self.table.write().unwrap().extend(found);
+        self.save();
+        Ok(tuned)
+    }
+
+    /// Kernel::Nvfp4Gemm16 of the NVFP4 shapes not measured yet: the W4A16 GEMM (FP16 rows of x and the GEMM) against
+    /// widening the weights for cuBLAS, at GEMM16_ROWS rows.
+    fn tune_gemm16(&self, nvfp4: &[((usize, usize), Vec<Weight>)], gemm: *mut sys::blz_gemm, s: &Stream) -> Result<usize> {
+        let missing: Vec<_> = {
+            let t = self.table.read().unwrap();
+            nvfp4.iter().filter(|((n, k), ws)| !t.contains_key(&(Kernel::Nvfp4Gemm16, *n, *k, 0)) && ws.iter().all(|w| w.f16)).collect()
+        };
+        if missing.is_empty() {
+            return Ok(0);
+        }
+        let rows = GEMM16_ROWS;
+        let max_k = missing.iter().map(|((_, k), _)| *k).max().unwrap();
+        let max_n = missing.iter().map(|((n, _), _)| *n).max().unwrap();
+        let max_nk = missing.iter().map(|((n, k), _)| n * k).max().unwrap();
+        let x = DevBuf::zeroed(rows * max_k * 2, s)?;
+        let y = DevBuf::zeroed(rows * max_n * 2, s)?;
+        let wide = DevBuf::zeroed(max_nk * 2, s)?;
+        let (x16, sh) = (DevBuf::zeroed(rows * max_k * 2, s)?, DevBuf::zeroed(rows * 4, s)?);
+        let timer = Timer::new()?;
+        let mut found = Vec::new();
+        for ((n, k), ws) in &missing {
+            let ws = &ws[..ws.len().min(4)];
+            let f16 = |w: &Weight| unsafe {
+                sys::blz_nvfp4_f16_rows(x.ptr(), *k as i64, rows as c_int, *k as c_int, x16.ptr(), sh.ptr(), s.0)
+                    | sys::blz_nvfp4_gemm_f16(x16.ptr(), sh.ptr(), w.codes, w.scales, w.alpha, w.wshift, y.ptr(), *n as i64, rows as c_int,
+                                              *n as c_int, *k as c_int, s.0)
+            };
+            let widen = |w: &Weight| unsafe {
+                sys::blz_nvfp4_weight_dequant(w.codes, w.scales, w.alpha, *n as c_int, *k as c_int, wide.ptr(), s.0)
+                    | sys::blz_gemm_bf16(gemm, x.ptr(), *k as i64, wide.ptr(), y.ptr(), *n as i64, rows as c_int, *n as c_int, *k as c_int, s.0)
+            };
+            let time = |f: &dyn Fn(&Weight) -> c_int| -> Result<f32> {
+                let mut err = 0;
+                for w in ws {
+                    err |= f(w);
+                }
+                if err != 0 {
+                    return Ok(f32::INFINITY);
+                }
+                timer.start(s)?;
+                for _ in 0..2 {
+                    for w in ws {
+                        f(w);
+                    }
+                }
+                timer.stop(s)
+            };
+            let (tf, tw) = (time(&f16)?, time(&widen)?);
+            found.push(((Kernel::Nvfp4Gemm16, *n, *k, 0), if tf < tw { (1, 0) } else { (0, 0) }));
         }
         let tuned = missing.len();
         self.table.write().unwrap().extend(found);

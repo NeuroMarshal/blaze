@@ -28,6 +28,13 @@ cudaError_t blz_nvfp4_gemm_w4a4(const uint8_t* x_codes, const uint8_t* x_scales,
                                 const uint8_t* w_codes, const uint8_t* w_scales, const float* w_alpha, uint16_t* y,
                                 int64_t ldy, int m, int n, int k, cudaStream_t stream);
 
+/// \brief W4A16 on the FP16 tensor cores (SM80+): x16 [m, k] FP16 rows times 2^-shift (blz_nvfp4_f16_rows), the
+/// weight's block scales taken times 2^-wshift (its largest to <= 1); FP16 accumulation within 128 values of K, FP32
+/// across. y [m, n] bf16 (row stride ldy). k a multiple of 128; any m and n.
+cudaError_t blz_nvfp4_gemm_f16(const uint16_t* x16, const int32_t* shift, const uint8_t* w_codes, const uint8_t* w_scales,
+                               const float* w_alpha, int wshift, uint16_t* y, int64_t ldy, int m, int n, int k,
+                               cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
