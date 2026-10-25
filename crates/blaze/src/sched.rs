@@ -387,6 +387,9 @@ pub struct SchedConfig {
     pub prompt_cache: bool,
     /// cut or skip drafts by the measured cost of a verify against a decode step (else always verify the full draft)
     pub spec_adaptive: bool,
+    /// with the engine's drafter: suffix-decoding drafts of up to this many tokens replace the drafter's where the
+    /// suffix index expects more of them accepted (0: off)
+    pub suffix_assist: usize,
     pub spec_method: SpecMethod,
     /// MTP candidate head: every request keeps the set of token ids it has seen, handed to the drafter with its items
     pub draft_cands: bool,
@@ -407,6 +410,10 @@ pub enum SpecMethod {
 
 /// Node counts a tree round verifies per sequence (rows: one more).
 const TREE_NODES: [usize; 12] = [0, 1, 3, 5, 7, 11, 15, 23, 31, 39, 47, 63];
+
+/// Suffix assist: the suffix draft replaces the drafter's from this many expected accepted tokens (an MTP chain of 3
+/// keeps about 0.8 on prose).
+const SUFFIX_ASSIST_SCORE: f32 = 2.0;
 
 /// Tokens of earlier outputs kept for suffix decoding.
 const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
@@ -945,6 +952,13 @@ impl Loop {
                 propose(&ctx, 4, 1, k)
             }
             SpecMethod::Suffix => self.suffix_draft(i, k),
+            SpecMethod::Eagle if self.cfg.suffix_assist > 0 => {
+                let drafted: Vec<i64> = a.eagle.iter().copied().take(k).collect();
+                let ks = self.cfg.suffix_assist.min(room.saturating_sub(1));
+                let (d, score) = self.suffix_draft_scored(i, ks);
+                // the suffix index's expected accepted tokens against what a chain of the drafter keeps on average
+                if score >= SUFFIX_ASSIST_SCORE && d.len() > drafted.len() { d } else { drafted }
+            }
             SpecMethod::Eagle => a.eagle.iter().copied().take(k).collect(),
         };
         if mm {
@@ -1366,6 +1380,11 @@ impl Loop {
     /// Suffix decoding draft of up to `k` tokens for active request `i`: the better of its own prompt and output and
     /// the earlier outputs.
     fn suffix_draft(&mut self, i: usize, k: usize) -> Vec<i64> {
+        self.suffix_draft_scored(i, k).0
+    }
+
+    /// The suffix draft and the index's expected number of its tokens accepted.
+    fn suffix_draft_scored(&mut self, i: usize, k: usize) -> (Vec<i64>, f32) {
         let cfg = self.suffix_cfg;
         let a = &mut self.active[i];
         let ix = a.suffix.get_or_insert_with(|| {
@@ -1380,8 +1399,8 @@ impl Loop {
             a.req.tokens[..a.orig_len].iter().map(|&t| t as i32).chain(a.generated.iter().copied()).skip(skip).collect();
         let own = ix.draft(&tail, k, &cfg);
         let global = self.suffix_global.draft(&tail, k, &cfg);
-        let best = if global.1 > own.1 { global.0 } else { own.0 };
-        best.into_iter().map(i64::from).collect()
+        let best = if global.1 > own.1 { global } else { own };
+        (best.0.into_iter().map(i64::from).collect(), best.1)
     }
 
     /// Suffix decoding: a finished output joins the earlier outputs.
@@ -1571,7 +1590,7 @@ impl Loop {
     }
 
     fn keep_output(&mut self, a: &Active) {
-        if self.cfg.spec_method == SpecMethod::Suffix && self.cfg.spec_tokens > 0 && !a.generated.is_empty() {
+        if (self.cfg.spec_method == SpecMethod::Suffix && self.cfg.spec_tokens > 0 || self.cfg.suffix_assist > 0) && !a.generated.is_empty() {
             self.suffix_global.extend(a.generated.iter().copied());
             self.suffix_global.end_seq();
             // rebuilt once the corpus passes the limit by a quarter, down to three quarters of it: one rebuild per
