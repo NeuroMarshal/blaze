@@ -410,6 +410,12 @@ unsafe extern "C" {
                                   k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_weight_dequant(w: *const u8, scale: *const u8, alpha: *const f32, n: c_int, k: c_int,
                                     out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    // nvfp4_gemm.h
+    pub fn blz_nvfp4_quant_rows(x: *const u16, ldx: i64, m: c_int, k: c_int, codes: *mut u8, scales: *mut u8, row_scale: *mut f32,
+                                s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_gemm_w4a4_supported() -> c_int;
+    pub fn blz_nvfp4_gemm_w4a4(x_codes: *const u8, x_scales: *const u8, x_row_scale: *const f32, w_codes: *const u8, w_scales: *const u8,
+                               w_alpha: *const f32, y: *mut u16, ldy: i64, m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,
                            k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_ex(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,

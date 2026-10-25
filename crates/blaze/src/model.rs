@@ -290,6 +290,8 @@ pub struct Options {
     /// every live sequence may verify in the same step); 0: none.
     pub max_verify: usize,
     pub kv_dtype: KvDtype,
+    /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
+    pub gemm: crate::linear::GemmRoute,
     /// EAGLE-4 drafter checkpoint (run on every rank; the layers it reads are captured)
     pub draft: Option<std::path::PathBuf>,
     /// CUDA graphs of the drafter's chain
@@ -1222,7 +1224,14 @@ impl Model {
             ple_state,
             embed,
             moe: None,
-            lin: LinCtx { gemm, scratch: scratch.ptr(), scratch_elems, tune: std::sync::Arc::new(crate::tune::Tuning::open(rank)) },
+            lin: LinCtx {
+                gemm,
+                scratch: scratch.ptr(),
+                scratch_elems,
+                tune: std::sync::Arc::new(crate::tune::Tuning::open(rank)),
+                route: opts.gemm,
+                w4a4: unsafe { sys::blz_nvfp4_gemm_w4a4_supported() } != 0,
+            },
             _scratch: scratch,
             inv_freq,
             rope_scale,
@@ -1282,6 +1291,9 @@ impl Model {
             }
         }
         let t0 = std::time::Instant::now();
+        if model.tp.rank == 0 {
+            eprintln!("blaze: NVFP4 layers on many rows (prefill): {}", model.lin.describe());
+        }
         let tuned = model.lin.tune.tune(&weights, model.lin.gemm, &model.stream)?;
         if tuned > 0 && model.tp.rank == 0 {
             eprintln!("blaze: tuned the GEMV launches of {tuned} weight shapes in {:.1} s", t0.elapsed().as_secs_f64());

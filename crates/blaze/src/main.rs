@@ -98,6 +98,10 @@ struct EngineArgs {
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
+    /// NVFP4 layers on many rows (prefill): auto (W4A4 on FP4 tensor cores where the GPU has them and the checkpoint
+    /// calibrated NVFP4 activations, else BF16), nvfp4 (W4A4 wherever the GPU can), bf16 (weights widened, cuBLAS)
+    #[arg(long, default_value = "auto")]
+    gemm: blaze::linear::GemmRoute,
     /// eager decode steps instead of CUDA graphs
     #[arg(long)]
     no_graphs: bool,
@@ -218,6 +222,7 @@ impl EngineArgs {
                 ple_cache_gib: self.ple_cache_gib,
                 max_verify: self.spec_defaults()?.0,
                 kv_dtype: self.kv_cache_dtype,
+                gemm: self.gemm,
                 draft: self.draft_model.clone(),
                 mtp_window: self.mtp_window,
                 mtp_head_vocab: self.mtp_head_vocab,

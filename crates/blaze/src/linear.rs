@@ -22,8 +22,9 @@ pub enum Cut {
 
 enum Store {
     Bf16(DevBuf),
-    /// `f16`: the FP16-accumulate GEMV may take it (no NaN scale), its block scales times 2^-wshift (the largest to <= 1)
-    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf, f16: bool, wshift: i32 },
+    /// `f16`: the FP16-accumulate GEMV may take it (no NaN scale), its block scales times 2^-wshift (the largest to <= 1);
+    /// `act4`: the checkpoint is calibrated for NVFP4 activations of it (W4A4)
+    Nvfp4 { codes: DevBuf, scales: DevBuf, alpha: DevBuf, f16: bool, wshift: i32, act4: bool },
     /// E4M3 codes [n, k], optional FP32 scales per [block_n, 128] block, FP32 multiplier per row.
     Fp8 { codes: DevBuf, block_scale: Option<DevBuf>, block_n: usize, alpha: DevBuf },
     /// MXFP8: E4M3 codes [n, k], E8M0 scales [n, k / 32].
@@ -61,6 +62,56 @@ pub struct LinCtx {
     pub scratch_elems: usize,
     /// launch configurations of the tensor-core GEMVs measured for this device (tune.rs)
     pub tune: std::sync::Arc<crate::tune::Tuning>,
+    /// how NVFP4 weights compute inputs of more rows than the GEMV takes (prefill), and whether this GPU and build
+    /// have the FP4 tensor cores (W4A4)
+    pub route: GemmRoute,
+    pub w4a4: bool,
+}
+
+/// The compute of NVFP4 linear layers on many rows (`--gemm`), chosen from the GPU's tensor cores and the checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GemmRoute {
+    /// W4A4 on FP4 tensor cores where the GPU has them and the checkpoint is calibrated for NVFP4 activations, else
+    /// BF16
+    #[default]
+    Auto,
+    /// W4A4 wherever the GPU has FP4 tensor cores (activations quantized whatever the calibration)
+    Nvfp4,
+    /// weights widened to BF16, cuBLAS (exact for the stored weight)
+    Bf16,
+}
+
+impl std::str::FromStr for GemmRoute {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "nvfp4" | "w4a4" => Ok(Self::Nvfp4),
+            "bf16" => Ok(Self::Bf16),
+            other => Err(format!("--gemm {other}: auto, nvfp4 or bf16")),
+        }
+    }
+}
+
+impl LinCtx {
+    /// W4A4 for a weight (`act4`: its checkpoint calibrated NVFP4 activations).
+    fn use_w4a4(&self, act4: bool) -> bool {
+        self.w4a4 && match self.route {
+            GemmRoute::Auto => act4,
+            GemmRoute::Nvfp4 => true,
+            GemmRoute::Bf16 => false,
+        }
+    }
+
+    /// The route in words, for the load log.
+    pub fn describe(&self) -> String {
+        match (self.route, self.w4a4) {
+            (GemmRoute::Bf16, _) => "BF16 (weights widened, cuBLAS): --gemm bf16".into(),
+            (_, false) => "BF16 (weights widened, cuBLAS): this GPU / build has no FP4 tensor cores (SM120a)".into(),
+            (GemmRoute::Nvfp4, true) => "W4A4 on the FP4 tensor cores for every NVFP4 weight: --gemm nvfp4".into(),
+            (GemmRoute::Auto, true) => "W4A4 on the FP4 tensor cores where the checkpoint calibrated NVFP4 activations, else BF16".into(),
+        }
+    }
 }
 
 /// Rows `rows` of a row-major tensor with `row_bytes` per row, bytes `cols` of each.
@@ -85,6 +136,8 @@ struct Module {
     cols: Range<usize>,
     /// Rows kept.
     n: usize,
+    /// calibrated for NVFP4 activations
+    act4: bool,
 }
 
 impl Module {
@@ -185,7 +238,8 @@ impl Linear {
                 bail!("stacked modules {modules:?} have different input sizes");
             }
             let n = rows.iter().map(|r| r.len()).sum();
-            mods.push(Module { name: name.clone(), format: scheme.format, names, rows, cols, n });
+            let act4 = scheme.act == crate::quant::ActQuant::Nvfp4;
+            mods.push(Module { name: name.clone(), format: scheme.format, names, rows, cols, n, act4 });
         }
         let k = k_local.unwrap();
         let mut parts = Vec::new();
@@ -241,7 +295,8 @@ impl Linear {
         }
         // the power of two that takes the largest block scale to <= 1 (E4M3: exponent bits 6..3, bias 7)
         let wshift = if smax > 0x38 { ((smax >> 3) as i32 - 7) + i32::from(smax & 7 != 0) } else { 0 };
-        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)?, f16, wshift })
+        let act4 = group.iter().all(|m| m.act4);
+        Ok(Store::Nvfp4 { codes, scales, alpha: DevBuf::from_slice(&alpha)?, f16, wshift, act4 })
     }
 
     fn load_fp8(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize, kind: Kind) -> Result<Store> {
@@ -385,7 +440,7 @@ impl Linear {
         let mut v = Vec::new();
         for p in &self.parts {
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha, f16, wshift } => v.push(crate::tune::Weight {
+                Store::Nvfp4 { codes, scales, alpha, f16, wshift, .. } => v.push(crate::tune::Weight {
                     f16: *f16,
                     wshift: *wshift,
                     kernel: crate::tune::Kernel::Nvfp4,
@@ -452,10 +507,38 @@ impl Linear {
         // the FP16 inputs of the FP16-accumulate GEMV, made once per input rows for every part that takes it (in the
         // scratch the prefill's widened weights use; tensor-core calls never widen)
         let mut x16: Option<(*const u16, *mut u16, *mut i32)> = None;
+        // the NVFP4 rows of x for the W4A4 GEMM, quantized once for every part (in the scratch)
+        let mut xq: Option<(*const u8, *const u8, *const f32)> = None;
         for p in &self.parts {
             let o = unsafe { out.add(p.col) };
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha, f16, wshift } => {
+                Store::Nvfp4 { codes, scales, alpha, act4, .. }
+                    if m > sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 && ctx.use_w4a4(*act4)
+                        && m * k / 2 + m * k / 16 + 4 * m + 256 <= ctx.scratch_elems * 2 =>
+                {
+                    let (xc, xs, xr) = match xq {
+                        Some(q) => q,
+                        None => {
+                            x16 = None;
+                            let base = ctx.scratch.cast::<u8>();
+                            let q = unsafe { (base, base.add((m * k / 2).next_multiple_of(64)), base.add((m * k / 2 + m * k / 16).next_multiple_of(64))) };
+                            check(unsafe { sys::blz_nvfp4_quant_rows(x, ldx as i64, m as c_int, k as c_int, q.0, q.1, q.2.cast(), s.0) }, "x to NVFP4")?;
+                            let q = (q.0.cast_const(), q.1.cast_const(), q.2.cast::<f32>().cast_const());
+                            xq = Some(q);
+                            q
+                        }
+                    };
+                    check(
+                        unsafe {
+                            sys::blz_nvfp4_gemm_w4a4(xc, xs, xr, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int, p.n as c_int,
+                                                     k as c_int, s.0)
+                        },
+                        "blz_nvfp4_gemm_w4a4",
+                    )?;
+                }
+                Store::Nvfp4 { codes, scales, alpha, f16, wshift, .. } => {
+                    // its FP16 inputs or widened weights take the scratch
+                    xq = None;
                     let w = Nvfp4Ref { codes: codes.ptr(), scales: scales.ptr(), alpha: alpha.ptr(), f16: *f16, wshift: *wshift, n: p.n, k };
                     let passes = m > sys::BLZ_NVFP4_MMA_MAX_ROWS
                         && k % 128 == 0
@@ -483,8 +566,9 @@ impl Linear {
                         if p.n * k > ctx.scratch_elems {
                             bail!("NVFP4 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
                         }
-                        // the widened weights overwrite the FP16 inputs a tensor-core part may have left in the scratch
+                        // the widened weights overwrite the FP16 or NVFP4 inputs an earlier part left in the scratch
                         x16 = None;
+                        xq = None;
                         check(
                             unsafe {
                                 sys::blz_nvfp4_weight_dequant(codes.ptr(), scales.ptr(), alpha.ptr(), p.n as c_int, k as c_int,
@@ -515,8 +599,9 @@ impl Linear {
                         if p.n * k > ctx.scratch_elems {
                             bail!("FP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
                         }
-                        // the widened weights overwrite the FP16 inputs a tensor-core part may have left in the scratch
+                        // the widened weights overwrite the FP16 or NVFP4 inputs an earlier part left in the scratch
                         x16 = None;
+                        xq = None;
                         check(
                             unsafe {
                                 sys::blz_fp8_weight_dequant(codes.ptr(), bs, *block_n as c_int, alpha.ptr(), p.n as c_int, k as c_int,
@@ -547,8 +632,9 @@ impl Linear {
                         if p.n * k > ctx.scratch_elems {
                             bail!("MXFP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
                         }
-                        // the widened weights overwrite the FP16 inputs a tensor-core part may have left in the scratch
+                        // the widened weights overwrite the FP16 or NVFP4 inputs an earlier part left in the scratch
                         x16 = None;
+                        xq = None;
                         check(unsafe { sys::blz_mxfp8_weight_dequant(codes.ptr(), scales.ptr(), p.n as c_int, k as c_int, ctx.scratch, s.0) },
                               "blz_mxfp8_weight_dequant")?;
                         check(
