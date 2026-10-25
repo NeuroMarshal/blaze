@@ -411,9 +411,11 @@ pub enum SpecMethod {
 /// Node counts a tree round verifies per sequence (rows: one more).
 const TREE_NODES: [usize; 12] = [0, 1, 3, 5, 7, 11, 15, 23, 31, 39, 47, 63];
 
-/// Suffix assist: the suffix draft replaces the drafter's from this many expected accepted tokens (an MTP chain of 3
-/// keeps about 0.8 on prose); BLAZE_SUFFIX_ASSIST_SCORE overrides it.
-const SUFFIX_ASSIST_SCORE: f32 = 2.0;
+/// Suffix assist: the suffix draft replaces the drafter's from this many expected accepted tokens; BLAZE_SUFFIX_ASSIST_SCORE
+/// overrides it. 27B MTP (`spec_bench.py`, chars/s of code / essay / essay again, tok/s of 2 sessions): none 759 / 611 /
+/// 586, 256; from 2: 1109 / 542 / 928, 240 (a two-token match drafts on prose); 3 and 4: 1221 / 635 / 611, 241; 6: 1250 /
+/// 610 / 861, 265.
+const SUFFIX_ASSIST_SCORE: f32 = 6.0;
 
 fn suffix_assist_score() -> f32 {
     static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();

@@ -61,10 +61,10 @@ struct EngineArgs {
     #[arg(long)]
     max_verify: Option<usize>,
     /// with a drafter (MTP, DFlash2, EAGLE-4 chains): suffix decoding drafts of up to N tokens replace the drafter's
-    /// when the suffix index expects more of them accepted (repeated text, code edits; 0: off). Raises the verify rows
-    /// to N + 1 unless --max-verify is given
-    #[arg(long, default_value_t = 0)]
-    suffix_assist: usize,
+    /// when the suffix index expects at least 6 of them accepted (repeated text, code edits; 0: off; default 8 with the
+    /// MTP head, else 0). Raises the verify rows to N + 1 unless --max-verify is given
+    #[arg(long)]
+    suffix_assist: Option<usize>,
     /// sequences decoded together (continuous batching)
     #[arg(long, default_value_t = 1)]
     max_seqs: usize,
@@ -138,6 +138,11 @@ struct EngineArgs {
 }
 
 impl EngineArgs {
+    /// Suffix assist's draft length: the flag, else 8 with the MTP head (its chains are 3 long), else off.
+    fn assist(&self) -> usize {
+        self.suffix_assist.unwrap_or(if self.mtp_window > 0 && self.draft_model.is_none() { 8 } else { 0 })
+    }
+
     /// The speculation defaults of the draft source: (verify rows, tree width, draft tokens per verify) measured best on
     /// the 27B (`concurrent_test.py`): EAGLE-4 trees 16 rows of width 4; DFlash2 9 rows, 7 drafts; suffix decoding 9
     /// rows, 8 drafts. Explicit flags win.
@@ -152,7 +157,7 @@ impl EngineArgs {
             None => (9, 0, 8),
         };
         let drafter = self.draft_model.is_some() || self.mtp_window > 0;
-        let assist = if drafter { self.suffix_assist } else { 0 };
+        let assist = if drafter { self.assist() } else { 0 };
         let verify = self.max_verify.unwrap_or(if assist > 0 { verify.max(assist + 1) } else { verify });
         let width = self.draft_tree_width.unwrap_or(width);
         // draft trees are EAGLE-4's: DFlash drafts a block, MTP and n-gram sources chains
@@ -808,7 +813,7 @@ fn main() -> Result<()> {
                     spec_tokens: spec_ngram.unwrap_or(engine.spec_defaults()?.2),
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
-                    suffix_assist: if drafter && e_tree_width <= 1 { engine.suffix_assist.min(e_max_verify.saturating_sub(1)) } else { 0 },
+                    suffix_assist: if drafter && e_tree_width <= 1 { engine.assist().min(e_max_verify.saturating_sub(1)) } else { 0 },
                     draft_cands: engine.mtp_head_cands.unwrap_or(0) > 0 && engine.mtp_window > 0,
                     frequent: if engine.mtp_head_cands.unwrap_or(0) > 0 && engine.mtp_window > 0 { text.frequent_ids(vocab, 12288, 6144, 6144, 3072) } else { Vec::new() },
                     spec_method: match (spec_method.as_str(), drafter) {
