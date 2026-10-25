@@ -548,3 +548,12 @@ unsafe extern "C" {
                           rows: c_int, ratio: c_int, block_topk: c_int, req_to_token: *const i32, rt_stride: i64,
                           table: *mut i32, table_stride: i64, counts: *mut i32, s: cudaStream_t) -> cudaError_t;
 }
+
+// CUDA driver API: a context of a rank's own (ranks that share a GPU, BLAZE_RANK_GPUS)
+pub type CUcontext = *mut c_void;
+unsafe extern "C" {
+    pub fn cuInit(flags: u32) -> c_int;
+    pub fn cuDeviceGet(device: *mut c_int, ordinal: c_int) -> c_int;
+    #[link_name = "cuCtxCreate_v2"]
+    pub fn cuCtxCreate(ctx: *mut CUcontext, flags: u32, device: c_int) -> c_int;
+}

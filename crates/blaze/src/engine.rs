@@ -552,6 +552,24 @@ fn rank_gpu(rank: usize) -> usize {
     map.get(rank).copied().unwrap_or(rank)
 }
 
+/// A rank that shares its GPU with another rank works in a CUDA context of its own: in the device's primary context
+/// one rank's cudaFree waits for the other's kernels, a spinning all-reduce among them (the contexts time-slice).
+fn own_context(rank: usize, world: usize) -> Result<()> {
+    let g = rank_gpu(rank);
+    if !(0..world).any(|r| r != rank && rank_gpu(r) == g) {
+        return Ok(());
+    }
+    let (mut dev, mut ctx) = (0, null_mut());
+    let err = unsafe {
+        let e = sys::cuInit(0);
+        if e != 0 { e } else if sys::cuDeviceGet(&mut dev, g as i32) != 0 { 1 } else { sys::cuCtxCreate(&mut ctx, 0, dev) }
+    };
+    if err != 0 {
+        bail!("rank {rank}: a CUDA context of its own on GPU {g} (driver error {err})");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_main(
     rank: usize,
@@ -568,6 +586,7 @@ fn worker_main(
     let kv_auto = opts.kv_auto.clone();
     let start = || -> Result<Runner> {
         gpu::set_device(rank_gpu(rank) as i32)?;
+        own_context(rank, world)?;
         let cfg = crate::config::ModelConfig::load(&dir)?;
         let tokens = opts.max_chunk.max(opts.max_seqs);
         let ar_bytes = (tokens * cfg.hidden * 2).max(opts.max_seqs * cfg.vocab * 2).next_multiple_of(16);
