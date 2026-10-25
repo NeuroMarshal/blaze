@@ -1074,7 +1074,8 @@ impl Engine {
     }
 
     fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Cands> {
-        let (k, world) = (sys::BLZ_TOPK_MAX, self.workers.len());
+        // the shards of the vocabulary: the tensor-parallel group (pipeline stages: the last one has it whole)
+        let (k, world) = (sys::BLZ_TOPK_MAX, if self.lead > 0 { 1 } else { self.workers.len() });
         (0..n)
             .map(|r| {
                 let mut top = Vec::with_capacity(world * k);
