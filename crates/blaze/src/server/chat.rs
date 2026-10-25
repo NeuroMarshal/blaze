@@ -292,6 +292,44 @@ pub(super) async fn chat(State(st): State<Arc<AppState>>, bytes: Bytes) -> Respo
     }
 }
 
+/// The chat endpoint called in-process (the Responses and Messages APIs translate onto it).
+pub(super) enum ChatOut {
+    /// a non-streaming answer or an error: its status and JSON body
+    Json(StatusCode, Value),
+    /// the chunk objects of a streaming answer
+    Stream(Pin<Box<dyn Stream<Item = Value> + Send>>),
+}
+
+pub(super) async fn call(st: Arc<AppState>, mut body: Value) -> ChatOut {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let resp = match run(st, &mut body).await {
+        Ok(r) | Err(r) => r,
+    };
+    let status = resp.status();
+    if !stream || !status.is_success() {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap_or_default();
+        return ChatOut::Json(status, serde_json::from_slice(&bytes).unwrap_or(Value::Null));
+    }
+    // the SSE body: "data: {...}" events, "data: [DONE]" at the end; dropping the stream drops the generation
+    let mut data = resp.into_body().into_data_stream();
+    ChatOut::Stream(Box::pin(async_stream::stream! {
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(Ok(b)) = data.next().await {
+            buf.extend_from_slice(&b);
+            while let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
+                let ev: Vec<u8> = buf.drain(..i + 2).collect();
+                for line in String::from_utf8_lossy(&ev).lines() {
+                    if let Some(d) = line.strip_prefix("data: ").filter(|d| *d != "[DONE]")
+                        && let Ok(v) = serde_json::from_str::<Value>(d)
+                    {
+                        yield v;
+                    }
+                }
+            }
+        }
+    }))
+}
+
 async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     check_ranges(&st, body)?;
     let images = super::media::gather(&st, body).await?;

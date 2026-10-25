@@ -30,6 +30,8 @@ pub enum GenEvent {
     /// The first event: prompt tokens and how many of them came from the prompt cache.
     Started { prompt_tokens: usize, cached_tokens: usize },
     Token(i32, Option<TokenLogprob>),
+    /// an embedding request's result: the final normed hidden state of its last prompt token
+    Embedding(Vec<f32>),
     Done(Finish),
     Error(String),
 }
@@ -53,6 +55,8 @@ pub struct GenRequest {
     pub events: UnboundedSender<GenEvent>,
     /// set by the client side (stop string seen, connection closed)
     pub cancel: Arc<AtomicBool>,
+    /// an embedding: the prompt is read and its last token's hidden state sent (GenEvent::Embedding), no token
+    pub embed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1737,6 +1741,13 @@ impl Loop {
                 let a = &mut self.active[i];
                 if a.fed < a.req.tokens.len() {
                     continue; // more prompt chunks to go; this pick is not a real output
+                }
+                if a.req.embed {
+                    // the prompt is read: its last row's final normed hidden state is the embedding
+                    let v = self.engine.last_hidden(ri)?;
+                    let _ = self.active[i].req.events.send(GenEvent::Embedding(v));
+                    finished.push((i, Finish::Stop));
+                    continue;
                 }
             }
             let (tok, f) = self.emit(i, pick, lp);

@@ -2255,6 +2255,14 @@ impl Model {
         Ok(raw.chunks(v).map(|r| r.iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect()).collect())
     }
 
+    /// The final normed hidden state of logit row `row` of the last forward (every rank holds it whole).
+    pub fn last_hidden(&self, row: usize) -> Result<Vec<f32>> {
+        self.stream.sync()?;
+        let h = self.cfg.hidden;
+        let raw = self.work.gnormed.download::<u16>((row + 1) * h)?;
+        Ok(raw[row * h..].iter().map(|&b| half::bf16::from_bits(b).to_f32()).collect())
+    }
+
     pub fn last_logits(&self, row: usize) -> Result<Vec<f32>> {
         self.stream.sync()?;
         let v = self.cfg.vocab;

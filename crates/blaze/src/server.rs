@@ -4,6 +4,9 @@
 mod chat;
 mod completions;
 mod media;
+mod embeddings;
+mod messages;
+mod responses;
 mod tokenize;
 
 pub use media::{MmConfig, parse_limit};
@@ -196,6 +199,11 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         .route("/v1/models/{*id}", get(model))
         .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/completions", post(completions::completions))
+        .route("/v1/embeddings", post(embeddings::embeddings))
+        .route("/v1/responses", post(responses::create))
+        .route("/v1/messages", post(messages::create))
+        .route("/v1/messages/count_tokens", post(messages::count_tokens))
+        .route("/v1/responses/{id}", get(responses::get_one))
         .route("/tokenize", post(tokenize::tokenize))
         .route("/detokenize", post(tokenize::detokenize))
         .fallback(|| async { api_error(StatusCode::NOT_FOUND, "no such endpoint", Some("not_found"), None) })
@@ -637,6 +645,7 @@ impl Gen {
                     self.prompt_tokens = prompt_tokens;
                     self.cached_tokens = cached_tokens;
                 }
+                GenEvent::Embedding(_) => {}
                 GenEvent::Token(t, lp) => {
                     self.completion_tokens += 1;
                     if let Some(lp) = lp {
@@ -737,6 +746,7 @@ fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constr
             mm: spec.mm.clone(),
             events: tx,
             cancel: cancel.clone(),
+            embed: false,
         })
         .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "the scheduler has stopped"))?;
     st.metrics.requests.fetch_add(1, Ordering::Relaxed);

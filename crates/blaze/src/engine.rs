@@ -99,6 +99,8 @@ enum Cmd {
     Draft(Arc<crate::eagle::DraftPlan>),
     Reset(usize),
     Logits(usize),
+    /// the final normed hidden state of logit row i of the last step
+    Hidden(usize),
     AllLogits(usize),
     /// time the all-reduce paths at these sizes (collective)
     TimeAllReduce(Arc<Vec<usize>>),
@@ -358,6 +360,7 @@ impl Runner {
                 Reply::Done
             }
             Cmd::Logits(row) => Reply::Logits(self.model.last_logits(row)?),
+            Cmd::Hidden(row) => Reply::Logits(self.model.last_hidden(row)?),
             Cmd::TimeAllReduce(sizes) => Reply::Logits(self.model.time_all_reduce(&sizes)?.into_iter().flat_map(|(a, b)| [a, b]).collect()),
             Cmd::SetDmaMin(bytes) => {
                 self.model.set_dma_min(bytes);
@@ -1116,6 +1119,14 @@ impl Engine {
     /// Logits of item `row` of the last step.
     pub fn last_logits(&self, row: usize) -> Result<Vec<f32>> {
         match self.broadcast(|| Cmd::Logits(row))? {
+            Reply::Logits(l) => Ok(l),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The final normed hidden state of logit row `row` of the last step (an embedding).
+    pub fn last_hidden(&self, row: usize) -> Result<Vec<f32>> {
+        match self.broadcast(|| Cmd::Hidden(row))? {
             Reply::Logits(l) => Ok(l),
             _ => unreachable!(),
         }
