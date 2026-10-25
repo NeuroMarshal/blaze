@@ -277,6 +277,8 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
         let mut next = 0usize;
         let mut calls: std::collections::HashMap<u64, usize> = Default::default();
         let (mut usage, mut finish) = (Value::Null, Value::Null);
+        // the reasoning, and whether any text or call came (an answer left inside the thinking becomes text at the end)
+        let (mut reasoning, mut answered) = (String::new(), false);
         while let Some(c) = chunks.next().await {
             if let Some(e) = c.get("error") {
                 yield json!({"type": "error", "error": {"type": "api_error", "message": e.get("message").cloned().unwrap_or(json!("error"))}});
@@ -300,6 +302,7 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
                     yield json!({"type": "content_block_start", "index": next, "content_block": {"type": "thinking", "thinking": "", "signature": ""}});
                     next += 1;
                 }
+                reasoning.push_str(r);
                 yield json!({"type": "content_block_delta", "index": open.unwrap().1, "delta": {"type": "thinking_delta", "thinking": r}});
             }
             if let Some(t) = d.get("content").and_then(Value::as_str).filter(|t| !t.is_empty()) {
@@ -313,6 +316,7 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
                     next += 1;
                 }
                 if let Some((_, i)) = open.filter(|o| o.0 == "text") {
+                    answered = true;
                     yield json!({"type": "content_block_delta", "index": i, "delta": {"type": "text_delta", "text": t}});
                 }
             }
@@ -338,6 +342,11 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
         if let Some((k, i)) = open.take() {
             if k == "thinking" { yield json!({"type": "content_block_delta", "index": i, "delta": {"type": "signature_delta", "signature": ""}}); }
             yield json!({"type": "content_block_stop", "index": i});
+        }
+        if finish == "stop" && !answered && calls.is_empty() && !reasoning.trim().is_empty() {
+            yield json!({"type": "content_block_start", "index": next, "content_block": {"type": "text", "text": ""}});
+            yield json!({"type": "content_block_delta", "index": next, "delta": {"type": "text_delta", "text": reasoning}});
+            yield json!({"type": "content_block_stop", "index": next});
         }
         let u = usage_of(&usage);
         yield json!({"type": "message_delta", "delta": {"stop_reason": stop_reason(&finish, !calls.is_empty()), "stop_sequence": null},

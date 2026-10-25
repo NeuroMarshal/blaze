@@ -726,7 +726,8 @@ impl Engine {
             deferred: Default::default(),
             info,
         };
-        if world > 1 {
+        // tensor parallelism only: pipeline stages exchange rows, not all-reduces
+        if world > 1 && stages == 1 {
             engine.tune_all_reduce()?;
         }
         Ok(engine)

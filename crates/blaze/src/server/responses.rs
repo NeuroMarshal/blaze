@@ -436,6 +436,19 @@ fn stream_events(body: Value, id: String, model: Value, messages: Vec<Value>, st
             }
         }
         for e in close(&mut open, &mut output, &mut ev) { yield e; }
+        // an answer left inside the thinking (a natural stop, no text, no call): a message of the reasoning
+        if finish == "stop" && content.trim().is_empty() && tool_calls.is_empty() && !reasoning.trim().is_empty() {
+            let item = json!({"type": "message", "id": new_id("msg"), "status": "in_progress", "role": "assistant", "content": []});
+            output.push(item.clone());
+            let oi = output.len() - 1;
+            yield ev.ev("response.output_item.added", json!({"output_index": oi, "item": item}));
+            yield ev.ev("response.content_part.added", json!({"item_id": output[oi]["id"], "output_index": oi, "content_index": 0,
+                                                              "part": {"type": "output_text", "text": "", "annotations": []}}));
+            yield ev.ev("response.output_text.delta", json!({"item_id": output[oi]["id"], "output_index": oi, "content_index": 0, "delta": reasoning}));
+            open = Some(("message", oi, reasoning.clone()));
+            content = reasoning.clone();
+            for e in close(&mut open, &mut output, &mut ev) { yield e; }
+        }
         resp["status"] = json!(if finish == "length" { "incomplete" } else { "completed" });
         if finish == "length" {
             resp["incomplete_details"] = json!({"reason": "max_output_tokens"});
