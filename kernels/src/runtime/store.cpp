@@ -72,6 +72,9 @@ ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix
     const auto* xg = extra_->find(xname(0, 0, "gate", xfmt->codes));
     if (xg->shape != g0->shape) throw std::runtime_error("blaze: the MTP experts of " + extra_dir + " differ in shape");
     while (extra_->find(xname(extra_layers, 0, "gate", xfmt->codes))) ++extra_layers;
+    if (extra_layers != 1)
+      throw std::runtime_error("blaze: the MTP checkpoint " + extra_dir + " has " + std::to_string(extra_layers) +
+                               " routed layers (one supported)");
     if (!extra_->find(xname(0, experts_ - 1, "gate", xfmt->codes)) || extra_->find(xname(0, experts_, "gate", xfmt->codes)))
       throw std::runtime_error("blaze: the MTP layer of " + extra_dir + " has another expert count");
     layers_ += extra_layers;

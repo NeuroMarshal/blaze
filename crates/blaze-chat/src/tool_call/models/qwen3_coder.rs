@@ -158,7 +158,9 @@ impl Qwen3CoderDetector {
                 };
                 let value_start = name_end + 1;
                 let rest = &slice[value_start..];
-                let mut from = self.value_scanned.min(rest.len());
+                // the value before `scan0` was searched by earlier calls (no end, no line-start tag there)
+                let scan0 = self.value_scanned.min(rest.len());
+                let mut from = scan0;
                 let mut end: Option<(usize, usize)> = None; // (value end, bytes consumed after the value start)
                 let mut wait = false;
                 while let Some(found) = rest[from..].find(PARAMETER_END) {
@@ -183,19 +185,15 @@ impl Qwen3CoderDetector {
                 }
                 // a value whose `</parameter>` the model left out ends at the next parameter or the function's end
                 // written at the start of a line (SGLang's tolerance; a tag inside a line stays text)
-                let open_end = [rest[from.min(rest.len())..].find("\n<parameter="), rest[from.min(rest.len())..].find("\n</function>")]
+                // (only before a proper end; searched from the scan start, not from where a literal `</parameter>` moved
+                // `from`; the value before it was searched already, so the whole value is never searched again)
+                let tail = &rest[scan0..];
+                let open_end = [tail.find("\n<parameter="), tail.find("\n</function>")]
                     .into_iter()
                     .flatten()
                     .min()
-                    .map(|i| from.min(rest.len()) + i);
-                let open_end = if let Some(i) = open_end {
-                    // only before a proper end; the tag searched from the scan start, not from where a literal
-                    // `</parameter>` moved `from`
-                    let lead = [rest.find("\n<parameter="), rest.find("\n</function>")].into_iter().flatten().min();
-                    lead.filter(|&l| end.is_none_or(|(e, _)| l < e)).or(Some(i).filter(|_| end.is_none()))
-                } else {
-                    [rest.find("\n<parameter="), rest.find("\n</function>")].into_iter().flatten().min().filter(|&l| end.is_none_or(|(e, _)| l < e))
-                };
+                    .map(|i| scan0 + i)
+                    .filter(|&l| end.is_none_or(|(e, _)| l < e));
                 if let Some(l) = open_end {
                     end = Some((l, l + 1));
                     wait = false;

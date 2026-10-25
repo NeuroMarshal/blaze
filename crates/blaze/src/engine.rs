@@ -429,8 +429,27 @@ impl Runner {
             Cmd::AllLogits(t) => Reply::AllLogits(self.model.all_logits(t)?),
             Cmd::Batch(cmds) => {
                 let mut last = Reply::Done;
-                for c in cmds {
-                    last = self.handle(c)?;
+                let mut cmds = cmds.into_iter();
+                while let Some(c) = cmds.next() {
+                    match self.handle(c) {
+                        Ok(r) => last = r,
+                        Err(e) => {
+                            // the steps it skips still count: the next stage is released from each forward
+                            for skipped in cmds {
+                                let forwards = match skipped {
+                                    Cmd::Step(..) => 1,
+                                    Cmd::Steps(m, _) => m.len(),
+                                    _ => 0,
+                                };
+                                for _ in 0..forwards {
+                                    if self.model.pp_begin().is_ok() {
+                                        self.model.pp_abort();
+                                    }
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
                 }
                 last
             }

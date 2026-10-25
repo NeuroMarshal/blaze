@@ -1,20 +1,5 @@
-//! The checkpoint's own MTP head as a drafter (Qwen3.5 / Qwen3-Next NextN: the `mtp.*` tensors of the target, one
-//! full-attention decoder layer with its own KV, sharing the target's embedding and LM head; Qwen4-Exp's routed one
-//! between hyper-connection mixes, see `Hyper`).
-//!
-//! A draft row at position p takes the target's final normed hidden state of p and the token at p + 1 and predicts the
-//! token at p + 2 (vLLM qwen3_5_mtp / SGLang Qwen3_5ForCausalLMMTP):
-//!
-//!   x = fc(concat(norm_e(embed(token)), norm_h(hidden)))         both norms zero-centered, the embedding first
-//!   x = x + attention(input_layernorm(x))   (gated: q_proj holds query and gate per head, q / k norms, partial rope)
-//!   x = x + mlp(post_attention_layernorm(x))
-//!   out = mtp.norm(x);  logits = lm_head(out)
-//!
-//! After a target step the drafter is extended over the step's kept rows (`DraftItem`), which yields the first draft
-//! token; each further draft token is one more row whose hidden input is the previous row's `out`. The KV of the layer is
-//! a BF16 ring of `window` positions per sequence row (exact while the context is shorter). With tensor parallelism
-//! every rank runs its share of the attention heads and MLP rows (the target's cut, two host all-reduces per row batch);
-//! `fc`, the norms and the head's vocabulary shard are the target's, so every rank picks the same tokens.
+//! Checkpoint MTP drafter (vLLM qwen3_5_mtp / SGLang Qwen3_5ForCausalLMMTP).
+//! A BF16 KV ring bounds draft context; target verification decides which tokens are accepted.
 
 use crate::eagle::{DraftPlan, MAX_CHAIN};
 use crate::gpu::{DevBuf, HostMapped, check};

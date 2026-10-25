@@ -762,7 +762,7 @@ pub struct Model {
     layer0: usize,
     pp: Option<(PpRank, DevBuf)>,
     /// the pipeline steps this rank was sent (the same on every stage); BLAZE_PP_FAULT=N: the first stage fails its
-    /// step N (a test of the abort path)
+    /// N-th forward, counted from 1 (a test of the abort path)
     pp_seq: Cell<u64>,
     pp_fault: Option<u64>,
     final_mix: FinalMix,
@@ -2014,6 +2014,8 @@ impl Model {
             let v = self.pp_seq.get().saturating_sub(1);
             unsafe {
                 sys::blz_pp_set(counters.ptr(), v, self.stream.0);
+                // the slot's bytes word is the step's: the step before in that slot is taken first
+                sys::blz_pp_wait_ack(link.dev_ptr::<u64>(), counters.at::<u64>(0), p.tp.max(1) as c_int, self.stream.0);
                 sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), u64::MAX, self.stream.0);
             }
         }
