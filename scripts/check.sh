@@ -102,7 +102,7 @@ fi
 
 echo
 echo "== server logs: panics, failed steps, slow steps, server errors"
-if grep -hE "panicked|step failed|slow step|blaze api: 5|grammar dropped" "$LOGS"/serve*.log | sort | uniq -c | sort -rn | head -20 | grep .; then
+if grep -hE "panicked|step failed|slow step|blaze hang|blaze api: 5|grammar dropped" "$LOGS"/serve*.log | sort | uniq -c | sort -rn | head -20 | grep .; then
   fail "server log clean"
 else
   pass "server log clean"

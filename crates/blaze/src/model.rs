@@ -3,7 +3,7 @@
 
 use crate::config::{QSA_TABLE_STRIDE, LayerKind, MlpConfig, ModelConfig, RopeScaling};
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check, stream_after};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use crate::linear::{Cut, LinCtx, Linear};
 use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
@@ -48,6 +48,14 @@ pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
         up: load_vec(ckpt, &format!("{prefix}input_mix_weight_up.weight"))?,
         inject: if ckpt.get(&inject).is_some() { Some(load_vec(ckpt, &inject)?) } else { None },
     })
+}
+
+/// Events of a forward's phase profile (4 marks a layer).
+const PROF_EVENTS: usize = 640;
+
+fn slow_forward_ms() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("BLAZE_SLOW_FORWARD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000.0))
 }
 
 fn prefill_profile() -> bool {
@@ -765,6 +773,10 @@ pub struct Model {
     /// N-th forward, counted from 1 (a test of the abort path)
     pp_seq: Cell<u64>,
     pp_fault: Option<u64>,
+    /// events of the last prefill forward's phases (PLE, attention, GDN, MLP / experts, the rest) and its rows, read once
+    /// the GPU passed them: a forward slower than BLAZE_SLOW_FORWARD_MS (3000) prints its phases
+    prof_events: Vec<crate::gpu::TimedEvent>,
+    prof_pending: RefCell<Option<(Vec<u8>, usize)>>,
     final_mix: FinalMix,
     lm_head: Linear,
     ple_table: Option<PleTable>,
@@ -1315,6 +1327,8 @@ impl Model {
                 None => None,
             },
             pp_seq: Cell::new(0),
+            prof_events: (0..PROF_EVENTS).map(|_| crate::gpu::TimedEvent::new()).collect::<Result<_>>()?,
+            prof_pending: RefCell::new(None),
             pp_fault: std::env::var("BLAZE_PP_FAULT").ok().and_then(|v| v.parse().ok()),
             final_mix,
             lm_head,
@@ -1991,6 +2005,28 @@ impl Model {
         )
     }
 
+    /// The last prefill forward's phases, once the GPU passed its events (else it is dropped when the next forward
+    /// comes: its events are reused): printed when it was slow.
+    fn prefill_report(&self) {
+        let Some((phases, t)) = self.prof_pending.borrow_mut().take() else { return };
+        let n = phases.len();
+        if n < 2 || !self.prof_events[n - 1].done() {
+            return;
+        }
+        let total = self.prof_events[n - 1].ms_since(&self.prof_events[0]);
+        if total < slow_forward_ms() {
+            return;
+        }
+        let mut ms = [0f32; 5];
+        for i in 1..n {
+            ms[phases[i] as usize] += self.prof_events[i].ms_since(&self.prof_events[i - 1]);
+        }
+        eprintln!(
+            "blaze slow forward: {t} rows in {total:.0} ms on the GPU: PLE {:.0}, attention {:.0}, GDN {:.0}, MLP / experts {:.0}, rest {:.0}",
+            ms[0], ms[1], ms[2], ms[3], ms[4]
+        );
+    }
+
     /// A pipeline step begins: its number into the hand-off counters (before anything of the step that may fail).
     pub fn pp_begin(&self) -> Result<()> {
         if let Some((_, counters)) = &self.pp {
@@ -2122,6 +2158,14 @@ impl Model {
         // BLAZE_PREFILL_PROFILE=1: the time of each phase of a step of 256 rows or more (the stream waited for after
         // each: their overlap is lost), one line a step
         let prof = prefill_profile() && t >= 256;
+        // without it, events at the same marks (no waiting): read after the GPU passed them
+        self.prefill_report();
+        let light = !prof && t >= 256;
+        let mut phases: Vec<u8> = Vec::new();
+        if light {
+            self.prof_events[0].record(s)?;
+            phases.push(4);
+        }
         let mut phase = [0f64; 5]; // PLE, attention, GDN, MoE / MLP, the rest
         let mut mark = std::time::Instant::now();
         let mut lap = |k: usize| -> Result<()> {
@@ -2129,6 +2173,9 @@ impl Model {
                 s.sync()?;
                 phase[k] += mark.elapsed().as_secs_f64();
                 mark = std::time::Instant::now();
+            } else if light && phases.len() < self.prof_events.len() {
+                self.prof_events[phases.len()].record(s)?;
+                phases.push(k as u8);
             }
             Ok(())
         };
@@ -2199,6 +2246,9 @@ impl Model {
             }
         }
         lap(4)?;
+        if light {
+            *self.prof_pending.borrow_mut() = Some((std::mem::take(&mut phases), t));
+        }
         if prof {
             eprintln!(
                 "blaze prefill profile: {t} rows in {:.0} ms: PLE {:.0}, attention {:.0}, GDN {:.0}, MLP / experts {:.0}, rest {:.0}",
@@ -2452,6 +2502,7 @@ impl Model {
     /// the shard's log-sum-exp).
     pub fn candidates(&self, rows: usize) -> Result<Vec<f32>> {
         self.stream.sync()?;
+        self.prefill_report();
         self.work.cand_pairs.download::<f32>(self.tp.world * rows * (sys::BLZ_TOPK_MAX + 1) * 2)
     }
 
@@ -2494,6 +2545,7 @@ impl Model {
     /// Greedy picks of the last forward (one per span), after a stream synchronization.
     pub fn next_tokens(&self, n: usize) -> Result<Vec<i32>> {
         self.stream.sync()?;
+        self.prefill_report();
         self.work.next.download::<i32>(n)
     }
 

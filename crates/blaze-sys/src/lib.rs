@@ -48,6 +48,7 @@ unsafe extern "C" {
     pub fn cudaEventDestroy(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventSynchronize(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventElapsedTime(ms: *mut f32, start: cudaEvent_t, end: cudaEvent_t) -> cudaError_t;
+    pub fn cudaEventQuery(e: cudaEvent_t) -> cudaError_t;
     pub fn cudaEventRecord(e: cudaEvent_t, s: cudaStream_t) -> cudaError_t;
     pub fn cudaStreamWaitEvent(s: cudaStream_t, e: cudaEvent_t, flags: u32) -> cudaError_t;
 }

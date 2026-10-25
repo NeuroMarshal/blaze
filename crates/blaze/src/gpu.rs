@@ -123,6 +123,39 @@ impl Drop for Event {
     }
 }
 
+/// An event with timing, read without waiting for it (the forward's phase profile).
+pub struct TimedEvent(sys::cudaEvent_t);
+
+impl TimedEvent {
+    pub fn new() -> Result<Self> {
+        let mut e = null_mut();
+        check(unsafe { sys::cudaEventCreateWithFlags(&mut e, 0) }, "cudaEventCreate")?;
+        Ok(Self(e))
+    }
+
+    pub fn record(&self, s: &Stream) -> Result<()> {
+        check(unsafe { sys::cudaEventRecord(self.0, s.0) }, "cudaEventRecord")
+    }
+
+    /// The GPU has passed it.
+    pub fn done(&self) -> bool {
+        unsafe { sys::cudaEventQuery(self.0) == 0 }
+    }
+
+    /// Milliseconds from `start` to this one (both done).
+    pub fn ms_since(&self, start: &TimedEvent) -> f32 {
+        let mut ms = 0.0f32;
+        unsafe { sys::cudaEventElapsedTime(&mut ms, start.0, self.0) };
+        ms
+    }
+}
+
+impl Drop for TimedEvent {
+    fn drop(&mut self) {
+        unsafe { sys::cudaEventDestroy(self.0) };
+    }
+}
+
 /// Make `waiter` wait for the work enqueued on `on` so far (through `ev`).
 pub fn stream_after(waiter: &Stream, on: &Stream, ev: &Event) -> Result<()> {
     check(unsafe { sys::cudaEventRecord(ev.0, on.0) }, "cudaEventRecord")?;

@@ -10,6 +10,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
 use std::ops::Range;
+use std::time::Instant;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
 
@@ -169,6 +170,8 @@ struct Runner {
     model: Model,
     draft: Option<crate::drafter::Drafter>,
     staging: HostMapped,
+    /// the hang report's view of this rank: (the engine's watch, this rank)
+    watch: Option<(Arc<Watch>, usize)>,
     /// recorded after the last step's metadata copy: the next step writes the staging buffer after it (the parts of a
     /// step are enqueued without waiting for each other)
     meta_copied: Option<crate::gpu::Event>,
@@ -299,6 +302,9 @@ impl Runner {
             self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree)?;
         }
         *handed = true;
+        if let Some((w, r)) = &self.watch {
+            w.note(*r, format!("step of {} rows: enqueued, waiting for the GPU", meta.tokens.len()));
+        }
         // a part of a step without logit rows: nothing to read back (no wait for the GPU)
         if n == 0 {
             return Ok(if meta.sample { Reply::Cands(Vec::new()) } else { Reply::Tokens(Vec::new()) });
@@ -537,9 +543,110 @@ pub struct Engine {
     /// the rank whose replies count (the last pipeline stage: it holds the head) and the shards of the head's vocabulary
     lead: usize,
     head_shards: usize,
+    /// what the ranks do, for the hang report (its watchdog thread ends with the engine)
+    watch: Arc<Watch>,
     /// pipeline stages: rows of a step's parts (0: one forward a step)
     pp_chunk: usize,
     pub info: Info,
+}
+
+/// What the ranks are doing, for the hang report: each rank's command and since when, the command the engine waits
+/// for (since when, which ranks answered, reports printed), the pipeline links and the ranks a link has.
+pub(crate) struct Watch {
+    ranks: Vec<std::sync::Mutex<(String, Instant)>>,
+    inflight: std::sync::Mutex<Option<(String, Instant, Vec<bool>, u32)>>,
+    links: Vec<Arc<HostMapped>>,
+    receivers: usize,
+}
+
+impl Watch {
+    pub(crate) fn new(world: usize, links: Vec<Arc<HostMapped>>, receivers: usize) -> Arc<Self> {
+        Arc::new(Self {
+            ranks: (0..world).map(|_| std::sync::Mutex::new(("starting".to_string(), Instant::now()))).collect(),
+            inflight: std::sync::Mutex::new(None),
+            links,
+            receivers,
+        })
+    }
+
+    fn note(&self, rank: usize, what: String) {
+        if let Some(m) = self.ranks.get(rank)
+            && let Ok(mut g) = m.lock()
+        {
+            *g = (what, Instant::now());
+        }
+    }
+
+    /// BLAZE_HANG_SECS (30): a command the ranks have not all answered after this long is reported (then every
+    /// minute while it lasts): what every rank does and since when, and the state of the pipeline links.
+    fn watchdog(watch: std::sync::Weak<Watch>) {
+        let hang = std::env::var("BLAZE_HANG_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(30);
+        if hang == 0 {
+            return;
+        }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let Some(w) = watch.upgrade() else { return };
+            let report = {
+                let Ok(mut g) = w.inflight.lock() else { return };
+                match g.as_mut() {
+                    Some((what, since, replied, reports)) if since.elapsed().as_secs() >= hang + 60 * u64::from(*reports) => {
+                        *reports += 1;
+                        Some((what.clone(), since.elapsed().as_secs(), replied.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            let Some((what, secs, replied)) = report else { continue };
+            let ranks: Vec<String> = (0..w.ranks.len())
+                .map(|r| {
+                    if replied.get(r).copied().unwrap_or(false) {
+                        return format!("rank {r} answered");
+                    }
+                    let (doing, since) = w.ranks[r].lock().map(|g| g.clone()).unwrap_or_else(|_| ("?".into(), Instant::now()));
+                    format!("rank {r}: {doing} for {} s", since.elapsed().as_secs())
+                })
+                .collect();
+            let links: Vec<String> = w
+                .links
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    // SAFETY: the header words of a live link (blaze/pp_link.h), read for a report
+                    let h = l.host_ptr().cast::<u64>();
+                    let word = |k: usize| unsafe { std::ptr::read_volatile(h.add(k)) };
+                    let taken: Vec<String> = (0..w.receivers).map(|j| word(8 + j).to_string()).collect();
+                    format!("link {i}->{}: step {} signaled (slots {} / {} B), taken {}", i + 1, word(0), word(2), word(3), taken.join(" "))
+                })
+                .collect();
+            eprintln!(
+                "blaze hang: `{what}` has waited {secs} s: {}{}",
+                ranks.join("; "),
+                if links.is_empty() { String::new() } else { format!("; {}", links.join("; ")) }
+            );
+        }
+    }
+}
+
+/// A command's name for the hang report.
+fn label(c: &Cmd) -> String {
+    match c {
+        Cmd::Step(m, _, verify) => format!("{} of {} rows", if *verify { "verify" } else { "step" }, m.tokens.len()),
+        Cmd::Steps(ms, _) => format!("step of {} rows in {} parts", ms.iter().map(|m| m.tokens.len()).sum::<usize>(), ms.len()),
+        Cmd::Batch(cs) => cs.last().map_or_else(|| "batch".to_string(), label),
+        Cmd::CopyState(..) => "copy state".into(),
+        Cmd::SetKvRow(..) => "KV row".into(),
+        Cmd::PleWarm(_) => "PLE read-ahead".into(),
+        Cmd::Commit(_) => "commit".into(),
+        Cmd::PreVerify(_) => "verify saves".into(),
+        Cmd::Draft(_) => "draft".into(),
+        Cmd::Reset(_) => "reset".into(),
+        Cmd::Logits(_) | Cmd::AllLogits(_) => "logits".into(),
+        Cmd::Hidden(_) => "hidden state".into(),
+        Cmd::TimeAllReduce(_) => "all-reduce timing".into(),
+        Cmd::SetDmaMin(_) => "all-reduce threshold".into(),
+        Cmd::Quit => "quit".into(),
+    }
 }
 
 /// The GPU of a rank: BLAZE_RANK_GPUS (a list, e.g. "0,0,1,1": two ranks a GPU, to test a pipeline of tensor-parallel
@@ -582,6 +689,7 @@ fn worker_main(
     barrier: Arc<RankBarrier>,
     rx: Receiver<Cmd>,
     tx: Sender<Result<Reply>>,
+    watch: Option<Arc<Watch>>,
 ) {
     let kv_auto = opts.kv_auto.clone();
     let start = || -> Result<Runner> {
@@ -636,7 +744,7 @@ fn worker_main(
             _ => None,
         };
         let graph_log = std::env::var("BLAZE_GRAPH_LOG").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0 && rank == 0).map(|n| (n, [0; 4]));
-        Ok(Runner { model, draft, staging, meta_copied: None, graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
+        Ok(Runner { model, draft, staging, watch: watch.clone().map(|w| (w, rank)), meta_copied: None, graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
     };
     let mut runner = match start() {
         Ok(r) => {
@@ -674,7 +782,13 @@ fn worker_main(
     };
     while let Ok(cmd) = rx.recv() {
         let quit = matches!(cmd, Cmd::Quit);
+        if let Some((w, r)) = &runner.watch {
+            w.note(*r, label(&cmd));
+        }
         let r = runner.handle(cmd);
+        if let Some((w, r)) = &runner.watch {
+            w.note(*r, "idle".into());
+        }
         if tx.send(r).is_err() || quit {
             break;
         }
@@ -711,6 +825,7 @@ impl Engine {
         let stages = opts.pp_stages.max(1);
         let opts_pp_chunk = opts.pp_chunk;
         let mut ranks: Vec<Option<crate::model::PpRank>> = vec![None; world];
+        let mut all_links: Vec<Arc<HostMapped>> = Vec::new();
         let tp = if stages > 1 { opts.pp_tp.max(1) } else { world };
         if stages > 1 {
             if stages * tp != world {
@@ -732,6 +847,7 @@ impl Engine {
                 l.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
                 links.push(Arc::new(l));
             }
+            all_links = links.clone();
             // rank = stage * tp + its rank in the stage's tensor-parallel group
             for (rank, r) in ranks.iter_mut().enumerate() {
                 let s = rank / tp;
@@ -757,6 +873,11 @@ impl Engine {
                     .join(", ")
             );
         }
+        let watch = Watch::new(world, all_links, tp);
+        {
+            let weak = Arc::downgrade(&watch);
+            std::thread::Builder::new().name("blaze-watchdog".into()).spawn(move || Watch::watchdog(weak))?;
+        }
         let mut workers = Vec::with_capacity(world);
         for rank in 0..world {
             // a stage on another machine: a relay to its stage worker
@@ -775,10 +896,10 @@ impl Engine {
             let (rtx, rrx) = channel();
             let (dir, mut opts, embed, barrier) = (dir.to_path_buf(), opts.clone(), embed.clone(), barrier.clone());
             opts.pp = ranks[rank].clone();
-            let draft_head = draft_head.clone();
+            let (draft_head, watch) = (draft_head.clone(), Some(watch.clone()));
             let handle = std::thread::Builder::new()
                 .name(format!("blaze-rank{rank}"))
-                .spawn(move || worker_main(rank, world, dir, opts, embed, draft_head, use_graphs, barrier, crx, rtx))?;
+                .spawn(move || worker_main(rank, world, dir, opts, embed, draft_head, use_graphs, barrier, crx, rtx, watch))?;
             workers.push(Worker { tx: ctx, rx: rrx, handle: Some(handle) });
         }
         let mut info = None;
@@ -856,6 +977,7 @@ impl Engine {
             free_rows: (0..info.max_seqs).rev().collect(),
             free_cache_rows: (info.max_seqs..info.max_seqs + info.cache_rows).rev().collect(),
             deferred: Default::default(),
+            watch,
             info,
         };
         // tensor parallelism only: pipeline stages exchange rows, not all-reduces
@@ -890,14 +1012,25 @@ impl Engine {
     /// Send `cmd` to every rank (made by `make`), after the deferred commands, wait for all, return rank 0's reply.
     fn broadcast(&self, make: impl Fn() -> Cmd) -> Result<Reply> {
         let ahead = std::mem::take(&mut *self.deferred.borrow_mut());
-        for w in &self.workers {
+        for (i, w) in self.workers.iter().enumerate() {
             let cmd = if ahead.is_empty() { make() } else { Cmd::Batch(ahead.iter().map(Deferred::cmd).chain(std::iter::once(make())).collect()) };
+            if i == 0
+                && let Ok(mut g) = self.watch.inflight.lock()
+            {
+                *g = Some((label(&cmd), Instant::now(), vec![false; self.workers.len()], 0));
+            }
             w.tx.send(cmd).map_err(|_| anyhow!("rank exited"))?;
         }
         let mut first = None;
         let mut err = None;
         for (i, w) in self.workers.iter().enumerate() {
-            match w.rx.recv().map_err(|_| anyhow!("rank exited"))? {
+            let got = w.rx.recv().map_err(|_| anyhow!("rank exited"))?;
+            if let Ok(mut g) = self.watch.inflight.lock()
+                && let Some((_, _, replied, _)) = g.as_mut()
+            {
+                replied[i] = true;
+            }
+            match got {
                 Ok(r) => {
                     if i == self.lead {
                         first = Some(r);
@@ -907,6 +1040,9 @@ impl Engine {
                     err.get_or_insert(e);
                 }
             }
+        }
+        if let Ok(mut g) = self.watch.inflight.lock() {
+            *g = None;
         }
         match err {
             Some(e) => Err(e),

@@ -480,7 +480,7 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
     let barrier = Arc::new(RankBarrier::new(1));
     let worker = std::thread::Builder::new()
         .name("blaze-rank0".into())
-        .spawn(move || worker_main(0, 1, dir2, opts, embed, None, use_graphs, barrier, crx, rtx))?;
+        .spawn(move || worker_main(0, 1, dir2, opts, embed, None, use_graphs, barrier, crx, rtx, None))?;
     // the load result, then command by command
     let first = rrx.recv().map_err(|_| anyhow!("the stage exited while loading"))?;
     let mut w = W::default();
