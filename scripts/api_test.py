@@ -858,6 +858,18 @@ def responses_text_tools_and_stream():
     # get by id
     s, _, g = http("GET", "/v1/responses/" + final["id"])
     check(s == 200 and g["id"] == final["id"], g)
+    # a custom (freeform) tool, a built-in tool left out
+    tools = [{"type": "custom", "name": "apply_patch", "description": "Apply a patch to the files; the input is the patch text."},
+             {"type": "web_search"}]
+    s, _, r = http("POST", "/v1/responses", {"model": MODEL, "input": "Create the file hello.txt containing hi.", "tools": tools,
+                                              "tool_choice": {"type": "custom", "name": "apply_patch"}, "max_output_tokens": 300})
+    calls = [it for it in r.get("output", []) if it["type"] == "custom_tool_call"]
+    check(s == 200 and calls and calls[0]["name"] == "apply_patch" and isinstance(calls[0]["input"], str) and calls[0]["input"], r)
+    s, _, r = http("POST", "/v1/responses", {"model": MODEL, "tools": tools, "max_output_tokens": 100, "reasoning": {"effort": "minimal"}, "input": [
+        {"role": "user", "content": "Create the file hello.txt containing hi."}, calls[0],
+        {"type": "custom_tool_call_output", "call_id": calls[0]["call_id"], "output": "Done: hello.txt created."},
+        {"type": "web_search_call", "id": "ws_1", "status": "completed"}]})
+    check(s == 200 and r["status"] in ("completed", "incomplete"), r)
 
 
 @test
@@ -884,6 +896,10 @@ def messages_text_tools_thinking_and_stream():
     ev = events("/v1/messages", {"model": MODEL, "max_tokens": 40, "stream": True, "messages": [{"role": "user", "content": "Count to three."}]})
     names = [n for n, _ in ev]
     check(names[0] == "message_start" and names[-1] == "message_stop" and "content_block_delta" in names and "message_delta" in names, names)
+    # a stop sequence ends it and is reported
+    s, _, m = http("POST", "/v1/messages", {"model": MODEL, "max_tokens": 80, "stop_sequences": ["5"],
+                                             "messages": [{"role": "user", "content": "Count from 1 to 10 separated by commas, nothing else."}]}, h)
+    check(s == 200 and m["stop_reason"] == "stop_sequence" and m["stop_sequence"] == "5", m)
     # count_tokens and errors
     s, _, c = http("POST", "/v1/messages/count_tokens", {"model": MODEL, "messages": [{"role": "user", "content": "Hello there"}]}, h)
     check(s == 200 and c["input_tokens"] > 0, c)

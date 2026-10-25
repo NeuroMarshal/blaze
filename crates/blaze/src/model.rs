@@ -714,6 +714,10 @@ pub struct Model {
     /// counters (device: steps sent, steps received)
     layer0: usize,
     pp: Option<(PpRank, DevBuf)>,
+    /// the pipeline steps this rank was sent (the same on every stage); BLAZE_PP_FAULT=N: the first stage fails its
+    /// step N (a test of the abort path)
+    pp_seq: Cell<u64>,
+    pp_fault: Option<u64>,
     final_mix: FinalMix,
     lm_head: Linear,
     ple_table: Option<PleTable>,
@@ -887,6 +891,9 @@ impl Model {
         }
         if opts.pp.is_some() && matches!(cfg.mlp, MlpConfig::Moe { .. }) {
             bail!("pipeline stages of MoE models are not supported yet (the expert engine spans both GPUs)");
+        }
+        if opts.pp.is_some() && cfg.ple.is_some() {
+            bail!("pipeline stages of per-layer-embedding models are not supported yet (one table serves every layer)");
         }
         let dims = Dims {
             heads: cfg.attn.heads / w,
@@ -1257,6 +1264,8 @@ impl Model {
                 Some(p) => Some((p, DevBuf::zeroed(16, s)?)),
                 None => None,
             },
+            pp_seq: Cell::new(0),
+            pp_fault: std::env::var("BLAZE_PP_FAULT").ok().and_then(|v| v.parse().ok()),
             final_mix,
             lm_head,
             ple_table,
@@ -1895,6 +1904,29 @@ impl Model {
         )
     }
 
+    /// A pipeline step begins: its number into the hand-off counters (before anything of the step that may fail).
+    pub fn pp_begin(&self) -> Result<()> {
+        if let Some((_, counters)) = &self.pp {
+            let v = self.pp_seq.get();
+            self.pp_seq.set(v + 1);
+            check(unsafe { sys::blz_pp_set(counters.ptr(), v, self.stream.0) }, "pipeline step")?;
+        }
+        Ok(())
+    }
+
+    /// A step that failed on this stage before it handed its rows on: the next stage's wait is released (bytes
+    /// u64::MAX, no rows) instead of spinning forever; the step's error is this stage's.
+    pub fn pp_abort(&self) {
+        if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages) {
+            let link = p.next.as_ref().unwrap();
+            let v = self.pp_seq.get().saturating_sub(1);
+            unsafe {
+                sys::blz_pp_set(counters.ptr(), v, self.stream.0);
+                sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), u64::MAX, self.stream.0);
+            }
+        }
+    }
+
     /// The hidden rows of a step between this stage and a pipeline link (`send`: into it, else out of it): the
     /// residual stream and the last layer's output, or the hyper-connection streams.
     fn pp_rows(&self, link: &HostMapped, t: usize, send: bool) -> Result<usize> {
@@ -1956,6 +1988,9 @@ impl Model {
             },
             "set_req_to_token",
         )?;
+        if self.pp.as_ref().is_some_and(|(p, _)| p.stage == 0) && self.pp_fault == Some(self.pp_seq.get()) {
+            bail!("BLAZE_PP_FAULT: step {} fails on the first stage", self.pp_seq.get());
+        }
         // a later pipeline stage starts from the hidden rows of the stage before it
         if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage > 0) {
             let link = p.prev.as_ref().unwrap();

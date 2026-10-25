@@ -272,6 +272,7 @@ fn decoded_events(mut g: Gen, choice: usize, totals: Arc<Totals>, text: Arc<Text
                 Piece::Text(t, lps) => yield Ok(DecodedChatEvent { choice, text: t, token_ids: Vec::new(), finish_reason: None,
                     logprobs: chat_logprobs(&text, &lps), prompt_tokens, completion_tokens: 1 }),
                 Piece::Finish(f) => {
+                    totals.note_stop(choice, &g);
                     yield Ok(DecodedChatEvent { choice, text: String::new(), token_ids: Vec::new(), finish_reason: Some(finish_of(f)),
                         logprobs: None, prompt_tokens, completion_tokens: 0 });
                     break;
@@ -416,8 +417,9 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
                         }
                         let logprobs = logprobs.and_then(|l| serde_json::to_value(l).ok()).unwrap_or(Value::Null);
                         if delta.is_empty() && finish_reason.is_none() && logprobs.is_null() { continue; }
-                        yield chunk(json!([{"index": choice, "delta": delta, "logprobs": logprobs,
-                                            "finish_reason": finish_reason.map(finish_name)}]), None);
+                        let mut c = json!({"index": choice, "delta": delta, "logprobs": logprobs, "finish_reason": finish_reason.map(finish_name)});
+                        if finish_reason.is_some() { c["stop_reason"] = totals.stop_of(choice); }
+                        yield chunk(json!([c]), None);
                     }
                     Ok(ChatEvent::Usage { .. }) => {
                         if include_usage { yield chunk(json!([]), Some(totals.usage())); }
@@ -492,7 +494,8 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
             } else {
                 json!({"content": a.logprobs, "refusal": null})
             };
-            json!({"index": i, "message": message, "logprobs": logprobs, "finish_reason": a.finish.map(finish_name).unwrap_or("stop")})
+            json!({"index": i, "message": message, "logprobs": logprobs, "finish_reason": a.finish.map(finish_name).unwrap_or("stop"),
+                   "stop_reason": totals.stop_of(i)})
         })
         .collect();
     Ok(Json(json!({"id": id, "object": "chat.completion", "created": created, "model": model, "choices": choices,

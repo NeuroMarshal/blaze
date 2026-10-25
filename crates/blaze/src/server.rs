@@ -482,13 +482,15 @@ struct StopCutter {
     include: bool,
     held: String,
     stopped: bool,
+    /// the stop string that ended the text
+    matched: Option<String>,
 }
 
 impl StopCutter {
     fn new(stops: Vec<String>, include: bool) -> Self {
         let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
         let borders = stops.iter().map(|s| borders(s.as_bytes())).collect();
-        Self { stops, borders, include, held: String::new(), stopped: false }
+        Self { stops, borders, include, held: String::new(), stopped: false, matched: None }
     }
 
     /// Text that is safe to send after `delta`.
@@ -501,9 +503,11 @@ impl StopCutter {
         }
         self.held.push_str(delta);
         // the earliest stop string of the held text (it may begin in an earlier chunk)
-        let hit = self.stops.iter().filter_map(|s| self.held.find(s.as_str()).map(|i| (i, s.len()))).min_by_key(|&(i, l)| (i, l));
-        if let Some((at, len)) = hit {
+        let hit = self.stops.iter().enumerate().filter_map(|(j, s)| self.held.find(s.as_str()).map(|i| (i, s.len(), j)))
+            .min_by_key(|&(i, l, _)| (i, l));
+        if let Some((at, len, j)) = hit {
             self.stopped = true;
+            self.matched = Some(self.stops[j].clone());
             let end = if self.include { at + len } else { at };
             let out = self.held[..end].to_string();
             self.held.clear();
@@ -628,6 +632,11 @@ struct Gen {
 }
 
 impl Gen {
+    /// The stop string that ended the generation, or null (vLLM's stop_reason).
+    fn stop_reason(&self) -> Value {
+        self.detok.cutter.matched.clone().map_or(Value::Null, Value::from)
+    }
+
     async fn next(&mut self) -> Option<Piece> {
         if let Some(p) = self.queued.take() {
             return Some(p);
@@ -699,11 +708,23 @@ struct Totals {
     prompt: usize,
     cached: AtomicUsize,
     completion: AtomicUsize,
+    /// the stop string that ended each choice
+    stops: std::sync::Mutex<std::collections::HashMap<usize, String>>,
 }
 
 impl Totals {
     fn new(prompt: usize) -> Arc<Self> {
-        Arc::new(Self { prompt, cached: AtomicUsize::new(0), completion: AtomicUsize::new(0) })
+        Arc::new(Self { prompt, cached: AtomicUsize::new(0), completion: AtomicUsize::new(0), stops: Default::default() })
+    }
+
+    fn note_stop(&self, choice: usize, g: &Gen) {
+        if let Some(s) = g.stop_reason().as_str() {
+            self.stops.lock().unwrap().insert(choice, s.to_string());
+        }
+    }
+
+    fn stop_of(&self, choice: usize) -> Value {
+        self.stops.lock().unwrap().get(&choice).map_or(Value::Null, |s| json!(s))
     }
 
     /// Fold in what `g` has produced since `seen` tokens.

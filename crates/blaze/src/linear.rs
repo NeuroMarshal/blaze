@@ -543,6 +543,7 @@ impl Linear {
                         Some(q) => q,
                         None => {
                             x16 = None;
+                            x16g = None;
                             let base = ctx.scratch.cast::<u8>();
                             let q = unsafe { (base, base.add((m * k / 2).next_multiple_of(64)), base.add((m * k / 2 + m * k / 16).next_multiple_of(64))) };
                             check(unsafe { sys::blz_nvfp4_quant_rows(x, ldx as i64, m as c_int, k as c_int, q.0, q.1, q.2.cast(), s.0) }, "x to NVFP4")?;
@@ -567,6 +568,9 @@ impl Linear {
                         && k % 128 == 0
                         && m <= crate::tune::PASS_MAX_ROWS
                         && ctx.tune.get(crate::tune::Kernel::Nvfp4Pass, p.n, k, m).0 == 1;
+                    if x16.is_none() && (passes || m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0) {
+                        x16g = None; // the tensor-core GEMV's FP16 rows go to the scratch
+                    }
                     if m <= sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 {
                         nvfp4_mma(ctx, &w, x, ldx, m, o, ldo, s, &mut x16)?;
                     } else if passes {

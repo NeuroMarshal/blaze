@@ -5,6 +5,7 @@ use super::*;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 // wire format
 
@@ -296,7 +297,7 @@ pub(super) fn connect(addr: &str, rank: &crate::model::PpRank, prev: Arc<HostMap
     let data = TcpStream::connect(addr)?;
     data.set_nodelay(true)?;
     let mut hello = W::default();
-    for v in [rank.stage, rank.stages, rank.layers.start, rank.layers.end] {
+    for v in [rank.stage, rank.stages, rank.layers.start, rank.layers.end, prev.bytes()] {
         hello.usize(v);
     }
     let (mut cw, mut cr) = (BufWriter::new(cmd.try_clone()?), BufReader::new(cmd));
@@ -312,15 +313,24 @@ pub(super) fn connect(addr: &str, rank: &crate::model::PpRank, prev: Arc<HostMap
         std::thread::Builder::new().name(format!("blaze-pp-send{}", rank.stage)).spawn(move || {
             let h = header(&prev);
             let mut seen = 0u64;
+            // spinning while steps come, then yielding, then short sleeps when idle (a core is not held by an idle
+            // server; the first step after a pause waits at most a sleep)
+            let mut idle = Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 // SAFETY: the link's header, written by the GPU of the stage before
                 let flag = unsafe { std::ptr::read_volatile(h) };
                 if flag <= seen {
-                    std::hint::spin_loop();
+                    match idle.elapsed().as_micros() {
+                        0..200 => std::hint::spin_loop(),
+                        200..20_000 => std::thread::yield_now(),
+                        _ => std::thread::sleep(Duration::from_micros(100)),
+                    }
                     continue;
                 }
                 std::sync::atomic::fence(Ordering::Acquire);
+                // an abort (u64::MAX) or a size past the link: the flag goes on without rows
                 let bytes = unsafe { std::ptr::read_volatile(h.add(1)) } as usize;
+                let bytes = if bytes > prev.bytes() - crate::model::PP_LINK_HEADER { 0 } else { bytes };
                 let rows = unsafe { std::slice::from_raw_parts(prev.host_ptr().cast::<u8>().add(crate::model::PP_LINK_HEADER), bytes) };
                 let mut f = W::default();
                 f.u64(flag);
@@ -329,6 +339,7 @@ pub(super) fn connect(addr: &str, rank: &crate::model::PpRank, prev: Arc<HostMap
                     break;
                 }
                 seen = flag;
+                idle = Instant::now();
             }
         })?;
     }
@@ -371,7 +382,7 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
     let (mut cw, mut cr) = (BufWriter::new(cmd.try_clone()?), BufReader::new(cmd));
     let hello = recv_frame(&mut cr)?;
     let mut h = R { b: &hello, p: 0 };
-    let (stage, stages, l0, l1) = (h.usize()?, h.usize()?, h.usize()?, h.usize()?);
+    let (stage, stages, l0, l1, peer_link) = (h.usize()?, h.usize()?, h.usize()?, h.usize()?, h.usize()?);
     let (data, _) = listener.accept()?;
     data.set_nodelay(true)?;
     let mut dr = BufReader::new(data);
@@ -385,7 +396,8 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
     let cfg = crate::config::ModelConfig::load(dir)?;
     let width = cfg.hc.as_ref().map_or(2 * cfg.hidden, |hc| hc.count * cfg.hidden);
     let rows = opts.max_chunk.max(opts.max_seqs * opts.max_verify.max(1)).max(opts.max_seqs);
-    let mut link = HostMapped::new(crate::model::PP_LINK_HEADER + rows * width * 2)?;
+    // the coordinator's link may be the larger one (other chunk or verify settings): its rows fit here too
+    let mut link = HostMapped::new((crate::model::PP_LINK_HEADER + rows * width * 2).max(peer_link))?;
     link.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
     let link = Arc::new(link);
     opts.pp = Some(crate::model::PpRank { stage, stages, layers: l0..l1, prev: Some(link.clone()), next: None });
@@ -396,11 +408,21 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
         std::thread::Builder::new().name("blaze-pp-recv".into()).spawn(move || {
             let h = header(&link);
             while let Ok(f) = recv_frame(&mut dr) {
-                if f.len() < 8 || f.len() - 8 + crate::model::PP_LINK_HEADER > link.bytes() {
-                    eprintln!("blaze: pipeline rows of {} B for a link of {} B", f.len(), link.bytes());
+                if f.len() < 8 {
+                    eprintln!("blaze: a pipeline frame of {} B", f.len());
                     break;
                 }
                 let flag = u64::from_le_bytes(f[..8].try_into().unwrap());
+                if f.len() - 8 + crate::model::PP_LINK_HEADER > link.bytes() {
+                    // the flag still goes up: the GPU must not wait for it forever (the step's rows are not there)
+                    eprintln!("blaze: pipeline rows of {} B for a link of {} B", f.len() - 8, link.bytes());
+                    unsafe {
+                        std::ptr::write_volatile(h.add(1), u64::MAX);
+                        std::sync::atomic::fence(Ordering::SeqCst);
+                        std::ptr::write_volatile(h, flag);
+                    }
+                    continue;
+                }
                 // SAFETY: the link's rows and header; the GPU reads them only after the flag below
                 unsafe {
                     std::ptr::copy_nonoverlapping(f[8..].as_ptr(), link.host_ptr().cast::<u8>().cast_mut().add(crate::model::PP_LINK_HEADER), f.len() - 8);

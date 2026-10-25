@@ -195,12 +195,14 @@ fn chat_body(body: &Value, stream: bool) -> Checked<Value> {
     Ok(chat)
 }
 
-fn stop_reason(finish: &Value, has_calls: bool) -> &'static str {
+/// The stop reason and the stop sequence of a chat choice's end (`stop`: the stop string that ended it).
+fn stop_reason(finish: &Value, has_calls: bool, stop: &Value) -> (&'static str, Value) {
     match finish.as_str() {
-        Some("length") => "max_tokens",
-        Some("tool_calls") => "tool_use",
-        _ if has_calls => "tool_use",
-        _ => "end_turn",
+        Some("length") => ("max_tokens", Value::Null),
+        Some("tool_calls") => ("tool_use", Value::Null),
+        _ if has_calls => ("tool_use", Value::Null),
+        _ if stop.is_string() => ("stop_sequence", stop.clone()),
+        _ => ("end_turn", Value::Null),
     }
 }
 
@@ -248,8 +250,9 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
             super::responses::unclosed_answer(&mut message, &choice["finish_reason"]);
             let content = blocks_of(&message);
             let has_calls = content.iter().any(|b| b["type"] == "tool_use");
+            let (reason, sequence) = stop_reason(&choice["finish_reason"], has_calls, &choice["stop_reason"]);
             Ok(Json(json!({"id": id, "type": "message", "role": "assistant", "model": model, "content": content,
-                           "stop_reason": stop_reason(&choice["finish_reason"], has_calls), "stop_sequence": null,
+                           "stop_reason": reason, "stop_sequence": sequence,
                            "usage": usage_of(&v["usage"])}))
             .into_response())
         }
@@ -276,7 +279,7 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
         let mut open: Option<(&'static str, usize)> = None;
         let mut next = 0usize;
         let mut calls: std::collections::HashMap<u64, usize> = Default::default();
-        let (mut usage, mut finish) = (Value::Null, Value::Null);
+        let (mut usage, mut finish, mut stop) = (Value::Null, Value::Null, Value::Null);
         // the reasoning, and whether any text or call came (an answer left inside the thinking becomes text at the end)
         let (mut reasoning, mut answered) = (String::new(), false);
         while let Some(c) = chunks.next().await {
@@ -290,6 +293,7 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
             let Some(choice) = c["choices"].get(0) else { continue };
             if !choice["finish_reason"].is_null() {
                 finish = choice["finish_reason"].clone();
+                stop = choice["stop_reason"].clone();
             }
             let d = &choice["delta"];
             if let Some(r) = d.get("reasoning_content").and_then(Value::as_str).filter(|r| !r.is_empty()) {
@@ -349,7 +353,8 @@ fn stream_events(id: String, model: Value, mut chunks: Pin<Box<dyn Stream<Item =
             yield json!({"type": "content_block_stop", "index": next});
         }
         let u = usage_of(&usage);
-        yield json!({"type": "message_delta", "delta": {"stop_reason": stop_reason(&finish, !calls.is_empty()), "stop_sequence": null},
+        let (reason, sequence) = stop_reason(&finish, !calls.is_empty(), &stop);
+        yield json!({"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": sequence},
                      "usage": {"output_tokens": u["output_tokens"], "input_tokens": u["input_tokens"], "cache_read_input_tokens": u["cache_read_input_tokens"]}});
         yield json!({"type": "message_stop"});
     }
@@ -391,7 +396,8 @@ mod tests {
                                   "tool_calls": [{"id": "c", "function": {"name": "w", "arguments": "{\"a\":1}"}}]}));
         assert_eq!(b.iter().map(|x| x["type"].as_str().unwrap()).collect::<Vec<_>>(), ["thinking", "text", "tool_use"]);
         assert_eq!(b[2]["input"], json!({"a": 1}));
-        assert_eq!(stop_reason(&json!("stop"), true), "tool_use");
-        assert_eq!(stop_reason(&json!("length"), false), "max_tokens");
+        assert_eq!(stop_reason(&json!("stop"), true, &Value::Null).0, "tool_use");
+        assert_eq!(stop_reason(&json!("length"), false, &Value::Null).0, "max_tokens");
+        assert_eq!(stop_reason(&json!("stop"), false, &json!("END")), ("stop_sequence", json!("END")));
     }
 }

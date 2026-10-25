@@ -62,18 +62,19 @@ struct Job {
 fn chunks(mut g: Gen, index: usize, echo: Option<String>, totals: Arc<Totals>, st: Arc<AppState>, id: String, model: String,
           created: u64) -> Pin<Box<dyn Stream<Item = String> + Send>> {
     Box::pin(async_stream::stream! {
-        let chunk = |text: &str, logprobs: Value, finish: Option<&str>| {
-            json!({"id": id, "object": "text_completion", "created": created, "model": model,
-                   "choices": [{"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish}]}).to_string()
+        let chunk = |text: &str, logprobs: Value, finish: Option<&str>, stop: Value| {
+            let mut c = json!({"index": index, "text": text, "logprobs": logprobs, "finish_reason": finish});
+            if finish.is_some() { c["stop_reason"] = stop; }
+            json!({"id": id, "object": "text_completion", "created": created, "model": model, "choices": [c]}).to_string()
         };
         let mut offset = 0;
         let mut seen = 0;
-        if let Some(e) = &echo { yield chunk(e, Value::Null, None); }
+        if let Some(e) = &echo { yield chunk(e, Value::Null, None, Value::Null); }
         while let Some(piece) = g.next().await {
             totals.note(&g, &mut seen);
             match piece {
-                Piece::Text(t, lps) => yield chunk(&t, completion_logprobs(&st.text, &lps, &mut offset), None),
-                Piece::Finish(f) => { yield chunk("", Value::Null, Some(finish_str(f))); break; }
+                Piece::Text(t, lps) => yield chunk(&t, completion_logprobs(&st.text, &lps, &mut offset), None, Value::Null),
+                Piece::Finish(f) => { yield chunk("", Value::Null, Some(finish_str(f)), g.stop_reason()); break; }
                 Piece::Error(e) => { yield stream_error(&e); break; }
             }
         }
@@ -178,7 +179,7 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
             }
         }
         choices.push(json!({"index": i, "text": text, "logprobs": completion_logprobs(&st.text, &logprobs, &mut 0),
-                            "finish_reason": finish_str(finish)}));
+                            "finish_reason": finish_str(finish), "stop_reason": g.stop_reason()}));
     }
     Ok(Json(json!({"id": id, "object": "text_completion", "created": created, "model": model, "choices": choices,
                    "usage": totals.usage()}))

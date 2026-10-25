@@ -190,6 +190,17 @@ impl Runner {
     }
 
     fn step(&mut self, meta: &StepMeta, allow_graph: bool, verify: bool) -> Result<Reply> {
+        self.model.pp_begin()?;
+        let mut handed = false;
+        let r = self.step_on(meta, allow_graph, verify, &mut handed);
+        if r.is_err() && !handed {
+            self.model.pp_abort();
+        }
+        r
+    }
+
+    /// `handed`: set once the forward is enqueued (a pipeline stage's rows handed on).
+    fn step_on(&mut self, meta: &StepMeta, allow_graph: bool, verify: bool, handed: &mut bool) -> Result<Reply> {
         let m = self.model.meta;
         self.put(m.tokens, &meta.tokens);
         self.put(m.positions, &meta.positions);
@@ -269,6 +280,7 @@ impl Runner {
         } else {
             self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree)?;
         }
+        *handed = true;
         if meta.sample { Ok(Reply::Cands(self.model.candidates(n)?)) } else { Ok(Reply::Tokens(self.model.next_tokens(n)?)) }
     }
 

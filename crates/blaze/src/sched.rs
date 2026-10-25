@@ -1524,7 +1524,23 @@ impl Loop {
                 self.engine.release(e.snap);
             }
             if self.engine.free_slots() < need {
-                return false; // the running requests free pages first
+                if !self.active.is_empty() {
+                    return false; // the running requests free pages first
+                }
+                // alone, nothing frees pages: it resumes without the headroom while its tokens fit, else it ends here
+                // (its output so far is sent) rather than holding every new request back
+                if self.engine.free_slots() < tokens.len() - cached + page {
+                    let a = self.preempted.pop_front().unwrap();
+                    eprintln!("blaze: KV pool full ({} free slots): a preempted request of {} tokens no longer fits and \
+                               ends at {} tokens of output", self.engine.free_slots(), tokens.len(), a.generated.len());
+                    self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
+                    self.health.cur.kv_full += 1;
+                    self.health.cur.requests += 1;
+                    self.health.cur.lengths += 1;
+                    let _ = a.req.events.send(GenEvent::Done(Finish::Length));
+                    self.keep_output(&a);
+                    continue;
+                }
             }
             let mut a = self.preempted.pop_front().unwrap();
             let hit = self.lookup(&a.req.tokens);

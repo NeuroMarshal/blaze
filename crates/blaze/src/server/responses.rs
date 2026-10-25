@@ -90,10 +90,14 @@ fn messages_of(input: &Value) -> Checked<Vec<Value>> {
                 let role = if role == "developer" { "system" } else { role };
                 out.push(json!({"role": role, "content": content_of(it.get("content").unwrap_or(&Value::Null))?}));
             }
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
+                // a custom (freeform) tool runs here as a function of one string, its input
+                let arguments = match kind {
+                    "custom_tool_call" => json!(json!({"input": it.get("input").cloned().unwrap_or(json!(""))}).to_string()),
+                    _ => it.get("arguments").cloned().unwrap_or(json!("{}")),
+                };
                 let call = json!({"id": it.get("call_id").or(it.get("id")).cloned().unwrap_or(json!(new_id("call"))), "type": "function",
-                                  "function": {"name": it.get("name").cloned().unwrap_or(json!("")),
-                                               "arguments": it.get("arguments").cloned().unwrap_or(json!("{}"))}});
+                                  "function": {"name": it.get("name").cloned().unwrap_or(json!("")), "arguments": arguments}});
                 // calls in a row are one assistant turn
                 match out.last_mut() {
                     Some(m) if m["role"] == "assistant" && m.get("tool_calls").is_some_and(Value::is_array) => {
@@ -102,7 +106,7 @@ fn messages_of(input: &Value) -> Checked<Vec<Value>> {
                     _ => out.push(json!({"role": "assistant", "content": null, "tool_calls": [call]})),
                 }
             }
-            "function_call_output" => {
+            "function_call_output" | "custom_tool_call_output" => {
                 let output = match it.get("output") {
                     Some(Value::String(s)) => json!(s),
                     Some(v @ Value::Array(_)) => content_of(v)?,
@@ -111,15 +115,26 @@ fn messages_of(input: &Value) -> Checked<Vec<Value>> {
                 };
                 out.push(json!({"role": "tool", "tool_call_id": it.get("call_id").cloned().unwrap_or(json!("")), "content": output}));
             }
-            "reasoning" | "item_reference" => {}
-            other => return Err(bad_param("input", format!("input item '{other}' is not supported"))),
+            "" => return Err(bad_param("input", "an input item needs a type or a role")),
+            // reasoning, references, and the calls of built-in tools this server does not run (web search, file
+            // search, computer, shell, MCP ...)
+            _ => {}
         }
     }
     Ok(out)
 }
 
-/// The chat request of a Responses request, and its conversation before the answer (kept for previous_response_id).
-fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>)> {
+/// The names of the request's custom (freeform) tools: their calls are custom_tool_call items.
+type Custom = std::collections::HashSet<String>;
+
+/// The input of a custom tool's call (the `input` string of its arguments).
+fn custom_input(arguments: &str) -> Value {
+    serde_json::from_str::<Value>(arguments).ok().and_then(|a| a.get("input").cloned()).filter(Value::is_string).unwrap_or(json!(arguments))
+}
+
+/// The chat request of a Responses request, its conversation before the answer (kept for previous_response_id) and
+/// its custom tools.
+fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>, Custom)> {
     let mut messages = Vec::new();
     if let Some(prev) = body.get("previous_response_id").and_then(Value::as_str) {
         let kept = store().lock().ok().and_then(|s| s.iter().find(|k| k.id == prev).map(|k| k.messages.clone()));
@@ -142,6 +157,7 @@ fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>)> {
             o.insert(to.into(), v.clone());
         }
     }
+    let mut custom = Custom::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array).filter(|t| !t.is_empty()) {
         let mut out = Vec::new();
         for t in tools {
@@ -150,20 +166,43 @@ fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>)> {
                     "name": t.get("name").cloned().unwrap_or(json!("")),
                     "description": t.get("description").cloned().unwrap_or(Value::Null),
                     "parameters": t.get("parameters").cloned().unwrap_or(json!({"type": "object", "properties": {}}))}})),
-                other => return Err(bad_param("tools", format!("tool type {other:?} is not supported (function tools only)"))),
+                Some("custom") => {
+                    let name = t.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+                    let mut about = t.get("description").and_then(Value::as_str).unwrap_or("").to_owned();
+                    if let Some(def) = t.pointer("/format/definition").and_then(Value::as_str) {
+                        about.push_str(&format!("\n\nThe input follows this grammar ({}):\n{def}",
+                                                t.pointer("/format/syntax").and_then(Value::as_str).unwrap_or("lark")));
+                    }
+                    out.push(json!({"type": "function", "function": {"name": name, "description": about, "parameters": {
+                        "type": "object", "properties": {"input": {"type": "string", "description": "the tool's input, as text"}},
+                        "required": ["input"]}}}));
+                    custom.insert(name);
+                }
+                // built-in tools (web search, file search, computer, shell, MCP ...): not run here, left out
+                _ => {}
             }
         }
-        o.insert("tools".into(), json!(out));
+        if !out.is_empty() {
+            o.insert("tools".into(), json!(out));
+        }
     }
     match body.get("tool_choice") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) => {
             o.insert("tool_choice".into(), json!(s));
         }
-        Some(c) if c.get("type").and_then(Value::as_str) == Some("function") => {
+        Some(c) if matches!(c.get("type").and_then(Value::as_str), Some("function" | "custom")) => {
             o.insert("tool_choice".into(), json!({"type": "function", "function": {"name": c.get("name").cloned().unwrap_or(json!(""))}}));
         }
-        Some(c) => return Err(bad_param("tool_choice", format!("tool_choice {c} is not supported"))),
+        // allowed_tools: its mode over all the tools
+        Some(c) if c.get("type").and_then(Value::as_str) == Some("allowed_tools") => {
+            o.insert("tool_choice".into(), c.get("mode").cloned().unwrap_or(json!("auto")));
+        }
+        // a built-in tool: not here
+        Some(_) => {}
+    }
+    if !o.contains_key("tools") {
+        o.remove("tool_choice");
     }
     if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
         // minimal: as little as possible, no thinking section for a model that has one
@@ -188,7 +227,7 @@ fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>)> {
         o.insert("stream".into(), json!(true));
         o.insert("stream_options".into(), json!({"include_usage": true}));
     }
-    Ok((chat, messages))
+    Ok((chat, messages, custom))
 }
 
 /// The response object's fixed fields (a copy of the request's settings).
@@ -231,8 +270,17 @@ pub(super) fn unclosed_answer(m: &mut Value, finish: &Value) {
     }
 }
 
-/// Output items of a chat message: reasoning, the message, the function calls.
-fn items_of(m: &Value) -> Vec<Value> {
+/// The output item of a call: a function_call, or a custom_tool_call for a custom tool.
+fn call_item(call_id: Value, name: &Value, arguments: &str, custom: &Custom, status: &str) -> Value {
+    if name.as_str().is_some_and(|n| custom.contains(n)) {
+        json!({"type": "custom_tool_call", "id": new_id("ctc"), "call_id": call_id, "name": name, "input": custom_input(arguments), "status": status})
+    } else {
+        json!({"type": "function_call", "id": new_id("fc"), "call_id": call_id, "name": name, "arguments": arguments, "status": status})
+    }
+}
+
+/// Output items of a chat message: reasoning, the message, the calls.
+fn items_of(m: &Value, custom: &Custom) -> Vec<Value> {
     let mut out = Vec::new();
     if let Some(r) = m.get("reasoning_content").and_then(Value::as_str).filter(|r| !r.is_empty()) {
         out.push(json!({"type": "reasoning", "id": new_id("rs"), "summary": [], "content": [{"type": "reasoning_text", "text": r}]}));
@@ -242,9 +290,8 @@ fn items_of(m: &Value) -> Vec<Value> {
                         "content": [{"type": "output_text", "text": t, "annotations": []}]}));
     }
     for c in m.get("tool_calls").and_then(Value::as_array).into_iter().flatten() {
-        out.push(json!({"type": "function_call", "id": new_id("fc"), "call_id": c.get("id").cloned().unwrap_or(json!(new_id("call"))),
-                        "name": c.pointer("/function/name").cloned().unwrap_or(json!("")),
-                        "arguments": c.pointer("/function/arguments").cloned().unwrap_or(json!("{}")), "status": "completed"}));
+        out.push(call_item(c.get("id").cloned().unwrap_or(json!(new_id("call"))), c.pointer("/function/name").unwrap_or(&json!("")),
+                           c.pointer("/function/arguments").and_then(Value::as_str).unwrap_or("{}"), custom, "completed"));
     }
     out
 }
@@ -268,7 +315,7 @@ fn keep(id: &str, mut messages: Vec<Value>, answer: &Value, response: &Value) {
 }
 
 async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
-    let (chat, messages) = chat_body(&body)?;
+    let (chat, messages, custom) = chat_body(&body)?;
     let id = new_id("resp");
     let model = json!(st.cfg.served_name);
     let stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -280,7 +327,7 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
             let mut message = choice["message"].clone();
             unclosed_answer(&mut message, &choice["finish_reason"]);
             let mut r = shell(&body, &id, &model, "completed");
-            r["output"] = json!(items_of(&message));
+            r["output"] = json!(items_of(&message, &custom));
             r["usage"] = usage_of(&v["usage"]);
             if choice["finish_reason"] == "length" {
                 r["status"] = json!("incomplete");
@@ -291,7 +338,7 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
             }
             Ok(Json(r).into_response())
         }
-        ChatOut::Stream(chunks) if stream => Ok(sse(stream_events(body, id, model, messages, store_it, chunks))),
+        ChatOut::Stream(chunks) if stream => Ok(sse(stream_events(body, id, model, messages, custom, store_it, chunks))),
         ChatOut::Stream(_) => Err(error(StatusCode::INTERNAL_SERVER_ERROR, "a stream for a non-streaming request")),
     }
 }
@@ -334,6 +381,14 @@ fn close(open: &mut Option<(&'static str, usize, String)>, output: &mut [Value],
             out.push(ev.ev("response.output_text.done", json!({"item_id": item_id, "output_index": oi, "content_index": 0, "text": text})));
             out.push(ev.ev("response.content_part.done", json!({"item_id": item_id, "output_index": oi, "content_index": 0, "part": part})));
         }
+        "custom_tool_call" => {
+            // the input is a string inside the arguments: sent whole when the call ends
+            let input = custom_input(&text);
+            item["input"] = input.clone();
+            item["status"] = json!("completed");
+            out.push(ev.ev("response.custom_tool_call_input.delta", json!({"item_id": item_id, "output_index": oi, "delta": input})));
+            out.push(ev.ev("response.custom_tool_call_input.done", json!({"item_id": item_id, "output_index": oi, "input": input})));
+        }
         _ => {
             item["arguments"] = json!(text);
             item["status"] = json!("completed");
@@ -346,7 +401,7 @@ fn close(open: &mut Option<(&'static str, usize, String)>, output: &mut [Value],
 
 /// The Responses stream of a chat chunk stream: one item per kind of output, opened as its first delta comes and
 /// closed when another kind starts or at the end.
-fn stream_events(body: Value, id: String, model: Value, messages: Vec<Value>, store_it: bool,
+fn stream_events(body: Value, id: String, model: Value, messages: Vec<Value>, custom: Custom, store_it: bool,
                  mut chunks: Pin<Box<dyn Stream<Item = Value> + Send>>) -> impl Stream<Item = Value> + Send {
     async_stream::stream! {
         let mut ev = Seq(0);
@@ -414,11 +469,12 @@ fn stream_events(body: Value, id: String, model: Value, messages: Vec<Value>, st
                     for e in close(&mut open, &mut output, &mut ev) { yield e; }
                     let call_id = tc.get("id").cloned().filter(|v| !v.is_null()).unwrap_or(json!(new_id("call")));
                     let name = tc.pointer("/function/name").cloned().unwrap_or(json!(""));
-                    let item = json!({"type": "function_call", "id": new_id("fc"), "call_id": call_id, "name": name, "arguments": "", "status": "in_progress"});
+                    let item = call_item(call_id.clone(), &name, "", &custom, "in_progress");
+                    let kind = if item["type"] == "custom_tool_call" { "custom_tool_call" } else { "function_call" };
                     output.push(item.clone());
                     calls.insert(ti, output.len() - 1);
                     tool_calls.push(json!({"id": call_id, "type": "function", "function": {"name": name, "arguments": ""}}));
-                    open = Some(("function_call", output.len() - 1, String::new()));
+                    open = Some((kind, output.len() - 1, String::new()));
                     yield ev.ev("response.output_item.added", json!({"output_index": output.len() - 1, "item": item}));
                 }
                 if let Some(a) = tc.pointer("/function/arguments").and_then(Value::as_str).filter(|a| !a.is_empty()) {
@@ -431,7 +487,9 @@ fn stream_events(body: Value, id: String, model: Value, messages: Vec<Value>, st
                         let prev = t["function"]["arguments"].as_str().unwrap_or("").to_owned();
                         t["function"]["arguments"] = json!(prev + a);
                     }
-                    yield ev.ev("response.function_call_arguments.delta", json!({"item_id": output[oi]["id"], "output_index": oi, "delta": a}));
+                    if output[oi]["type"] == "function_call" {
+                        yield ev.ev("response.function_call_arguments.delta", json!({"item_id": output[oi]["id"], "output_index": oi, "delta": a}));
+                    }
                 }
             }
         }
@@ -479,7 +537,7 @@ mod tests {
             {"type": "reasoning", "id": "rs_1", "summary": []},
         ], "tools": [{"type": "function", "name": "w", "parameters": {"type": "object"}}], "tool_choice": {"type": "function", "name": "w"},
            "max_output_tokens": 50, "text": {"format": {"type": "json_object"}}, "reasoning": {"effort": "low"}});
-        let (chat, _) = chat_body(&body).unwrap();
+        let (chat, _, _) = chat_body(&body).unwrap();
         let m = chat["messages"].as_array().unwrap();
         assert_eq!(m[0], json!({"role": "system", "content": "Be brief."}));
         assert_eq!(m[1]["content"], json!([{"type": "text", "text": "Weather?"}]));
@@ -495,11 +553,37 @@ mod tests {
 
     #[test]
     fn a_chat_answer_becomes_output_items() {
+        let custom: Custom = ["patch".to_string()].into();
         let items = items_of(&json!({"reasoning_content": "think", "content": "Hi",
-                                     "tool_calls": [{"id": "c", "function": {"name": "w", "arguments": "{}"}}]}));
+                                     "tool_calls": [{"id": "c", "function": {"name": "w", "arguments": "{}"}},
+                                                    {"id": "d", "function": {"name": "patch", "arguments": "{\"input\": \"*** Begin\"}"}}]}), &custom);
         let kinds: Vec<&str> = items.iter().map(|i| i["type"].as_str().unwrap()).collect();
-        assert_eq!(kinds, ["reasoning", "message", "function_call"]);
+        assert_eq!(kinds, ["reasoning", "message", "function_call", "custom_tool_call"]);
         assert_eq!(items[1]["content"][0]["text"], "Hi");
         assert_eq!(items[2]["call_id"], "c");
+        assert_eq!(items[3]["input"], "*** Begin");
+    }
+
+    #[test]
+    fn custom_and_built_in_tools() {
+        let body = json!({"input": [
+            {"role": "user", "content": "Fix it."},
+            {"type": "custom_tool_call", "call_id": "c1", "name": "patch", "input": "*** Begin"},
+            {"type": "custom_tool_call_output", "call_id": "c1", "output": "done"},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed"},
+        ], "tools": [{"type": "custom", "name": "patch", "description": "Apply a patch."}, {"type": "web_search"}],
+           "tool_choice": {"type": "allowed_tools", "mode": "required", "tools": []}});
+        let (chat, _, custom) = chat_body(&body).unwrap();
+        let m = chat["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 3);
+        assert_eq!(m[1]["tool_calls"][0]["function"]["arguments"], "{\"input\":\"*** Begin\"}");
+        assert_eq!(m[2]["role"], "tool");
+        assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["tools"][0]["function"]["parameters"]["required"], json!(["input"]));
+        assert_eq!(chat["tool_choice"], "required");
+        assert!(custom.contains("patch"));
+        // only built-in tools: no tools and no tool choice
+        let (chat, _, _) = chat_body(&json!({"input": "Hi", "tools": [{"type": "web_search"}], "tool_choice": "required"})).unwrap();
+        assert!(chat.get("tools").is_none() && chat.get("tool_choice").is_none());
     }
 }
