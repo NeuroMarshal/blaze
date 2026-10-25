@@ -98,6 +98,9 @@ struct EngineArgs {
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
+    /// pipeline stages: the model's layers split over this many GPUs (one GPU a stage; instead of --tp)
+    #[arg(long, default_value_t = 1)]
+    pp: usize,
     /// NVFP4 layers on many rows (prefill): auto (W4A4 on FP4 tensor cores where the GPU has them and the checkpoint
     /// calibrated NVFP4 activations, else BF16), nvfp4 (W4A4 wherever the GPU can), bf16 (weights widened, cuBLAS)
     #[arg(long, default_value = "auto")]
@@ -161,7 +164,11 @@ impl EngineArgs {
             "off" => Some(false),
             _ => None,
         };
-        let world = self.tp.max(1);
+        // GPUs: the tensor-parallel group, or one per pipeline stage
+        if self.pp > 1 && (self.tp > 1 || self.draft_model.is_some() || self.mtp_window > 0) {
+            anyhow::bail!("--pp {}: pipeline stages run without --tp and without a drafter for now", self.pp);
+        }
+        let world = if self.pp > 1 { self.pp } else { self.tp.max(1) };
         let mut later_vram = vec![0usize; world];
         if let Some(d) = &self.draft_model {
             let b = blaze::drafter::vram_estimate(d, world, head_vram)?;
@@ -223,6 +230,8 @@ impl EngineArgs {
                 max_verify: self.spec_defaults()?.0,
                 kv_dtype: self.kv_cache_dtype,
                 gemm: self.gemm,
+                pp_stages: self.pp,
+                pp: None,
                 draft: self.draft_model.clone(),
                 mtp_window: self.mtp_window,
                 mtp_head_vocab: self.mtp_head_vocab,
@@ -238,7 +247,7 @@ impl EngineArgs {
                     v => anyhow::bail!("--draft-head-vram {v} (on, off, auto)"),
                 },
             },
-            self.tp,
+            world,
             !self.no_graphs,
         )?;
         eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());

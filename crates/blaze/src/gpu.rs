@@ -281,6 +281,10 @@ impl HostMapped {
     pub fn host_ptr(&self) -> *const std::ffi::c_void {
         self.host
     }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
 }
 
 impl Drop for HostMapped {

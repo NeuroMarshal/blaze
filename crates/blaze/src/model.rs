@@ -244,6 +244,20 @@ const KV_PROBE_TOKENS: usize = 4096;
 /// a pool shared by KV pages and expert slots would size this by use).
 const MOE_AUTO_CONTEXT: usize = 65536;
 
+/// One rank's place in the pipeline: its stage, the layers it holds, the links to the stages before and after it
+/// (pinned host memory: a 256-byte header with the flag, then the hidden rows of a step).
+#[derive(Clone)]
+pub struct PpRank {
+    pub stage: usize,
+    pub stages: usize,
+    pub layers: Range<usize>,
+    pub prev: Option<Arc<HostMapped>>,
+    pub next: Option<Arc<HostMapped>>,
+}
+
+/// Bytes of a pipeline link's header (the flag) before its rows.
+pub const PP_LINK_HEADER: usize = 256;
+
 #[derive(Clone)]
 pub struct Options {
     /// KV cache size in tokens (with `kv_auto`: set from the free VRAM after the load)
@@ -292,6 +306,9 @@ pub struct Options {
     pub kv_dtype: KvDtype,
     /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
     pub gemm: crate::linear::GemmRoute,
+    /// pipeline parallelism (`--pp`): the stages (1: none), and this rank's stage (set by the engine for each rank)
+    pub pp_stages: usize,
+    pub pp: Option<PpRank>,
     /// EAGLE-4 drafter checkpoint (run on every rank; the layers it reads are captured)
     pub draft: Option<std::path::PathBuf>,
     /// CUDA graphs of the drafter's chain
@@ -691,6 +708,10 @@ pub struct Model {
     pub dims: Dims,
     pub tp: Tp,
     layers: Vec<Layer>,
+    /// the global index of `layers[0]` (pipeline stages hold a range of the layers), and the stage's hand-off
+    /// counters (device: steps sent, steps received)
+    layer0: usize,
+    pp: Option<(PpRank, DevBuf)>,
     final_mix: FinalMix,
     lm_head: Linear,
     ple_table: Option<PleTable>,
@@ -862,6 +883,9 @@ impl Model {
         if w > 1 && matches!(cfg.mlp, MlpConfig::Moe { .. }) {
             bail!("tensor parallelism of MoE models is not supported yet");
         }
+        if opts.pp.is_some() && matches!(cfg.mlp, MlpConfig::Moe { .. }) {
+            bail!("pipeline stages of MoE models are not supported yet (the expert engine spans both GPUs)");
+        }
         let dims = Dims {
             heads: cfg.attn.heads / w,
             kv_heads: cfg.attn.kv_heads / w,
@@ -877,7 +901,10 @@ impl Model {
         let mut layers = Vec::with_capacity(cfg.layers.len());
         let (mut n_full, mut n_gdn) = (0, 0);
         let hd = cfg.attn.head_dim;
-        for (i, kind) in cfg.layers.iter().enumerate() {
+        // a pipeline stage loads its own layers; the KV pools and GDN states follow them
+        let held = opts.pp.as_ref().map_or(0..cfg.layers.len(), |p| p.layers.clone());
+        let layer0 = held.start;
+        for (i, kind) in cfg.layers.iter().enumerate().filter(|(i, _)| held.contains(i)) {
             let l = format!("{p}layers.{i}.");
             let (attn, gdn, slot) = match kind {
                 LayerKind::Full => {
@@ -1040,7 +1067,12 @@ impl Model {
             bail!("tensor parallelism of hyper-connection models is not supported yet");
         }
         let lm_name = if cfg.tie_embeddings { format!("{p}embed_tokens") } else { "lm_head".into() };
-        let lm_head = Linear::load(&ckpt, &quant, &[rows(lm_name, vec![part(cfg.vocab, r, w)])], s)?;
+        // the head on the last stage only
+        let lm_head = if opts.pp.as_ref().is_some_and(|p| p.stage + 1 < p.stages) {
+            Linear::empty(cfg.vocab, cfg.hidden)
+        } else {
+            Linear::load(&ckpt, &quant, &[rows(lm_name, vec![part(cfg.vocab, r, w)])], s)?
+        };
 
         let (freqs, rope_scale) = inv_freq(&cfg);
         let mrope_comp = DevBuf::from_slice(&mrope_components(&cfg.rope))?;
@@ -1218,6 +1250,11 @@ impl Model {
             dims,
             tp,
             layers,
+            layer0,
+            pp: match opts.pp.clone() {
+                Some(p) => Some((p, DevBuf::zeroed(16, s)?)),
+                None => None,
+            },
             final_mix,
             lm_head,
             ple_table,
@@ -1395,7 +1432,11 @@ impl Model {
         let gib = (1u64 << 30) as f64;
         let moe = matches!(self.cfg.mlp, MlpConfig::Moe { .. });
         let later = self.opts.later_vram.get(self.tp.rank).copied().unwrap_or(0)
-            + if self.tp.rank == 0 && (!moe || self.opts.vision_gpu) { self.opts.vision_vram } else { 0 };
+            + if self.tp.rank == 0 && self.pp.as_ref().is_none_or(|(p, _)| p.stage == 0) && (!moe || self.opts.vision_gpu) {
+                self.opts.vision_vram
+            } else {
+                0
+            };
         let reserve = (self.opts.reserve_gib * gib) as usize;
         // the probe pools are given back: they count as free
         let probe: usize = self.kv.iter().flatten().map(DevBuf::owned_bytes).sum::<usize>() + self.qsa_comp.iter().map(DevBuf::bytes).sum::<usize>();
@@ -1852,6 +1893,32 @@ impl Model {
         )
     }
 
+    /// The hidden rows of a step between this stage and a pipeline link (`send`: into it, else out of it): the
+    /// residual stream and the last layer's output, or the hyper-connection streams.
+    fn pp_rows(&self, link: &HostMapped, t: usize, send: bool) -> Result<()> {
+        let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
+        let data = unsafe { link.dev_ptr::<u8>().add(PP_LINK_HEADER).cast_mut() };
+        let bufs: Vec<(*mut u16, usize)> = match (&w.streams, &self.cfg.hc) {
+            (Some(streams), Some(hc)) => vec![(streams.ptr(), t * hc.count * h)],
+            _ => vec![(w.x.ptr(), t * h), (w.residual.ptr(), t * h)],
+        };
+        let need: usize = bufs.iter().map(|b| b.1 * 2).sum::<usize>() + PP_LINK_HEADER;
+        if need > link.bytes() {
+            bail!("pipeline link of {} B for {need} B of rows", link.bytes());
+        }
+        let mut off = 0;
+        for (buf, elems) in bufs {
+            let (dst, src, kind) = if send {
+                (unsafe { data.add(off) }.cast::<std::ffi::c_void>(), buf.cast::<std::ffi::c_void>().cast_const(), sys::MEMCPY_D2H)
+            } else {
+                (buf.cast::<std::ffi::c_void>(), unsafe { data.add(off) }.cast::<std::ffi::c_void>().cast_const(), sys::MEMCPY_H2D)
+            };
+            check(unsafe { sys::cudaMemcpyAsync(dst, src, elems * 2, kind, s.0) }, "pipeline rows")?;
+            off += elems * 2;
+        }
+        Ok(())
+    }
+
     /// The image rows of the next forward: whether the M-RoPE streams differ (positions in the metadata's pos_h / pos_w)
     /// and the embeddings that replace the gathered rows. Steps with image rows are never captured into a graph.
     pub fn set_image_rows(&self, mrope: bool, segs: &[crate::mm::ImgSeg]) {
@@ -1887,14 +1954,21 @@ impl Model {
             },
             "set_req_to_token",
         )?;
-        check(
-            unsafe {
-                sys::blz_embed_gather(self.meta_ptr(m.tokens), t as i64, self.embed.dev_ptr(), cfg.vocab as i64, (h * 2) as i64,
-                                      w.residual.ptr(), s.0)
-            },
-            "embed",
-        )?;
-        for seg in self.img_segs.borrow().iter() {
+        // a later pipeline stage starts from the hidden rows of the stage before it
+        if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage > 0) {
+            let link = p.prev.as_ref().unwrap();
+            check(unsafe { sys::blz_pp_wait(link.dev_ptr::<u64>(), counters.at::<u64>(1), s.0) }, "pipeline receive")?;
+            self.pp_rows(link, t, false)?;
+        } else {
+            check(
+                unsafe {
+                    sys::blz_embed_gather(self.meta_ptr(m.tokens), t as i64, self.embed.dev_ptr(), cfg.vocab as i64, (h * 2) as i64,
+                                          w.residual.ptr(), s.0)
+                },
+                "embed",
+            )?;
+        }
+        for seg in self.img_segs.borrow().iter().filter(|_| self.pp.as_ref().is_none_or(|(p, _)| p.stage == 0)) {
             let bytes = seg.count * h * 2;
             if (seg.row0 + seg.count) * h > seg.emb.len() || seg.at + seg.count > t {
                 bail!("image rows {}..{} do not fit their embedding or the step", seg.row0, seg.row0 + seg.count);
@@ -1911,9 +1985,11 @@ impl Model {
         let eps = cfg.rms_eps;
         self.ple_request(t, n, verify)?;
         for (li, layer) in self.layers.iter().enumerate() {
+            // the model's first layer (a later pipeline stage's first one continues the residual stream)
+            let first = self.layer0 + li == 0;
             match &layer.mix {
                 Mixing::Norm { input, .. } => {
-                    if li == 0 {
+                    if first {
                         check(unsafe { sys::blz_rmsnorm(w.residual.ptr(), null_mut(), input.ptr(), eps, t as c_int, h as c_int, 1, w.normed.ptr(), s.0) }, "rmsnorm")?;
                     } else {
                         self.reduce_norm(input, t)?;
@@ -1921,7 +1997,7 @@ impl Model {
                 }
                 Mixing::Hyper { attn, .. } => {
                     let streams = w.streams.as_ref().unwrap();
-                    if li == 0 {
+                    if first {
                         let c = cfg.hc.as_ref().unwrap().count;
                         check(unsafe { sys::blz_hc_widen(w.residual.ptr(), t as c_int, c as c_int, h as c_int, streams.ptr(), s.0) }, "hc widen")?;
                     }
@@ -1967,6 +2043,13 @@ impl Model {
         }
         self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
+        // a pipeline stage before the last hands its rows on and is done
+        if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages) {
+            let link = p.next.as_ref().unwrap();
+            self.pp_rows(link, t, true)?;
+            check(unsafe { sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), s.0) }, "pipeline send")?;
+            return Ok(());
+        }
         // the MTP drafter reads the final normed hidden state of every row (aux column 0); the head below takes its rows
         // from there (the sum x + residual is formed here once: the residual stream is updated in place)
         let kept = self.opts.mtp_window > 0 && matches!(self.final_mix, FinalMix::Norm(_));

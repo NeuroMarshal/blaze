@@ -455,6 +455,8 @@ pub struct Engine {
     free_cache_rows: Vec<usize>,
     /// commands sent ahead of the next broadcast
     deferred: std::cell::RefCell<Vec<Deferred>>,
+    /// the rank whose replies count (the last pipeline stage: it holds the head)
+    lead: usize,
     pub info: Info,
 }
 
@@ -478,7 +480,9 @@ fn worker_main(
         let tokens = opts.max_chunk.max(opts.max_seqs);
         let ar_bytes = (tokens * cfg.hidden * 2).max(opts.max_seqs * cfg.vocab * 2).next_multiple_of(16);
         let mut ar = null_mut();
-        if world > 1 {
+        // pipeline stages hold whole layers: no tensor-parallel group, no all-reduce
+        let (tp_rank, tp_world) = if opts.pp.is_some() { (0, 1) } else { (rank, world) };
+        if tp_world > 1 {
             // Rank 0 creates the shared buffer before the others map it; every rank passes both barriers.
             let name = CString::new(format!("/blaze_ar_{}", std::process::id()))?;
             let mut err = 0;
@@ -496,7 +500,7 @@ fn worker_main(
             check(err, "host all-reduce buffer")?;
         }
         let draft_dir = opts.draft.clone();
-        let model = Model::load(&dir, opts, Tp { rank, world, ar, ar_bytes }, embed)?;
+        let model = Model::load(&dir, opts, Tp { rank: tp_rank, world: tp_world, ar, ar_bytes }, embed)?;
         let staging = HostMapped::new(model.meta.bytes)?;
         let draft = match draft_dir {
             Some(d) => {
@@ -586,11 +590,47 @@ impl Engine {
             _ => None,
         };
         let barrier = Arc::new(RankBarrier::new(world));
+        // pipeline stages: a GPU each, the layers split evenly, a link of pinned host memory between neighbours (the
+        // rows of the largest step: a prefill chunk or a verify of every sequence)
+        let stages = opts.pp_stages.max(1);
+        let mut ranks: Vec<Option<crate::model::PpRank>> = vec![None; world];
+        if stages > 1 {
+            if stages != world {
+                bail!("--pp {stages} needs one GPU per stage ({world} given; tensor parallelism inside a stage is not supported)");
+            }
+            let cfg = crate::config::ModelConfig::load(dir)?;
+            let layers = cfg.layers.len();
+            if layers < stages {
+                bail!("{layers} layers for {stages} pipeline stages");
+            }
+            let width = cfg.hc.as_ref().map_or(2 * cfg.hidden, |hc| hc.count * cfg.hidden);
+            let rows = opts.max_chunk.max(opts.max_seqs * opts.max_verify.max(1)).max(opts.max_seqs);
+            let mut links = Vec::new();
+            for _ in 1..stages {
+                let mut l = HostMapped::new(crate::model::PP_LINK_HEADER + rows * width * 2)?;
+                l.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
+                links.push(Arc::new(l));
+            }
+            for (s, r) in ranks.iter_mut().enumerate() {
+                *r = Some(crate::model::PpRank {
+                    stage: s,
+                    stages,
+                    layers: s * layers / stages..(s + 1) * layers / stages,
+                    prev: (s > 0).then(|| links[s - 1].clone()),
+                    next: (s + 1 < stages).then(|| links[s].clone()),
+                });
+            }
+            eprintln!(
+                "blaze: pipeline of {stages} stages: layers {}",
+                ranks.iter().flatten().map(|r| format!("{}..{} on GPU {}", r.layers.start, r.layers.end, r.stage)).collect::<Vec<_>>().join(", ")
+            );
+        }
         let mut workers = Vec::with_capacity(world);
         for rank in 0..world {
             let (ctx, crx) = channel();
             let (rtx, rrx) = channel();
-            let (dir, opts, embed, barrier) = (dir.to_path_buf(), opts.clone(), embed.clone(), barrier.clone());
+            let (dir, mut opts, embed, barrier) = (dir.to_path_buf(), opts.clone(), embed.clone(), barrier.clone());
+            opts.pp = ranks[rank].clone();
             let draft_head = draft_head.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("blaze-rank{rank}"))
@@ -649,7 +689,9 @@ impl Engine {
             return Err(e);
         }
         let info = info.unwrap();
+        let lead = if stages > 1 { world - 1 } else { 0 };
         let mut engine = Self {
+            lead,
             workers,
             last_verify: Vec::new(),
             free_pages: (0..(info.max_tokens / info.page) as u32).rev().collect(),
@@ -696,10 +738,12 @@ impl Engine {
         }
         let mut first = None;
         let mut err = None;
-        for w in &self.workers {
+        for (i, w) in self.workers.iter().enumerate() {
             match w.rx.recv().map_err(|_| anyhow!("rank exited"))? {
                 Ok(r) => {
-                    first.get_or_insert(r);
+                    if i == self.lead {
+                        first = Some(r);
+                    }
                 }
                 Err(e) => {
                     err.get_or_insert(e);

@@ -224,6 +224,11 @@ pub(crate) fn nvfp4_mma(ctx: &LinCtx, w: &Nvfp4Ref, x: *const u16, ldx: usize, m
 }
 
 impl Linear {
+    /// A layer with no weights (`run` writes nothing): a part of the model another pipeline stage computes.
+    pub fn empty(n: usize, k: usize) -> Self {
+        Self { parts: Vec::new(), n, k }
+    }
+
     /// Load `modules` (name without `.weight`, cut) stacked in order.
     pub fn load(ckpt: &Checkpoint, quant: &QuantConfig, modules: &[(String, Cut)], s: &Stream) -> Result<Self> {
         let mut mods = Vec::with_capacity(modules.len());

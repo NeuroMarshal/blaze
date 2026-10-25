@@ -410,6 +410,9 @@ unsafe extern "C" {
                                   k: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_weight_dequant(w: *const u8, scale: *const u8, alpha: *const f32, n: c_int, k: c_int,
                                     out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    // pp_link.h
+    pub fn blz_pp_signal(flag: *mut u64, counter: *mut u64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_pp_wait(flag: *const u64, counter: *mut u64, s: cudaStream_t) -> cudaError_t;
     // nvfp4_gemm.h
     pub fn blz_nvfp4_quant_rows(x: *const u16, ldx: i64, m: c_int, k: c_int, codes: *mut u8, scales: *mut u8, row_scale: *mut f32,
                                 s: cudaStream_t) -> cudaError_t;
