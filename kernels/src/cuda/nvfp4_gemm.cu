@@ -58,14 +58,28 @@ __global__ void __launch_bounds__(kQuantThreads) quant_rows_kernel(const uint16_
       v[j] = bf16f(row[b * 16 + j]);
       bmax = fmaxf(bmax, fabsf(v[j]));
     }
-    const __nv_fp8_e4m3 sc(bmax / (6.0f * s));  // round to nearest, saturating at 448
-    const float bs = float(sc) * s;
-    const float inv = bs > 0.0f ? 1.0f / bs : 0.0f;
+    // four over six: the block's largest value at 6 or at 4 of the E2M1 grid (4: finer steps for the rest, the
+    // largest exact), the one with the smaller squared error
     uint32_t lo = 0, hi = 0;
+    __nv_fp8_e4m3 sc;
+    float best = INFINITY;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) lo |= e2m1_code(v[j] * inv) << (4 * j);
+    for (int c = 0; c < 2; ++c) {
+      const __nv_fp8_e4m3 cand(bmax / ((c ? 4.0f : 6.0f) * s));  // round to nearest, saturating at 448
+      const float bs = float(cand) * s;
+      const float inv = bs > 0.0f ? 1.0f / bs : 0.0f;
+      uint32_t l = 0, h = 0;
+      float err = 0.0f;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) hi |= e2m1_code(v[8 + j] * inv) << (4 * j);
+      for (int j = 0; j < 16; ++j) {
+        const uint32_t code = e2m1_code(v[j] * inv);
+        const float d = v[j] - blaze::e2m1_value(int(code)) * bs;
+        err = fmaf(d, d, err);
+        if (j < 8) l |= code << (4 * j);
+        else h |= code << (4 * (j - 8));
+      }
+      if (err < best) best = err, lo = l, hi = h, sc = cand;
+    }
     uint2* dst = reinterpret_cast<uint2*>(codes + int64_t(r) * (k / 2) + b * 8);
     *dst = make_uint2(lo, hi);
     scales[int64_t(r) * blocks + b] = sc.__x;
