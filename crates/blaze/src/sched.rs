@@ -412,8 +412,13 @@ pub enum SpecMethod {
 const TREE_NODES: [usize; 12] = [0, 1, 3, 5, 7, 11, 15, 23, 31, 39, 47, 63];
 
 /// Suffix assist: the suffix draft replaces the drafter's from this many expected accepted tokens (an MTP chain of 3
-/// keeps about 0.8 on prose).
+/// keeps about 0.8 on prose); BLAZE_SUFFIX_ASSIST_SCORE overrides it.
 const SUFFIX_ASSIST_SCORE: f32 = 2.0;
+
+fn suffix_assist_score() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("BLAZE_SUFFIX_ASSIST_SCORE").ok().and_then(|v| v.parse().ok()).unwrap_or(SUFFIX_ASSIST_SCORE))
+}
 
 /// Tokens of earlier outputs kept for suffix decoding.
 const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
@@ -957,7 +962,7 @@ impl Loop {
                 let ks = self.cfg.suffix_assist.min(room.saturating_sub(1));
                 let (d, score) = self.suffix_draft_scored(i, ks);
                 // the suffix index's expected accepted tokens against what a chain of the drafter keeps on average
-                if score >= SUFFIX_ASSIST_SCORE && d.len() > drafted.len() { d } else { drafted }
+                if score >= suffix_assist_score() && d.len() > drafted.len() { d } else { drafted }
             }
             SpecMethod::Eagle => a.eagle.iter().copied().take(k).collect(),
         };
