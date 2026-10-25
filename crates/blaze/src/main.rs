@@ -360,6 +360,13 @@ enum Command {
         /// vLLM's --limit-mm-per-prompt: most images per request, as JSON ({"image": 4}) or image=4 (default 999)
         #[arg(long, default_value = "")]
         limit_mm_per_prompt: String,
+        /// patches one pass of the vision tower encodes together (an image above it alone); 0: auto, the patches of
+        /// the largest image the memory plan keeps activations for (the peak memory of one such image)
+        #[arg(long, default_value_t = 0)]
+        mm_encoder_patches: usize,
+        /// most images in one pass of the vision tower; 0: as many as the patches allow
+        #[arg(long, default_value_t = 0)]
+        mm_encoder_batch: usize,
         /// image_url.detail "low": cap of the image's pixels (OpenAI's low detail is 512 x 512); 0 ignores `detail` as
         /// vLLM does. "auto" and "high" use the processor's own limits
         #[arg(long, default_value_t = 512 * 512)]
@@ -679,6 +686,8 @@ fn main() -> Result<()> {
             vision_threads,
             mm_processor_kwargs,
             limit_mm_per_prompt,
+            mm_encoder_patches,
+            mm_encoder_batch,
             mm_low_detail_pixels,
             image_fetch_timeout,
             image_fetch_max_mib,
@@ -712,7 +721,8 @@ fn main() -> Result<()> {
             // (the embeddings go to every rank through host memory)
             let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
             let tower =
-                blaze::vision::Vision::load(&engine.model, vision, vision_threads.unwrap_or((cores / 2).max(4)), 0, mm_kwargs.max_pixels)?;
+                blaze::vision::Vision::load(&engine.model, vision, vision_threads.unwrap_or((cores / 2).max(4)), 0, mm_kwargs.max_pixels,
+                                            blaze::vision::EncoderBatch { patches: mm_encoder_patches, images: mm_encoder_batch })?;
             let mm = blaze::server::MmConfig::new(
                 tower.map(std::sync::Arc::new),
                 mm_kwargs,

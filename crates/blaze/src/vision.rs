@@ -600,24 +600,38 @@ impl GpuEncoder {
     }
 
     /// `stages`: receives the activations after the position embedding, the first block and the last block (bf16, debugging).
-    pub fn encode_stages(&self, px: &[u16], gh: usize, gw: usize, mut stages: Option<&mut Vec<Vec<u16>>>) -> Result<Vec<u16>> {
+    pub fn encode_stages(&self, px: &[u16], gh: usize, gw: usize, stages: Option<&mut Vec<Vec<u16>>>) -> Result<Vec<u16>> {
+        Ok(self.encode_batch(&[(px, gh, gw)], stages)?.pop().unwrap())
+    }
+
+    /// Images in one pass of the tower: their patches one after the other, every row operation (GEMMs, norms, MLP,
+    /// merger) over all of them at once, the position embedding, rotary and attention per image on its rows.
+    pub fn encode_batch(&self, items: &[(&[u16], usize, usize)], mut stages: Option<&mut Vec<Vec<u16>>>) -> Result<Vec<Vec<u16>>> {
         let c = &self.cfg;
         gpu::set_device(self.device)?;
-        let (n, h, i) = (gh * gw, c.hidden, c.intermediate);
-        if px.len() != n * c.patch_dim() {
-            bail!("{} pixel values for {n} patches", px.len());
+        let (h, i) = (c.hidden, c.intermediate);
+        let mm = c.merge * c.merge;
+        let mut rows = Vec::with_capacity(items.len());
+        let mut n = 0;
+        for &(px, gh, gw) in items {
+            let ni = gh * gw;
+            if px.len() != ni * c.patch_dim() || ni % mm != 0 {
+                bail!("{} pixel values for {ni} patches", px.len());
+            }
+            rows.push((n, ni, gh, gw));
+            n += ni;
         }
         let need = Self::scratch_for(c, n);
         self.scratch_bytes.set(need);
         let s = self.stream.0;
-        let nm = n / (c.merge * c.merge);
-        let mh = h * c.merge * c.merge;
+        let nm = n / mm;
+        let mh = h * mm;
         let mut slot = self.work.borrow_mut();
         if slot.as_ref().is_none_or(|w| w.cap < n) {
             *slot = None;
             let free = gpu::mem_info()?.0;
             if free < need + (64 << 20) {
-                bail!("not enough free VRAM for an image of {n} patches: {:.0} MiB needed, {:.0} MiB free", need as f64 / 1048576.0, free as f64 / 1048576.0);
+                bail!("not enough free VRAM for {n} patches: {:.0} MiB needed, {:.0} MiB free", need as f64 / 1048576.0, free as f64 / 1048576.0);
             }
             let b = |elems: usize| DevBuf::new(elems * 2);
             let cap = n.max(1024);
@@ -630,20 +644,27 @@ impl GpuEncoder {
                 v: b(cap * h)?,
                 o: b(cap * h)?,
                 big: b(cap * (3 * h).max(i).max(c.patch_dim()))?,
-                out: b(cap / (c.merge * c.merge) * c.out_hidden)?,
+                out: b(cap / mm * c.out_hidden)?,
             });
         }
         let w_ = slot.as_ref().unwrap();
         let (x, xn, q, k, v, o, big, out) = (&w_.x, &w_.xn, &w_.q, &w_.k, &w_.v, &w_.o, &w_.big, &w_.out);
-        big.upload_async(px, &self.stream)?;
+        for (&(px, ..), &(r0, ..)) in items.iter().zip(&rows) {
+            big.upload_at(r0 * c.patch_dim() * 2, px)?;
+        }
         let g = |a: &DevBuf, lda: usize, w: &DevBuf, dst: &DevBuf, ldo: usize, m: usize, nn: usize, kk: usize| -> Result<()> {
             check(unsafe { sys::blz_gemm_bf16(self.gemm, a.ptr(), lda as i64, w.ptr(), dst.ptr(), ldo as i64, m as i32, nn as i32, kk as i32, s) }, "vision gemm")
         };
         g(big, c.patch_dim(), &self.patch_w, x, h, n, h, c.patch_dim())?;
-        check(
-            unsafe { sys::blz_vis_embed_pos(x.ptr(), self.patch_b.ptr(), self.pos.ptr(), (c.num_pos as f64).sqrt() as i32, gh as i32, gw as i32, c.merge as i32, h as i32, s) },
-            "vision pos embed",
-        )?;
+        for &(r0, _, gh, gw) in &rows {
+            check(
+                unsafe {
+                    sys::blz_vis_embed_pos(x.at::<u16>(r0 * h), self.patch_b.ptr(), self.pos.ptr(), (c.num_pos as f64).sqrt() as i32, gh as i32,
+                                           gw as i32, c.merge as i32, h as i32, s)
+                },
+                "vision pos embed",
+            )?;
+        }
         let snap = |x: &DevBuf, stages: &mut Option<&mut Vec<Vec<u16>>>| -> Result<()> {
             if let Some(st) = stages.as_deref_mut() {
                 self.stream.sync()?;
@@ -657,11 +678,22 @@ impl GpuEncoder {
             let w = &l.w;
             check(unsafe { sys::blz_vis_layernorm(x.ptr(), w[0].ptr(), w[1].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision ln1")?;
             g(xn, h, &w[2], big, 3 * h, n, 3 * h, h)?;
-            check(
-                unsafe { sys::blz_vis_qkv_rope(big.ptr(), w[3].ptr(), gh as i32, gw as i32, c.merge as i32, c.heads as i32, hd as i32, c.theta, q.ptr(), k.ptr(), v.ptr(), s) },
-                "vision qkv",
-            )?;
-            check(unsafe { sys::blz_vis_attention(q.ptr(), k.ptr(), v.ptr(), n as i32, c.heads as i32, hd as i32, o.ptr(), s) }, "vision attention")?;
+            for &(r0, ni, gh, gw) in &rows {
+                check(
+                    unsafe {
+                        sys::blz_vis_qkv_rope(big.at::<u16>(r0 * 3 * h), w[3].ptr(), gh as i32, gw as i32, c.merge as i32, c.heads as i32, hd as i32,
+                                              c.theta, q.at::<u16>(r0 * h), k.at::<u16>(r0 * h), v.at::<u16>(r0 * h), s)
+                    },
+                    "vision qkv",
+                )?;
+                check(
+                    unsafe {
+                        sys::blz_vis_attention(q.at::<u16>(r0 * h), k.at::<u16>(r0 * h), v.at::<u16>(r0 * h), ni as i32, c.heads as i32, hd as i32,
+                                               o.at::<u16>(r0 * h), s)
+                    },
+                    "vision attention",
+                )?;
+            }
             g(o, h, &w[4], xn, h, n, h, h)?;
             check(unsafe { sys::blz_vis_bias_residual(xn.ptr(), w[5].ptr(), x.ptr(), n as i32, h as i32, x.ptr(), s) }, "vision proj residual")?;
             check(unsafe { sys::blz_vis_layernorm(x.ptr(), w[6].ptr(), w[7].ptr(), 1e-6, n as i32, h as i32, xn.ptr(), s) }, "vision ln2")?;
@@ -680,11 +712,11 @@ impl GpuEncoder {
         g(big, mh, &m[4], out, c.out_hidden, nm, c.out_hidden, mh)?;
         check(unsafe { sys::blz_vis_bias_act(out.ptr(), m[5].ptr(), nm as i32, c.out_hidden as i32, 0, s) }, "vision merger bias")?;
         self.stream.sync()?;
-        let res = out.download::<u16>(nm * c.out_hidden);
+        let all = out.download::<u16>(nm * c.out_hidden)?;
         if n > KEEP_PATCHES {
             *slot = None;
         }
-        res
+        Ok(rows.iter().map(|&(r0, ni, ..)| all[r0 / mm * c.out_hidden..(r0 + ni) / mm * c.out_hidden].to_vec()).collect())
     }
 }
 
@@ -813,6 +845,17 @@ pub struct Vision {
     pub settings: ImageSettings,
     enc: Mutex<Encoder>,
     pub on_gpu: bool,
+    /// one pass of the tower takes images up to this many patches together (an image above it alone), and at most
+    /// `batch_images` of them
+    pub batch_patches: usize,
+    pub batch_images: usize,
+}
+
+/// How many images one pass of the tower encodes (`--mm-encoder-patches`, `--mm-encoder-batch`; 0: auto).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EncoderBatch {
+    pub patches: usize,
+    pub images: usize,
 }
 
 
@@ -835,7 +878,7 @@ pub fn vram_need(dir: &Path, mode: VisionMode, max_pixels: Option<u64>) -> usize
 impl Vision {
     /// The tower of the checkpoint in `dir`; None when `mode` is Off or the checkpoint has none. `max_pixels`: the
     /// server's own limit (--mm-processor-kwargs), which `auto` plans the activations for (vram_need).
-    pub fn load(dir: &Path, mode: VisionMode, threads: usize, device: i32, max_pixels: Option<u64>) -> Result<Option<Self>> {
+    pub fn load(dir: &Path, mode: VisionMode, threads: usize, device: i32, max_pixels: Option<u64>, batch: EncoderBatch) -> Result<Option<Self>> {
         if mode == VisionMode::Off {
             return Ok(None);
         }
@@ -872,7 +915,52 @@ impl Vision {
             eprintln!("blaze: vision tower on the CPU ({threads} threads){}", if mode == VisionMode::Auto { ": not enough free VRAM" } else { "" });
             Encoder::Cpu(CpuEncoder::load(dir, &cfg, threads)?)
         };
-        Ok(Some(Self { cfg, settings, enc: Mutex::new(enc), on_gpu }))
+        // auto: as many patches per pass as the memory plan keeps activations for (its largest image), so batching
+        // small images never needs more than one large one; the CPU tower, a few large images' worth (its memory
+        // is RAM)
+        let limit = settings.max_pixels;
+        let pixels = max_pixels.unwrap_or(limit.min(PLAN_PIXELS));
+        let planned = (pixels / (cfg.patch * cfg.patch).max(1) as u64) as usize;
+        let batch_patches = if batch.patches > 0 { batch.patches } else if on_gpu { planned } else { 4 * planned };
+        let batch_images = if batch.images > 0 { batch.images } else { usize::MAX };
+        eprintln!(
+            "blaze: vision tower: up to {batch_patches} patches{} in one pass",
+            if batch_images < usize::MAX { format!(" and {batch_images} images") } else { String::new() }
+        );
+        Ok(Some(Self { cfg, settings, enc: Mutex::new(enc), on_gpu, batch_patches, batch_images }))
+    }
+
+    /// The embeddings of several images in passes of the tower within its batch limits, in order.
+    pub fn encode_many(&self, ps: &[&Patches]) -> Result<Vec<Vec<u16>>> {
+        let mut out = Vec::with_capacity(ps.len());
+        let mut i = 0;
+        while i < ps.len() {
+            // the images that fit one pass (at least one)
+            let mut j = i + 1;
+            let mut patches = ps[i].grid_h * ps[i].grid_w;
+            while j < ps.len() && j - i < self.batch_images {
+                let p = ps[j].grid_h * ps[j].grid_w;
+                if patches + p > self.batch_patches {
+                    break;
+                }
+                patches += p;
+                j += 1;
+            }
+            let enc = self.enc.lock().map_err(|_| anyhow!("vision encoder poisoned"))?;
+            match &*enc {
+                Encoder::Gpu(e) => {
+                    let items: Vec<(&[u16], usize, usize)> = ps[i..j].iter().map(|p| (p.pixels.as_slice(), p.grid_h, p.grid_w)).collect();
+                    out.extend(e.encode_batch(&items, None)?);
+                }
+                Encoder::Cpu(e) => {
+                    for p in &ps[i..j] {
+                        out.push(e.encode(&p.pixels, p.grid_h, p.grid_w)?);
+                    }
+                }
+            }
+            i = j;
+        }
+        Ok(out)
     }
 
     /// The embeddings of one image: [tokens, out_hidden] bf16.

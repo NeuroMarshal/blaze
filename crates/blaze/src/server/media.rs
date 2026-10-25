@@ -296,23 +296,34 @@ pub(super) async fn encode(st: &Arc<AppState>, parts: Vec<Part>, starts: Vec<usi
     let st2 = st.clone();
     tokio::task::spawn_blocking(move || -> std::result::Result<Arc<MmInput>, String> {
         let vision = st2.mm.vision.clone().ok_or("no vision tower")?;
-        let mut images = Vec::with_capacity(parts.len());
-        for (p, start) in parts.into_iter().zip(starts) {
+        // the images seen recently come from the cache, the rest go through the tower together (in passes within its
+        // batch limits)
+        let mut keyed = Vec::with_capacity(parts.len());
+        let mut todo: Vec<(usize, crate::vision::Patches)> = Vec::new();
+        for (i, p) in parts.iter().enumerate() {
             let img: RgbImage = decode_image(&p.bytes)?;
             // the embeddings depend on the pixels and on how they were processed
             let key = hash_bytes(&img.data) ^ hash_bytes(format!("{:?}{}x{}", p.settings, img.w, img.h).as_bytes()).rotate_left(31);
             let cached = st2.mm.cache.lock().ok().and_then(|mut c| c.get(key));
-            let emb = match cached {
-                Some(e) => e,
-                None => {
-                    let patches = preprocess(&img, &p.settings)?;
-                    let e = Arc::new(vision.encode(&patches).map_err(|e| format!("{e:#}"))?);
-                    if let Ok(mut c) = st2.mm.cache.lock() {
-                        c.put(key, e.clone());
-                    }
-                    e
+            if cached.is_none() {
+                todo.push((i, preprocess(&img, &p.settings)?));
+            }
+            keyed.push((key, cached));
+        }
+        if !todo.is_empty() {
+            let refs: Vec<&crate::vision::Patches> = todo.iter().map(|(_, p)| p).collect();
+            let embs = vision.encode_many(&refs).map_err(|e| format!("{e:#}"))?;
+            for ((i, _), e) in todo.iter().zip(embs) {
+                let e = Arc::new(e);
+                if let Ok(mut c) = st2.mm.cache.lock() {
+                    c.put(keyed[*i].0, e.clone());
                 }
-            };
+                keyed[*i].1 = Some(e);
+            }
+        }
+        let mut images = Vec::with_capacity(parts.len());
+        for ((p, start), (key, emb)) in parts.iter().zip(starts).zip(keyed) {
+            let emb = emb.ok_or("an image was not encoded")?;
             if emb.len() != p.tokens() * vision.cfg.out_hidden {
                 return Err(format!("the encoder returned {} values for {} tokens", emb.len(), p.tokens()));
             }
