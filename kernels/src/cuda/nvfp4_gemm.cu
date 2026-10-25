@@ -197,11 +197,13 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
         const float s = xrow[r];
         const float v0 = acc[i][j][2 * half] * s * a0, v1 = acc[i][j][2 * half + 1] * s * a1;
         uint16_t* out = y + int64_t(r) * ldy + c;
-        if (c + 1 < n) {
+        if (c + 1 < n && (ldy & 1) == 0) {
           const __nv_bfloat162 p = __floats2bfloat162_rn(v0, v1);
           *reinterpret_cast<__nv_bfloat162*>(out) = p;
         } else {
-          *out = __bfloat16_as_ushort(__float2bfloat16(v0));
+          // an odd row stride: no aligned pair
+          out[0] = __bfloat16_as_ushort(__float2bfloat16(v0));
+          if (c + 1 < n) out[1] = __bfloat16_as_ushort(__float2bfloat16(v1));
         }
       }
     }
