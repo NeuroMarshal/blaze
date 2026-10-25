@@ -50,6 +50,11 @@ pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
     })
 }
 
+fn prefill_profile() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var("BLAZE_PREFILL_PROFILE").is_ok_and(|v| v == "1"))
+}
+
 /// Stage `stage` of `stages`'s share of a CPU list ("3-4,6,9-17"): a contiguous part of its cores, as a list.
 fn stage_cores(list: &str, stage: usize, stages: usize) -> String {
     let cores: Vec<usize> = list
@@ -2112,7 +2117,22 @@ impl Model {
             )?;
         }
         let eps = cfg.rms_eps;
+        // BLAZE_PREFILL_PROFILE=1: the time of each phase of a step of 256 rows or more (the stream waited for after
+        // each: their overlap is lost), one line a step
+        let prof = prefill_profile() && t >= 256;
+        let mut phase = [0f64; 5]; // PLE, attention, GDN, MoE / MLP, the rest
+        let mut mark = std::time::Instant::now();
+        let mut lap = |k: usize| -> Result<()> {
+            if prof {
+                s.sync()?;
+                phase[k] += mark.elapsed().as_secs_f64();
+                mark = std::time::Instant::now();
+            }
+            Ok(())
+        };
+        let t_all = std::time::Instant::now();
         self.ple_request(t, n, verify)?;
+        lap(0)?;
         for (li, layer) in self.layers.iter().enumerate() {
             // the model's first layer (a later pipeline stage's first one continues the residual stream)
             let first = self.layer0 + li == 0;
@@ -2131,7 +2151,9 @@ impl Model {
                         check(unsafe { sys::blz_hc_widen(w.residual.ptr(), t as c_int, c as c_int, h as c_int, streams.ptr(), s.0) }, "hc widen")?;
                     }
                     if let Some(ple) = &layer.ple {
+                        lap(4)?;
                         self.ple_apply(ple, t, n, verify)?;
+                        lap(0)?;
                         self.dump(&format!("l{li}_ple"), streams.ptr(), t, cfg.hc.as_ref().unwrap().count * h)?;
                     }
                     self.hc_enter(attn, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?;
@@ -2149,10 +2171,12 @@ impl Model {
                     "capture",
                 )?;
             }
+            lap(4)?;
             match layer.kind {
                 LayerKind::Full => self.attention(layer, t, spans, sparse, verify, tree)?,
                 LayerKind::Linear => self.gdn(layer, t, n, verify, tree)?,
             }
+            lap(if matches!(layer.kind, LayerKind::Full) { 1 } else { 2 })?;
             match &layer.mix {
                 Mixing::Norm { post, .. } => self.reduce_norm(post, t)?,
                 Mixing::Hyper { attn, mlp } => {
@@ -2162,13 +2186,27 @@ impl Model {
                     self.hc_enter(mlp, t, streams.ptr(), w.hnorm.as_ref().unwrap().ptr(), w.normed.ptr())?;
                 }
             }
+            lap(4)?;
             self.mlp(li, layer, t)?;
+            lap(3)?;
             if let Mixing::Hyper { mlp, .. } = &layer.mix {
                 self.dump(&format!("l{li}_mlp_out"), w.x.ptr(), t, h)?;
                 self.hc_exit(mlp, t)?;
                 let streams = w.streams.as_ref().unwrap();
                 self.dump(&format!("l{li}_streams"), streams.ptr(), t, cfg.hc.as_ref().unwrap().count * h)?;
             }
+        }
+        lap(4)?;
+        if prof {
+            eprintln!(
+                "blaze prefill profile: {t} rows in {:.0} ms: PLE {:.0}, attention {:.0}, GDN {:.0}, MLP / experts {:.0}, rest {:.0}",
+                t_all.elapsed().as_secs_f64() * 1e3,
+                phase[0] * 1e3,
+                phase[1] * 1e3,
+                phase[2] * 1e3,
+                phase[3] * 1e3,
+                phase[4] * 1e3
+            );
         }
         self.all_reduce(w.x.ptr(), t * h)?;
         self.prefetch_join()?;
