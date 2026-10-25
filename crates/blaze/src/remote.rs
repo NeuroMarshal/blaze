@@ -170,6 +170,14 @@ fn put_cmd(w: &mut W, c: &Cmd) -> Result<()> {
                 put_cmd(w, c)?;
             }
         }
+        Cmd::Steps(metas, graph) => {
+            w.tag(13);
+            w.usize(metas.len());
+            for m in metas {
+                put_meta(w, m);
+            }
+            w.bool(*graph);
+        }
         Cmd::Quit => w.tag(11),
         // nothing of these runs on a remote stage (drafters, PLE, all-reduce timing are not supported there)
         Cmd::PleWarm(_) | Cmd::TimeAllReduce(_) | Cmd::SetDmaMin(_) => w.tag(12),
@@ -211,6 +219,11 @@ fn get_cmd(r: &mut R) -> Result<Cmd> {
         }
         11 => Cmd::Quit,
         12 => Cmd::Batch(Vec::new()),
+        13 => {
+            let n = r.usize()?;
+            let metas = (0..n).map(|_| get_meta(r).map(Arc::new)).collect::<Result<Vec<_>>>()?;
+            Cmd::Steps(metas, r.bool()?)
+        }
         t => bail!("unknown command {t}"),
     })
 }
@@ -328,14 +341,28 @@ pub(super) fn connect(addr: &str, rank: &crate::model::PpRank, prev: Arc<HostMap
                     continue;
                 }
                 std::sync::atomic::fence(Ordering::Acquire);
-                // an abort (u64::MAX) or a size past the link: the flag goes on without rows
-                let bytes = unsafe { std::ptr::read_volatile(h.add(1)) } as usize;
-                let bytes = if bytes > prev.bytes() - crate::model::PP_LINK_HEADER { 0 } else { bytes };
-                let rows = unsafe { std::slice::from_raw_parts(prev.host_ptr().cast::<u8>().add(crate::model::PP_LINK_HEADER), bytes) };
-                let mut f = W::default();
-                f.u64(flag);
-                f.0.extend_from_slice(rows);
-                if send_frame(&mut dw, &f.0).is_err() {
+                // every step since the last one sent (at most two: the GPU waits for its slot back), in order
+                let slot_bytes = crate::model::pp_slot_bytes(prev.bytes());
+                let mut broken = false;
+                for v in seen + 1..=flag {
+                    let slot = ((v - 1) % 2) as usize;
+                    // an abort (u64::MAX) or a size past the slot: the flag goes on without rows
+                    let bytes = unsafe { std::ptr::read_volatile(h.add(2 + slot)) } as usize;
+                    let bytes = if bytes > slot_bytes { 0 } else { bytes };
+                    let at = crate::model::PP_LINK_HEADER + slot * slot_bytes;
+                    let rows = unsafe { std::slice::from_raw_parts(prev.host_ptr().cast::<u8>().add(at), bytes) };
+                    let mut f = W::default();
+                    f.u64(v);
+                    f.0.extend_from_slice(rows);
+                    // the rows are in the frame: the slot goes back to the GPU
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    unsafe { std::ptr::write_volatile(h.add(1), v) };
+                    if send_frame(&mut dw, &f.0).is_err() {
+                        broken = true;
+                        break;
+                    }
+                }
+                if broken {
                     break;
                 }
                 seen = flag;
@@ -397,7 +424,7 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
     let width = cfg.hc.as_ref().map_or(2 * cfg.hidden, |hc| hc.count * cfg.hidden);
     let rows = opts.max_chunk.max(opts.max_seqs * opts.max_verify.max(1)).max(opts.max_seqs);
     // the coordinator's link may be the larger one (other chunk or verify settings): its rows fit here too
-    let mut link = HostMapped::new((crate::model::PP_LINK_HEADER + rows * width * 2).max(peer_link))?;
+    let mut link = HostMapped::new(crate::model::pp_link_bytes(rows, width).max(peer_link))?;
     link.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
     let link = Arc::new(link);
     opts.pp = Some(crate::model::PpRank { stage, stages, layers: l0..l1, prev: Some(link.clone()), next: None });
@@ -407,26 +434,36 @@ pub fn serve(listen: &str, dir: &Path, mut opts: Options, use_graphs: bool) -> R
         let link = link.clone();
         std::thread::Builder::new().name("blaze-pp-recv".into()).spawn(move || {
             let h = header(&link);
+            let slot_bytes = crate::model::pp_slot_bytes(link.bytes());
             while let Ok(f) = recv_frame(&mut dr) {
                 if f.len() < 8 {
                     eprintln!("blaze: a pipeline frame of {} B", f.len());
                     break;
                 }
                 let flag = u64::from_le_bytes(f[..8].try_into().unwrap());
-                if f.len() - 8 + crate::model::PP_LINK_HEADER > link.bytes() {
+                let slot = ((flag.max(1) - 1) % 2) as usize;
+                // the slot held step flag - 2: the GPU gives it back once it copied those rows out
+                let t0 = Instant::now();
+                while unsafe { std::ptr::read_volatile(h.add(1)) } + 2 < flag {
+                    if t0.elapsed() < Duration::from_micros(200) { std::hint::spin_loop() } else { std::thread::sleep(Duration::from_micros(20)) }
+                }
+                std::sync::atomic::fence(Ordering::SeqCst);
+                let rows = f.len() - 8;
+                if rows > slot_bytes {
                     // the flag still goes up: the GPU must not wait for it forever (the step's rows are not there)
-                    eprintln!("blaze: pipeline rows of {} B for a link of {} B", f.len() - 8, link.bytes());
+                    eprintln!("blaze: pipeline rows of {rows} B for a link slot of {slot_bytes} B");
                     unsafe {
-                        std::ptr::write_volatile(h.add(1), u64::MAX);
+                        std::ptr::write_volatile(h.add(2 + slot), u64::MAX);
                         std::sync::atomic::fence(Ordering::SeqCst);
                         std::ptr::write_volatile(h, flag);
                     }
                     continue;
                 }
-                // SAFETY: the link's rows and header; the GPU reads them only after the flag below
+                // SAFETY: the slot's rows and the header; the GPU reads them only after the flag below
                 unsafe {
-                    std::ptr::copy_nonoverlapping(f[8..].as_ptr(), link.host_ptr().cast::<u8>().cast_mut().add(crate::model::PP_LINK_HEADER), f.len() - 8);
-                    std::ptr::write_volatile(h.add(1), (f.len() - 8) as u64);
+                    let at = crate::model::PP_LINK_HEADER + slot * slot_bytes;
+                    std::ptr::copy_nonoverlapping(f[8..].as_ptr(), link.host_ptr().cast::<u8>().cast_mut().add(at), rows);
+                    std::ptr::write_volatile(h.add(2 + slot), rows as u64);
                     std::sync::atomic::fence(Ordering::SeqCst);
                     std::ptr::write_volatile(h, flag);
                 }

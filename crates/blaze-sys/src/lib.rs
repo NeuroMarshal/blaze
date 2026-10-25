@@ -412,6 +412,10 @@ unsafe extern "C" {
                                     out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     // pp_link.h
     pub fn blz_pp_set(counters: *mut u64, v: u64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_pp_ack(flag: *mut u64, counter: *const u64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_pp_wait_ack(flag: *const u64, counter: *const u64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_pp_copy(flag: *mut u64, slot_bytes: i64, counter: *const u64, send: c_int, offset: i64, dev: *mut c_void, bytes: i64,
+                       s: cudaStream_t) -> cudaError_t;
     pub fn blz_pp_signal(flag: *mut u64, counter: *mut u64, bytes: u64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_pp_wait(flag: *const u64, counter: *mut u64, s: cudaStream_t) -> cudaError_t;
     // nvfp4_gemm.h

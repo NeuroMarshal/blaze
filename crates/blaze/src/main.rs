@@ -113,6 +113,10 @@ struct EngineArgs {
     /// a pipeline stage on another machine: STAGE=HOST:PORT of its `blaze stage-worker` (the last stage for now)
     #[arg(long)]
     pp_remote: Vec<String>,
+    /// pipeline stages: a step's rows in forwards of about this many, the parts of a prefill chunk on the stages at
+    /// once (0: one forward a step)
+    #[arg(long, default_value_t = 512)]
+    pp_chunk: usize,
     /// NVFP4 layers on many rows (prefill): auto (W4A4 on FP4 tensor cores where the GPU has them and the checkpoint
     /// calibrated NVFP4 activations, else BF16), nvfp4 (W4A4 wherever the GPU can), bf16 (weights widened, cuBLAS)
     #[arg(long, default_value = "auto")]
@@ -259,6 +263,7 @@ impl EngineArgs {
                 gemm: self.gemm,
                 pp_stages: self.pp,
                 pp: None,
+                pp_chunk: self.pp_chunk,
                 pp_remote: self
                     .pp_remote
                     .iter()

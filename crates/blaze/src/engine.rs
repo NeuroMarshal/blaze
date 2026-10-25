@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
+use std::ops::Range;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::Arc;
 
@@ -88,6 +89,8 @@ struct CommitItem {
 enum Cmd {
     /// metadata, CUDA graph allowed, speculative verify
     Step(Arc<StepMeta>, bool, bool),
+    /// the parts of one step, forward after forward (pipeline stages), CUDA graph allowed: the replies of all of them
+    Steps(Vec<Arc<StepMeta>>, bool),
     /// recurrent state row src -> dst
     CopyState(usize, usize),
     /// KV table row and its slots
@@ -166,6 +169,9 @@ struct Runner {
     model: Model,
     draft: Option<crate::drafter::Drafter>,
     staging: HostMapped,
+    /// recorded after the last step's metadata copy: the next step writes the staging buffer after it (the parts of a
+    /// step are enqueued without waiting for each other)
+    meta_copied: Option<crate::gpu::Event>,
     graphs: HashMap<GraphKey, Graph>,
     warmed: HashSet<GraphKey>,
     /// The graphs' device memory, measured at each instantiation, within a budget of half the VRAM free at the first
@@ -203,6 +209,9 @@ impl Runner {
     fn step_on(&mut self, meta: &StepMeta, allow_graph: bool, verify: bool, handed: &mut bool) -> Result<Reply> {
         if self.model.pp_fault_now() {
             bail!("BLAZE_PP_FAULT: this step fails on the first stage");
+        }
+        if let Some(e) = &self.meta_copied {
+            check(unsafe { sys::cudaEventSynchronize(e.0) }, "meta copy done")?;
         }
         let m = self.model.meta;
         self.put(m.tokens, &meta.tokens);
@@ -243,6 +252,10 @@ impl Runner {
             tail.extend([(m.pos_h, meta.pos_h.len() * 8), (m.pos_w, meta.pos_w.len() * 8)]);
         }
         self.model.set_image_rows(meta.mrope, &meta.segs);
+        let copied = match self.meta_copied.take() {
+            Some(e) => e,
+            None => crate::gpu::Event::new()?,
+        };
         let s = self.model.stream.0;
         let dev = self.model.meta_buffer().ptr::<u8>();
         let host = self.staging.host_ptr().cast::<u8>();
@@ -278,12 +291,18 @@ impl Runner {
                           self.graphs.keys().filter(|k| k.3).count());
             }
         }
+        check(unsafe { sys::cudaEventRecord(copied.0, s) }, "meta copy event")?;
+        self.meta_copied = Some(copied);
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
             self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree)?;
         }
         *handed = true;
+        // a part of a step without logit rows: nothing to read back (no wait for the GPU)
+        if n == 0 {
+            return Ok(if meta.sample { Reply::Cands(Vec::new()) } else { Reply::Tokens(Vec::new()) });
+        }
         if meta.sample { Ok(Reply::Cands(self.model.candidates(n)?)) } else { Ok(Reply::Tokens(self.model.next_tokens(n)?)) }
     }
 
@@ -342,6 +361,29 @@ impl Runner {
     fn handle(&mut self, cmd: Cmd) -> Result<Reply> {
         Ok(match cmd {
             Cmd::Step(meta, allow_graph, verify) => self.step(&meta, allow_graph, verify)?,
+            Cmd::Steps(metas, allow_graph) => {
+                let (mut tokens, mut cands, mut sampled) = (Vec::new(), Vec::new(), false);
+                for (k, meta) in metas.iter().enumerate() {
+                    match self.step(meta, allow_graph, false) {
+                        Ok(Reply::Tokens(t)) => tokens.extend(t),
+                        Ok(Reply::Cands(c)) => {
+                            sampled = true;
+                            cands.extend(c);
+                        }
+                        Ok(_) => bail!("a step part without tokens or candidates"),
+                        Err(e) => {
+                            // the parts after it still count as steps: the next stage is released from each
+                            for _ in k + 1..metas.len() {
+                                if self.model.pp_begin().is_ok() {
+                                    self.model.pp_abort();
+                                }
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                if sampled { Reply::Cands(cands) } else { Reply::Tokens(tokens) }
+            }
             Cmd::CopyState(src, dst) => {
                 self.model.copy_state(src, dst)?;
                 Reply::Done
@@ -475,6 +517,8 @@ pub struct Engine {
     deferred: std::cell::RefCell<Vec<Deferred>>,
     /// the rank whose replies count (the last pipeline stage: it holds the head)
     lead: usize,
+    /// pipeline stages: rows of a step's parts (0: one forward a step)
+    pp_chunk: usize,
     pub info: Info,
 }
 
@@ -540,7 +584,7 @@ fn worker_main(
             _ => None,
         };
         let graph_log = std::env::var("BLAZE_GRAPH_LOG").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0 && rank == 0).map(|n| (n, [0; 4]));
-        Ok(Runner { model, draft, staging, graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
+        Ok(Runner { model, draft, staging, meta_copied: None, graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
     };
     let mut runner = match start() {
         Ok(r) => {
@@ -613,6 +657,7 @@ impl Engine {
         // pipeline stages: a GPU each, the layers split evenly, a link of pinned host memory between neighbours (the
         // rows of the largest step: a prefill chunk or a verify of every sequence)
         let stages = opts.pp_stages.max(1);
+        let opts_pp_chunk = opts.pp_chunk;
         let mut ranks: Vec<Option<crate::model::PpRank>> = vec![None; world];
         if stages > 1 {
             if stages != world {
@@ -627,7 +672,7 @@ impl Engine {
             let rows = opts.max_chunk.max(opts.max_seqs * opts.max_verify.max(1)).max(opts.max_seqs);
             let mut links = Vec::new();
             for _ in 1..stages {
-                let mut l = HostMapped::new(crate::model::PP_LINK_HEADER + rows * width * 2)?;
+                let mut l = HostMapped::new(crate::model::pp_link_bytes(rows, width))?;
                 l.host_slice_mut()[..crate::model::PP_LINK_HEADER].fill(0);
                 links.push(Arc::new(l));
             }
@@ -734,6 +779,7 @@ impl Engine {
         let lead = if stages > 1 { world - 1 } else { 0 };
         let mut engine = Self {
             lead,
+            pp_chunk: if stages > 1 { opts_pp_chunk } else { 0 },
             workers,
             last_verify: Vec::new(),
             free_pages: (0..(info.max_tokens / info.page) as u32).rev().collect(),
@@ -978,6 +1024,13 @@ impl Engine {
     /// One step: `tokens[i]` is appended to `seqs[i]`; decode items (one token) must come first. Returns the greedy
     /// next token of every item.
     pub fn step(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]]) -> Result<Vec<i32>> {
+        if let Some(parts) = self.pp_parts(seqs, tokens) {
+            let metas = self.plan_parts(seqs, tokens, &parts, None)?;
+            return match self.broadcast(|| Cmd::Steps(metas.clone(), true))? {
+                Reply::Tokens(t) => Ok(t),
+                _ => unreachable!(),
+            };
+        }
         let meta = Arc::new(self.plan(seqs, tokens, false, None)?);
         match self.broadcast(|| Cmd::Step(meta.clone(), true, false))? {
             Reply::Tokens(t) => Ok(t),
@@ -988,6 +1041,15 @@ impl Engine {
     /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
     /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
     pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Cands>> {
+        if let Some(parts) = self.pp_parts(seqs, tokens) {
+            let metas = self.plan_parts(seqs, tokens, &parts, Some(pens))?;
+            let n: usize = metas.iter().map(|m| m.logit_rows.len()).sum();
+            let pairs = match self.broadcast(|| Cmd::Steps(metas.clone(), true))? {
+                Reply::Cands(p) => p,
+                _ => unreachable!(),
+            };
+            return Ok(self.merge_candidates(&pairs, n));
+        }
         let mut m = self.plan(seqs, tokens, false, None)?;
         m.sample = true;
         fill_edits(&mut m, pens);
@@ -999,6 +1061,41 @@ impl Engine {
         };
         let out = self.merge_candidates(&pairs, n);
         Ok(out)
+    }
+
+    /// Pipeline stages: the step's rows cut into parts of about `pp_chunk` (a sequence's rows may span parts; decode rows
+    /// go with the first), each part (sequence, its rows) a forward of its own. None: one forward (no stages, a short
+    /// step, image rows).
+    fn pp_parts(&self, seqs: &[&mut Seq], tokens: &[&[i64]]) -> Option<Vec<Vec<(usize, Range<usize>)>>> {
+        let total: usize = tokens.iter().map(|t| t.len()).sum();
+        if self.pp_chunk == 0 || total < 2 * self.pp_chunk {
+            return None;
+        }
+        if seqs.iter().zip(tokens).any(|(s, t)| s.mm.as_ref().is_some_and(|mm| mm.touches_image(s.len(), t.len()))) {
+            return None;
+        }
+        cut_parts(&tokens.iter().map(|t| t.len()).collect::<Vec<_>>(), self.pp_chunk)
+    }
+
+    /// The metadata of every part; logit rows only where a sequence's rows of the step end (with its penalties).
+    fn plan_parts(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], parts: &[Vec<(usize, Range<usize>)>],
+                  pens: Option<&[Penalty]>) -> Result<Vec<Arc<StepMeta>>> {
+        let mut metas = Vec::with_capacity(parts.len());
+        for part in parts {
+            let idx: Vec<usize> = part.iter().map(|p| p.0).collect();
+            let toks: Vec<&[i64]> = part.iter().map(|(i, r)| &tokens[*i][r.clone()]).collect();
+            let mut sub: Vec<&mut Seq> = seqs.iter_mut().enumerate().filter(|(i, _)| idx.contains(i)).map(|(_, s)| &mut **s).collect();
+            let mut m = self.plan(&mut sub, &toks, false, None)?;
+            let ends: Vec<bool> = part.iter().map(|(i, r)| r.end == tokens[*i].len()).collect();
+            m.logit_rows = m.logit_rows.iter().zip(&ends).filter(|(_, e)| **e).map(|(r, _)| *r).collect();
+            if let Some(pens) = pens {
+                m.sample = true;
+                let kept: Vec<Penalty> = part.iter().zip(&ends).filter(|(_, e)| **e).map(|((i, _), _)| pens[*i].clone()).collect();
+                fill_edits(&mut m, &kept);
+            }
+            metas.push(Arc::new(m));
+        }
+        Ok(metas)
     }
 
     /// Prefill `tokens` into `seq` in chunks; returns the greedy token after the last one.
@@ -1259,6 +1356,40 @@ fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
     }
 }
 
+/// A step's rows (`lens` per sequence, decode rows first) cut into parts of about `chunk` rows: (sequence, its rows) per
+/// part, no piece but a whole sequence shorter than 16 rows. None: fewer than two parts.
+fn cut_parts(lens: &[usize], chunk: usize) -> Option<Vec<Vec<(usize, Range<usize>)>>> {
+    let total: usize = lens.iter().sum();
+    if chunk == 0 || total < 2 * chunk {
+        return None;
+    }
+    let per = total.div_ceil(total / chunk);
+    let mut parts: Vec<Vec<(usize, Range<usize>)>> = vec![Vec::new()];
+    let mut fill = 0;
+    for (i, &len) in lens.iter().enumerate() {
+        let mut a = 0;
+        while a < len {
+            let (left, room) = (len - a, per.saturating_sub(fill));
+            // too little room left in this part for a piece of 16 rows: the next part (a single row would read
+            // as a decode row; decode rows come first, they always fit)
+            if fill > 0 && room < left.min(16) {
+                parts.push(Vec::new());
+                fill = 0;
+                continue;
+            }
+            let mut take = left.min(room.max(1));
+            if left - take < 16 {
+                take = left; // no short tail for the next part
+            }
+            parts.last_mut().unwrap().push((i, a..a + take));
+            a += take;
+            fill += take;
+        }
+    }
+    parts.retain(|p| !p.is_empty());
+    (parts.len() > 1).then_some(parts)
+}
+
 /// Depth-first GDN program of one tree (blaze/tree.h, blz_gdn_recurrent_tree): [row, load, save] per row, rows at
 /// `row0`. A row continues from the row before it when that is its parent, else restores its parent's saved state;
 /// a row with several children saves its state, in the level counted by the branching rows above it.
@@ -1290,4 +1421,37 @@ fn tree_program(parent: &[i32], row0: usize, levels: usize) -> Result<Vec<i32>> 
         }
     }
     Ok(prog)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut_parts;
+
+    #[test]
+    fn step_parts_cover_every_row_once() {
+        for lens in [vec![1, 1, 2048], vec![2048], vec![1, 700, 1400], vec![1; 4].into_iter().chain([1500, 30]).collect::<Vec<_>>()] {
+            let parts = cut_parts(&lens, 512).unwrap();
+            for (i, &len) in lens.iter().enumerate() {
+                let mut at = 0;
+                for p in &parts {
+                    for (j, r) in p {
+                        if *j == i {
+                            assert_eq!(r.start, at, "{lens:?}: {parts:?}");
+                            at = r.end;
+                        }
+                    }
+                }
+                assert_eq!(at, len, "{lens:?}: {parts:?}");
+            }
+            for p in &parts {
+                // a single row only as a whole sequence, and only before the longer ones
+                let first_long = p.iter().position(|(_, r)| r.len() > 1).unwrap_or(p.len());
+                assert!(p[first_long..].iter().all(|(i, r)| r.len() >= 16 || r.len() == lens[*i]), "{lens:?}: {parts:?}");
+                assert!(p[first_long..].iter().all(|(_, r)| r.len() > 1), "{lens:?}: {parts:?}");
+            }
+            assert!(parts.len() >= 2 && parts.iter().all(|p| p.iter().map(|(_, r)| r.len()).sum::<usize>() <= 1100), "{lens:?}: {parts:?}");
+        }
+        assert!(cut_parts(&[1, 1, 900], 512).is_none());
+        assert!(cut_parts(&[4096], 0).is_none());
+    }
 }

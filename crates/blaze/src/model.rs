@@ -258,6 +258,16 @@ pub struct PpRank {
 /// Bytes of a pipeline link's header (the flag) before its rows.
 pub const PP_LINK_HEADER: usize = 256;
 
+/// A pipeline link of `rows` rows of `width` values a step: the header and two slots (blaze/pp_link.h).
+pub fn pp_link_bytes(rows: usize, width: usize) -> usize {
+    PP_LINK_HEADER + 2 * (rows * width * 2).next_multiple_of(256)
+}
+
+/// The bytes of one slot of a link of `bytes`.
+pub fn pp_slot_bytes(bytes: usize) -> usize {
+    (bytes.saturating_sub(PP_LINK_HEADER) / 2) / 256 * 256
+}
+
 #[derive(Clone)]
 pub struct Options {
     /// KV cache size in tokens (with `kv_auto`: set from the free VRAM after the load)
@@ -311,6 +321,9 @@ pub struct Options {
     pub pp: Option<PpRank>,
     /// pipeline stages on other machines: (stage, address of its `blaze stage-worker`)
     pub pp_remote: Vec<(usize, String)>,
+    /// pipeline stages: a step's rows in forwards of about this many (a prefill chunk's parts run on the stages at
+    /// once: part k on stage s while part k + 1 on stage s - 1); 0: one forward a step
+    pub pp_chunk: usize,
     /// EAGLE-4 drafter checkpoint (run on every rank; the layers it reads are captured)
     pub draft: Option<std::path::PathBuf>,
     /// CUDA graphs of the drafter's chain
@@ -1961,26 +1974,33 @@ impl Model {
 
     /// The hidden rows of a step between this stage and a pipeline link (`send`: into it, else out of it): the
     /// residual stream and the last layer's output, or the hyper-connection streams.
-    fn pp_rows(&self, link: &HostMapped, t: usize, send: bool) -> Result<usize> {
+    fn pp_rows(&self, link: &HostMapped, counters: &DevBuf, t: usize, send: bool) -> Result<usize> {
         let (w, s, h) = (&self.work, &self.stream, self.cfg.hidden);
-        let data = unsafe { link.dev_ptr::<u8>().add(PP_LINK_HEADER).cast_mut() };
+        let hdr = link.dev_ptr::<u64>().cast_mut();
+        let slot = pp_slot_bytes(link.bytes());
         let bufs: Vec<(*mut u16, usize)> = match (&w.streams, &self.cfg.hc) {
             (Some(streams), Some(hc)) => vec![(streams.ptr(), t * hc.count * h)],
             _ => vec![(w.x.ptr(), t * h), (w.residual.ptr(), t * h)],
         };
-        let need: usize = bufs.iter().map(|b| b.1 * 2).sum::<usize>() + PP_LINK_HEADER;
-        if need > link.bytes() {
-            bail!("pipeline link of {} B for {need} B of rows", link.bytes());
+        let need: usize = bufs.iter().map(|b| b.1 * 2).sum::<usize>();
+        if need > slot {
+            bail!("pipeline link slot of {slot} B for {need} B of rows");
+        }
+        // the sender's counter: the steps signaled (its next one's slot); the receiver's: the step received
+        let counter: *const u64 = counters.at::<u64>(if send { 0 } else { 1 });
+        if send {
+            check(unsafe { sys::blz_pp_wait_ack(hdr, counter, s.0) }, "pipeline slot")?;
         }
         let mut off = 0;
         for (buf, elems) in bufs {
-            let (dst, src, kind) = if send {
-                (unsafe { data.add(off) }.cast::<std::ffi::c_void>(), buf.cast::<std::ffi::c_void>().cast_const(), sys::MEMCPY_D2H)
-            } else {
-                (buf.cast::<std::ffi::c_void>(), unsafe { data.add(off) }.cast::<std::ffi::c_void>().cast_const(), sys::MEMCPY_H2D)
-            };
-            check(unsafe { sys::cudaMemcpyAsync(dst, src, elems * 2, kind, s.0) }, "pipeline rows")?;
+            check(
+                unsafe { sys::blz_pp_copy(hdr, slot as i64, counter, send as c_int, off as i64, buf.cast(), (elems * 2) as i64, s.0) },
+                "pipeline rows",
+            )?;
             off += elems * 2;
+        }
+        if !send {
+            check(unsafe { sys::blz_pp_ack(hdr, counter, s.0) }, "pipeline slot back")?;
         }
         Ok(off)
     }
@@ -2024,7 +2044,7 @@ impl Model {
         if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage > 0) {
             let link = p.prev.as_ref().unwrap();
             check(unsafe { sys::blz_pp_wait(link.dev_ptr::<u64>(), counters.at::<u64>(1), s.0) }, "pipeline receive")?;
-            self.pp_rows(link, t, false)?;
+            self.pp_rows(link, counters, t, false)?;
         } else {
             check(
                 unsafe {
@@ -2112,7 +2132,7 @@ impl Model {
         // a pipeline stage before the last hands its rows on and is done
         if let Some((p, counters)) = self.pp.as_ref().filter(|(p, _)| p.stage + 1 < p.stages) {
             let link = p.next.as_ref().unwrap();
-            let bytes = self.pp_rows(link, t, true)?;
+            let bytes = self.pp_rows(link, counters, t, true)?;
             check(unsafe { sys::blz_pp_signal(link.dev_ptr::<u64>().cast_mut(), counters.at::<u64>(0), bytes as u64, s.0) }, "pipeline send")?;
             return Ok(());
         }
