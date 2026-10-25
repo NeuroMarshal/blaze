@@ -802,6 +802,111 @@ def completions_stream_usage_and_logprobs():
     error_shape(*http("POST", "/v1/completions", {"model": MODEL, "prompt": "Hi", "max_tokens": 3, "echo": True, "logprobs": 1})[::2])
 
 
+# responses, messages, embeddings
+
+def events(path, body):
+    """(event name, parsed data) of a streaming response with named SSE events."""
+    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    out, name = [], None
+    with urllib.request.urlopen(req, timeout=300) as r:
+        for line in r:
+            line = line.decode().strip()
+            if line.startswith("event:"):
+                name = line[6:].strip()
+            elif line.startswith("data:"):
+                out.append((name, json.loads(line[5:].strip())))
+    return out
+
+
+@test
+def responses_text_tools_and_stream():
+    s, _, r = http("POST", "/v1/responses", {"model": MODEL, "input": "Say the word pong and nothing else.", "max_output_tokens": 30,
+                                              "reasoning": {"effort": "minimal"}})
+    check(s == 200 and r["object"] == "response" and r["status"] in ("completed", "incomplete"), r)
+    texts = [c["text"] for it in r["output"] if it["type"] == "message" for c in it["content"]]
+    check(texts and "pong" in texts[0].lower(), r["output"])
+    check(r["usage"]["input_tokens"] > 0 and r["usage"]["output_tokens"] > 0, r["usage"])
+    # previous_response_id continues the conversation
+    s, _, r2 = http("POST", "/v1/responses", {"model": MODEL, "input": "Repeat your last word.", "previous_response_id": r["id"], "max_output_tokens": 30})
+    check(s == 200, r2)
+    # a tool loop: function_call, then its output, then the answer
+    tool = {"type": "function", "name": "get_time", "description": "Current local time of a city",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
+    s, _, r = http("POST", "/v1/responses", {"model": MODEL, "input": "What time is it in Oslo?", "tools": [tool],
+                                              "tool_choice": {"type": "function", "name": "get_time"}, "max_output_tokens": 300})
+    calls = [it for it in r["output"] if it["type"] == "function_call"]
+    check(s == 200 and calls and calls[0]["name"] == "get_time" and "city" in json.loads(calls[0]["arguments"]), r)
+    s, _, r3 = http("POST", "/v1/responses", {"model": MODEL, "tools": [tool], "max_output_tokens": 200, "input": [
+        {"role": "user", "content": "What time is it in Oslo?"}, calls[0],
+        {"type": "function_call_output", "call_id": calls[0]["call_id"], "output": "13:37"}]})
+    out = " ".join(c["text"] for it in r3.get("output", []) if it["type"] == "message" for c in it["content"])
+    check(s == 200 and "13" in out, r3)
+    # structured output
+    s, _, r = http("POST", "/v1/responses", {"model": MODEL, "input": "Give a JSON object with key a.", "max_output_tokens": 60,
+                                              "text": {"format": {"type": "json_object"}}, "reasoning": {"effort": "minimal"}})
+    t = ([c["text"] for it in r.get("output", []) if it["type"] == "message" for c in it["content"]] or [str(r)])[0]
+    check(isinstance(json.loads(t), dict), t)
+    # stream: event order and the final response
+    ev = events("/v1/responses", {"model": MODEL, "input": "Count to three.", "max_output_tokens": 40, "stream": True,
+                                  "reasoning": {"effort": "minimal"}})
+    names = [n for n, _ in ev]
+    check(names[0] == "response.created" and names[-1] in ("response.completed", "response.incomplete"), names[:5] + names[-3:])
+    check("response.output_text.delta" in names and all(d["sequence_number"] == i for i, (_, d) in enumerate(ev)), names)
+    text = "".join(d["delta"] for n, d in ev if n == "response.output_text.delta")
+    final = ev[-1][1]["response"]
+    check(text and final["usage"]["output_tokens"] > 0, final)
+    # get by id
+    s, _, g = http("GET", "/v1/responses/" + final["id"])
+    check(s == 200 and g["id"] == final["id"], g)
+
+
+@test
+def messages_text_tools_thinking_and_stream():
+    h = {"x-api-key": "none", "anthropic-version": "2023-06-01"}
+    s, _, m = http("POST", "/v1/messages", {"model": MODEL, "max_tokens": 40, "messages": [{"role": "user", "content": "Say pong."}]}, h)
+    check(s == 200 and m["type"] == "message" and m["content"][0]["type"] == "text" and "pong" in m["content"][0]["text"].lower(), m)
+    check(m["stop_reason"] in ("end_turn", "max_tokens") and m["usage"]["input_tokens"] > 0, m)
+    tools = [{"name": "get_time", "description": "Current local time of a city",
+              "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+    s, _, m = http("POST", "/v1/messages", {"model": MODEL, "max_tokens": 300, "tools": tools, "tool_choice": {"type": "tool", "name": "get_time"},
+                                             "messages": [{"role": "user", "content": "Time in Rome?"}]}, h)
+    use = [b for b in m["content"] if b["type"] == "tool_use"]
+    check(s == 200 and m["stop_reason"] == "tool_use" and use and use[0]["name"] == "get_time" and isinstance(use[0]["input"], dict), m)
+    s, _, m2 = http("POST", "/v1/messages", {"model": MODEL, "max_tokens": 200, "tools": tools, "messages": [
+        {"role": "user", "content": "Time in Rome?"}, {"role": "assistant", "content": m["content"]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": use[0]["id"], "content": "09:15"}]}]}, h)
+    check(s == 200 and any("9" in b.get("text", "") and "15" in b.get("text", "") for b in m2["content"]), m2)
+    # thinking when asked for
+    s, _, m = http("POST", "/v1/messages", {"model": MODEL, "max_tokens": 400, "thinking": {"type": "enabled", "budget_tokens": 200},
+                                             "messages": [{"role": "user", "content": "What is 17 * 3?"}]}, h)
+    note(s == 200 and m["content"][0]["type"] == "thinking", [b["type"] for b in m.get("content", [])])
+    # stream
+    ev = events("/v1/messages", {"model": MODEL, "max_tokens": 40, "stream": True, "messages": [{"role": "user", "content": "Count to three."}]})
+    names = [n for n, _ in ev]
+    check(names[0] == "message_start" and names[-1] == "message_stop" and "content_block_delta" in names and "message_delta" in names, names)
+    # count_tokens and errors
+    s, _, c = http("POST", "/v1/messages/count_tokens", {"model": MODEL, "messages": [{"role": "user", "content": "Hello there"}]}, h)
+    check(s == 200 and c["input_tokens"] > 0, c)
+    s, _, e = http("POST", "/v1/messages", {"model": MODEL, "messages": [{"role": "user", "content": "x"}]}, h)
+    check(s == 400 and e["type"] == "error" and e["error"]["type"] == "invalid_request_error", e)
+
+
+@test
+def embeddings_shape_norm_and_similarity():
+    s, _, r = http("POST", "/v1/embeddings", {"model": MODEL, "input": ["The cat sat on the mat.", "A cat is sitting on a mat.", "Quarterly tax filing deadlines."]})
+    check(s == 200 and len(r["data"]) == 3 and r["usage"]["prompt_tokens"] > 0, r if s != 200 else r["usage"])
+    v = [d["embedding"] for d in r["data"]]
+    norms = [sum(x * x for x in e) ** 0.5 for e in v]
+    check(all(abs(n - 1) < 1e-3 for n in norms), norms)
+    cos = lambda a, b: sum(x * y for x, y in zip(a, b))
+    note(cos(v[0], v[1]) > cos(v[0], v[2]), (cos(v[0], v[1]), cos(v[0], v[2])))
+    s, _, r = http("POST", "/v1/embeddings", {"model": MODEL, "input": "hello", "dimensions": 64, "encoding_format": "base64"})
+    import base64, struct
+    raw = base64.b64decode(r["data"][0]["embedding"])
+    check(s == 200 and len(raw) == 64 * 4 and abs(sum(x * x for x in struct.unpack("<64f", raw)) - 1) < 1e-3, len(raw))
+    error_shape(*http("POST", "/v1/embeddings", {"model": MODEL, "input": []})[::2])
+
+
 # cancellation
 
 def quiesced(timeout=60):

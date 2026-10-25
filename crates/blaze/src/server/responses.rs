@@ -166,7 +166,8 @@ fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>)> {
         Some(c) => return Err(bad_param("tool_choice", format!("tool_choice {c} is not supported"))),
     }
     if let Some(effort) = body.pointer("/reasoning/effort").and_then(Value::as_str) {
-        o.insert("reasoning_effort".into(), json!(effort));
+        // minimal: as little as possible, no thinking section for a model that has one
+        o.insert("reasoning_effort".into(), json!(if effort == "minimal" { "none" } else { effort }));
     }
     match body.pointer("/text/format") {
         None | Some(Value::Null) => {}
@@ -219,6 +220,17 @@ fn usage_of(u: &Value) -> Value {
            "output_tokens_details": {"reasoning_tokens": u.pointer("/completion_tokens_details/reasoning_tokens").and_then(Value::as_u64).unwrap_or(0)}})
 }
 
+/// An answer the model ended inside its thinking section (a natural stop, no text, no call): its reasoning is the
+/// answer (a model that skips the closing tag after a tool result).
+pub(super) fn unclosed_answer(m: &mut Value, finish: &Value) {
+    let empty = m.get("content").and_then(Value::as_str).is_none_or(|t| t.trim().is_empty());
+    let calls = m.get("tool_calls").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
+    if finish == "stop" && empty && !calls && let Some(r) = m.get("reasoning_content").cloned().filter(|r| r.as_str().is_some_and(|r| !r.trim().is_empty())) {
+        m["content"] = r;
+        m["reasoning_content"] = Value::Null;
+    }
+}
+
 /// Output items of a chat message: reasoning, the message, the function calls.
 fn items_of(m: &Value) -> Vec<Value> {
     let mut out = Vec::new();
@@ -265,15 +277,17 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
         ChatOut::Json(status, v) if !status.is_success() => Ok((status, Json(v)).into_response()),
         ChatOut::Json(_, v) => {
             let choice = &v["choices"][0];
+            let mut message = choice["message"].clone();
+            unclosed_answer(&mut message, &choice["finish_reason"]);
             let mut r = shell(&body, &id, &model, "completed");
-            r["output"] = json!(items_of(&choice["message"]));
+            r["output"] = json!(items_of(&message));
             r["usage"] = usage_of(&v["usage"]);
             if choice["finish_reason"] == "length" {
                 r["status"] = json!("incomplete");
                 r["incomplete_details"] = json!({"reason": "max_output_tokens"});
             }
             if store_it {
-                keep(&id, messages, &choice["message"], &r);
+                keep(&id, messages, &message, &r);
             }
             Ok(Json(r).into_response())
         }

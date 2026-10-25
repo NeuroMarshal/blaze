@@ -244,7 +244,9 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
         ChatOut::Json(status, v) if !status.is_success() => Ok(translate_error(status, &v)),
         ChatOut::Json(_, v) => {
             let choice = &v["choices"][0];
-            let content = blocks_of(&choice["message"]);
+            let mut message = choice["message"].clone();
+            super::responses::unclosed_answer(&mut message, &choice["finish_reason"]);
+            let content = blocks_of(&message);
             let has_calls = content.iter().any(|b| b["type"] == "tool_use");
             Ok(Json(json!({"id": id, "type": "message", "role": "assistant", "model": model, "content": content,
                            "stop_reason": stop_reason(&choice["finish_reason"], has_calls), "stop_sequence": null,
