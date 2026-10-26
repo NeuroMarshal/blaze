@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use crate::linear::{Cut, LinCtx, Linear};
 use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use blaze_sys as sys;
 use std::ffi::{CString, c_int};
 use std::ops::Range;
@@ -40,6 +40,14 @@ fn part(total: usize, rank: usize, world: usize) -> Range<usize> {
     rank * n..(rank + 1) * n
 }
 
+/// Split-K output rows must fit both attention workspaces, including diagnostic overrides.
+fn bounded_mha_splits(requested: usize, rows: usize, parts_per_split: usize, capacity: usize) -> Result<usize> {
+    ensure!((1..=64).contains(&requested), "attention splits must be in 1..=64");
+    let available = capacity.checked_div(rows).and_then(|n| n.checked_div(parts_per_split)).unwrap_or(0);
+    ensure!(available > 0, "attention partial workspace cannot hold {rows} rows");
+    Ok(requested.min(available))
+}
+
 pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
     let inject = format!("{prefix}block_inject_weight.weight");
     Ok(HcBlock {
@@ -52,11 +60,6 @@ pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
 
 /// Events of a forward's phase profile (4 marks a layer).
 const PROF_EVENTS: usize = 640;
-
-fn slow_forward_ms() -> f32 {
-    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("BLAZE_SLOW_FORWARD_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000.0))
-}
 
 fn prefill_profile() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -309,6 +312,7 @@ pub fn pp_slot_bytes(bytes: usize) -> usize {
 pub struct Options {
     /// KV cache size in tokens (with `kv_auto`: set from the free VRAM after the load)
     pub max_tokens: usize,
+    pub max_context: Option<usize>,
     pub kv_auto: Option<std::sync::Arc<KvAuto>>,
     /// VRAM per rank that what loads after the model takes (the drafter): left out of the KV cache (auto) and of the
     /// expert slots
@@ -773,8 +777,7 @@ pub struct Model {
     /// N-th forward, counted from 1 (a test of the abort path)
     pp_seq: Cell<u64>,
     pp_fault: Option<u64>,
-    /// events of the last prefill forward's phases (PLE, attention, GDN, MLP / experts, the rest) and its rows, read once
-    /// the GPU passed them: a forward slower than BLAZE_SLOW_FORWARD_MS (3000) prints its phases
+    /// Optional CUDA timing events for prefill phases; allocated only with explicit profiling or debug logging.
     prof_events: Vec<crate::gpu::TimedEvent>,
     prof_pending: RefCell<Option<(Vec<u8>, usize)>>,
     final_mix: FinalMix,
@@ -917,6 +920,10 @@ impl Model {
             }
             cfg.rope.scaling = RopeScaling::Yarn { factor: f, original_max: cfg.max_positions, beta_fast: 32.0, beta_slow: 1.0 };
             cfg.max_positions = (cfg.max_positions as f64 * f) as usize;
+        }
+        if let Some(max) = opts.max_context {
+            anyhow::ensure!(max > 1 && max <= cfg.max_positions, "--max-model-len {max} exceeds the configured model context {} (use explicit YaRN to extend it)", cfg.max_positions);
+            cfg.max_positions = max;
         }
         let ckpt = Checkpoint::open(dir)?;
         let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
@@ -1327,7 +1334,8 @@ impl Model {
                 None => None,
             },
             pp_seq: Cell::new(0),
-            prof_events: (0..PROF_EVENTS).map(|_| crate::gpu::TimedEvent::new()).collect::<Result<_>>()?,
+            prof_events: (0..if crate::logging::options().profile_prefill { PROF_EVENTS } else { 0 })
+                .map(|_| crate::gpu::TimedEvent::new()).collect::<Result<_>>()?,
             prof_pending: RefCell::new(None),
             pp_fault: std::env::var("BLAZE_PP_FAULT").ok().and_then(|v| v.parse().ok()),
             final_mix,
@@ -2014,17 +2022,16 @@ impl Model {
             return;
         }
         let total = self.prof_events[n - 1].ms_since(&self.prof_events[0]);
-        if total < slow_forward_ms() {
+        if !crate::logging::options().profile_prefill {
             return;
         }
         let mut ms = [0f32; 5];
         for i in 1..n {
             ms[phases[i] as usize] += self.prof_events[i].ms_since(&self.prof_events[i - 1]);
         }
-        eprintln!(
-            "blaze slow forward: {t} rows in {total:.0} ms on the GPU: PLE {:.0}, attention {:.0}, GDN {:.0}, MLP / experts {:.0}, rest {:.0}",
-            ms[0], ms[1], ms[2], ms[3], ms[4]
-        );
+        let level=if crate::logging::enabled(crate::logging::Level::Debug){crate::logging::Level::Debug}else{crate::logging::Level::Info};
+        crate::logging::event(level,"gpu.prefill",serde_json::json!({"rank":self.tp.rank,"rows":t,
+            "total_ms":total,"ple_ms":ms[0],"attention_ms":ms[1],"gdn_ms":ms[2],"mlp_ms":ms[3],"other_ms":ms[4],"tok_s":t as f32*1000.0/total.max(0.001)}));
     }
 
     /// A pipeline step begins: its number into the hand-off counters (before anything of the step that may fail).
@@ -2160,7 +2167,7 @@ impl Model {
         let prof = prefill_profile() && t >= 256;
         // without it, events at the same marks (no waiting): read after the GPU passed them
         self.prefill_report();
-        let light = !prof && t >= 256;
+        let light = !prof && t >= 256 && !self.prof_events.is_empty();
         let mut phases: Vec<u8> = Vec::new();
         if light {
             self.prof_events[0].record(s)?;
@@ -2774,7 +2781,10 @@ impl Model {
             let forced_splits: Option<usize> = std::env::var("BLAZE_QSA_SPLITS").ok().and_then(|v| v.parse().ok());
             let mha = |r0: usize, n: usize, pv: sys::blz_nvfp4_pool, tab: *const i32| -> Result<()> {
                 // as the dense calls (within the partial-result workspace), at most 16
-                let splits = forced_splits.unwrap_or_else(|| self.attn_splits(n, 1).min(16));
+                let splits = match forced_splits {
+                    Some(requested) => self.attn_splits(n, 1, Some(requested))?,
+                    None => self.attn_splits(n, 1, None)?.min(16),
+                };
                 check(
                     unsafe {
                         sys::blz_nvfp4_mha_decode(
@@ -2867,7 +2877,7 @@ impl Model {
             calls.push((i, 1, sp.len, sp.offset));
         }
         for (first, count, q_len, off) in calls {
-            let splits = self.attn_splits(count, q_len);
+            let splits = self.attn_splits(count, q_len, None)?;
             if tree && q_len > 1 {
                 // a tree verify span: each row sees its ancestors among the span's rows
                 check(
@@ -2936,17 +2946,17 @@ impl Model {
     /// Context splits of an attention call of `count` requests of `q_len` query rows: about four CTAs per SM over the
     /// call's query tiles and KV heads (a verify span of a few rows gets as many as a decode step, not one CTA walking
     /// the whole context), within the partial-result workspace.
-    fn attn_splits(&self, count: usize, q_len: usize) -> usize {
+    fn attn_splits(&self, count: usize, q_len: usize, requested: Option<usize>) -> Result<usize> {
+        ensure!(count > 0 && q_len > 0, "attention requires nonempty query rows");
         let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, self.cfg.attn.head_dim);
         let group = heads / kvh;
         let mt = (q_len * group).div_ceil(16).min(3);
         let tiles = q_len.div_ceil((16 * mt / group).max(1));
-        let cap = self.work.partial_o.bytes() / (heads * hd * 4);
-        let mut splits = (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64);
-        while splits > 1 && count * q_len * unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, splits as c_int) } as usize > cap {
-            splits /= 2;
-        }
-        splits
+        let cap = (self.work.partial_o.bytes() / (heads * hd * 4)).min(self.work.partial_ml.bytes() / (heads * 2 * 4));
+        let target = requested.unwrap_or_else(|| (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64));
+        let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, 1) } as usize;
+        let rows = count.checked_mul(q_len).context("attention row count overflow")?;
+        bounded_mha_splits(target, rows, parts, cap)
     }
 
     fn prefetch_mlp(&self, layer: &Layer, t: usize) -> Result<()> {
@@ -3272,6 +3282,15 @@ pub fn describe_load(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod stage_tests {
+    #[test]
+    fn attention_splits_respect_sparse_workspace_capacity() {
+        assert_eq!(super::bounded_mha_splits(16, 1024, 4, 4096).unwrap(),1);
+        assert_eq!(super::bounded_mha_splits(16, 1024, 4, 32768).unwrap(),8);
+        assert_eq!(super::bounded_mha_splits(3, 1, 4, 32768).unwrap(),3);
+        assert!(super::bounded_mha_splits(16, 1024, 4, 4095).is_err());
+        assert!(super::bounded_mha_splits(0, 1024, 4, 4096).is_err());
+        assert!(super::bounded_mha_splits(65, 1024, 4, 4096).is_err());
+    }
     #[test]
     fn stage_cores_split_a_cpu_list() {
         assert_eq!(super::stage_cores("3-4,6,9-12", 0, 2), "3,4,6,9");

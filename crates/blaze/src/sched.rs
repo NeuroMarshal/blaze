@@ -6,7 +6,7 @@ use crate::sampler::{Rng, SamplingParams, sample};
 use crate::suffix::{SuffixConfig, SuffixIndex};
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
@@ -37,6 +37,9 @@ pub enum GenEvent {
 }
 
 pub struct GenRequest {
+    pub trace: crate::logging::RequestTrace,
+    /// Held through waiting, prefill, decode and preemption; all exit paths release admission.
+    permit: Option<Admission>,
     pub tokens: Vec<i64>,
     pub params: SamplingParams,
     pub max_tokens: usize,
@@ -70,16 +73,67 @@ pub struct ThinkBudget {
     pub force: Vec<i32>,
 }
 
-/// A prompt-cache snapshot. Eviction is GreedyDual-Size: an entry is worth the prefill it saves (its tokens) on top of
-/// the inflation at its last use, the least worth goes first and raises the inflation to its worth. A short side
-/// request (a title, a probe) loses to a long conversation however recent it is, and a long entry nobody uses ages
-/// out as the inflation passes it (plain LRU let two side requests per turn evict an agent's whole conversation).
+/// A prompt-cache snapshot. Ordinary admission uses GreedyDual-Size: an entry is worth the prefill it saves (its
+/// tokens) on top of the inflation at its last use. Explicit Point boundaries have anchor priority: the first Point
+/// can replace the least-worth non-Point, and an uncached branch can replace a Point not used within one cache-capacity
+/// of admissions. Prompt/Finish admission cannot evict the last Point. With one cache row, this recency window is one
+/// request; KV-pressure eviction does not honor Point admission priority.
 struct CacheEntry {
     tokens: Vec<i64>,
     snap: Snapshot,
     worth: f64,
     kind: SnapKind,
     hit: bool,
+    last_use_epoch: u64,
+}
+
+/// Snapshot rows are stable identities; Vec indices change when eviction uses swap_remove.
+fn eviction_index(cache:&[CacheEntry],keep_row:Option<usize>)->Option<usize> {
+    cache.iter().enumerate().filter(|(_,e)|Some(e.snap.row)!=keep_row)
+        .min_by(|a,b|a.1.worth.total_cmp(&b.1.worth)).map(|(i,_)|i)
+}
+
+/// Admission keeps at least one reusable boundary when a full cache has none yet. An uncached branch first consumes a
+/// non-Point row; if none remains, it can replace a Point unused for one cache-capacity of admissions. Recent Points
+/// are protected from uncached Point and Prompt/Finish admissions; a cache-derived Point still uses ordinary GDS. With
+/// one cache row, the recency window is one request. KV-pressure eviction remains unprotected.
+fn cache_admission_victim(
+    cache: &[CacheEntry],
+    incoming: SnapKind,
+    uncached_branch: bool,
+    epoch: u64,
+    cache_rows: usize,
+) -> Option<(usize, bool)> {
+    let points = cache.iter().filter(|e| e.kind == SnapKind::Point).count();
+    if incoming == SnapKind::Point && points == 0 {
+        return eviction_index_kind(cache, |e| e.kind != SnapKind::Point).map(|i| (i, true));
+    }
+    if incoming == SnapKind::Point && uncached_branch
+        && let Some(i) = eviction_index_kind(cache, |e| e.kind != SnapKind::Point)
+    {
+        return Some((i, true));
+    }
+    if incoming == SnapKind::Point && uncached_branch && cache_rows > 0
+        && let Some((i, _)) = cache.iter().enumerate()
+            .filter(|(_, e)| e.kind == SnapKind::Point && epoch.saturating_sub(e.last_use_epoch) >= cache_rows as u64)
+            .min_by_key(|(_, e)| e.last_use_epoch)
+    {
+        return Some((i, true));
+    }
+    eviction_index_kind(cache, |e| {
+        if e.kind != SnapKind::Point {
+            return true;
+        }
+        let last_anchor = incoming != SnapKind::Point && points == 1;
+        let recent = cache_rows > 0 && epoch.saturating_sub(e.last_use_epoch) < cache_rows as u64;
+        let protect_recent = incoming != SnapKind::Point || uncached_branch;
+        !last_anchor && !(protect_recent && recent)
+    }).map(|i| (i, false))
+}
+
+fn eviction_index_kind(cache: &[CacheEntry], eligible: impl Fn(&CacheEntry) -> bool) -> Option<usize> {
+    cache.iter().enumerate().filter(|(_, e)| eligible(e))
+        .min_by(|a, b| a.1.worth.total_cmp(&b.1.worth)).map(|(i, _)| i)
 }
 
 /// Where a prompt-cache snapshot was taken. Its worth is also weighed by how often snapshots of its kind are used
@@ -91,6 +145,16 @@ enum SnapKind {
     Point,
     Prompt,
     Finish,
+}
+
+impl SnapKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Point => "point",
+            Self::Prompt => "prompt",
+            Self::Finish => "finish",
+        }
+    }
 }
 
 /// Decayed counts per SnapKind: snapshots made, snapshots used at least once.
@@ -120,7 +184,13 @@ struct Active {
     seq: Seq,
     /// health-log id and admission time
     id: u64,
-    t0: Instant,
+    cached: usize,
+    first_token: Option<Instant>,
+    last_token: Option<Instant>,
+    progress: Instant,
+    progress_tokens: usize,
+    prefill_work: usize,
+    prefill_secs: f64,
     /// tokens of the request's prompt; `req.tokens` holds more after a preemption (the prompt and the output it had,
     /// read again when it resumes)
     orig_len: usize,
@@ -185,14 +255,14 @@ impl Acceptance {
 }
 
 /// Online cost model of speculation: seconds of a one-token decode step and of a verify round of n rows (verify +
-/// commit), as decayed means. A round with a draft of d tokens emits 1 + sum_{j=1..d} prod_{i<=j} c_i tokens on
+/// commit and the next draft), as decayed means. A round with a draft of d tokens emits 1 + sum_{j=1..d} prod_{i<=j} c_i tokens on
 /// average (c_i: the request's acceptance at depth i); the draft is cut to the length with the most tokens per second,
 /// and a plain step runs instead when it is faster.
 #[derive(Default)]
 struct SpecCost {
-    /// seconds of a plain decode step, by batch size
+    /// seconds of a plain decode step including the next draft, by batch size
     decode: Vec<f64>,
-    /// seconds of a verify round (verify + commit), by rows in the step
+    /// seconds of a verify round (verify + commit + next draft), by rows in the step
     verify: Vec<f64>,
 }
 
@@ -379,6 +449,7 @@ impl SpecCost {
 }
 
 pub struct SchedConfig {
+    pub max_requests: usize,
     /// most tokens of one step (decode tokens + the prefill chunk)
     pub step_tokens: usize,
     /// n-gram speculative decoding: draft tokens per verify (0: off; the engine needs max_verify >= this + 1)
@@ -428,6 +499,26 @@ const SUFFIX_GLOBAL_TOKENS: usize = 1 << 20;
 /// Counters the scheduler thread publishes for the server's metrics.
 #[derive(Default)]
 pub struct SchedStats {
+    pub outstanding: AtomicUsize,
+    pub completed: AtomicU64,
+    pub errors: AtomicU64,
+    pub prompt_tokens: AtomicU64,
+    pub cached_tokens: AtomicU64,
+    pub prefill_tokens: AtomicU64,
+    pub generation_tokens: AtomicU64,
+    pub prefill_micros: AtomicU64,
+    pub decode_micros: AtomicU64,
+    pub kv_pages_free: AtomicUsize,
+    pub kv_pages_total: AtomicUsize,
+    pub cache_entries: AtomicUsize,
+    pub spec_rounds: AtomicU64,
+    pub spec_emitted: AtomicU64,
+    pub ttft: crate::telemetry::Histogram,
+    pub queue_time: crate::telemetry::Histogram,
+    pub request_time: crate::telemetry::Histogram,
+    pub inter_token: crate::telemetry::Histogram,
+    pub prefill_step: crate::telemetry::Histogram,
+    pub decode_step: crate::telemetry::Histogram,
     /// requests prefilling or decoding
     pub running: AtomicUsize,
     /// requests admitted by nobody yet
@@ -443,8 +534,33 @@ pub struct SchedStats {
 /// Handle of the scheduler thread.
 #[derive(Clone)]
 pub struct Scheduler {
-    tx: Sender<GenRequest>,
+    lifecycle: Arc<SchedulerLifecycle>,
+    max_requests: usize,
     pub stats: Arc<SchedStats>,
+}
+
+struct SchedulerLifecycle {
+    tx: Mutex<Option<Sender<GenRequest>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl SchedulerLifecycle {
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.tx.lock().unwrap().take();
+        // Keep the lock while joining so concurrent shutdown callers cannot return before the worker has exited.
+        let mut thread_slot = self.thread.lock().unwrap();
+        if let Some(thread) = thread_slot.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for SchedulerLifecycle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 impl Scheduler {
@@ -452,16 +568,21 @@ impl Scheduler {
         let (tx, rx) = channel();
         let stats = Arc::new(SchedStats::default());
         let loop_stats = stats.clone();
-        std::thread::Builder::new()
+        let max_requests = cfg.max_requests;
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stop = stop.clone();
+        let thread = std::thread::Builder::new()
             .name("blaze-sched".into())
             .spawn(move || {
                 let mut s = Loop {
                     engine,
                     cfg,
                     rx,
+                    stop: loop_stop,
                     waiting: VecDeque::new(),
                     active: Vec::new(),
                     cache: Vec::new(),
+                    cache_epoch: 0,
                     inflation: 0.0,
                     pen_turn: 0,
                     pen_split_logged: false,
@@ -482,11 +603,361 @@ impl Scheduler {
                 s.run();
             })
             .expect("scheduler thread");
-        Self { tx, stats }
+        Self {
+            lifecycle: Arc::new(SchedulerLifecycle { tx: Mutex::new(Some(tx)), thread: Mutex::new(Some(thread)), stop }),
+            stats,
+            max_requests,
+        }
     }
 
-    pub fn submit(&self, req: GenRequest) -> Result<(), GenRequest> {
-        self.tx.send(req).map_err(|e| e.0)
+    pub fn submit(&self, mut req: GenRequest) -> Result<(), SubmitError> {
+        req.permit = Some(Admission::acquire(self.stats.clone(),self.max_requests)?);
+        let sender = self.lifecycle.tx.lock().unwrap();
+        if self.lifecycle.stop.load(Ordering::Acquire) {
+            return Err(SubmitError::Stopped);
+        }
+        sender.as_ref().ok_or(SubmitError::Stopped)?.send(req).map_err(|_| SubmitError::Stopped)
+    }
+
+    /// Stop new work and wait for the current engine step and GPU worker teardown before returning.
+    pub fn shutdown(&self) {
+        self.lifecycle.shutdown();
+    }
+}
+
+struct Admission(Arc<SchedStats>);
+impl Admission {
+    fn acquire(stats:Arc<SchedStats>,limit:usize)->Result<Self,SubmitError> {
+        let mut current=stats.outstanding.load(Ordering::Relaxed);
+        loop {
+            if current>=limit {return Err(SubmitError::Overloaded);}
+            match stats.outstanding.compare_exchange_weak(current,current+1,Ordering::AcqRel,Ordering::Relaxed) {
+                Ok(_)=>return Ok(Self(stats)),
+                Err(n)=>current=n,
+            }
+        }
+    }
+}
+impl Drop for Admission {
+    fn drop(&mut self) { self.0.outstanding.fetch_sub(1, Ordering::AcqRel); }
+}
+
+#[derive(Debug)]
+pub enum SubmitError { Overloaded, Stopped }
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn key_id(key: &str) -> i64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut h);
+        h.finish() as i64
+    }
+
+    fn fake_entry(row: usize, key: &str, len: usize, kind: SnapKind, worth: f64, hit: bool) -> CacheEntry {
+        let mut tokens = vec![0; len];
+        tokens[0] = key_id(key);
+        CacheEntry {
+            tokens,
+            snap: Snapshot { row, slots: Vec::new() },
+            worth,
+            kind,
+            hit,
+            last_use_epoch: 0,
+        }
+    }
+
+    fn remember_fake(
+        cache: &mut Vec<CacheEntry>,
+        stats: &mut SnapStats,
+        inflation: &mut f64,
+        row: &mut usize,
+        key: &str,
+        len: usize,
+        kind: SnapKind,
+        uncached_branch: bool,
+        epoch: u64,
+        cache_rows: usize,
+    ) -> bool {
+        if cache.iter().any(|e| e.tokens[0] == key_id(key)) {
+            return false;
+        }
+        let Some((i, forced_point)) = cache_admission_victim(cache, kind, uncached_branch, epoch, cache_rows) else { return false };
+        let candidate = *inflation + len as f64 * stats.useful(kind);
+        if !forced_point && candidate <= cache[i].worth {
+            return false;
+        }
+        let e = cache.swap_remove(i);
+        *inflation = (*inflation).max(e.worth);
+        let worth = *inflation + len as f64 * stats.useful(kind);
+        stats.made(kind);
+        let mut entry = fake_entry(*row, key, len, kind, worth, false);
+        entry.last_use_epoch = epoch;
+        cache.push(entry);
+        *row += 1;
+        true
+    }
+
+    fn hit_fake(cache: &mut [CacheEntry], stats: &mut SnapStats, inflation: f64, key: &str, epoch: u64) -> bool {
+        let Some(e) = cache.iter_mut().find(|e| e.tokens[0] == key_id(key)) else { return false };
+        if !e.hit {
+            e.hit = true;
+            stats.used[e.kind as usize] += 1.0;
+        }
+        e.last_use_epoch = epoch;
+        e.worth = inflation + e.tokens.len() as f64 * stats.useful(e.kind);
+        true
+    }
+
+    #[test]
+    fn concurrent_admission_never_exceeds_limit_and_releases_all_permits() {
+        let stats=Arc::new(SchedStats::default());
+        let barrier=Arc::new(std::sync::Barrier::new(33));
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let (stats,barrier)=(stats.clone(),barrier.clone());
+                scope.spawn(move|| {
+                    let permit=Admission::acquire(stats,4);
+                    barrier.wait();barrier.wait();drop(permit);
+                });
+            }
+            barrier.wait();
+            assert_eq!(stats.outstanding.load(Ordering::Relaxed),4);
+            barrier.wait();
+        });
+        assert_eq!(stats.outstanding.load(Ordering::Relaxed),0);
+        assert!(Admission::acquire(stats,1).is_ok());
+    }
+    #[test]
+    fn prefix_protection_survives_swap_removal() {
+        let entry=|row,worth|CacheEntry{tokens:vec![row as i64],snap:Snapshot{row,slots:Vec::new()},worth,kind:SnapKind::Prompt,hit:false,last_use_epoch:0};
+        let mut cache=vec![entry(10,0.),entry(11,1.),entry(12,-1.)];
+        // The protected entry starts last: first eviction moves it into slot zero.
+        let first=eviction_index(&cache,Some(12)).unwrap();
+        assert_eq!(cache[first].snap.row,10);
+        cache.swap_remove(first);
+        let second=eviction_index(&cache,Some(12)).unwrap();
+        assert_eq!(cache[second].snap.row,11);
+        cache.swap_remove(second);
+        assert!(eviction_index(&cache,Some(12)).is_none());
+    }
+
+    #[test]
+    fn point_anchor_survives_mixed_stale_cache_and_short_side_traffic() {
+        let mut cache = Vec::new();
+        let mut stats = SnapStats::default();
+        let mut inflation = 0.0;
+        let mut row = 0;
+        for (key, len, kind) in [
+            ("old32p", 32_768, SnapKind::Prompt),
+            ("old32f", 32_768, SnapKind::Finish),
+            ("old131p", 131_072, SnapKind::Prompt),
+            ("old131f", 131_072, SnapKind::Finish),
+        ] {
+            let worth = inflation + len as f64 * stats.useful(kind);
+            stats.made(kind);
+            cache.push(fake_entry(row, key, len, kind, worth, false));
+            row += 1;
+        }
+        // Native benchmark priming hits Prompt snapshots; Finish uses a different chat-template thinking marker.
+        for key in ["old32p", "old131p"] {
+            let e = cache.iter_mut().find(|e| e.tokens[0] == key_id(key)).unwrap();
+            e.hit = true;
+            stats.used[SnapKind::Prompt as usize] += 1.0;
+            e.worth = inflation + e.tokens.len() as f64 * stats.useful(SnapKind::Prompt);
+        }
+
+        let mut point_hits = 0;
+        let mut epoch = 0;
+        for turn in 1..=6 {
+            epoch += 1;
+            if turn > 1 {
+                point_hits += hit_fake(&mut cache, &mut stats, inflation, "main-point", epoch) as usize;
+            }
+            remember_fake(&mut cache, &mut stats, &mut inflation, &mut row, "main-point", 1_544, SnapKind::Point, turn == 1, epoch, 4);
+            remember_fake(
+                &mut cache,
+                &mut stats,
+                &mut inflation,
+                &mut row,
+                &format!("main-prompt-{turn}"),
+                1_544,
+                SnapKind::Prompt,
+                false,
+                epoch,
+                4,
+            );
+            remember_fake(
+                &mut cache,
+                &mut stats,
+                &mut inflation,
+                &mut row,
+                &format!("main-finish-{turn}"),
+                1_600,
+                SnapKind::Finish,
+                false,
+                epoch,
+                4,
+            );
+            if turn == 1 {
+                assert!(cache.iter().any(|e| e.tokens[0] == key_id("main-point") && e.kind == SnapKind::Point));
+                assert!(cache.iter().any(|e| e.tokens[0] == key_id("main-prompt-1") && e.kind == SnapKind::Prompt),
+                        "non-Point entries retain the other cache rows");
+            }
+            for side in 0..2 {
+                epoch += 1;
+                for kind in [SnapKind::Point, SnapKind::Prompt, SnapKind::Finish] {
+                    let key = format!("side-{turn}-{side}-{}", kind.name());
+                    remember_fake(&mut cache, &mut stats, &mut inflation, &mut row, &key, 49, kind, true, epoch, 4);
+                    assert!(cache.iter().any(|e| e.tokens[0] == key_id("main-point") && e.kind == SnapKind::Point),
+                            "a 49-token side request must not evict the main Point");
+                }
+            }
+        }
+        assert_eq!(point_hits, 5, "the next chat reuses only the stable Point boundary");
+    }
+
+    #[test]
+    fn one_cache_slot_prefers_point_anchor() {
+        let point = fake_entry(1, "main-point", 1_544, SnapKind::Point, 800.0, true);
+        assert!(cache_admission_victim(&[point], SnapKind::Prompt, false, 0, 1).is_none());
+        assert!(cache_admission_victim(
+            &[fake_entry(2, "old", 131_072, SnapKind::Finish, 30_000.0, false)],
+            SnapKind::Point,
+            false,
+            0,
+            1,
+        )
+        .is_some_and(|(_, forced)| forced));
+    }
+
+    #[test]
+    fn recent_point_yields_cache_space_to_new_branch_and_survives_side_branches() {
+        let mut cache = vec![
+            fake_entry(0, "old-point", 15_000, SnapKind::Point, 40_000.0, false),
+            fake_entry(1, "old-prompt", 32_768, SnapKind::Prompt, 60_000.0, false),
+            fake_entry(2, "old-finish-a", 32_768, SnapKind::Finish, 61_000.0, false),
+            fake_entry(3, "old-finish-b", 131_072, SnapKind::Finish, 62_000.0, false),
+        ];
+        for entry in &mut cache {
+            entry.last_use_epoch = 1;
+        }
+        let mut stats = SnapStats::default();
+        let mut inflation = 0.0;
+        let mut row = 4;
+
+        // The cache entries were last used at epoch 1; the main branch arrives at epoch 2, still within the four-row window.
+        assert!(remember_fake(&mut cache, &mut stats, &mut inflation, &mut row,
+            "main-point", 1_544, SnapKind::Point, true, 2, 4));
+        assert!(cache.iter().any(|e| e.tokens[0] == key_id("old-point")));
+        assert!(cache.iter().any(|e| e.tokens[0] == key_id("main-point")));
+
+        for epoch in [3, 4] {
+            for kind in [SnapKind::Point, SnapKind::Prompt, SnapKind::Finish] {
+                remember_fake(&mut cache, &mut stats, &mut inflation, &mut row,
+                    &format!("side-{epoch}-{}", kind.name()), 49, kind, kind == SnapKind::Point, epoch, 4);
+            }
+            assert!(cache.iter().any(|e| e.tokens[0] == key_id("main-point")),
+                "side Point must not replace the recent main Point inside the recency window");
+        }
+        assert!(cache.iter().any(|e| e.tokens[0] == key_id("old-point")),
+            "side traffic must not evict the existing recent Point either");
+
+        assert!(hit_fake(&mut cache, &mut stats, inflation, "main-point", 5));
+        assert_eq!(cache.iter().find(|e| e.tokens[0] == key_id("main-point")).unwrap().last_use_epoch, 5);
+    }
+
+    #[test]
+    fn stale_point_is_replaced_when_no_nonpoint_slot_remains() {
+        let mut point = fake_entry(0, "stale-point", 15_000, SnapKind::Point, 40_000.0, false);
+        point.last_use_epoch = 1;
+        assert_eq!(cache_admission_victim(&[point], SnapKind::Point, true, 5, 4), Some((0, true)));
+    }
+
+    #[test]
+    fn inflation_jump_does_not_evict_recent_points_for_side_snapshots() {
+        let mut cache = vec![
+            fake_entry(0, "main-point", 1_544, SnapKind::Point, 20.0, true),
+            fake_entry(1, "other-point", 800, SnapKind::Point, 30.0, false),
+            fake_entry(2, "prompt", 4_000, SnapKind::Prompt, 100.0, false),
+            fake_entry(3, "finish", 4_100, SnapKind::Finish, 110.0, false),
+        ];
+        cache[0].last_use_epoch = 3;
+        cache[1].last_use_epoch = 4;
+        let mut stats = SnapStats::default();
+        let mut inflation = 1_000_000.0;
+        let mut row = 4;
+
+        for (key, kind, uncached) in [
+            ("side-point", SnapKind::Point, true),
+            ("side-prompt", SnapKind::Prompt, false),
+            ("side-finish", SnapKind::Finish, false),
+        ] {
+            remember_fake(&mut cache, &mut stats, &mut inflation, &mut row,
+                key, 49, kind, uncached, 5, 4);
+            assert!(cache.iter().any(|e| e.tokens[0] == key_id("main-point")));
+            assert!(cache.iter().any(|e| e.tokens[0] == key_id("other-point")));
+        }
+    }
+}
+
+#[cfg(test)]
+mod scheduler_lifecycle_tests {
+    use super::*;
+
+    fn request() -> GenRequest {
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        GenRequest::new(Vec::new(), SamplingParams::default(), events, Arc::new(AtomicBool::new(false)))
+    }
+
+    #[test]
+    fn shutdown_closes_and_joins_worker_and_releases_admission() {
+        let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = done.clone();
+        let (started_tx, started_rx) = channel();
+        let thread = std::thread::spawn(move || {
+            let held = rx.recv().unwrap();
+            started_tx.send(()).unwrap();
+            while let Ok(req) = rx.recv() {
+                drop(req);
+            }
+            drop(held);
+            worker_done.store(true, Ordering::Release);
+        });
+        let stats = Arc::new(SchedStats::default());
+        let scheduler = Scheduler {
+            lifecycle: Arc::new(SchedulerLifecycle {
+                tx: Mutex::new(Some(tx)),
+                thread: Mutex::new(Some(thread)),
+                stop: stop.clone(),
+            }),
+            max_requests: 2,
+            stats: stats.clone(),
+        };
+
+        scheduler.submit(request()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        scheduler.submit(request()).unwrap();
+        scheduler.shutdown();
+
+        assert!(stop.load(Ordering::Acquire));
+        assert!(done.load(Ordering::Acquire));
+        assert_eq!(stats.outstanding.load(Ordering::Acquire), 0);
+        assert!(matches!(scheduler.submit(request()), Err(SubmitError::Stopped)));
+        assert_eq!(stats.outstanding.load(Ordering::Acquire), 0);
+        scheduler.shutdown();
+    }
+}
+
+impl GenRequest {
+    pub fn new(tokens: Vec<i64>, params: SamplingParams, events: UnboundedSender<GenEvent>, cancel: Arc<AtomicBool>) -> Self {
+        Self { trace: crate::logging::request_trace(0), permit: None, tokens, params, max_tokens: 1,
+            stop_ids: Vec::new(), cache_points: Vec::new(), think: None, constraint: None, mm: None,
+            events, cancel, embed: false }
     }
 }
 
@@ -494,9 +965,12 @@ struct Loop {
     engine: Engine,
     cfg: SchedConfig,
     rx: Receiver<GenRequest>,
+    stop: Arc<AtomicBool>,
     waiting: VecDeque<GenRequest>,
     active: Vec<Active>,
     cache: Vec<CacheEntry>,
+    /// Number of requests admitted while this cache instance has been alive; Point staleness uses this bounded clock.
+    cache_epoch: u64,
     /// GreedyDual-Size inflation of the prompt cache (CacheEntry) and the usefulness of its snapshot kinds
     inflation: f64,
     /// steps whose logit edits overflowed the engine's table rotate the requests that go first
@@ -527,6 +1001,9 @@ struct Loop {
 impl Loop {
     fn run(&mut self) {
         loop {
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
             // intake: block while idle, poll while busy
             if self.active.is_empty() && self.waiting.is_empty() && self.preempted.is_empty() {
                 self.publish_stats();
@@ -549,9 +1026,18 @@ impl Loop {
                     }
                 }
             }
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
             self.reap_cancelled();
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
             self.admit();
             self.publish_stats();
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
             if self.active.is_empty() {
                 // nothing admissible yet (KV full): wait for a finish or a new request
                 std::thread::sleep(Duration::from_millis(2));
@@ -559,11 +1045,29 @@ impl Loop {
             }
             let shape = self.step_shape();
             let t0 = Instant::now();
+            let tokens0 = self.stats.generation_tokens.load(Ordering::Relaxed);
             let r = self.step();
-            self.health.step(t0.elapsed().as_secs_f64(), shape);
+            let secs = t0.elapsed().as_secs_f64();
+            self.health.step(secs, shape);
+            if shape.prefilling > 0 {
+                self.stats.prefill_step.observe(secs);
+                self.stats.prefill_micros.fetch_add((secs * 1e6) as u64, Ordering::Relaxed);
+            } else {
+                self.stats.decode_step.observe(secs);
+                self.stats.decode_micros.fetch_add((secs * 1e6) as u64, Ordering::Relaxed);
+                self.health.cur.decode_secs += secs;
+                self.health.cur.decode_tokens += self.stats.generation_tokens.load(Ordering::Relaxed)-tokens0;
+            }
+            if crate::logging::enabled(crate::logging::Level::Debug) {
+                crate::logging::event(crate::logging::Level::Debug, "scheduler.step", serde_json::json!({
+                    "shape":shape.to_string(), "elapsed_ms":secs*1e3,"emitted":self.stats.generation_tokens.load(Ordering::Relaxed)-tokens0,
+                    "kv_pages_free":self.engine.free_page_count(),"waiting":self.waiting.len(),
+                    "requests":self.active.iter().map(|a|serde_json::json!({"id":a.req.trace.id,"choice":a.req.trace.choice,"prefill":a.fed,"prompt":a.req.tokens.len(),"output":a.generated.len()})).collect::<Vec<_>>() }));
+            }
             if let Err(e) = r {
                 eprintln!("blaze: step failed ({shape}; KV {} pages free): {e:#}", self.engine.free_page_count());
                 self.health.cur.errors += self.active.len() as u64;
+                self.stats.errors.fetch_add(self.active.len() as u64, Ordering::Relaxed);
                 for a in self.active.drain(..) {
                     let _ = a.req.events.send(GenEvent::Error(format!("{e:#}")));
                     self.engine.close(a.seq);
@@ -588,12 +1092,17 @@ impl Loop {
     fn publish_stats(&self) {
         self.stats.running.store(self.active.len(), Ordering::Relaxed);
         self.stats.waiting.store(self.waiting.len() + self.preempted.len(), Ordering::Relaxed);
+        self.stats.kv_pages_free.store(self.engine.free_page_count(), Ordering::Relaxed);
+        self.stats.kv_pages_total.store(self.engine.info.max_tokens / self.engine.info.page.max(1), Ordering::Relaxed);
+        self.stats.cache_entries.store(self.cache.len(), Ordering::Relaxed);
+        self.stats.spec_rounds.store(self.spec_stats.0 as u64, Ordering::Relaxed);
+        self.stats.spec_emitted.store(self.spec_stats.1 as u64, Ordering::Relaxed);
     }
 
     /// Requests whose client is gone (cancel flag set, event channel closed) leave at once, also while they wait or
     /// read a long prompt; decoding requests are checked after every token in `emit`.
     fn reap_cancelled(&mut self) {
-        let gone = |r: &GenRequest| r.cancel.load(Ordering::Relaxed) || r.events.is_closed();
+        let gone = |r: &GenRequest| r.cancel.load(Ordering::Relaxed) || r.trace.cancelled.load(Ordering::Relaxed) || r.events.is_closed();
         let mut n = 0;
         self.waiting.retain(|r| {
             if !gone(r) {
@@ -607,9 +1116,7 @@ impl Loop {
         while i < self.active.len() {
             if self.active[i].pending.is_none() && gone(&self.active[i].req) {
                 let a = self.active.swap_remove(i);
-                let _ = a.req.events.send(GenEvent::Done(Finish::Cancelled));
-                self.engine.close(a.seq);
-                n += 1;
+                self.retire_as(a,Finish::Cancelled,false);
             } else {
                 i += 1;
             }
@@ -621,7 +1128,7 @@ impl Loop {
     }
 
     /// Longest cached prefix of `tokens` that leaves at least one token to feed.
-    fn lookup(&mut self, tokens: &[i64]) -> Option<usize> {
+    fn lookup(&self, tokens: &[i64]) -> Option<usize> {
         let mut best: Option<(usize, usize)> = None;
         for (i, e) in self.cache.iter().enumerate() {
             let n = e.tokens.len();
@@ -633,14 +1140,14 @@ impl Loop {
     }
 
     fn evict_lru(&mut self) -> bool {
-        let Some(i) = self.cache.iter().enumerate().min_by(|a, b| a.1.worth.total_cmp(&b.1.worth)).map(|(i, _)| i) else { return false };
+        let Some(i) = eviction_index(&self.cache,None) else { return false };
         let e = self.cache.swap_remove(i);
         self.inflation = self.inflation.max(e.worth);
         self.engine.release(e.snap);
         true
     }
 
-    fn remember(&mut self, seq: &Seq, tokens: Vec<i64>, kind: SnapKind) {
+    fn remember(&mut self, seq: &Seq, tokens: Vec<i64>, kind: SnapKind, uncached_branch: bool) {
         if !self.cfg.prompt_cache
             || tokens.len() != seq.len()
             || tokens.len() % self.engine.info.page != 0
@@ -648,15 +1155,37 @@ impl Loop {
         {
             return;
         }
+        let mut evicted: Option<(SnapKind, f64)> = None;
+        let mut forced_point_admission = false;
         let snap = match self.engine.snapshot(seq) {
             Ok(Some(s)) => s,
             Ok(None) => {
-                // full: a new entry worth no more than the least worth one (a short side request against a
-                // conversation) is not kept rather than pushing that one out
-                let least = self.cache.iter().map(|e| e.worth).fold(f64::INFINITY, f64::min);
-                if self.inflation + tokens.len() as f64 * self.snap_stats.useful(kind) <= least || !self.evict_lru() {
+                let Some((i, forced_point)) = cache_admission_victim(
+                    &self.cache, kind, uncached_branch, self.cache_epoch, self.engine.info.cache_rows,
+                ) else {
+                    crate::logging::event(crate::logging::Level::Debug, "cache.decision", serde_json::json!({
+                        "action":"bypass", "kind":kind.name(), "tokens":tokens.len(), "reason":"no eligible victim",
+                        "point_entries":self.cache.iter().filter(|e|e.kind==SnapKind::Point).count(),
+                        "cache_epoch":self.cache_epoch, "cache_rows":self.engine.info.cache_rows
+                    }));
+                    return;
+                };
+                let candidate = self.inflation + tokens.len() as f64 * self.snap_stats.useful(kind);
+                let least = self.cache[i].worth;
+                if !forced_point && candidate <= least {
+                    crate::logging::event(crate::logging::Level::Debug, "cache.decision", serde_json::json!({
+                        "action":"bypass", "kind":kind.name(), "tokens":tokens.len(), "candidate_worth":candidate,
+                        "victim_kind":self.cache[i].kind.name(), "victim_worth":least, "inflation":self.inflation,
+                        "reason":"lower worth", "cache_epoch":self.cache_epoch,
+                        "victim_last_use_epoch":self.cache[i].last_use_epoch, "cache_rows":self.engine.info.cache_rows
+                    }));
                     return;
                 }
+                forced_point_admission = forced_point;
+                let e = self.cache.swap_remove(i);
+                self.inflation = self.inflation.max(e.worth);
+                evicted = Some((e.kind, e.worth));
+                self.engine.release(e.snap);
                 match self.engine.snapshot(seq) {
                     Ok(Some(s)) => s,
                     _ => return,
@@ -669,7 +1198,14 @@ impl Loop {
         };
         let worth = self.inflation + tokens.len() as f64 * self.snap_stats.useful(kind);
         self.snap_stats.made(kind);
-        self.cache.push(CacheEntry { tokens, snap, worth, kind, hit: false });
+        self.cache.push(CacheEntry { tokens, snap, worth, kind, hit: false, last_use_epoch: self.cache_epoch });
+        crate::logging::event(crate::logging::Level::Debug, "cache.decision", serde_json::json!({
+            "action":"admit", "kind":kind.name(), "tokens":self.cache.last().unwrap().tokens.len(),
+            "worth":worth, "inflation":self.inflation,
+            "point_anchor_override":forced_point_admission,
+            "cache_epoch":self.cache_epoch, "cache_rows":self.engine.info.cache_rows,
+            "evicted_kind":evicted.map(|(k, _)|k.name()), "evicted_worth":evicted.map(|(_, w)|w)
+        }));
     }
 
     fn admit(&mut self) {
@@ -677,7 +1213,7 @@ impl Loop {
             return;
         }
         while let Some(req) = self.waiting.front() {
-            if req.cancel.load(Ordering::Relaxed) {
+            if req.cancel.load(Ordering::Relaxed) || req.trace.cancelled.load(Ordering::Relaxed) {
                 let req = self.waiting.pop_front().unwrap();
                 let _ = req.events.send(GenEvent::Done(Finish::Cancelled));
                 continue;
@@ -695,8 +1231,7 @@ impl Loop {
                 )));
                 continue;
             }
-            let prompt = req.tokens.clone();
-            let hit = self.lookup(&prompt);
+            let hit = self.lookup(&req.tokens);
             let cached = hit.map_or(0, |i| self.cache[i].tokens.len());
             // KV room for the rest of the prompt next to what the admitted requests still read (their prompts) and
             // a verify of each decoding one: evict cached prefixes (not the one we are about to use) if needed
@@ -706,16 +1241,10 @@ impl Loop {
                 .iter()
                 .map(|a| (if a.pending.is_some() { self.engine.info.max_verify.max(1) } else { a.req.tokens.len() - a.fed }) + page)
                 .sum();
-            let need = prompt.len() - cached + 16 + reserved;
-            while self.engine.free_slots() < need && self.cache.len() > hit.map_or(0, |_| 1) {
-                let keep = hit.map(|i| self.cache[i].tokens.clone());
-                let lru = self
-                    .cache
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| keep.as_ref() != Some(&e.tokens))
-                    .min_by(|a, b| a.1.worth.total_cmp(&b.1.worth))
-                    .map(|(i, _)| i);
+            let need = req.tokens.len() - cached + 16 + reserved;
+            let keep_row=hit.map(|i|self.cache[i].snap.row);
+            while self.engine.free_slots() < need && self.cache.len() > usize::from(keep_row.is_some()) {
+                let lru=eviction_index(&self.cache,keep_row);
                 let Some(i) = lru else { break };
                 let e = self.cache.swap_remove(i);
                 self.inflation = self.inflation.max(e.worth);
@@ -737,10 +1266,12 @@ impl Loop {
                 continue;
             }
             let req = self.waiting.pop_front().unwrap();
+            self.cache_epoch = self.cache_epoch.saturating_add(1);
             let hit = self.lookup(&req.tokens);
             let opened = match hit {
                 Some(i) => {
                     let k = self.cache[i].kind;
+                    self.cache[i].last_use_epoch = self.cache_epoch;
                     if !self.cache[i].hit {
                         self.cache[i].hit = true;
                         self.snap_stats.used[k as usize] += 1.0;
@@ -771,9 +1302,13 @@ impl Loop {
             let id = self.health.next_id();
             self.health.cur.prompt += req.tokens.len() as u64;
             self.health.cur.cached += fed as u64;
+            self.stats.prompt_tokens.fetch_add(req.tokens.len() as u64, Ordering::Relaxed);
+            self.stats.cached_tokens.fetch_add(fed as u64, Ordering::Relaxed);
+            self.stats.queue_time.observe(req.trace.received.elapsed().as_secs_f64());
             if self.health.req_log {
-                eprintln!("blaze req {id}: prompt {} tokens, {fed} from the prompt cache, max {} new, {} running, {} waiting",
-                          req.tokens.len(), req.max_tokens, self.active.len(), self.waiting.len());
+                crate::logging::event(crate::logging::Level::Info, "request.admitted", serde_json::json!({"request_id":req.trace.id,
+                    "choice":req.trace.choice,"prompt_tokens":req.tokens.len(),"cached_tokens":fed,"max_tokens":req.max_tokens,
+                    "queue_ms":req.trace.received.elapsed().as_secs_f64()*1e3,"running":self.active.len()+1,"waiting":self.waiting.len(),"sampling":req.params}));
             }
             let rng = req.params.seed.map(Rng::new).unwrap_or_else(Rng::from_time);
             let page = self.engine.info.page;
@@ -790,7 +1325,13 @@ impl Loop {
             let seen = if self.cfg.draft_cands { seen_set(&req.tokens, &self.cfg.frequent, self.engine.info.vocab) } else { Vec::new() };
             self.active.push(Active {
                 id,
-                t0: Instant::now(),
+                cached: fed,
+                first_token: None,
+                last_token: None,
+                progress: Instant::now(),
+                progress_tokens: 0,
+                prefill_work: 0,
+                prefill_secs: 0.0,
                 orig_len: req.tokens.len(),
                 seen,
                 prompt_set,
@@ -862,6 +1403,21 @@ impl Loop {
     /// actually emitted (the budget may replace it) and the finish reason if the request ends here.
     fn emit(&mut self, i: usize, pick: i32, lp: Option<TokenLogprob>) -> (i32, Option<Finish>) {
         let a = &mut self.active[i];
+        let now = Instant::now();
+        if a.first_token.is_none() {
+            a.first_token = Some(now);
+            self.stats.ttft.observe(a.req.trace.received.elapsed().as_secs_f64());
+            if self.health.req_log {
+                crate::logging::event(crate::logging::Level::Info, "request.first_token", serde_json::json!({
+                    "request_id":a.req.trace.id,"choice":a.req.trace.choice,"ttft_ms":a.req.trace.received.elapsed().as_secs_f64()*1e3,
+                    "prefill_tokens":a.prefill_work,"cached_tokens":a.cached,"prefill_tok_s":a.prefill_work as f64/a.prefill_secs.max(1e-9)}));
+            }
+            a.progress = now;
+            a.progress_tokens = 1;
+        } else if let Some(last) = a.last_token {
+            self.stats.inter_token.observe(now.duration_since(last).as_secs_f64());
+        }
+        a.last_token = Some(now);
         let sampled = pick;
         let mut pick = pick;
         if let Some(tb) = a.req.think.clone() {
@@ -900,6 +1456,17 @@ impl Loop {
         *a.counts.entry(pick).or_insert(0) += 1;
         let _ = a.req.events.send(GenEvent::Token(pick, lp));
         self.health.cur.tokens += 1;
+        self.stats.generation_tokens.fetch_add(1, Ordering::Relaxed);
+        if crate::logging::enabled(crate::logging::Level::Trace) {
+            crate::logging::event(crate::logging::Level::Trace, "request.token", serde_json::json!({"request_id":a.req.trace.id,"choice":a.req.trace.choice,"index":a.generated.len(),"token_id":pick,"context_tokens":a.seq.len()}));
+        }
+        let interval = crate::logging::options().progress_secs;
+        if self.health.req_log && interval > 0.0 && a.progress.elapsed().as_secs_f64() >= interval {
+            crate::logging::event(crate::logging::Level::Info,"request.decode",serde_json::json!({"request_id":a.req.trace.id,"choice":a.req.trace.choice,
+                "output_tokens":a.generated.len(),"context_tokens":a.seq.len(),"decode_tok_s":a.generated.len().saturating_sub(a.progress_tokens) as f64/a.progress.elapsed().as_secs_f64()}));
+            a.progress = now;
+            a.progress_tokens = a.generated.len();
+        }
         let stop = a.req.stop_ids.contains(&pick);
         if let Some(c) = a.req.constraint.as_mut()
             && let Err(e) = c.advance(pick, stop)
@@ -907,7 +1474,7 @@ impl Loop {
             eprintln!("blaze: grammar dropped: {e}");
             a.req.constraint = None;
         }
-        let cancel = a.req.cancel.load(Ordering::Relaxed) || a.req.events.is_closed();
+        let cancel = a.req.cancel.load(Ordering::Relaxed) || a.req.trace.cancelled.load(Ordering::Relaxed) || a.req.events.is_closed();
         let full = a.seq.len() + 1 >= self.engine.info.ctx_stride;
         if stop || cancel || a.generated.len() >= a.req.max_tokens || full {
             let reason = if stop {
@@ -924,7 +1491,7 @@ impl Loop {
             let tokens = a.req.tokens.clone();
             let seq_ptr: *const Seq = &a.seq;
             // SAFETY: remember() touches the engine and the cache, not the active list.
-            self.remember(unsafe { &*seq_ptr }, tokens, SnapKind::Prompt);
+            self.remember(unsafe { &*seq_ptr }, tokens, SnapKind::Prompt, false);
         }
         (pick, None)
     }
@@ -1421,20 +1988,26 @@ impl Loop {
     /// hold them).
     fn retire_as(&mut self, a: Active, reason: Finish, keep: bool) {
         self.health.cur.requests += 1;
+        self.stats.completed.fetch_add(1, Ordering::Relaxed);
+        self.stats.request_time.observe(a.req.trace.received.elapsed().as_secs_f64());
         match reason {
             Finish::Length => self.health.cur.lengths += 1,
             Finish::Cancelled => self.health.cur.cancelled += 1,
             _ => {}
         }
         if self.health.req_log {
-            let secs = a.t0.elapsed().as_secs_f64();
-            eprintln!("blaze req {}: {reason:?} after {} tokens in {secs:.2} s ({:.1} tok/s)", a.id, a.generated.len(),
-                      a.generated.len() as f64 / secs.max(1e-9));
+            let decode = a.first_token.zip(a.last_token).map_or(0.0, |(first,last)|last.duration_since(first).as_secs_f64());
+            crate::logging::event(crate::logging::Level::Info,"request.finished",serde_json::json!({"request_id":a.req.trace.id,"choice":a.req.trace.choice,
+                "finish_reason":format!("{reason:?}"),"prompt_tokens":a.orig_len,"cached_tokens":a.cached,"output_tokens":a.generated.len(),
+                "e2e_ms":a.req.trace.received.elapsed().as_secs_f64()*1e3,"prefill_ms":a.prefill_secs*1e3,"decode_ms":decode*1e3,
+                "prefill_tok_s":a.prefill_work as f64/a.prefill_secs.max(1e-9),
+                "decode_tok_s":if a.generated.len()>1 && decode>0.0 {Some((a.generated.len()-1) as f64/decode)}else{None},
+                "tpot_ms":if a.generated.len()>1 {Some(decode*1e3/(a.generated.len()-1) as f64)}else{None}}));
         }
         if reason != Finish::Cancelled && keep {
             let mut tokens = a.req.tokens[..a.orig_len].to_vec();
             tokens.extend(a.generated[..a.generated.len().saturating_sub(1)].iter().map(|&t| t as i64));
-            self.remember(&a.seq, tokens, SnapKind::Finish);
+            self.remember(&a.seq, tokens, SnapKind::Finish, false);
         }
         if reason == Finish::Cancelled {
             self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -1515,7 +2088,7 @@ impl Loop {
     /// Preempted requests back into the batch while their tokens fit (the oldest first; new requests wait for them).
     fn resume_preempted(&mut self) -> bool {
         while let Some(a) = self.preempted.front() {
-            if a.req.cancel.load(Ordering::Relaxed) || a.req.events.is_closed() {
+            if a.req.cancel.load(Ordering::Relaxed) || a.req.trace.cancelled.load(Ordering::Relaxed) || a.req.events.is_closed() {
                 let a = self.preempted.pop_front().unwrap();
                 let _ = a.req.events.send(GenEvent::Done(Finish::Cancelled));
                 self.stats.cancelled.fetch_add(1, Ordering::Relaxed);
@@ -1525,8 +2098,8 @@ impl Loop {
             if self.engine.free_rows() == 0 {
                 return false;
             }
-            let tokens = a.req.tokens.clone();
-            let hit = self.lookup(&tokens);
+            let token_len=a.req.tokens.len();
+            let hit = self.lookup(&a.req.tokens);
             let cached = hit.map_or(0, |i| self.cache[i].tokens.len());
             let page = self.engine.info.page;
             let reserved: usize = self
@@ -1534,16 +2107,10 @@ impl Loop {
                 .iter()
                 .map(|x| (if x.pending.is_some() { self.engine.info.max_verify.max(1) } else { x.req.tokens.len() - x.fed }) + page)
                 .sum();
-            let need = tokens.len() - cached + 16 + reserved + self.engine.info.max_verify.max(1);
-            let keep = hit.map(|i| self.cache[i].tokens.clone());
-            while self.engine.free_slots() < need && self.cache.len() > usize::from(keep.is_some()) {
-                let lru = self
-                    .cache
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| keep.as_ref() != Some(&e.tokens))
-                    .min_by(|a, b| a.1.worth.total_cmp(&b.1.worth))
-                    .map(|(i, _)| i);
+            let need = token_len - cached + 16 + reserved + self.engine.info.max_verify.max(1);
+            let keep_row=hit.map(|i|self.cache[i].snap.row);
+            while self.engine.free_slots() < need && self.cache.len() > usize::from(keep_row.is_some()) {
+                let lru=eviction_index(&self.cache,keep_row);
                 let Some(i) = lru else { break };
                 let e = self.cache.swap_remove(i);
                 self.inflation = self.inflation.max(e.worth);
@@ -1555,10 +2122,10 @@ impl Loop {
                 }
                 // alone, nothing frees pages: it resumes without the headroom while its tokens fit, else it ends here
                 // (its output so far is sent) rather than holding every new request back
-                if self.engine.free_slots() < tokens.len() - cached + page {
+                if self.engine.free_slots() < token_len - cached + page {
                     let a = self.preempted.pop_front().unwrap();
                     eprintln!("blaze: KV pool full ({} free slots): a preempted request of {} tokens no longer fits and \
-                               ends at {} tokens of output", self.engine.free_slots(), tokens.len(), a.generated.len());
+                               ends at {} tokens of output", self.engine.free_slots(), token_len, a.generated.len());
                     self.stats.kv_full.fetch_add(1, Ordering::Relaxed);
                     self.health.cur.kv_full += 1;
                     self.health.cur.requests += 1;
@@ -1571,7 +2138,10 @@ impl Loop {
             let mut a = self.preempted.pop_front().unwrap();
             let hit = self.lookup(&a.req.tokens);
             let opened = match hit {
-                Some(i) => self.engine.open_from(Some(&self.cache[i].snap)),
+                Some(i) => {
+                    self.cache[i].last_use_epoch = self.cache_epoch;
+                    self.engine.open_from(Some(&self.cache[i].snap))
+                }
                 None => self.engine.open(),
             };
             match opened {
@@ -1613,7 +2183,6 @@ impl Loop {
     fn step(&mut self) -> Result<()> {
         self.decode_room();
         if self.cfg.spec_tokens > 0
-            && self.waiting.is_empty()
             && !self.active.is_empty()
             && self.active.iter().all(|a| a.pending.is_some())
             && self.spec_step()?
@@ -1675,8 +2244,10 @@ impl Loop {
                 let _ = self.engine.ple_warm(prev, &a.req.tokens[next0..next1]);
             }
         }
-        let sampled = order.iter().any(|&i| self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some());
-        let mut pens: Vec<Penalty> = if sampled { order.iter().map(|&i| self.edits_for(i, &[])).collect() } else { Vec::new() };
+        // Intermediate prompt chunks need no penalties, candidate transfer or RNG draw.
+        let emits = |a: &Active| a.pending.is_some() || (!a.req.embed && a.fed + chunk_len >= a.req.tokens.len());
+        let sampled = order.iter().any(|&i| emits(&self.active[i]) && (self.active[i].req.params.needs_candidates() || self.active[i].req.constraint.is_some()));
+        let mut pens: Vec<Penalty> = if sampled { order.iter().map(|&i| if emits(&self.active[i]) {self.edits_for(i, &[])} else {Penalty::default()}).collect() } else { Vec::new() };
         if !self.pens_fit(&pens) {
             // more logit edits than the engine's table: the requests past it wait for the next step, from a
             // different first request each time
@@ -1733,7 +2304,14 @@ impl Loop {
         // SAFETY: `order` holds distinct indices, so the pointers are distinct and live for this call.
         let mut seqs: Vec<&mut Seq> = seq_ptrs.iter_mut().map(|p| unsafe { &mut **p }).collect();
         let tok_refs: Vec<&[i64]> = toks.iter().map(|t| t.as_slice()).collect();
-        let (picks, lps): (Vec<i32>, Vec<Option<TokenLogprob>>) = if sampled {
+        let headless = order.len() == 1 && chunk_len > 0 && {
+            let a = &self.active[order[0]];
+            a.pending.is_none() && a.fed + chunk_len < a.req.tokens.len()
+        };
+        let (picks, lps): (Vec<i32>, Vec<Option<TokenLogprob>>) = if headless {
+            self.engine.prefill_only(seqs[0], tok_refs[0])?;
+            (vec![0], vec![None]) // no output is emitted until the final prompt chunk
+        } else if sampled {
             for (p, m) in pens.iter_mut().zip(masks) {
                 p.mask = m;
             }
@@ -1746,7 +2324,9 @@ impl Loop {
                 .zip(allowed)
                 .map(|((&i, c), allowed)| {
                     let a = &mut self.active[i];
-                    let x = sample(&c.top, &a.req.params, &mut a.rng);
+                    // Intermediate prefill chunks produce no output: never consume this request's RNG there.
+                    let real_output = a.pending.is_some() || a.fed + chunk_len >= a.req.tokens.len();
+                    let x = if real_output { sample(&c.top, &a.req.params, &mut a.rng) } else { c.top.first().map_or(0, |c|c.1) };
                     if glog && a.req.constraint.is_some() {
                         let top: Vec<String> = c.top.iter().take(4).map(|(v, t)| format!("{t}:{v:.2}")).collect();
                         eprintln!("blaze grammar: step {} mask {:?} allowed, pick {x}, top {}", a.generated.len(), allowed, top.join(" "));
@@ -1759,9 +2339,6 @@ impl Loop {
             let n = p.len();
             (p, vec![None; n])
         };
-        if chunk_len == 0 {
-            SpecCost::note(&mut self.spec_cost.decode, order.len(), t0.elapsed().as_secs_f64());
-        }
         // apply
         let mut finished = Vec::new();
         let eagle = self.eagle_on();
@@ -1773,12 +2350,27 @@ impl Loop {
             let fed0 = a.fed;
             if a.pending.is_none() {
                 a.fed += chunk_len;
+                let secs=t0.elapsed().as_secs_f64();
+                a.prefill_work+=chunk_len;
+                a.prefill_secs+=secs;
+                self.stats.prefill_tokens.fetch_add(chunk_len as u64,Ordering::Relaxed);
+                self.health.cur.prefill_work+=chunk_len as u64;
+                self.health.cur.prefill_secs+=secs;
+                let every=crate::logging::options().progress_secs;
+                if self.health.req_log && ((every>0.0 && a.progress.elapsed().as_secs_f64()>=every) || crate::logging::enabled(crate::logging::Level::Debug)) {
+                    crate::logging::event(crate::logging::Level::Info,"request.prefill",serde_json::json!({"request_id":a.req.trace.id,"choice":a.req.trace.choice,
+                        "processed_tokens":a.fed,"prompt_tokens":a.req.tokens.len(),"cached_tokens":a.cached,"progress_pct":100.0*a.fed as f64/a.req.tokens.len().max(1) as f64,
+                        "chunk_tokens":chunk_len,"chunk_ms":secs*1e3,"chunk_tok_s":chunk_len as f64/secs.max(1e-9),
+                        "prefill_tok_s":a.prefill_work as f64/a.prefill_secs.max(1e-9),"kv_pages_free":self.engine.free_page_count()}));
+                    a.progress=Instant::now();
+                }
                 if a.points.front() == Some(&a.fed) {
                     a.points.pop_front();
                     let tokens = a.req.tokens[..a.fed].to_vec();
+                    let uncached_branch = a.cached == 0;
                     let seq_ptr: *const Seq = &a.seq;
                     // SAFETY: remember() touches the engine and the cache, not the active list.
-                    self.remember(unsafe { &*seq_ptr }, tokens, SnapKind::Point);
+                    self.remember(unsafe { &*seq_ptr }, tokens, SnapKind::Point, uncached_branch);
                 }
                 let a = &mut self.active[i];
                 if a.fed < a.req.tokens.len() {
@@ -1828,6 +2420,11 @@ impl Loop {
                 }
             }
             self.eagle_extend(items)?;
+        }
+        if chunk_len == 0 {
+            // Verify timings include this synchronous extension too. Comparing the same complete
+            // round avoids rejecting useful drafts because the plain baseline omitted their cost.
+            SpecCost::note(&mut self.spec_cost.decode, order.len(), t0.elapsed().as_secs_f64());
         }
         finished.sort_by(|a, b| b.0.cmp(&a.0));
         for (i, reason) in finished {

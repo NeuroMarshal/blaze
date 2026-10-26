@@ -352,13 +352,12 @@ fn sse(s: impl Stream<Item = Value> + Send + 'static) -> Response {
 }
 
 /// Sequence numbers of a stream's events.
-struct Seq(u64);
+struct Seq(Arc<std::sync::atomic::AtomicU64>);
 
 impl Seq {
     fn ev(&mut self, kind: &str, mut v: Value) -> Value {
         v["type"] = json!(kind);
-        v["sequence_number"] = json!(self.0);
-        self.0 += 1;
+        v["sequence_number"] = json!(self.0.fetch_add(1, Ordering::Relaxed));
         v
     }
 }
@@ -403,8 +402,9 @@ fn close(open: &mut Option<(&'static str, usize, String)>, output: &mut [Value],
 /// closed when another kind starts or at the end.
 fn stream_events(body: Value, id: String, model: Value, messages: Vec<Value>, custom: Custom, store_it: bool,
                  mut chunks: Pin<Box<dyn Stream<Item = Value> + Send>>) -> impl Stream<Item = Value> + Send {
+    let sequence = crate::logging::request_trace(0).stream_sequence;
     async_stream::stream! {
-        let mut ev = Seq(0);
+        let mut ev = Seq(sequence);
         let mut resp = shell(&body, &id, &model, "in_progress");
         yield ev.ev("response.created", json!({"response": resp.clone()}));
         yield ev.ev("response.in_progress", json!({"response": resp.clone()}));

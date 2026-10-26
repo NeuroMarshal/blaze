@@ -2,7 +2,7 @@
 //! Probability mass beyond BLZ_TOPK_MAX candidates is discarded, even with top-k disabled.
 
 /// Sampling parameters of one request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct SamplingParams {
     pub temperature: f32,
     pub top_p: f32,

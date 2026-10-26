@@ -9,6 +9,7 @@ Prints TTFT, prompt size and which codes the model returned.
 
 import argparse
 import json
+import os
 import random
 import re
 import time
@@ -51,7 +52,7 @@ def main() -> None:
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "user", "content": " ".join(sentences) + question}]}
     req = urllib.request.Request(args.url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + os.environ["BLAZE_API_KEY"]} if os.environ.get("BLAZE_API_KEY") else {})})
     t0, first, text, usage = time.perf_counter(), None, "", {}
     with urllib.request.urlopen(req, timeout=7200) as resp:
         for raw in resp:

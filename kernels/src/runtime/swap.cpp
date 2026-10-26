@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -34,6 +35,41 @@ void select(std::vector<size_t>& idx, const std::vector<double>& score, size_t c
   idx.resize(count);
 }
 
+void validate_swap_config(const SwapConfig& c) {
+  if (c.period_ms <= 0) throw std::invalid_argument("swap period_ms must be positive");
+  if (c.max_moves <= 0 || c.max_moves > std::numeric_limits<int>::max() / 2)
+    throw std::invalid_argument("swap max_moves must be positive and at most INT_MAX / 2");
+  if (!std::isfinite(c.halflife_tokens) || c.halflife_tokens <= 0)
+    throw std::invalid_argument("swap halflife must be finite and positive");
+  if (!std::isfinite(c.halflife_ssd_tokens) || c.halflife_ssd_tokens <= 0)
+    throw std::invalid_argument("swap halflife_ssd must be finite and positive");
+  if (!std::isfinite(c.hysteresis) || c.hysteresis < 0)
+    throw std::invalid_argument("swap hysteresis must be finite and nonnegative");
+  if (c.spare_slots < 0) throw std::invalid_argument("swap spare must be nonnegative");
+  if (c.ssd_threads < 1) throw std::invalid_argument("swap ssd_threads must be positive");
+  if (!std::isfinite(c.prefill_weight) || c.prefill_weight < 0)
+    throw std::invalid_argument("swap prefill_weight must be finite and nonnegative");
+  if (c.save_period_s <= 0) throw std::invalid_argument("swap save_s must be positive");
+  if (c.log_period_s < 0) throw std::invalid_argument("swap log_s must be nonnegative");
+}
+
+void validate_hybrid_config(const HybridConfig& cfg) {
+  if (cfg.cpu_fast_cols < 0) throw std::invalid_argument("cpu_fast_cols must be nonnegative");
+  if (cfg.wide_tokens < 0) throw std::invalid_argument("wide_tokens must be nonnegative");
+  if (cfg.wide_min_tokens < 0) throw std::invalid_argument("wide_min_tokens must be nonnegative");
+  if (cfg.wide_slots < 1) throw std::invalid_argument("wide_slots must be positive");
+  if (cfg.imm_heat < 0) throw std::invalid_argument("imm_heat must be nonnegative");
+  if (cfg.defer_ssd_rank < -1) throw std::invalid_argument("defer_ssd must be -1 or nonnegative");
+  if (cfg.cpu_gu_chunk < 1) throw std::invalid_argument("cpu_gu_chunk must be positive");
+  if (cfg.cpu_down_chunk < 1) throw std::invalid_argument("cpu_down_chunk must be positive");
+  constexpr long double kGib = 1073741824.0L;
+  if (!std::isfinite(cfg.host_reserve_gib) || cfg.host_reserve_gib < 0 ||
+      static_cast<long double>(cfg.host_reserve_gib) * kGib >
+          static_cast<long double>(std::numeric_limits<size_t>::max()))
+    throw std::invalid_argument("host_reserve_gib must be finite, nonnegative, and representable");
+  if (cfg.ssd_io_threads < 1) throw std::invalid_argument("ssd_io must be positive");
+}
+
 }  // namespace
 
 SwapConfig parse_swap_options(const std::string& options, SwapConfig c) {
@@ -61,6 +97,7 @@ SwapConfig parse_swap_options(const std::string& options, SwapConfig c) {
     else if (key == "log_s") c.log_period_s = std::stoi(val);
     else throw std::invalid_argument("unknown swap option: " + key);
   }
+  validate_swap_config(c);
   return c;
 }
 
@@ -96,6 +133,7 @@ void apply_hybrid_options(const std::string& options, HybridConfig& cfg) {
     }
     else throw std::invalid_argument("unknown blaze option: " + key);
   }
+  validate_hybrid_config(cfg);
 }
 
 HeatProfile load_heat(const std::string& path, int num_layers, int num_experts) {

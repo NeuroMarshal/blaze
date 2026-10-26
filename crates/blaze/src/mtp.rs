@@ -592,6 +592,7 @@ impl Mtp {
         // the extend eagerly (its shape changes every call), the chain through one CUDA graph per (length, items)
         self.extend(model, plan, &fwds[..n_ext], &ext_start)?;
         if plan.k == 0 {
+            s.sync()?;
             return Ok(vec![Vec::new(); n_items]);
         }
         let dump = std::env::var_os("BLAZE_MTP_DUMP").filter(|_| !self.dumped && model.tp.rank == 0 && matches!(self.body, Body::Dense(_)));

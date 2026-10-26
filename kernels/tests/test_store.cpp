@@ -11,11 +11,72 @@
 #include <vector>
 
 #include "blaze/expert.h"
+#include "blaze/hybrid.h"
+#include "blaze/log.h"
 #include "blaze/store.h"
 #include "synthetic_checkpoint.h"
 
 namespace fs = std::filesystem;
 using namespace blaze;
+
+static std::string callback_message;
+
+extern "C" void test_log_callback(const char* message) { callback_message = message; }
+
+bool check_log_callback() {
+  blaze_set_log_callback(test_log_callback);
+  blaze::log("formatted CPU log %s=%d", "count", 17);
+  blaze_set_log_callback(nullptr);
+  if (callback_message != "formatted CPU log count=17") {
+    std::printf("C++ log callback received '%s'\n", callback_message.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool check_option_validation() {
+  int bad = 0;
+  auto rejects = [&](const char* name, auto parse) {
+    try {
+      parse();
+      std::printf("option validation accepted %s\n", name);
+      ++bad;
+    } catch (const std::invalid_argument&) {
+    }
+  };
+
+  rejects("spare=-1", [] { (void)parse_swap_options("spare=-1"); });
+  rejects("max_moves=-1", [] { (void)parse_swap_options("max_moves=-1"); });
+  rejects("max_moves overflow", [] { (void)parse_swap_options("max_moves=1073741824"); });
+  rejects("period_ms=0", [] { (void)parse_swap_options("period_ms=0"); });
+  rejects("halflife=nan", [] { (void)parse_swap_options("halflife=nan"); });
+  rejects("cpu_gu_chunk=0", [] {
+    HybridConfig cfg;
+    apply_hybrid_options("cpu_gu_chunk=0", cfg);
+  });
+  rejects("cpu_down_chunk=-1", [] {
+    HybridConfig cfg;
+    apply_hybrid_options("cpu_down_chunk=-1", cfg);
+  });
+  rejects("host_reserve_gib=inf", [] {
+    HybridConfig cfg;
+    apply_hybrid_options("host_reserve_gib=inf", cfg);
+  });
+  rejects("ssd_io=0", [] {
+    HybridConfig cfg;
+    apply_hybrid_options("ssd_io=0", cfg);
+  });
+
+  const SwapConfig swap = parse_swap_options("spare=0,max_moves=1,period_ms=1");
+  HybridConfig cfg;
+  apply_hybrid_options("cpu_gu_chunk=1,cpu_down_chunk=1,host_reserve_gib=0,ssd_io=1", cfg);
+  if (swap.spare_slots != 0 || swap.max_moves != 1 || swap.period_ms != 1 || cfg.cpu_gu_chunk != 1 ||
+      cfg.cpu_down_chunk != 1 || cfg.host_reserve_gib != 0 || cfg.ssd_io_threads != 1) {
+    std::printf("option validation changed valid boundary values\n");
+    ++bad;
+  }
+  return bad == 0;
+}
 
 // One synthetic checkpoint in either exporter's naming; returns the number of wrong experts.
 int check(bool modelopt, const std::string& prefix) {
@@ -95,7 +156,9 @@ int check(bool modelopt, const std::string& prefix) {
 }
 
 int main() {
-  const int bad = check(false, "model.language_model.layers.") + check(true, "model.layers.");
+  const int bad = (check_log_callback() ? 0 : 1) + (check_option_validation() ? 0 : 1) +
+                  check(false, "model.language_model.layers.") +
+                  check(true, "model.layers.");
   std::printf(bad ? "FAILED\n" : "PASSED\n");
   return bad ? 1 : 0;
 }

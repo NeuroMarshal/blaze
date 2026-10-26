@@ -8,12 +8,13 @@ must still answer afterwards.
 
 import argparse
 import json
+import os
 import threading
 import urllib.request
 
 
 def post(url, body, timeout=1800):
-    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + os.environ["BLAZE_API_KEY"]} if os.environ.get("BLAZE_API_KEY") else {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.load(r)

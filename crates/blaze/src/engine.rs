@@ -388,6 +388,11 @@ impl Runner {
                         }
                     }
                 }
+                // A headless prefill has no D2H readback to wait on. Complete its GPU work before the
+                // scheduler reports progress, snapshots recurrent state or reuses the captured rows.
+                if tokens.is_empty() && cands.is_empty() {
+                    self.model.stream.sync()?;
+                }
                 if sampled { Reply::Cands(cands) } else { Reply::Tokens(tokens) }
             }
             Cmd::CopyState(src, dst) => {
@@ -823,7 +828,9 @@ impl Engine {
         // pipeline stages: a GPU each, the layers split evenly, a link of pinned host memory between neighbours (the
         // rows of the largest step: a prefill chunk or a verify of every sequence)
         let stages = opts.pp_stages.max(1);
-        let opts_pp_chunk = opts.pp_chunk;
+        // Captured drafter rows use full-step offsets. Splitting a step would overwrite aux from
+        // row zero for each part, leaving only the last part available to the drafter.
+        let opts_pp_chunk = if opts.capture_layers.is_empty() { opts.pp_chunk } else { 0 };
         let mut ranks: Vec<Option<crate::model::PpRank>> = vec![None; world];
         let mut all_links: Vec<Arc<HostMapped>> = Vec::new();
         let tp = if stages > 1 { opts.pp_tp.max(1) } else { world };
@@ -1243,6 +1250,31 @@ impl Engine {
         }
     }
 
+    /// Append an intermediate prompt chunk without running the vocabulary projection or reading a token back.
+    /// Hidden states needed by a drafter are still captured; completion is synchronous, like `step`.
+    pub fn prefill_only(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<()> {
+        anyhow::ensure!(!tokens.is_empty(), "prefill chunk must not be empty");
+        let seqs = &mut [seq];
+        let toks = &[tokens];
+        let metas = if let Some(parts) = self.pp_parts(seqs, toks) {
+            self.plan_parts(seqs, toks, &parts, None)?
+                .into_iter()
+                .map(|m| {
+                    let mut m = Arc::try_unwrap(m).map_err(|_| anyhow!("shared prefill metadata"))?;
+                    m.logit_rows.clear();
+                    Ok(Arc::new(m))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            let mut m = self.plan(seqs, toks, false, None)?;
+            m.logit_rows.clear();
+            vec![Arc::new(m)]
+        };
+        // A one-row intermediate chunk must not share a decode graph with a real output row.
+        self.broadcast(|| Cmd::Steps(metas.clone(), false))?;
+        Ok(())
+    }
+
     /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
     /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
     pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Cands>> {
@@ -1306,15 +1338,21 @@ impl Engine {
     /// Prefill `tokens` into `seq` in chunks; returns the greedy token after the last one.
     pub fn prefill(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<i32> {
         let chunk = self.info.max_chunk;
+        anyhow::ensure!(chunk > 0, "prefill chunk must be positive");
+        anyhow::ensure!(!tokens.is_empty(), "prefill prompt must not be empty");
         let mut next = 0;
         // PLE read-ahead one chunk ahead of the compute
         self.ple_warm(&[], &tokens[..chunk.min(tokens.len())])?;
         for (i, c) in tokens.chunks(chunk).enumerate() {
             let n0 = (i + 1) * chunk;
             if n0 < tokens.len() {
-                self.ple_warm(&tokens[n0 - 2..n0], &tokens[n0..(n0 + chunk).min(tokens.len())])?;
+                self.ple_warm(&tokens[n0.saturating_sub(2)..n0], &tokens[n0..(n0 + chunk).min(tokens.len())])?;
             }
-            next = self.step(&mut [seq], &[c])?[0];
+            if n0 < tokens.len() {
+                self.prefill_only(seq, c)?;
+            } else {
+                next = self.step(&mut [seq], &[c])?[0];
+            }
         }
         Ok(next)
     }

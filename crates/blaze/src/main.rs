@@ -3,10 +3,14 @@ use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
+use blaze::eprintln;
 
 #[derive(Parser)]
-#[command(name = "blaze", version, about = "LLM inference runtime")]
+#[command(name = "blaze", version, propagate_version = true, about = "LLM inference runtime")]
 struct Cli {
+    /// Flat JSON serving configuration; explicit flags override it
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -15,15 +19,18 @@ struct Cli {
 #[derive(clap::Args)]
 struct EngineArgs {
     /// checkpoint directory (config.json, *.safetensors, tokenizer.json)
-    #[arg(long)]
+    #[arg(long, alias = "model-path")]
     model: PathBuf,
+    /// Limit the model context (cannot exceed the checkpoint's context plus explicit YaRN)
+    #[arg(long, alias = "context-length")]
+    max_model_len: Option<usize>,
     /// KV cache size in tokens, or auto: the VRAM left once the model is loaded, less what the drafter and the vision
     /// tower will take and --vram-reserve, up to the contexts the sequences and prompt-cache snapshots can use (a model
     /// with routed experts: 65536 tokens shared by the sequences, the expert slots take the rest)
     #[arg(long, default_value = "auto")]
     kv_tokens: String,
     /// prefill chunk in tokens
-    #[arg(long, default_value_t = 2048)]
+    #[arg(long, alias = "chunked-prefill-size", default_value_t = 2048)]
     chunk: usize,
     /// VRAM left free after the KV cache (auto) or the expert slots, GiB
     #[arg(long, default_value_t = 0.8)]
@@ -66,8 +73,11 @@ struct EngineArgs {
     #[arg(long)]
     suffix_assist: Option<usize>,
     /// sequences decoded together (continuous batching)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, aliases = ["max-num-seqs", "max-running-requests"], default_value_t = 1)]
     max_seqs: usize,
+    /// Disable reusable prompt snapshots
+    #[arg(long, alias = "disable-radix-cache")]
+    disable_prefix_caching: bool,
     /// prompt-cache snapshots of the recurrent state (each holds the GDN state of one prefix; their KV pages are shared
     /// with the pool); an agent's conversation needs about one for itself and one per kind of side request; 0: off
     #[arg(long, default_value_t = 4)]
@@ -79,7 +89,7 @@ struct EngineArgs {
     #[arg(long, default_value_t = 4.0)]
     ple_cache_gib: f64,
     /// GPUs (tensor-parallel ranks)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, aliases = ["tensor-parallel-size", "tp-size"], default_value_t = 1)]
     tp: usize,
     /// YaRN context extension by this factor (Qwen: 2 for 524288 positions from 262144), the checkpoint unchanged
     #[arg(long)]
@@ -108,7 +118,7 @@ struct EngineArgs {
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
     /// pipeline stages: the model's layers split over this many GPUs (one GPU a stage; instead of --tp)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, aliases = ["pipeline-parallel-size", "pp-size"], default_value_t = 1)]
     pp: usize,
     /// a pipeline stage on another machine: STAGE=HOST:PORT of its `blaze stage-worker` (the last stage for now)
     #[arg(long)]
@@ -122,7 +132,7 @@ struct EngineArgs {
     #[arg(long, default_value = "auto")]
     gemm: blaze::linear::GemmRoute,
     /// eager decode steps instead of CUDA graphs
-    #[arg(long)]
+    #[arg(long, alias = "enforce-eager")]
     no_graphs: bool,
     /// QSA models (Flash Next): KV pools in pinned host memory, read through a device row cache (decode) and a staged
     /// prefix (prefill), their VRAM left to expert slots
@@ -142,6 +152,22 @@ struct EngineArgs {
 }
 
 impl EngineArgs {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.tp > 0 && self.pp > 0 && self.max_seqs > 0 && self.chunk > 0,
+                        "--tp, --pp, --max-seqs and --chunk must be positive");
+        anyhow::ensure!(self.tp.checked_mul(self.pp).is_some_and(|n| n <= 256), "invalid parallel world size");
+        anyhow::ensure!(self.vram_reserve.is_finite() && self.vram_reserve >= 0.0, "--vram-reserve must be finite and nonnegative");
+        anyhow::ensure!(self.max_model_len.is_none_or(|n| n > 1), "--max-model-len must be at least 2");
+        anyhow::ensure!(self.yarn_factor.is_none_or(|x| x.is_finite() && (1.0..=64.0).contains(&x)), "--yarn-factor must be finite and in [1,64]");
+        anyhow::ensure!(matches!(self.draft_head_vram.as_str(),"auto"|"on"|"off"), "--draft-head-vram must be auto, on or off");
+        for (name,value) in [("expert-gpu1-gib",self.expert_gpu1_gib),("ple-cache-gib",self.ple_cache_gib)] {
+            anyhow::ensure!(value.is_finite() && value>=0., "--{name} must be finite and nonnegative");
+        }
+        anyhow::ensure!(self.expert_ram_gib.is_finite() && self.expert_ram_gib>=-1., "--expert-ram-gib must be finite and at least -1");
+        anyhow::ensure!(self.expert_threads>0 && self.ple_threads>0, "expert and PLE thread counts must be positive");
+        anyhow::ensure!(self.kv_tokens=="auto" || self.kv_tokens.parse::<usize>().is_ok_and(|n|n>0), "--kv-tokens must be auto or a positive integer");
+        Ok(())
+    }
     /// Suffix assist's draft length: the flag, else 8 with the MTP head (its chains are 3 long), else off.
     fn assist(&self) -> usize {
         self.suffix_assist.unwrap_or(if self.mtp_window > 0 && self.draft_model.is_none() { 8 } else { 0 })
@@ -191,10 +217,13 @@ impl EngineArgs {
 
     /// The engine options of these arguments and the GPUs they take.
     fn options(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize, vision_gpu: bool) -> Result<(blaze::model::Options, usize)> {
+        self.validate()?;
+        anyhow::ensure!(chunk.is_none_or(|n|n>0), "chunk size must be positive");
         let head_vram = match self.draft_head_vram.as_str() {
             "on" => Some(true),
             "off" => Some(false),
-            _ => None,
+            "auto" => None,
+            x => anyhow::bail!("--draft-head-vram {x}: expected auto, on or off"),
         };
         // GPUs: the tensor-parallel group, or one per pipeline stage
         if self.pp > 1 && (self.draft_model.is_some() || self.mtp_window > 0) {
@@ -239,6 +268,7 @@ impl EngineArgs {
         Ok((
             blaze::model::Options {
                 max_tokens,
+                max_context: self.max_model_len,
                 kv_auto,
                 later_vram,
                 vision_vram: gpu0_later,
@@ -256,7 +286,7 @@ impl EngineArgs {
                 l2_prefetch_mib: self.l2_prefetch_mib.unwrap_or_else(|| blaze::gpu::l2_bytes().map_or(4, |b| (b / 12 + (1 << 19)) >> 20)),
                 full_logits,
                 capture_layers: Vec::new(),
-                cache_rows: self.prompt_cache_slots,
+                cache_rows: if self.disable_prefix_caching { 0 } else { self.prompt_cache_slots },
                 ple_threads: self.ple_threads,
                 ple_cache_gib: self.ple_cache_gib,
                 max_verify: self.spec_defaults()?.0,
@@ -356,6 +386,8 @@ enum Command {
     Serve {
         #[command(flatten)]
         engine: EngineArgs,
+        #[command(flatten)]
+        service: blaze::service::ServiceArgs,
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
         #[arg(long, default_value_t = 8000)]
@@ -364,21 +396,21 @@ enum Command {
         #[arg(long)]
         served_model_name: Option<String>,
         /// default sampling of requests that do not set it
-        #[arg(long, default_value_t = 0.8)]
-        temperature: f32,
-        #[arg(long, default_value_t = 0.95)]
-        top_p: f32,
-        #[arg(long, default_value_t = 20, allow_hyphen_values = true)]
-        top_k: i32,
-        #[arg(long, default_value_t = 0.0)]
-        min_p: f32,
-        #[arg(long, default_value_t = 0.5)]
-        presence_penalty: f32,
+        #[arg(long)]
+        temperature: Option<f32>,
+        #[arg(long)]
+        top_p: Option<f32>,
+        #[arg(long, allow_hyphen_values = true)]
+        top_k: Option<i32>,
+        #[arg(long)]
+        min_p: Option<f32>,
+        #[arg(long, allow_hyphen_values = true)]
+        presence_penalty: Option<f32>,
         /// default max_tokens of chat requests
         #[arg(long, default_value_t = 32768)]
         max_tokens: usize,
         /// tokens of one step (decode tokens + the prefill chunk)
-        #[arg(long, default_value_t = 2048)]
+        #[arg(long, alias = "max-num-batched-tokens", default_value_t = 2048)]
         step_tokens: usize,
         /// speculative decoding: draft tokens per verify, 0 off (at most --max-verify - 1; default: the draft
         /// source's measured best, see --max-verify)
@@ -496,7 +528,28 @@ fn exit_on_thread_panic() {
 
 fn main() -> Result<()> {
     exit_on_thread_panic();
-    match Cli::parse().command {
+    let (cli, mut effective) = blaze::cli::parse::<Cli>()?;
+    if let Command::Serve { service, engine, temperature, top_p, top_k, min_p, presence_penalty, step_tokens, max_tokens, .. } = &cli.command {
+        service.validate()?;
+        engine.validate()?;
+        for (name,x) in [("temperature",temperature),("top-p",top_p),("min-p",min_p),("presence-penalty",presence_penalty)] {
+            anyhow::ensure!(x.is_none_or(|x|x.is_finite()), "--{name} must be finite");
+        }
+        anyhow::ensure!(*step_tokens > 0 && *max_tokens > 0, "--step-tokens and --max-tokens must be positive");
+        blaze::logging::init(service.logging());
+        let sampling = service.sampling(&engine.model, &serde_json::json!({"temperature":temperature,"top_p":top_p,"top_k":top_k,"min_p":min_p,"presence_penalty":presence_penalty}))?;
+        effective["sampling"] = serde_json::to_value(&sampling)?;
+        if service.print_config {
+            println!("{}", serde_json::to_string_pretty(&effective)?);
+            return Ok(());
+        }
+        blaze::logging::event(blaze::logging::Level::Info, "startup", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),
+            "model":engine.model,"tp":engine.tp,"prefill_chunk":engine.chunk,"kv_tokens":engine.kv_tokens,
+            "max_model_len":engine.max_model_len,"max_queued_requests":service.max_queued_requests,
+            "request_timeout_s":service.request_timeout,"sampling":sampling}));
+        blaze::logging::event(blaze::logging::Level::Debug, "startup.config", serde_json::json!({"config":effective}));
+    }
+    match cli.command {
         Command::StageWorker { engine, listen } => {
             let (opts, _) = engine.options(None, false, 0, false)?;
             blaze::engine::remote::serve(&listen, &engine.model, opts, !engine.no_graphs)
@@ -727,6 +780,7 @@ fn main() -> Result<()> {
         }
         Command::Serve {
             engine,
+            service,
             host,
             port,
             served_model_name,
@@ -756,6 +810,16 @@ fn main() -> Result<()> {
             allowed_media_domains,
         } => {
             let mut engine = engine;
+            if spec_method == "none" {
+                engine.draft_model=None;
+                engine.mtp_window=0;
+                engine.max_verify=Some(0);
+                engine.draft_tree_width=Some(0);
+                engine.suffix_assist=Some(0);
+            }
+            if engine.disable_prefix_caching { engine.prompt_cache_slots = 0; }
+            let defaults = service.sampling(&engine.model, &serde_json::json!({"temperature":temperature,"top_p":top_p,"top_k":top_k,"min_p":min_p,"presence_penalty":presence_penalty}))?;
+            let api_keys = service.keys()?;
             if spec_method == "mtp" {
                 // the checkpoint's own MTP head drafts chains
                 if engine.mtp_window == 0 {
@@ -817,6 +881,7 @@ fn main() -> Result<()> {
                 e,
                 blaze::sched::SchedConfig {
                     step_tokens,
+                    max_requests: service.max_queued_requests,
                     spec_tokens: spec_ngram.unwrap_or(engine.spec_defaults()?.2),
                     prompt_cache: engine.prompt_cache_slots > 0,
                     spec_adaptive: !spec_fixed,
@@ -825,6 +890,7 @@ fn main() -> Result<()> {
                     frequent: if engine.mtp_head_cands.unwrap_or(0) > 0 && engine.mtp_window > 0 { text.frequent_ids(vocab, 12288, 6144, 6144, 3072) } else { Vec::new() },
                     spec_method: match (spec_method.as_str(), drafter) {
                         ("ngram", _) => blaze::sched::SpecMethod::Ngram,
+                        ("none", _) => blaze::sched::SpecMethod::Ngram,
                         ("suffix", _) | ("auto", false) => blaze::sched::SpecMethod::Suffix,
                         ("draft" | "eagle" | "dflash" | "mtp", true) | ("auto", true) => blaze::sched::SpecMethod::Eagle,
                         ("draft" | "eagle" | "dflash", false) => anyhow::bail!("--spec-method {spec_method} needs --draft-model"),
@@ -838,16 +904,14 @@ fn main() -> Result<()> {
                 served_name: name,
                 host,
                 port,
-                defaults: blaze::sampler::SamplingParams {
-                    temperature,
-                    top_p,
-                    top_k,
-                    min_p,
-                    presence_penalty,
-                    frequency_penalty: 0.0,
-                    seed: None,
-                    ..Default::default()
-                },
+                defaults,
+                api_keys,
+                max_concurrent_requests: service.max_concurrent_requests,
+                request_timeout: std::time::Duration::from_secs_f64(service.request_timeout),
+                shutdown_timeout: std::time::Duration::from_secs_f64(service.shutdown_timeout),
+                body_limit: service.max_request_body_mib << 20,
+                allowed_origins: service.allowed_origins.split(',').map(str::trim).filter(|s| !s.is_empty() && *s != "none").map(str::to_owned).collect(),
+                effective,
                 default_max_tokens: max_tokens,
                 tool_parser: (!tool_call_parser.is_empty() && tool_call_parser != "none").then_some(tool_call_parser),
                 reasoning_parser: (!reasoning_parser.is_empty() && reasoning_parser != "none").then_some(reasoning_parser),
@@ -855,7 +919,15 @@ fn main() -> Result<()> {
                 grammar_whitespace,
             };
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
-            rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab, mm))
+            let shutdown = sched.clone();
+            let result = rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab, mm));
+            // Join the scheduler (which joins rank workers) before the runtime and process begin teardown. It stops
+            // admitting work immediately and waits only for an in-flight engine step and GPU resource destruction.
+            let stopping = Instant::now();
+            blaze::logging::event(blaze::logging::Level::Info, "engine.stopping", serde_json::json!({"message":"joining scheduler and GPU workers"}));
+            shutdown.shutdown();
+            blaze::logging::event(blaze::logging::Level::Info, "engine.stopped", serde_json::json!({"elapsed_ms":stopping.elapsed().as_secs_f64()*1000.0}));
+            result
         }
         Command::Generate { engine, prompt, prompt_file, max_tokens, logits } => {
             let prompt = match prompt_file {

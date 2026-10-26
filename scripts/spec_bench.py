@@ -11,7 +11,7 @@ cases = {
 for name, q in list(cases.items()) + [("essay_again", cases["essay"])]:
     body = {"model": "x", "temperature": 0, "max_tokens": 300, "stream": True, "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "user", "content": q}]}
-    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json", **({"Authorization": "Bearer " + os.environ["BLAZE_API_KEY"]} if os.environ.get("BLAZE_API_KEY") else {})})
     t0 = time.time(); first = None; n = 0; text = ""
     for line in urllib.request.urlopen(req, timeout=900):
         line = line.decode().strip()

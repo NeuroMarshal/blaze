@@ -25,6 +25,8 @@ int bucket(int tokens) { return tokens <= 1 ? 1 : tokens <= 2 ? 2 : tokens <= 4 
 
 Gpu1Service::Gpu1Service(int device, const blz_moe_layer& layer, uint8_t* mail_host)
     : device_(device), layer_(layer), mail_host_(mail_host) {
+  auto* hdr = reinterpret_cast<blz_mail_header*>(mail_host_);
+  initial_seq_ = blz_req_seq(__atomic_load_n(&hdr->req, __ATOMIC_ACQUIRE));
   check(cudaSetDevice(device_), "set device");
   check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&mail_dev_), mail_host_, 0), "mailbox device pointer");
   check(cudaMalloc(&ws_mem_, blz_moe_workspace_bytes(layer_.hidden, layer_.inter)), "workspace");
@@ -71,7 +73,7 @@ void Gpu1Service::run() {
   cudaThreadExchangeStreamCaptureMode(&mode);
   check(cudaSetDevice(device_), "set device");
   auto* hdr = reinterpret_cast<blz_mail_header*>(mail_host_);
-  uint32_t last = blz_req_seq(__atomic_load_n(&hdr->req, __ATOMIC_ACQUIRE));
+  uint32_t last = initial_seq_;
   auto last_work = std::chrono::steady_clock::now();
   while (!stop_.load(std::memory_order_acquire)) {
     const uint64_t req = __atomic_load_n(&hdr->req, __ATOMIC_ACQUIRE);

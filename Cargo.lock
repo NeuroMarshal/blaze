@@ -441,6 +441,7 @@ dependencies = [
  "clap",
  "futures",
  "half",
+ "http-body-util",
  "image",
  "llguidance",
  "memmap2",

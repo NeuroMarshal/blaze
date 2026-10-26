@@ -25,6 +25,7 @@ ap.add_argument("--list", action="store_true")
 ap.add_argument("--expect-prompt-cache", action="store_true", help="the server runs with --prompt-cache-slots: a tool-result turn must hit the cache")
 ap.add_argument("--prefill-tokens", type=int, default=0, help="prompt size of the prefill cancellation test (default: 3/4 of the context, at most 12000)")
 args = ap.parse_args()
+AUTH_HEADERS = {"Content-Type": "application/json", "Authorization": "Bearer " + args.api_key}
 
 BASE = args.base_url.rstrip("/")
 client = openai.OpenAI(base_url=BASE + "/v1", api_key=args.api_key, timeout=300, max_retries=0)
@@ -38,7 +39,7 @@ MAX_LEN = None
 def http(method, path, body=None, headers=None, timeout=300):
     """(status, headers, parsed JSON or text) of one request; HTTP errors are results, not exceptions."""
     data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
-    h = {"Content-Type": "application/json", **(headers or {})}
+    h = {**AUTH_HEADERS, **(headers or {})}
     req = urllib.request.Request(BASE + path, data=data, method=method, headers=h)
     try:
         r = urllib.request.urlopen(req, timeout=timeout)
@@ -53,7 +54,7 @@ def http(method, path, body=None, headers=None, timeout=300):
 
 def sse(path, body):
     """Chunks of a streaming response as (list of parsed `data:` JSON objects, saw [DONE])."""
-    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), AUTH_HEADERS)
     out, done = [], False
     with urllib.request.urlopen(req, timeout=300) as r:
         assert "text/event-stream" in r.headers.get("content-type", ""), r.headers.get("content-type")
@@ -195,6 +196,29 @@ def endpoints_metrics():
     m = metrics()
     for k in ("blaze_requests_total", "blaze_requests_running", "blaze_requests_waiting", "blaze_requests_cancelled_total"):
         check(k in m, f"{k} missing from /metrics")
+
+
+@test
+def endpoints_request_tracing_and_server_info():
+    s, h, info = http("GET", "/server_info", headers={"X-Request-Id": "test-trace-42"})
+    check(s == 200 and info["model"] == MODEL, info)
+    check(h.get("x-request-id") == "test-trace-42", dict(h))
+    check(info["max_model_len"] == MAX_LEN, info)
+    check("sampling_defaults" in info and "scheduler" in info, info)
+    check(info["config"].get("api-key") in (None, "[REDACTED]"), "API key exposed")
+    s, h, _ = http("GET", "/v1/models", headers={"X-Request-Id": "invalid request id"})
+    check(s == 200 and h.get("x-request-id") and h.get("x-request-id") != "invalid request id", dict(h))
+
+
+@test
+def errors_sampling_types_and_ranges():
+    for extra in ({"temperature": "cold"}, {"temperature": -1}, {"top_p": 0}, {"min_p": 2}, {"top_k": 1.5},
+                  {"max_tokens": 1.5}, {"max_tokens": "ten"}, {"seed": -1}, {"repetition_penalty": 0},
+                  {"logit_bias": {"0": 101}}, {"stop_token_ids": ["bad"]}, {"stop_token_ids": [2**64 - 1]},
+                  {"top_logprobs": "many"}, {"logprobs": "yes"}, {"stream": "yes"},
+                  {"min_tokens": 20, "max_tokens": 10}, {"max_completion_tokens": None, "min_tokens": 20, "max_tokens": 10}):
+        status, _, body = http("POST", "/v1/completions", {"model": MODEL, "prompt": "hello", "max_tokens": 2, **extra})
+        check(status == 400 and "error" in body, (extra, status, body))
 
 
 # chat
@@ -806,7 +830,7 @@ def completions_stream_usage_and_logprobs():
 
 def events(path, body):
     """(event name, parsed data) of a streaming response with named SSE events."""
-    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(BASE + path, json.dumps(body).encode(), AUTH_HEADERS)
     out, name = [], None
     with urllib.request.urlopen(req, timeout=300) as r:
         for line in r:
@@ -936,7 +960,7 @@ def cancel_streaming_disconnect():
     before = metrics()["blaze_requests_cancelled_total"]
     body = {"model": MODEL, "messages": [{"role": "user", "content": "Write a very long story about a dragon."}], "max_tokens": 3000,
             "stream": True, "temperature": 0.7, **NOTHINK}
-    req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), AUTH_HEADERS)
     r = urllib.request.urlopen(req, timeout=60)
     got = 0
     for line in r:
@@ -960,7 +984,8 @@ def cancel_non_streaming_disconnect():
     body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": "Write a very long story about a dragon."}],
                        "max_tokens": 3000, "temperature": 0.7, **NOTHINK}).encode()
     s = socket.create_connection((host, port))
-    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+    auth = ("Authorization: Bearer " + args.api_key + "\r\n").encode()
+    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" + auth + b"Content-Length: %d\r\n\r\n" % len(body) + body)
     wait_for(lambda: metrics()["blaze_requests_running"] >= 1, "the request to start")
     time.sleep(1.0)
     s.close()
@@ -978,7 +1003,7 @@ def cancel_during_prefill():
     # varied text (no prefix-cache hit, one token or two per word)
     text = " ".join(f"item{i} is {i * 7 % 13} of {i % 5}." for i in range(n // 9))
     body = {"model": MODEL, "messages": [{"role": "user", "content": text + "\nSummarize."}], "max_tokens": 5, "stream": True, **NOTHINK}
-    req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), AUTH_HEADERS)
     t0 = time.time()
     r = urllib.request.urlopen(req, timeout=60)
     wait_for(lambda: metrics()["blaze_requests_running"] >= 1, "the prefill to start")

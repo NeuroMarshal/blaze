@@ -64,21 +64,10 @@ async fn run(st: &Arc<AppState>, body: &Value) -> Checked<Response> {
     let mut rxs = Vec::with_capacity(all.len());
     for tokens in &all {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        st.sched
-            .submit(GenRequest {
-                tokens: tokens.clone(),
-                params: SamplingParams { temperature: 0.0, ..Default::default() },
-                max_tokens: 1,
-                stop_ids: Vec::new(),
-                cache_points: Vec::new(),
-                think: None,
-                constraint: None,
-                mm: None,
-                events: tx,
-                cancel: Arc::new(AtomicBool::new(false)),
-                embed: true,
-            })
-            .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "the scheduler has stopped"))?;
+        let mut req = GenRequest::new(tokens.clone(), SamplingParams {temperature:0.0,..Default::default()},tx,Arc::new(AtomicBool::new(false)));
+        req.trace.choice = rxs.len();
+        req.embed = true;
+        st.sched.submit(req).map_err(control::submit_error)?;
         rxs.push(rx);
     }
     st.metrics.requests.fetch_add(all.len() as u64, Ordering::Relaxed);

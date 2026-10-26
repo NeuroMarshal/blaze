@@ -10,6 +10,7 @@ schema request, a tool call that does not parse) or the server stopped answering
 
 import argparse
 import json
+import os
 import random
 import statistics
 import threading
@@ -49,7 +50,7 @@ class Stats:
 
 def post(url, body, timeout=1800):
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + os.environ["BLAZE_API_KEY"]} if os.environ.get("BLAZE_API_KEY") else {})})
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -126,27 +127,30 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=30000)
     args = ap.parse_args()
     stats, history = Stats(), []
-    end = time.time() + 60 * args.minutes
+    end = time.monotonic() + 60 * args.minutes
 
     def client(seed):
         rng = random.Random(seed)
-        while time.time() < end:
+        while time.monotonic() < end:
             one(args.url, rng, stats, args.long_tokens, history)
 
     threads = [threading.Thread(target=client, args=(i,), daemon=True) for i in range(args.clients)]
     for t in threads:
         t.start()
-    t_start, last_tokens = time.time(), 0
+    t_start, last_tokens = time.monotonic(), 0
+    last_report = t_start
     while any(t.is_alive() for t in threads):
-        time.sleep(60 if time.time() + 60 < end else max(1, end - time.time()))
+        time.sleep(60 if time.monotonic() + 60 < end else max(1, end - time.monotonic()))
+        now = time.monotonic()
         with stats.lock:
             lat = sorted(stats.lat[-500:])
             p50 = statistics.median(lat) if lat else 0
             p95 = lat[int(0.95 * (len(lat) - 1))] if lat else 0
-            rate = (stats.tokens - last_tokens) / 60
+            rate = (stats.tokens - last_tokens) / max(now - last_report, 1e-9)
             last_tokens = stats.tokens
-            print(f"[{(time.time() - t_start) / 60:5.1f} min] {stats.ok} done, errors {stats.errors or 'none'}; "
-                  f"{rate:.0f} tok/s; latency p50 {p50:.1f} s p95 {p95:.1f} s", flush=True)
+            last_report = now
+            print(f"[{(now - t_start) / 60:5.1f} min] {stats.ok} done, errors {stats.errors or 'none'}; "
+                  f"{rate:.0f} completed tok/s; latency p50 {p50:.1f} s p95 {p95:.1f} s", flush=True)
     for t in threads:
         t.join(timeout=1900)
     try:

@@ -91,6 +91,7 @@ class PleService {
   std::atomic<uint64_t> hits_{0}, misses_{0};
   bool cache_get(int64_t id, uint16_t* dst);
   void cache_put(int64_t id, const uint16_t* src);
+  bool cache_contains(int64_t id);
   // warm-up queue (row ids), its dispatcher and the O_DIRECT reader pool: the dispatcher publishes a job (ids, next
   // index) and waits until the readers have taken every id
   std::mutex warm_mu_;

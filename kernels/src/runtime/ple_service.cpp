@@ -1,6 +1,7 @@
 #include <memory>
 #include <cstdio>
 #include "blaze/ple.h"
+#include "blaze/log.h"
 
 #include <fcntl.h>
 #include <immintrin.h>
@@ -109,6 +110,18 @@ void PleService::cache_put(int64_t id, const uint16_t* src) {
   lk.store(0, std::memory_order_release);
 }
 
+bool PleService::cache_contains(int64_t id) {
+  if (!cache_sets_) return false;
+  const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
+  auto& lk = cache_lock_[set];
+  uint8_t expected = 0;
+  while (!lk.compare_exchange_weak(expected, 1, std::memory_order_acquire)) expected = 0, _mm_pause();
+  bool hit = false;
+  for (int w = 0; w < kWays; ++w) hit |= cache_tags_[set * kWays + w] == uint64_t(id) + 1;
+  lk.store(0, std::memory_order_release);
+  return hit;
+}
+
 PleService::PleService(const std::string& path, int max_ids, int threads, size_t cache_bytes)
     : max_ids_(max_ids), threads_(std::max(threads, 1)) {
   fd_ = open(path.c_str(), O_RDONLY);
@@ -193,11 +206,7 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
       for (int64_t id : ids) {
         if (id < 0 || uint64_t(id) >= rows_) continue;
         if (cache_sets_) {
-          // a racy tag look-up is enough for a hint
-          const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
-          bool cached = false;
-          for (int w = 0; w < kWays; ++w) cached |= cache_tags_[set * kWays + w] == uint64_t(id) + 1;
-          if (cached) continue;
+          if (cache_contains(id)) continue;
         }
         const uint8_t* p = shard_[size_t(uint64_t(id) / shard_rows_)] + size_t(uint64_t(id) % shard_rows_) * row_bytes;
         const uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
@@ -230,11 +239,7 @@ void PleService::warm_reader() {
       for (size_t i = i0; i < std::min(n, i0 + 16); ++i) {
         const int64_t id = warm_job_[i];
         if (id < 0 || uint64_t(id) >= rows_) continue;
-        // a racy tag look-up is enough to skip a cached row
-        const size_t set = size_t((uint64_t(id) * 0x9E3779B97F4A7C15ull) >> 20) % cache_sets_;
-        bool cached = false;
-        for (int w = 0; w < kWays; ++w) cached |= cache_tags_[set * kWays + w] == uint64_t(id) + 1;
-        if (cached) continue;
+        if (cache_contains(id)) continue;
         const size_t off = size_t(shard_[size_t(uint64_t(id) / shard_rows_)] - table_) +
                            size_t(uint64_t(id) % shard_rows_) * row_bytes;
         const size_t a = off & ~(blk - 1), len = ((off + row_bytes + blk - 1) & ~(blk - 1)) - a;
@@ -276,7 +281,7 @@ PleService::~PleService() {
   munmap(const_cast<uint8_t*>(table_), table_bytes_);
   if (cache_map_) {
     const uint64_t h = hits_.load(), m = misses_.load();
-    std::fprintf(stderr, "blaze: PLE row cache %.2f GiB: %llu hits, %llu misses (%.1f%%), %llu rows read ahead\n",
+    log("blaze: PLE row cache %.2f GiB: %llu hits, %llu misses (%.1f%%), %llu rows read ahead",
                  double(cache_map_bytes_) / double(1ull << 30), (unsigned long long)h, (unsigned long long)m,
                  h + m ? 100.0 * double(h) / double(h + m) : 0.0, (unsigned long long)warmed_.load());
     munmap(cache_map_, cache_map_bytes_);

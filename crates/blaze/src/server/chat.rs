@@ -332,9 +332,15 @@ pub(super) async fn call(st: Arc<AppState>, mut body: Value) -> ChatOut {
 }
 
 async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
+    let prepared_at=std::time::Instant::now();
     check_ranges(&st, body)?;
     let images = super::media::gather(&st, body).await?;
     let p = prepare(&st, body, true, &images)?;
+    if crate::logging::enabled(crate::logging::Level::Debug) {
+        crate::logging::event(crate::logging::Level::Debug,"request.prepared",json!({"request_id":crate::logging::request_trace(0).id,
+            "prompt_tokens":p.tokens.len(),"messages":p.request.messages.len(),"images":images.len(),"tools_enabled":p.tools_enabled,
+            "reasoning":p.starts_in_reasoning,"prepare_ms":prepared_at.elapsed().as_secs_f64()*1e3}));
+    }
     let n = n_of(body);
     #[allow(deprecated)]
     let max_tokens = p.request.max_completion_tokens.or(p.request.max_tokens).map(|x| x as usize).unwrap_or(st.cfg.default_max_tokens);

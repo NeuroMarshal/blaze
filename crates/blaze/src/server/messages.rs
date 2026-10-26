@@ -126,14 +126,16 @@ fn chat_body(body: &Value, stream: bool) -> Checked<Value> {
             messages.push(msg);
             continue;
         }
-        // a user turn: its tool results become tool messages (first, as they answer the turn before), the rest a
-        // user message
+        // Preserve the order of user content blocks when tool results split text and image parts into chat messages.
         let mut parts = Vec::new();
         for b in &blocks {
             match b.get("type").and_then(Value::as_str).unwrap_or("") {
                 "text" => parts.push(json!({"type": "text", "text": b["text"]})),
                 "image" => parts.push(image_part(b)?),
                 "tool_result" => {
+                    if !parts.is_empty() {
+                        messages.push(json!({"role": "user", "content": std::mem::take(&mut parts)}));
+                    }
                     let mut content = result_text(b.get("content").unwrap_or(&Value::Null));
                     if b.get("is_error").and_then(Value::as_bool) == Some(true) {
                         content = format!("Error: {content}");
@@ -388,6 +390,22 @@ mod tests {
         assert_eq!(chat["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(chat["thinking_token_budget"], 64);
         assert_eq!(chat["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn user_blocks_keep_their_order_around_tool_results() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "before"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "done"},
+            {"type": "text", "text": "after"}
+        ]}]});
+
+        let chat = chat_body(&body, false).unwrap();
+        assert_eq!(chat["messages"], json!([
+            {"role": "user", "content": [{"type": "text", "text": "before"}]},
+            {"role": "tool", "tool_call_id": "t1", "content": "done"},
+            {"role": "user", "content": [{"type": "text", "text": "after"}]}
+        ]));
     }
 
     #[test]

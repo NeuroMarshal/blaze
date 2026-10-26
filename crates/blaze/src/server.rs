@@ -8,6 +8,7 @@ mod embeddings;
 mod messages;
 mod responses;
 mod tokenize;
+mod control;
 
 pub use media::{MmConfig, parse_limit};
 
@@ -34,7 +35,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::mpsc::unbounded_channel;
 
 /// Largest request body: a 500k-token prompt is a few MB of JSON, images (inlined as base64) more.
-const BODY_LIMIT: usize = 512 << 20;
 /// Most choices of one request (`n`); the scheduler queues what does not fit its rows at once.
 const MAX_N: u64 = 64;
 /// Most stop strings of a request and bytes of one (the cutter scans them after every token).
@@ -48,6 +48,13 @@ pub(crate) const MAX_GENERATIONS: usize = 256;
 const MAX_TOP_LOGPROBS: u64 = 20;
 
 pub struct ServeConfig {
+    pub api_keys: Vec<String>,
+    pub max_concurrent_requests: usize,
+    pub request_timeout: std::time::Duration,
+    pub shutdown_timeout: std::time::Duration,
+    pub body_limit: usize,
+    pub allowed_origins: Vec<String>,
+    pub effective: Value,
     pub served_name: String,
     pub host: String,
     pub port: u16,
@@ -62,6 +69,8 @@ pub struct ServeConfig {
 }
 
 struct AppState {
+    http_slots: Arc<tokio::sync::Semaphore>,
+    key_hashes: Vec<blake3::Hash>,
     mm: MmConfig,
     sched: Scheduler,
     text: Arc<Text>,
@@ -82,6 +91,12 @@ struct AppState {
 /// Request counters of /metrics (the scheduler's own are in `Scheduler::stats`).
 #[derive(Default)]
 struct Metrics {
+    http_requests: AtomicU64,
+    http_active: AtomicUsize,
+    http_errors: AtomicU64,
+    http_rejected: AtomicU64,
+    http_timeouts: AtomicU64,
+    http_latency: crate::telemetry::Histogram,
     requests: AtomicU64,
     prompt_tokens: AtomicU64,
     generation_tokens: AtomicU64,
@@ -105,13 +120,14 @@ impl From<ProcessorError> for ApiError {
 /// An error in OpenAI's shape: {"error": {"message", "type", "param", "code"}}.
 fn api_error(status: StatusCode, message: impl Into<String>, code: Option<&str>, param: Option<&str>) -> Response {
     let message = message.into();
-    let kind = if status.is_server_error() { "server_error" } else { "invalid_request_error" };
+    let kind = if status == StatusCode::UNAUTHORIZED { "authentication_error" } else if status == StatusCode::TOO_MANY_REQUESTS { "rate_limit_error" } else if status.is_server_error() { "server_error" } else { "invalid_request_error" };
     // every refused or failed request on stderr, one line (a client that only shows "400" leaves the reason here)
     let mut shown: String = message.chars().take(300).collect();
     if shown.len() < message.len() {
         shown.push_str("...");
     }
-    eprintln!("blaze api: {} {}: {shown}", status.as_u16(), param.unwrap_or("-"));
+    crate::logging::event(if status.is_server_error() { crate::logging::Level::Error } else { crate::logging::Level::Warn },"api.error",
+        json!({"request_id":crate::logging::request_trace(0).id,"status":status.as_u16(),"param":param,"message":shown}));
     (status, Json(json!({"error": {"message": message, "type": kind, "param": param, "code": code}}))).into_response()
 }
 
@@ -178,8 +194,11 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
     if grammars.is_some() {
         eprintln!("blaze: grammar compiler ready in {:.2} s", t0.elapsed().as_secs_f64());
     }
-    let addr = format!("{}:{}", cfg.host, cfg.port);
+    let addr = (cfg.host.clone(), cfg.port);
+    let body_limit = cfg.body_limit;
     let state = Arc::new(AppState {
+        http_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_requests)),
+        key_hashes: cfg.api_keys.iter().map(|k| blake3::hash(k.as_bytes())).collect(),
         mm,
         sched,
         text: Arc::new(text),
@@ -197,6 +216,8 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         .route("/ping", get(|| async { "ok" }).post(|| async { "ok" }))
         .route("/version", get(version))
         .route("/metrics", get(metrics))
+        .route("/server_info", get(control::info))
+        .route("/get_server_info", get(control::info))
         .route("/v1/models", get(models))
         .route("/v1/models/{*id}", get(model))
         .route("/v1/chat/completions", post(chat::chat))
@@ -210,28 +231,30 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         .route("/detokenize", post(tokenize::detokenize))
         .fallback(|| async { api_error(StatusCode::NOT_FOUND, "no such endpoint", Some("not_found"), None) })
         .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed") })
-        .layer(DefaultBodyLimit::max(BODY_LIMIT))
-        .layer(axum::middleware::from_fn(cors))
-        .with_state(state);
+        .layer(DefaultBodyLimit::max(body_limit))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), control::request))
+        .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    eprintln!("blaze: serving on http://{addr}");
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-/// CORS for browser clients: any origin, the headers it asks for; preflights answer here.
-async fn cors(req: Request, next: Next) -> Response {
-    let ask = req.headers().get(header::ACCESS_CONTROL_REQUEST_HEADERS).cloned();
-    let preflight = req.method() == Method::OPTIONS;
-    let mut res = if preflight { StatusCode::NO_CONTENT.into_response() } else { next.run(req).await };
-    let h = res.headers_mut();
-    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
-    if preflight {
-        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
-        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, ask.unwrap_or(HeaderValue::from_static("*")));
-        h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+    crate::logging::event(crate::logging::Level::Info,"server.ready",json!({"listen":listener.local_addr()?.to_string(),
+        "model":state.cfg.served_name,"max_model_len":max_context,"api_auth":!state.key_hashes.is_empty(),
+        "endpoints":["/v1/chat/completions","/v1/completions","/v1/responses","/v1/messages","/v1/embeddings","/metrics","/server_info"]}));
+    use std::future::IntoFuture;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(async { let _ = stop_rx.await; }).into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result?,
+        _ = control::shutdown() => {
+            let _ = stop_tx.send(());
+            match tokio::time::timeout(state.cfg.shutdown_timeout, &mut serving).await {
+                Ok(result) => result?,
+                Err(_) => crate::logging::event(crate::logging::Level::Warn,"server.shutdown_timeout",
+                    json!({"active_http":state.metrics.http_active.load(Ordering::Relaxed),"drain_seconds":state.cfg.shutdown_timeout.as_secs_f64()})),
+            }
+        }
     }
-    res
+    Ok(())
 }
 
 async fn version() -> Json<Value> {
@@ -243,6 +266,23 @@ async fn metrics(State(st): State<Arc<AppState>>) -> Response {
     let m = &st.metrics;
     let s = &st.sched.stats;
     let rows = [
+        ("blaze_http_requests_total", "counter", "HTTP requests excluding liveness probes", m.http_requests.load(Ordering::Relaxed) as f64),
+        ("blaze_http_requests_active", "gauge", "Active HTTP requests including streaming bodies", m.http_active.load(Ordering::Relaxed) as f64),
+        ("blaze_http_errors_total", "counter", "HTTP server errors", m.http_errors.load(Ordering::Relaxed) as f64),
+        ("blaze_http_rejected_total", "counter", "HTTP authentication or admission rejections", m.http_rejected.load(Ordering::Relaxed) as f64),
+        ("blaze_http_timeouts_total", "counter", "HTTP requests exceeding their deadline", m.http_timeouts.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_outstanding", "gauge", "Generations admitted including intake and preempted requests", s.outstanding.load(Ordering::Relaxed) as f64),
+        ("blaze_requests_completed_total", "counter", "Generations retired by the scheduler", s.completed.load(Ordering::Relaxed) as f64),
+        ("blaze_prefill_tokens_total", "counter", "Prompt tokens actually computed including recompute", s.prefill_tokens.load(Ordering::Relaxed) as f64),
+        ("blaze_cached_tokens_total", "counter", "Prompt tokens restored from the prefix cache", s.cached_tokens.load(Ordering::Relaxed) as f64),
+        ("blaze_scheduler_generation_tokens_total", "counter", "Output tokens emitted live by the scheduler", s.generation_tokens.load(Ordering::Relaxed) as f64),
+        ("blaze_prefill_seconds_total", "counter", "Time of scheduler steps containing prefill", s.prefill_micros.load(Ordering::Relaxed) as f64 / 1e6),
+        ("blaze_decode_seconds_total", "counter", "Time of scheduler steps containing only decode", s.decode_micros.load(Ordering::Relaxed) as f64 / 1e6),
+        ("blaze_kv_pages_free", "gauge", "Available KV pages", s.kv_pages_free.load(Ordering::Relaxed) as f64),
+        ("blaze_kv_pages_total", "gauge", "KV pool capacity in pages", s.kv_pages_total.load(Ordering::Relaxed) as f64),
+        ("blaze_prefix_cache_entries", "gauge", "Reusable prefix snapshots", s.cache_entries.load(Ordering::Relaxed) as f64),
+        ("blaze_speculative_rounds_total", "counter", "Speculative verify rounds", s.spec_rounds.load(Ordering::Relaxed) as f64),
+        ("blaze_speculative_tokens_total", "counter", "Output tokens emitted by speculative rounds", s.spec_emitted.load(Ordering::Relaxed) as f64),
         ("blaze_requests_total", "counter", "Generations started", m.requests.load(Ordering::Relaxed) as f64),
         ("blaze_prompt_tokens_total", "counter", "Prompt tokens of finished or dropped generations", m.prompt_tokens.load(Ordering::Relaxed) as f64),
         ("blaze_generation_tokens_total", "counter", "Generated tokens", m.generation_tokens.load(Ordering::Relaxed) as f64),
@@ -258,6 +298,15 @@ async fn metrics(State(st): State<Arc<AppState>>) -> Response {
     for (name, kind, help, v) in rows {
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n"));
     }
+    for (h,name,help) in [
+        (&s.ttft,"blaze_time_to_first_token_seconds","Time from HTTP arrival to first generated token, including queue"),
+        (&s.queue_time,"blaze_queue_time_seconds","Time from HTTP arrival to scheduler admission"),
+        (&s.request_time,"blaze_request_duration_seconds","Generation duration including queue and prefill"),
+        (&s.inter_token,"blaze_inter_token_seconds","Time between emitted tokens; speculative bursts share a round"),
+        (&s.prefill_step,"blaze_prefill_step_seconds","Scheduler step durations containing prefill"),
+        (&s.decode_step,"blaze_decode_step_seconds","Decode and speculative step durations"),
+        (&m.http_latency,"blaze_http_duration_seconds","HTTP duration through response-body completion or disconnect"),
+    ] { h.render(name,help,&mut out); }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out).into_response()
 }
 
@@ -284,6 +333,17 @@ type Checked<T> = std::result::Result<T, Response>;
 /// Numeric fields out of range: what the engines would reject (or silently turn into garbage), and token ids that are
 /// not in the vocabulary (the GPU would index outside its tables).
 fn check_ranges(st: &AppState, body: &Value) -> Checked<()> {
+    crate::service::validate_sampling(body).map_err(|e| bad_param(e.field, e.message))?;
+    if let Some(ids)=body.get("stop_token_ids").filter(|v|!v.is_null()) {
+        if ids.as_array().is_none_or(|a|a.iter().any(|t|t.as_u64().is_none())) {
+            return Err(bad_param("stop_token_ids","stop_token_ids must be an array of nonnegative token IDs"));
+        }
+    }
+    if let Some(bias)=body.get("logit_bias").filter(|v|!v.is_null()) {
+        if bias.as_object().is_none_or(|m|m.iter().any(|(k,v)|k.parse::<u32>().is_err() || v.as_f64().is_none_or(|v|!v.is_finite() || !(-100.0..=100.0).contains(&v)))) {
+            return Err(bad_param("logit_bias","logit_bias must map token IDs to finite numbers in [-100,100]"));
+        }
+    }
     let num = |k: &str| body.get(k).and_then(Value::as_f64);
     if num("temperature").is_some_and(|t| t < 0.0) {
         return Err(bad_param("temperature", "temperature must be at least 0"));
@@ -307,18 +367,30 @@ fn check_ranges(st: &AppState, body: &Value) -> Checked<()> {
         return Err(bad_param("n", format!("n must be an integer between 1 and {MAX_N}")));
     }
     for k in ["max_tokens", "max_completion_tokens"] {
-        if body.get(k).is_some_and(|v| v.as_i64().is_some_and(|x| x < 1)) {
+        if body.get(k).is_some_and(|v| !v.is_null() && v.as_u64().is_none_or(|x| x < 1 || x > usize::MAX as u64)) {
             return Err(bad_param(k, format!("{k} must be an integer of at least 1")));
         }
     }
-    if body.get("top_logprobs").and_then(Value::as_u64).is_some_and(|k| k > MAX_TOP_LOGPROBS) {
-        return Err(bad_param("top_logprobs", format!("top_logprobs is at most {MAX_TOP_LOGPROBS}")));
+    let requested_max=body.get("max_completion_tokens").filter(|v|!v.is_null()).or(body.get("max_tokens")).and_then(Value::as_u64);
+    if requested_max.is_some_and(|max|body.get("min_tokens").and_then(Value::as_u64).is_some_and(|min|min>max)) {
+        return Err(bad_param("min_tokens","min_tokens exceeds the requested output token limit"));
+    }
+    if body.get("top_logprobs").is_some_and(|v| !v.is_null() && v.as_u64().is_none_or(|k| k > MAX_TOP_LOGPROBS)) {
+        return Err(bad_param("top_logprobs", format!("top_logprobs must be an integer in 0..={MAX_TOP_LOGPROBS}")));
     }
     if matches!(body.get("logprobs"), Some(Value::Number(k)) if k.as_u64().is_none_or(|k| k > MAX_TOP_LOGPROBS)) {
         return Err(bad_param("logprobs", format!("logprobs is at most {MAX_TOP_LOGPROBS}")));
     }
+    if body.get("logprobs").is_some_and(|v|!v.is_null() && !v.is_boolean() && !v.is_number()) {
+        return Err(bad_param("logprobs","logprobs must be a boolean or an integer"));
+    }
+    for key in ["stream", "ignore_eos", "skip_special_tokens", "include_stop_str_in_output", "no_stop_trim", "echo"] {
+        if body.get(key).is_some_and(|v|!v.is_null() && !v.is_boolean()) {
+            return Err(bad_param(key,format!("{key} must be a boolean")));
+        }
+    }
     let outside = |mut ids: Box<dyn Iterator<Item = i64> + '_>| ids.find(|&t| t < 0 || t as usize >= st.vocab);
-    if let Some(bad) = body.get("stop_token_ids").and_then(Value::as_array).and_then(|a| outside(Box::new(a.iter().filter_map(Value::as_i64)))) {
+    if let Some(bad) = body.get("stop_token_ids").and_then(Value::as_array).and_then(|a|a.iter().filter_map(Value::as_u64).find(|&id|id>=st.vocab as u64)) {
         return Err(bad_param("stop_token_ids", format!("token id {bad} is outside the vocabulary of {}", st.vocab)));
     }
     if let Some(bad) = body.get("logit_bias").and_then(Value::as_object).and_then(|m| outside(Box::new(m.keys().filter_map(|k| k.parse().ok())))) {
@@ -375,10 +447,10 @@ fn sampling_of(body: &Value, d: &SamplingParams, text: &Text) -> SamplingParams 
         min_p: f("min_p").unwrap_or(d.min_p),
         presence_penalty: f("presence_penalty").unwrap_or(d.presence_penalty),
         frequency_penalty: f("frequency_penalty").unwrap_or(d.frequency_penalty),
-        seed: body.get("seed").and_then(Value::as_u64),
+        seed: body.get("seed").and_then(Value::as_u64).or(d.seed),
         repetition_penalty: f("repetition_penalty").unwrap_or(d.repetition_penalty),
         logit_bias,
-        min_tokens: body.get("min_tokens").and_then(Value::as_u64).unwrap_or(0) as usize,
+        min_tokens: body.get("min_tokens").and_then(Value::as_u64).map_or(d.min_tokens, |x| x as usize),
         bad_words,
         logprobs,
     }
@@ -757,21 +829,15 @@ fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constr
         .collect();
     let mut params = spec.params.clone();
     params.seed = params.seed.map(|s| s.wrapping_add(choice as u64));
-    st.sched
-        .submit(GenRequest {
-            tokens: tokens.to_vec(),
-            params,
-            max_tokens: spec.max_tokens,
-            stop_ids: spec.stop_ids.clone(),
-            cache_points,
-            think: spec.think.clone(),
-            constraint,
-            mm: spec.mm.clone(),
-            events: tx,
-            cancel: cancel.clone(),
-            embed: false,
-        })
-        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "the scheduler has stopped"))?;
+    let mut req = GenRequest::new(tokens.to_vec(), params, tx, cancel.clone());
+    req.trace = crate::logging::request_trace(choice);
+    req.max_tokens = spec.max_tokens.min(st.max_context.saturating_sub(tokens.len()));
+    req.stop_ids = spec.stop_ids.clone();
+    req.cache_points = cache_points;
+    req.think = spec.think.clone();
+    req.constraint = constraint;
+    req.mm = spec.mm.clone();
+    st.sched.submit(req).map_err(control::submit_error)?;
     st.metrics.requests.fetch_add(1, Ordering::Relaxed);
     st.metrics.open.fetch_add(1, Ordering::Relaxed);
     Ok(Gen {

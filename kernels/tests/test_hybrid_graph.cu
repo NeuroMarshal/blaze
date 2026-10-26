@@ -280,6 +280,7 @@ static Result run(const Model& m, int T, const std::vector<uint16_t>& x0, const 
 }
 
 int main() {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);  // Keep progress when a graph stalls or the harness times out.
   cudaDeviceProp prop;
   CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
   std::printf("device: %s; host threads: %u\n", prop.name, std::thread::hardware_concurrency());

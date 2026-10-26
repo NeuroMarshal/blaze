@@ -1,26 +1,16 @@
-// Console messages in SGLang's format ("[YYYY-MM-DD HH:MM:SS] message", stderr), so blaze's lines read like the
-// server's own. Info messages are emitted once at load; per-interval statistics only when asked for (swap log_s).
+// Formatted C++ runtime logs. When installed, the callback receives the message without a timestamp; otherwise the
+// original timestamped stderr output is used (including in standalone C++ tests/tools).
 #pragma once
 
 #include <cstdarg>
-#include <cstdio>
-#include <ctime>
+
+extern "C" {
+typedef void blaze_log_callback_fn(const char* message);
+void blaze_set_log_callback(blaze_log_callback_fn* callback);
+}
 
 namespace blaze {
 
-__attribute__((format(printf, 1, 2))) inline void log(const char* fmt, ...) {
-  char stamp[32];
-  const std::time_t now = std::time(nullptr);
-  std::tm tm{};
-  localtime_r(&now, &tm);
-  std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tm);
-  char msg[1024];
-  va_list ap;
-  va_start(ap, fmt);
-  std::vsnprintf(msg, sizeof(msg), fmt, ap);
-  va_end(ap);
-  std::fprintf(stderr, "[%s] %s\n", stamp, msg);
-  std::fflush(stderr);
-}
+__attribute__((format(printf, 1, 2))) void log(const char* fmt, ...);
 
 }  // namespace blaze

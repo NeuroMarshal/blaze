@@ -584,6 +584,7 @@ impl Draft {
             }
         }
         if plan.k == 0 {
+            s.sync()?;
             return Ok(vec![Vec::new(); n_items]);
         }
         s.sync()?;

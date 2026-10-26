@@ -10,6 +10,7 @@ its prompt; a turn that finds nothing after the first prints MISS.
 
 import argparse
 import json
+import os
 import random
 import time
 import urllib.request
@@ -22,7 +23,7 @@ def chat(url, messages, max_tokens):
     body = {"model": "default", "messages": messages, "max_tokens": max_tokens, "temperature": 0, "stream": True,
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(url + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **({"Authorization": "Bearer " + os.environ["BLAZE_API_KEY"]} if os.environ.get("BLAZE_API_KEY") else {})})
     t0, first, last, text, usage = time.perf_counter(), None, None, "", {}
     with urllib.request.urlopen(req, timeout=3600) as r:
         for raw in r:

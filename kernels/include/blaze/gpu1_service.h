@@ -38,6 +38,7 @@ class Gpu1Service {
   blz_moe_workspace ws_{};
   cudaStream_t stream_ = nullptr;
   cudaGraphExec_t graphs_[BLZ_MOE_MAX_TOKENS + 1] = {};
+  uint32_t initial_seq_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<uint64_t> served_{0};
   std::thread thread_;

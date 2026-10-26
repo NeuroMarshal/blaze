@@ -4,6 +4,11 @@ description = "LLM inference runtime: Rust host, CUDA C++ kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "blaze"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
 
 [dependencies]
 blaze-sys = { path = "../blaze-sys" }
@@ -32,3 +37,4 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # image URLs parsed as ureq does (WHATWG); image content keys (both in the lock already)
 url = "2.5"
 blake3 = "1.8"
+http-body-util = "0.1"

@@ -1,6 +1,5 @@
-//! The scheduler's health log on stderr: every BLAZE_STATS_SECS seconds (default 60, 0: off) a line with what the
-//! interval did, when it did anything; a slow step with what it held; with BLAZE_REQ_LOG=1 a line per request when it
-//! is admitted and when it finishes.
+//! Scheduler health: actual prefill work, decode throughput, KV pressure and queue activity.
+//! The default interval is five seconds; phase-specific baselines detect latency outliers.
 
 use std::time::{Duration, Instant};
 
@@ -21,6 +20,10 @@ pub struct Interval {
     pub tokens: u64,
     pub prompt: u64,
     pub cached: u64,
+    pub prefill_work: u64,
+    pub prefill_secs: f64,
+    pub decode_tokens: u64,
+    pub decode_secs: f64,
     steps: u64,
     step_secs: f64,
     step_max: f64,
@@ -57,21 +60,21 @@ pub struct Health {
     pub cur: Interval,
     spec0: (usize, usize),
     /// decayed mean step time (s)
-    mean: f64,
+    mean: [f64;2],
     slow_lines: u32,
     next_id: u64,
 }
 
 impl Health {
     pub fn from_env() -> Self {
-        let secs = std::env::var("BLAZE_STATS_SECS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(60);
+        let secs = crate::logging::options().stats_secs;
         Self {
-            every: (secs > 0).then(|| Duration::from_secs(secs)),
-            req_log: std::env::var_os("BLAZE_REQ_LOG").is_some_and(|v| v != "0"),
+            every: (secs > 0.0).then(|| Duration::from_secs_f64(secs)),
+            req_log: crate::logging::options().requests,
             since: Instant::now(),
             cur: Interval::default(),
             spec0: (0, 0),
-            mean: 0.0,
+            mean: [0.0;2],
             slow_lines: 0,
             next_id: 0,
         }
@@ -88,11 +91,12 @@ impl Health {
         c.steps += 1;
         c.step_secs += secs;
         c.step_max = c.step_max.max(secs);
-        if self.mean > 0.0 && secs > SLOW_STEP_SECS && secs > SLOW_STEP_FACTOR * self.mean && self.slow_lines < SLOW_STEP_LINES {
+        let mean=&mut self.mean[usize::from(shape.prefilling>0)];
+        if *mean > 0.0 && secs > SLOW_STEP_SECS && secs > SLOW_STEP_FACTOR * *mean && self.slow_lines < SLOW_STEP_LINES {
             self.slow_lines += 1;
-            eprintln!("blaze: slow step of {secs:.2} s (typical {:.1} ms): {shape}", self.mean * 1e3);
+            crate::logging::event(crate::logging::Level::Warn,"scheduler.latency_outlier",serde_json::json!({"elapsed_ms":secs*1e3,"phase_mean_ms":*mean*1e3,"shape":shape.to_string()}));
         }
-        self.mean = if self.mean == 0.0 { secs } else { 0.98 * self.mean + 0.02 * secs };
+        *mean = if *mean == 0.0 { secs } else { 0.98 * *mean + 0.02 * secs };
     }
 
     /// End of a scheduler round: the interval's line when it is due and anything happened.
@@ -112,30 +116,17 @@ impl Health {
             return;
         }
         let secs = dt.as_secs_f64();
-        let mut line = format!(
-            "blaze stats: {secs:.0} s: {} requests done ({} errors, {} cancelled, {} at length, {} KV full, {} preempted), {} tokens out \
-             ({:.1} tok/s), prompts {} tokens ({:.0}% cached), {} steps (mean {:.1} ms, max {:.0} ms), KV {} of {} pages \
-             free, {snapshots} prompt-cache snapshots, running {running}, waiting {waiting} (max {})",
-            c.requests,
-            c.errors,
-            c.cancelled,
-            c.lengths,
-            c.kv_full,
-            c.preempted,
-            c.tokens,
-            c.tokens as f64 / secs,
-            c.prompt,
-            100.0 * c.cached as f64 / c.prompt.max(1) as f64,
-            c.steps,
-            1e3 * c.step_secs / c.steps.max(1) as f64,
-            1e3 * c.step_max,
-            kv_pages.0,
-            kv_pages.1,
-            c.waiting_max,
-        );
-        if verifies > 0 {
-            line += &format!(", speculation {:.2} tokens a verify", emitted as f64 / verifies as f64);
-        }
-        eprintln!("{line}");
+        crate::logging::event(crate::logging::Level::Info, "engine.stats", serde_json::json!({
+            "interval_s":secs,"running":running,"waiting":waiting,"waiting_peak":c.waiting_max,
+            "completed":c.requests,"errors":c.errors,"cancelled":c.cancelled,"preempted":c.preempted,"kv_full":c.kv_full,
+            "prefill_tokens":c.prefill_work,"prefill_tok_s":c.prefill_work as f64/c.prefill_secs.max(1e-9),
+            "decode_tok_s":c.decode_tokens as f64/c.decode_secs.max(1e-9),
+            "output_tokens":c.tokens,"output_tok_s_wall":c.tokens as f64/secs,
+            "admitted_prompt_tokens":c.prompt,"cached_tokens":c.cached,
+            "step_mean_ms":1e3*c.step_secs/c.steps.max(1) as f64,"step_max_ms":c.step_max*1e3,
+            "kv_usage_pct":100.0*(kv_pages.1.saturating_sub(kv_pages.0)) as f64/kv_pages.1.max(1) as f64,
+            "kv_pages_free":kv_pages.0,"kv_pages_total":kv_pages.1,"cache_entries":snapshots,
+            "spec_tokens_per_verify":if verifies>0 {Some(emitted as f64/verifies as f64)}else{None}
+        }));
     }
 }

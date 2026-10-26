@@ -54,20 +54,37 @@ serve() {  # log name, extra options...
   target/release/blaze serve --model "$MODEL" --port "$PORT" "$@" > "$LOGS/$log" 2>&1 &
   SERVER=$!
   for _ in $(seq 1 600); do
-    curl -s "$URL/health" >/dev/null && return 0
-    kill -0 "$SERVER" 2>/dev/null || { echo "the server exited:"; tail -20 "$LOGS/$log"; return 1; }
+    curl -fsS --max-time 2 "$URL/health" >/dev/null && return 0
+    running "$SERVER" || { echo "the server exited:"; tail -20 "$LOGS/$log"; return 1; }
     sleep 2
   done
   echo "the server did not come up in 20 minutes"
   return 1
 }
-stop() { kill "$SERVER" 2>/dev/null; wait "$SERVER" 2>/dev/null; }
+SERVER=""
+# An exited child may still be a zombie until wait; kill -0 alone does not detect completion.
+running() {
+  local state
+  state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+  [[ -n "$state" && "$state" != *Z* ]]
+}
+stop() {
+  [ -n "$SERVER" ] || return 0
+  local status=0 forced=0
+  kill "$SERVER" 2>/dev/null || true
+  for _ in $(seq 1 20); do running "$SERVER" || break; sleep 1; done
+  if running "$SERVER"; then forced=1; kill -KILL "$SERVER" 2>/dev/null || true; fi
+  wait "$SERVER" 2>/dev/null || status=$?
+  SERVER=""
+  if ((forced || status != 0)); then fail "server shutdown (exit=$status forced=$forced)"; else pass "server shutdown"; fi
+}
+trap stop EXIT
 
 if serve serve.log "$@"; then
   pass "serve starts"
-  grep -E "^blaze: (VRAM|KV|speculation|MoE|vision|tuned|MTP|DFlash|EAGLE)" "$LOGS/serve.log" | head -12
+  grep -E "VRAM|KV cache|speculation|MoE|vision|tuned|MTP|DFlash|EAGLE|server.ready" "$LOGS/serve.log" | head -12
   if [ -n "${PY:-}" ]; then
-    run api "$PY" scripts/api_test.py --base-url "$URL"
+    run api "$PY" scripts/api_test.py --base-url "$URL" --api-key "${BLAZE_API_KEY:-none}"
     grep -E "passed|FAIL" "$LOGS/api.log" | tail -4
   else
     fail "api (no python with the openai package: set PY)"
@@ -102,12 +119,12 @@ fi
 
 echo
 echo "== server logs: panics, failed steps, slow steps, server errors"
-if grep -hE "panicked|step failed|slow step|blaze hang|blaze api: 5|grammar dropped" "$LOGS"/serve*.log | sort | uniq -c | sort -rn | head -20 | grep .; then
+if grep -hE 'panicked|step failed|blaze hang|grammar dropped|ERROR.*api.error|"level":"ERROR"' "$LOGS"/serve*.log | sort | uniq -c | sort -rn | head -20 | grep .; then
   fail "server log clean"
 else
   pass "server log clean"
 fi
-grep -h "^blaze stats" "$LOGS"/serve.log | tail -3
+grep -h "engine.stats" "$LOGS"/serve.log | tail -3
 
 echo
 echo "== summary ($LOGS)"
