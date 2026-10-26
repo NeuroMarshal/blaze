@@ -1342,7 +1342,12 @@ impl Model {
         }
 
         let rank = tp.rank;
+        // prefill: FP16 accumulation where the GPU runs it twice as fast (the shared dequantization keeps the kernel on the
+        // tensor cores); decode / verify only where the codes also convert in hardware (SM 12.x: on SM 8.x each warp
+        // converts in software and the kernel waits on the ALUs, not the MMAs)
         let attn_f16 = opts.attn_f16_acc.unwrap_or_else(crate::gpu::fast_f16_accumulate);
+        let decode_f16 = opts.attn_f16_acc.unwrap_or(crate::gpu::compute_capability().0 == 12);
+        unsafe { sys::blz_mha_set_f16_accumulate(decode_f16 as c_int) };
         let mut model = Self {
             cfg,
             dims,
@@ -1444,6 +1449,14 @@ impl Model {
                     (Some(_), _) => ": --attn-f16-acc",
                     (None, true) => ": FP16 accumulation at twice the MMA rate here",
                     (None, false) => ": one MMA rate for both here",
+                }
+            );
+            eprintln!(
+                "blaze: decode / verify attention: {}",
+                match (model.opts.attn_f16_acc, major) {
+                    (Some(true), _) | (None, 12) => "FP16 accumulation in runs summed in FP32",
+                    (Some(false), _) => "FP32 accumulation (--attn-f16-acc off)",
+                    _ => "FP32 accumulation (the codes convert in software here: the kernel waits on the ALUs)",
                 }
             );
         }

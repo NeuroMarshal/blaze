@@ -76,6 +76,11 @@ int blz_nvfp4_mha_prefill_supported(void);
 /// \brief 1 when blz_nvfp4_mha_prefill takes this head geometry.
 int blz_nvfp4_mha_prefill_group_ok(int q_heads, int kv_heads);
 
+/// \brief The decode / verify kernels (blz_nvfp4_mha_decode, _tree, blz_mha_decode_window, _tail) accumulate in FP16 in
+/// short runs summed in FP32 from now on (twice the MMA rate on GeForce GPUs: a verify of 8 tokens over a long context
+/// is compute-bound), process-wide; 0: FP32 accumulation (the default).
+void blz_mha_set_f16_accumulate(int on);
+
 /// \brief Context parts of blz_nvfp4_mha_decode (the partial workspaces' third dimension): splits times the warps a CTA
 /// runs along the context for this query geometry; 0 for an unsupported one.
 int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits);

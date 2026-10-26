@@ -463,6 +463,19 @@ int main() {
   test_window("decode, no window", 4, 1, {2000}, 0, 8, rng);
   test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
   test_window("DFlash block 8, short window", 2, 8, {500}, 37, 2, rng, 0);
+  // the decode / verify kernels with FP16 accumulation
+  blz_mha_set_f16_accumulate(1);
+  std::printf("-- decode / verify with FP16 accumulation\n");
+  test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 16, rng);
+  test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
+  test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
+  test_case("decode, GQA 12, lengths 1 / 37 / 3000", 2, 12, 1, {1, 37, 3000}, 16, rng);
+  for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng, f);
+  test_window("verify 9 tokens, lengths 9 / 5000", 8, 9, {9, 5000}, 4096, 8, rng);
+  test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
+  bench(524000, 1, 1, 64, rng);
+  bench(524000, 1, 8, 64, rng);
+  blz_mha_set_f16_accumulate(0);
   for (bool f16 : {false, true}) {
     test_prefill("GQA 6, 37 tokens, a first chunk", 2, 6, 37, 37, f16, rng);
     test_prefill("GQA 6, 300 tokens after 1700", 2, 6, 300, 2000, f16, rng);

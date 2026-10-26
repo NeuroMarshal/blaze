@@ -48,6 +48,18 @@ __device__ __forceinline__ void mma_f16(float c[4], const uint32_t a[4], uint32_
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// FP16 accumulation (blz_mha_set_f16_accumulate): twice the MMA rate of FP32 accumulation on GeForce GPUs.
+__device__ __forceinline__ void mma_f16h(uint32_t d[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+               : "+r"(d[0]), "+r"(d[1])
+               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ void add_h2(float& x, float& y, uint32_t h) {
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
+  x += f.x, y += f.y;
+}
+
 // Two E2M1 codes (one byte, first in the low nibble) as f16x2.
 __device__ __forceinline__ __half2 e2m1x2_to_f16x2(uint32_t byte) {
 #if __CUDA_FP8_INTERNAL_CAN_RELY_ON_PTX_FOR_SHORTTYPESCVT__
@@ -203,7 +215,9 @@ __device__ __forceinline__ uint4 load_bf16x8(const uint8_t* data, int64_t row, i
 
 // grid: (batch * tiles, kv_heads, splits), block: 32 * MT * KW, dynamic shared memory: MT * 16 * q_stride<D> f16.
 // F: pool format; D: head dim (256; 128 for BF16 pools); window > 0: a row at position p sees p - window + 1 .. p.
-template <int F, int D, int MT, int KW>
+// H: FP16 accumulation (Q K^T in runs of 4 k-steps, P V per step, summed in FP32) with an exact running max, so P <= 1
+// and a step of P V stays inside FP16 (16 x 6 x 448 for NVFP4 codes times scales; normed FP8 / BF16 values far below).
+template <int F, int D, int MT, int KW, bool H = false>
 __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
     const __nv_bfloat16* __restrict__ q, int64_t sq_tok, int64_t sq_head, int group, int tokens_per_tile, int tiles,
     int q_heads, blz_nvfp4_pool pool, const int32_t* __restrict__ req_to_token, int64_t req_stride,
@@ -297,6 +311,7 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
   for (; tc < t1; tc += int64_t(kChunk) * KW) {
     // S = Q K^T over the chunk's 16 positions (two n8 tiles), two accumulation chains per tile.
     float sacc[2][2][4] = {};
+    uint32_t hacc[2][2] = {};  // H: the current run of 4 k-steps, per n8 tile
     {
       __half2 ks[2][4];
       if constexpr (F == BLZ_KV_NVFP4) {
@@ -337,7 +352,21 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
             b0 = h2_bits(bf16x2_to_f16x2(word_of(kb[n], 2 * (ks_ & 1))));
             b1 = h2_bits(bf16x2_to_f16x2(word_of(kb[n], 2 * (ks_ & 1) + 1)));
           }
-          mma_f16(sacc[ks_ & 1][n], qa, b0, b1);
+          if constexpr (H) {
+            mma_f16h(hacc[n], qa, b0, b1);
+          } else {
+            mma_f16(sacc[ks_ & 1][n], qa, b0, b1);
+          }
+        }
+        if constexpr (H) {
+          if ((ks_ & 3) == 3) {
+#pragma unroll
+            for (int n = 0; n < 2; ++n) {
+              add_h2(sacc[0][n][0], sacc[0][n][1], hacc[n][0]);
+              add_h2(sacc[0][n][2], sacc[0][n][3], hacc[n][1]);
+              hacc[n][0] = hacc[n][1] = 0;
+            }
+          }
         }
       }
     }
@@ -378,7 +407,7 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
         cm = fmaxf(cm, __shfl_xor_sync(0xffffffffu, cm, 1));
         cm = fmaxf(cm, __shfl_xor_sync(0xffffffffu, cm, 2));
         alpha[h] = 1.0f;
-        if (cm > m[h] + kRescaleSlack || (m[h] == -INFINITY && cm != -INFINITY)) {
+        if (cm > m[h] + (H ? 0.0f : kRescaleSlack) || (m[h] == -INFINITY && cm != -INFINITY)) {
           alpha[h] = m[h] == -INFINITY ? 0.0f : exp2f(m[h] - cm);
           m[h] = cm;
           grow = true;
@@ -437,8 +466,16 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
           else
             f[i] = bf16x2_to_f16x2(word_of(vb[i], j % 4));
         }
-        mma_f16(o[2 * j], pa, h2_bits(__lows2half2(f[0], f[1])), h2_bits(__lows2half2(f[2], f[3])));
-        mma_f16(o[2 * j + 1], pa, h2_bits(__highs2half2(f[0], f[1])), h2_bits(__highs2half2(f[2], f[3])));
+        if constexpr (H) {
+          uint32_t h0[2] = {0, 0}, h1[2] = {0, 0};
+          mma_f16h(h0, pa, h2_bits(__lows2half2(f[0], f[1])), h2_bits(__lows2half2(f[2], f[3])));
+          mma_f16h(h1, pa, h2_bits(__highs2half2(f[0], f[1])), h2_bits(__highs2half2(f[2], f[3])));
+          add_h2(o[2 * j][0], o[2 * j][1], h0[0]), add_h2(o[2 * j][2], o[2 * j][3], h0[1]);
+          add_h2(o[2 * j + 1][0], o[2 * j + 1][1], h1[0]), add_h2(o[2 * j + 1][2], o[2 * j + 1][3], h1[1]);
+        } else {
+          mma_f16(o[2 * j], pa, h2_bits(__lows2half2(f[0], f[1])), h2_bits(__lows2half2(f[2], f[3])));
+          mma_f16(o[2 * j + 1], pa, h2_bits(__highs2half2(f[0], f[1])), h2_bits(__highs2half2(f[2], f[3])));
+        }
       }
     }
     // The next chunk's V, in flight during its Q K^T.
@@ -530,6 +567,12 @@ __global__ void dequant_rows_kernel(blz_nvfp4_pool pool, blz_index_ptr slots, in
 }  // namespace
 }  // namespace blaze
 
+namespace {
+bool g_f16_accumulate = false;
+}
+
+extern "C" void blz_mha_set_f16_accumulate(int on) { g_f16_accumulate = on != 0; }
+
 extern "C" int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits) {
   if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 || q_heads / kv_heads > 16 ||
       q_len < 1 || splits < 1 || splits > 64) return 0;
@@ -567,12 +610,16 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
   };
   auto by_tiles = [&](auto fmt, auto dim) {
     constexpr int F = decltype(fmt)::value, Dc = decltype(dim)::value;
-    if (mt == 1)
-      launch(blaze::mha_decode_kernel<F, Dc, 1, blaze::parts_per_cta(1)>, blaze::parts_per_cta(1));
-    else if (mt == 2)
-      launch(blaze::mha_decode_kernel<F, Dc, 2, blaze::parts_per_cta(2)>, 2 * blaze::parts_per_cta(2));
-    else
-      launch(blaze::mha_decode_kernel<F, Dc, 3, blaze::parts_per_cta(3)>, 3 * blaze::parts_per_cta(3));
+    auto go = [&](auto h) {
+      constexpr bool H = decltype(h)::value;
+      if (mt == 1)
+        launch(blaze::mha_decode_kernel<F, Dc, 1, blaze::parts_per_cta(1), H>, blaze::parts_per_cta(1));
+      else if (mt == 2)
+        launch(blaze::mha_decode_kernel<F, Dc, 2, blaze::parts_per_cta(2), H>, 2 * blaze::parts_per_cta(2));
+      else
+        launch(blaze::mha_decode_kernel<F, Dc, 3, blaze::parts_per_cta(3), H>, 3 * blaze::parts_per_cta(3));
+    };
+    if (g_f16_accumulate) go(std::true_type{}); else go(std::false_type{});
   };
   using D256 = std::integral_constant<int, 256>;
   if (D == 128)
