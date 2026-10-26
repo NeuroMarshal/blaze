@@ -131,6 +131,10 @@ struct EngineArgs {
     /// calibrated NVFP4 activations, else BF16), nvfp4 (W4A4 wherever the GPU can), bf16 (weights widened, cuBLAS)
     #[arg(long, default_value = "auto")]
     gemm: blaze::linear::GemmRoute,
+    /// prefill attention accumulates in FP16 in short runs summed in FP32: auto (where the GPU runs it twice as fast,
+    /// GeForce SM 8.6 / 8.9 / 12.x), on, off
+    #[arg(long, default_value = "auto")]
+    attn_f16_acc: String,
     /// eager decode steps instead of CUDA graphs
     #[arg(long, alias = "enforce-eager")]
     no_graphs: bool,
@@ -292,6 +296,12 @@ impl EngineArgs {
                 max_verify: self.spec_defaults()?.0,
                 kv_dtype: self.kv_cache_dtype,
                 gemm: self.gemm,
+                attn_f16_acc: match self.attn_f16_acc.as_str() {
+                    "auto" => None,
+                    "on" | "true" | "1" => Some(true),
+                    "off" | "false" | "0" => Some(false),
+                    v => anyhow::bail!("--attn-f16-acc {v}: auto, on or off"),
+                },
                 pp_stages: self.pp,
                 pp_tp: self.tp.max(1),
                 pp: None,

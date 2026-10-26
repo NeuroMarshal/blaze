@@ -65,6 +65,12 @@ pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
 /// Events of a forward's phase profile (4 marks a layer).
 const PROF_EVENTS: usize = 640;
 
+/// BLAZE_PREFILL_ATTN=split: prefill spans on the split decode kernel (the A / B check of the FlashAttention-2 one).
+fn prefill_attn_split() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("BLAZE_PREFILL_ATTN").is_ok_and(|v| v == "split"))
+}
+
 fn prefill_profile() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *P.get_or_init(|| std::env::var("BLAZE_PREFILL_PROFILE").is_ok_and(|v| v == "1"))
@@ -300,6 +306,10 @@ pub struct PpRank {
 }
 
 /// Bytes of a pipeline link's header (the flag) before its rows.
+/// Prefill spans of at least this many rows take the FlashAttention-2 kernel (shorter ones, verify and decode the split
+/// decode kernel: a few query tiles cannot fill the GPU without splitting the context).
+const PREFILL_KERNEL_ROWS: usize = 64;
+
 pub const PP_LINK_HEADER: usize = 256;
 
 /// A pipeline link of `rows` rows of `width` values a step: the header and two slots (blaze/pp_link.h).
@@ -361,6 +371,9 @@ pub struct Options {
     pub kv_dtype: KvDtype,
     /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
     pub gemm: crate::linear::GemmRoute,
+    /// prefill attention (the FlashAttention-2 kernel of NVFP4 pools) with FP16 accumulation in short runs: twice the
+    /// MMA rate on GeForce GPUs, the error below the bf16 output's rounding; None: where the GPU runs it faster
+    pub attn_f16_acc: Option<bool>,
     /// pipeline parallelism (`--pp`): the stages (1: none), and this rank's stage (set by the engine for each rank)
     pub pp_stages: usize,
     /// tensor-parallel ranks of each pipeline stage
@@ -842,6 +855,8 @@ pub struct Model {
     pf_active: Cell<bool>,
     pub opts: Options,
     num_sms: usize,
+    /// prefill attention accumulates in FP16 (Options::attn_f16_acc resolved for this GPU)
+    attn_f16: bool,
     /// image rows of the step being enqueued (set by the engine's runner): the M-RoPE streams differ, and these
     /// embeddings replace the gathered token rows
     mrope_step: Cell<bool>,
@@ -1327,6 +1342,7 @@ impl Model {
         }
 
         let rank = tp.rank;
+        let attn_f16 = opts.attn_f16_acc.unwrap_or_else(crate::gpu::fast_f16_accumulate);
         let mut model = Self {
             cfg,
             dims,
@@ -1390,6 +1406,7 @@ impl Model {
             pf_active: Cell::new(false),
             opts,
             num_sms: num_sms.max(1) as usize,
+            attn_f16,
             mrope_step: Cell::new(false),
             img_segs: Default::default(),
             mrope_comp,
@@ -1418,6 +1435,17 @@ impl Model {
         let t0 = std::time::Instant::now();
         if model.tp.rank == 0 {
             eprintln!("blaze: NVFP4 layers on many rows (prefill): {}", model.lin.describe());
+            let (major, minor) = crate::gpu::compute_capability();
+            eprintln!(
+                "blaze: prefill attention (NVFP4 KV): FlashAttention-2 kernel, a CTA of 16 tokens x a KV head's query heads, {} \
+                 (SM {major}.{minor}{})",
+                if model.attn_f16 { "FP16 accumulation in runs summed in FP32" } else { "FP32 accumulation" },
+                match (model.opts.attn_f16_acc, model.attn_f16) {
+                    (Some(_), _) => ": --attn-f16-acc",
+                    (None, true) => ": FP16 accumulation at twice the MMA rate here",
+                    (None, false) => ": one MMA rate for both here",
+                }
+            );
         }
         let tuned = model.lin.tune.tune(&weights, model.lin.gemm, &model.stream)?;
         if tuned > 0 && model.tp.rank == 0 {
@@ -2883,7 +2911,41 @@ impl Model {
         for (i, sp) in spans.iter().enumerate().skip(n_decode) {
             calls.push((i, 1, sp.len, sp.offset));
         }
+        // prefill spans of an NVFP4 pool: the FlashAttention-2 kernel (no split, no workspace)
+        let fa2 = !verify
+            && !tree
+            && !prefill_attn_split()
+            && view.format == sys::BLZ_KV_NVFP4
+            && unsafe { sys::blz_nvfp4_mha_prefill_group_ok(heads as c_int, kvh as c_int) } != 0;
         for (first, count, q_len, off) in calls {
+            if fa2 && q_len >= PREFILL_KERNEL_ROWS {
+                let sp = &spans[first];
+                check(
+                    unsafe {
+                        sys::blz_nvfp4_mha_prefill(
+                            w.q.at::<u16>(off * heads * hd).cast(),
+                            (heads * hd) as i64,
+                            hd as i64,
+                            heads as c_int,
+                            view,
+                            self.req_to_token.ptr(),
+                            self.ctx_stride() as i64,
+                            sp.row as i64,
+                            sp.kv_len as c_int,
+                            q_len as c_int,
+                            1.0 / (hd as f32).sqrt(),
+                            self.attn_f16 as c_int,
+                            sys::BLZ_BF16,
+                            w.attn.at::<u16>(off * heads * hd).cast(),
+                            (heads * hd) as i64,
+                            hd as i64,
+                            s.0,
+                        )
+                    },
+                    "mha prefill",
+                )?;
+                continue;
+            }
             let splits = self.attn_splits(count, q_len, None)?;
             if tree && q_len > 1 {
                 // a tree verify span: each row sees its ancestors among the span's rows
@@ -2945,6 +3007,7 @@ impl Model {
                 "mha",
             )?;
         }
+        self.dump(&format!("attn_core_{}", layer.slot), w.attn.ptr(), t, heads * hd)?;
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
         self.prefetch_mlp(layer, t)

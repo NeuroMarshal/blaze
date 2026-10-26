@@ -1,6 +1,6 @@
 // Dense attention straight from an NVFP4, FP8 or BF16 pool (blaze/mha.h) against a double-precision reference on the
-// dequantized cache (decode and causal verify, GQA 6 and 8, several context splits), the FP8 / BF16 store, the row
-// dequantization, and the decode time of a long context per format.
+// dequantized cache (decode and causal verify, GQA 6 and 8, several context splits; the prefill kernel in both
+// accumulation modes), the FP8 / BF16 store, the row dequantization, and the decode time of a long context per format.
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -229,6 +229,55 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
   g_failures += !ok;
 }
 
+// The prefill kernel (blz_nvfp4_mha_prefill, one sequence, causal) against the same double reference: FP32 and FP16
+// accumulation, groups the CTAs take whole or in parts, chunks shorter than a CTA's 16 tokens.
+void test_prefill(const char* what, int kv_heads, int group, int q_len, int kv_len, bool f16, std::mt19937& rng) {
+  const int q_heads = kv_heads * group, slots = 8192;
+  Pool p = make_pool(slots, kv_heads, rng, BLZ_KV_NVFP4);
+  DevPool dp(p);
+  const int reqs = 3, stride = kv_len + 8, req = 1;
+  std::vector<int32_t> r2t(size_t(reqs) * stride);
+  for (auto& s : r2t) s = int32_t(rng() % slots);
+  std::normal_distribution<float> n01;
+  std::vector<__nv_bfloat16> q(size_t(q_len) * q_heads * kDim);
+  for (auto& v : q) v = __float2bfloat16(n01(rng));
+  const float scale = 1.0f / std::sqrt(float(kDim));
+  Dev<int32_t> d_r2t(r2t);
+  Dev<__nv_bfloat16> d_q(q), d_out(size_t(q_len) * q_heads * kDim);
+  CHECK_CUDA(blz_nvfp4_mha_prefill(d_q.ptr, int64_t(q_heads) * kDim, kDim, q_heads, dp.pool, d_r2t.ptr, stride, req, kv_len,
+                                   q_len, scale, f16, BLZ_BF16, d_out.ptr, int64_t(q_heads) * kDim, kDim, nullptr));
+  CHECK_CUDA(cudaDeviceSynchronize());
+  const auto out = d_out.get();
+  double worst = 0, peak = 0;
+  std::vector<double> sc;
+  for (int i = 0; i < q_len; ++i)
+    for (int h = 0; h < q_heads; ++h) {
+      const int g = h / group, L = kv_len - q_len + i + 1;
+      const __nv_bfloat16* qr = &q[(size_t(i) * q_heads + h) * kDim];
+      sc.assign(L, 0.0);
+      double mx = -1e300;
+      for (int t = 0; t < L; ++t) {
+        const int64_t slot = r2t[size_t(req) * stride + t];
+        double d = 0;
+        for (int k = 0; k < kDim; ++k) d += double(__bfloat162float(qr[k])) * p.value(false, slot, g, k);
+        sc[t] = d * scale, mx = std::max(mx, sc[t]);
+      }
+      double sum = 0;
+      for (int t = 0; t < L; ++t) sum += (sc[t] = std::exp(sc[t] - mx));
+      for (int k = 0; k < kDim; ++k) {
+        double ref = 0;
+        for (int t = 0; t < L; ++t) ref += sc[t] * p.value(true, r2t[size_t(req) * stride + t], g, k);
+        ref /= sum;
+        const double got = __bfloat162float(out[(size_t(i) * q_heads + h) * kDim + k]);
+        worst = std::max(worst, std::fabs(got - ref)), peak = std::max(peak, std::fabs(ref));
+      }
+    }
+  const double rel = worst / std::max(peak, 1e-30);
+  const bool ok = rel < (f16 ? 3e-2 : 1.5e-2);
+  std::printf("prefill %-4s %-44s: max error / max |out| %.2e %s\n", f16 ? "f16" : "f32", what, rel, ok ? "ok" : "FAIL");
+  g_failures += !ok;
+}
+
 // Head dim 128 from a BF16 pool with a sliding window (the EAGLE-4 draft layer: MHA, window 4096) against a double
 // reference over positions max(0, p - window + 1) .. p of each query.
 void test_window(const char* what, int heads, int q_len, std::vector<int> kv_lens, int window, int splits,
@@ -414,6 +463,13 @@ int main() {
   test_window("decode, no window", 4, 1, {2000}, 0, 8, rng);
   test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
   test_window("DFlash block 8, short window", 2, 8, {500}, 37, 2, rng, 0);
+  for (bool f16 : {false, true}) {
+    test_prefill("GQA 6, 37 tokens, a first chunk", 2, 6, 37, 37, f16, rng);
+    test_prefill("GQA 6, 300 tokens after 1700", 2, 6, 300, 2000, f16, rng);
+    test_prefill("GQA 8 (two CTAs of 4), 65 tokens after 935", 1, 8, 65, 1000, f16, rng);
+    test_prefill("GQA 12 (two CTAs of 6), 33 tokens after 467", 2, 12, 33, 500, f16, rng);
+    test_prefill("MHA, 129 tokens after 2000", 3, 1, 129, 2129, f16, rng);
+  }
   test_dequant_rows(rng);
   for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
     bench(122000, 1, 1, 64, rng, f);

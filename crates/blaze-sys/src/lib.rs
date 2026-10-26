@@ -294,6 +294,11 @@ unsafe extern "C" {
                                 out: *mut c_void, out_stride_tok: i64, out_stride_head: i64,
                                 s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_mha_parts(q_heads: c_int, kv_heads: c_int, q_len: c_int, splits: c_int) -> c_int;
+    pub fn blz_nvfp4_mha_prefill(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
+                                 pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64, req: i64, kv_len: c_int,
+                                 q_len: c_int, scale: f32, f16_accumulate: c_int, dtype: c_int, out: *mut c_void,
+                                 out_stride_tok: i64, out_stride_head: i64, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_mha_prefill_group_ok(q_heads: c_int, kv_heads: c_int) -> c_int;
     pub fn blz_mha_decode_window(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
                                  pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64,
                                  req_indices: blz_index_ptr, kv_lens: blz_index_ptr, batch: c_int, q_len: c_int,

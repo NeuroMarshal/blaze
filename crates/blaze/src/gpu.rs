@@ -39,6 +39,23 @@ pub fn l2_bytes() -> Option<usize> {
     (e == 0 && v > 0).then_some(v as usize)
 }
 
+/// (major, minor) compute capability of the current device.
+pub fn compute_capability() -> (i32, i32) {
+    let (mut major, mut minor, mut dev) = (0, 0, 0);
+    unsafe {
+        let _ = sys::cudaGetDevice(&mut dev);
+        sys::cudaDeviceGetAttribute(&mut major, sys::ATTR_COMPUTE_CAPABILITY_MAJOR, dev);
+        sys::cudaDeviceGetAttribute(&mut minor, sys::ATTR_COMPUTE_CAPABILITY_MINOR, dev);
+    }
+    (major, minor)
+}
+
+/// GeForce-class tensor cores: FP16 accumulation runs at twice the rate of FP32 accumulation (SM 8.6, 8.9, 12.x;
+/// the data-centre parts 8.0, 9.0, 10.x run both at one rate).
+pub fn fast_f16_accumulate() -> bool {
+    matches!(compute_capability(), (8, 6) | (8, 9) | (12, _))
+}
+
 /// Start or stop the CUDA profiler's capture range (all GPUs of the process).
 pub fn profiler(start: bool) -> Result<()> {
     unsafe extern "C" {

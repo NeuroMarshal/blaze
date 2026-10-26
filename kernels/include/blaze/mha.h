@@ -59,6 +59,23 @@ cudaError_t blz_nvfp4_mha_tree(const void* q, int64_t q_stride_tok, int64_t q_st
                                blz_half_t dtype, void* out, int64_t out_stride_tok, int64_t out_stride_head,
                                cudaStream_t stream);
 
+/// \brief Causal prefill attention of one sequence's q_len query tokens (its last q_len positions of kv_len, all in the
+/// pool; slots in row `req` of req_to_token) from an NVFP4 pool, FlashAttention-2 style: a CTA of 16 tokens x the
+/// query heads of a KV head reads each key tile once, dequantized once in shared memory; no split, no workspace.
+/// q / out [q_len, q_heads, 256] bf16 (strides in elements: q multiple of 8, out of 2). A CTA takes 6, 4, 2 or 1 of a
+/// KV head's query heads (the largest dividing the group).
+/// f16_accumulate: the MMAs accumulate in FP16 in short runs summed in FP32 (twice the MMA rate on GeForce GPUs).
+cudaError_t blz_nvfp4_mha_prefill(const void* q, int64_t q_stride_tok, int64_t q_stride_head, int q_heads,
+                                  blz_nvfp4_pool pool, const int32_t* req_to_token, int64_t req_stride, int64_t req,
+                                  int kv_len, int q_len, float scale, int f16_accumulate, blz_half_t dtype, void* out,
+                                  int64_t out_stride_tok, int64_t out_stride_head, cudaStream_t stream);
+
+/// \brief 1 when blz_nvfp4_mha_prefill runs on this build.
+int blz_nvfp4_mha_prefill_supported(void);
+
+/// \brief 1 when blz_nvfp4_mha_prefill takes this head geometry.
+int blz_nvfp4_mha_prefill_group_ok(int q_heads, int kv_heads);
+
 /// \brief Context parts of blz_nvfp4_mha_decode (the partial workspaces' third dimension): splits times the warps a CTA
 /// runs along the context for this query geometry; 0 for an unsupported one.
 int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits);
