@@ -319,12 +319,22 @@ __global__ void __launch_bounds__(32 * G, 1)
     uint32_t pa[2][4];
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) {
-      const float p00 = exp2f(s[nt][0] - b0), p01 = exp2f(s[nt][1] - b0);
-      const float p10 = exp2f(s[nt][2] - b1), p11 = exp2f(s[nt][3] - b1);
-      sum[0] += p00 + p01, sum[1] += p10 + p11;
       // A fragment of k-step nt / 2 (positions 16 j ..): a0 / a1 rows gr / gr + 8 at 2c, a2 / a3 at 8 + 2c
-      pa[nt >> 1][(nt & 1) * 2 + 0] = pack_f16(p00, p01);
-      pa[nt >> 1][(nt & 1) * 2 + 1] = pack_f16(p10, p11);
+      if constexpr (F16) {
+        // exp2 of two scores in one f16x2 instruction (the running max is exact: the inputs are <= 0, P is f16 anyway)
+        const __half2 e0 = h2exp2(__floats2half2_rn(s[nt][0] - b0, s[nt][1] - b0));
+        const __half2 e1 = h2exp2(__floats2half2_rn(s[nt][2] - b1, s[nt][3] - b1));
+        const float2 f0 = __half22float2(e0), f1 = __half22float2(e1);
+        sum[0] += f0.x + f0.y, sum[1] += f1.x + f1.y;
+        pa[nt >> 1][(nt & 1) * 2 + 0] = *reinterpret_cast<const uint32_t*>(&e0);
+        pa[nt >> 1][(nt & 1) * 2 + 1] = *reinterpret_cast<const uint32_t*>(&e1);
+      } else {
+        const float p00 = exp2f(s[nt][0] - b0), p01 = exp2f(s[nt][1] - b0);
+        const float p10 = exp2f(s[nt][2] - b1), p11 = exp2f(s[nt][3] - b1);
+        sum[0] += p00 + p01, sum[1] += p10 + p11;
+        pa[nt >> 1][(nt & 1) * 2 + 0] = pack_f16(p00, p01);
+        pa[nt >> 1][(nt & 1) * 2 + 1] = pack_f16(p10, p11);
+      }
     }
     lrow[0] = lrow[0] * alpha[0] + sum[0];
     lrow[1] = lrow[1] * alpha[1] + sum[1];
