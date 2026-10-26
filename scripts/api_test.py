@@ -448,6 +448,24 @@ def chat_logprobs():
 
 
 @test
+def chat_logprobs_toggle_reuses_separate_gpu_graphs():
+    # Exercise both graph keys repeatedly: the no-logprobs graph must never serve a logprobs request.
+    for want in [False, False, False, True, True, True, False, True]:
+        r = chat([{"role": "user", "content": "List several small prime numbers."}], max_tokens=12,
+                 temperature=0.8, seed=123, logprobs=want, **({"top_logprobs": 5} if want else {}))
+        lp = r.choices[0].logprobs
+        if want:
+            import math
+            check(lp and lp.content, "missing logprobs after switching graph key")
+            for e in lp.content:
+                check(math.isfinite(e.logprob) and -9999 <= e.logprob <= 0, e)
+                check(all(math.isfinite(t.logprob) and -9999 <= t.logprob <= 0 for t in e.top_logprobs), e)
+                check(sum(math.exp(t.logprob) for t in e.top_logprobs) <= 1.001, "incorrect full-vocabulary normalizer")
+        else:
+            check(lp is None, "unexpected logprobs")
+
+
+@test
 def chat_logprobs_are_numbers_and_bytes_make_the_text():
     # under a grammar most of the vocabulary is -inf: every logprob is still a number (vLLM writes -9999)
     r = chat([{"role": "user", "content": "Give me a JSON object with a key 'a'."}], max_tokens=40, logprobs=True,
@@ -998,11 +1016,15 @@ def cancel_non_streaming_disconnect():
 @test
 def cancel_during_prefill():
     quiesced()
-    before = metrics()["blaze_requests_cancelled_total"]
+    start_metrics = metrics()
+    before = start_metrics["blaze_requests_cancelled_total"]
     n = args.prefill_tokens or min(12000, MAX_LEN * 3 // 4)
     # varied text (no prefix-cache hit, one token or two per word)
     text = " ".join(f"item{i} is {i * 7 % 13} of {i % 5}." for i in range(n // 9))
     body = {"model": MODEL, "messages": [{"role": "user", "content": text + "\nSummarize."}], "max_tokens": 5, "stream": True, **NOTHINK}
+    status, _, tokenized = http("POST", "/tokenize", body)
+    check(status == 200, tokenized)
+    prompt_tokens = tokenized["count"]
     req = urllib.request.Request(BASE + "/v1/chat/completions", json.dumps(body).encode(), AUTH_HEADERS)
     t0 = time.time()
     r = urllib.request.urlopen(req, timeout=60)
@@ -1011,14 +1033,14 @@ def cancel_during_prefill():
     r.close()
     quiesced(30)
     gone = time.time() - t0
-    # a full prefill of this prompt is measured below; the cancelled one must have stopped well before it
-    t1 = time.time()
-    s, _, b = raw_chat({"messages": [{"role": "user", "content": text + "\nSummarize in one word."}], "max_tokens": 3})
-    full = time.time() - t1
-    check(s == 200, b)
-    print(f"      prefill cancelled after {gone:.1f} s; the same prompt takes {full:.1f} s ({b['usage']['prompt_tokens']} tokens)")
-    check(metrics()["blaze_requests_cancelled_total"] > before, "the cancellation was not counted by the scheduler")
-    check(gone < full * 0.8 or full < 4, f"cancelled prefill took {gone:.1f} s of {full:.1f} s")
+    after = metrics()
+    computed = after["blaze_prefill_tokens_total"] - start_metrics["blaze_prefill_tokens_total"]
+    print(f"      prefill cancelled after {gone:.1f} s; computed {computed:.0f}/{prompt_tokens} prompt tokens")
+    check(after["blaze_requests_cancelled_total"] > before, "the cancellation was not counted by the scheduler")
+    # Cancellation is observed between GPU chunks. Cold expert I/O can make the first chunk slower than a later
+    # complete prompt, so compare actual work instead of assuming uniform wall-clock time across the two runs.
+    check(computed < prompt_tokens - 1, f"prefill continued after disconnect: {computed:.0f}/{prompt_tokens} tokens")
+
 
 
 @test

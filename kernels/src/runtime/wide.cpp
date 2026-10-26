@@ -82,7 +82,7 @@ struct HybridMoe::Wide {
   // SSD-tier read-ahead: pinned slots and, per GPU, an event per slot recorded after its record left for the device.
   std::vector<uint8_t*> ahead;
   std::vector<cudaEvent_t> ahead_copied[2];
-  cudaEvent_t x_ready = nullptr, imports_done = nullptr;
+  cudaEvent_t ids_ready = nullptr, x_ready = nullptr, imports_done = nullptr;
 };
 
 void HybridMoe::init_wide() {
@@ -130,6 +130,7 @@ void HybridMoe::init_wide() {
     for (cudaEvent_t& e : w->ahead_copied[g]) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
   }
   check(cudaSetDevice(cfg_.gpu0), "set gpu0");
+  check(cudaEventCreateWithFlags(&w->ids_ready, cudaEventDisableTiming), "event");
   check(cudaEventCreateWithFlags(&w->x_ready, cudaEventDisableTiming), "event");
   check(cudaEventCreateWithFlags(&w->imports_done, cudaEventDisableTiming), "event");
   host_alloc(&w->ids, size_t(w->routes_cap), "ids");
@@ -166,6 +167,7 @@ void HybridMoe::free_wide() {
     for (cudaEvent_t e : w->ahead_copied[g]) cudaEventDestroy(e);
   }
   cudaSetDevice(cfg_.gpu0);
+  cudaEventDestroy(w->ids_ready);
   cudaEventDestroy(w->x_ready);
   cudaEventDestroy(w->imports_done);
   for (void* p : {(void*)w->ids, (void*)w->x_host, (void*)w->y_host, (void*)w->route_token_host,
@@ -200,13 +202,16 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
   try {
     check(cudaSetDevice(cfg_.gpu0), "set gpu0");
     check(cudaMemcpyAsync(W.ids, ids, size_t(R) * 4, cudaMemcpyDeviceToHost, stream), "ids");
+    // The CPU only needs route IDs before grouping. Mark that transfer separately so grouping overlaps GPU0's
+    // encoding and GPU1's x staging; all GPU work still remains ordered on the caller stream.
+    check(cudaEventRecord(W.ids_ready, stream), "ids ready");
     if (has_gpu1) {
       check(cudaMemcpyAsync(W.x_host, x, size_t(T) * H * 2, cudaMemcpyDeviceToHost, stream), "x to host");
       check(cudaEventRecord(W.x_ready, stream), "x ready");
     }
     check(blz_wide_encode(x, T, H, W.gpu[0].x_planes, W.gpu[0].x_emax, stream), "encode");
     if (cfg_.wide_a8) check(blz_wide_to_a8(W.gpu[0].x_planes, T, H, stream), "x to a8");
-    check(cudaStreamSynchronize(stream), "ids");
+    check(cudaEventSynchronize(W.ids_ready), "ids ready");
 
     // Routes by expert, in token order.
     std::vector<int> count(E, 0);

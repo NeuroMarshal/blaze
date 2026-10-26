@@ -48,6 +48,10 @@ fn bounded_mha_splits(requested: usize, rows: usize, parts_per_split: usize, cap
     Ok(requested.min(available))
 }
 
+fn logits_width(vocab: usize, shard_vocab: usize, world: usize, full_logits: bool) -> usize {
+    if world > 1 && !full_logits { shard_vocab } else { vocab }
+}
+
 pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
     let inject = format!("{prefix}block_inject_weight.weight");
     Ok(HcBlock {
@@ -1778,7 +1782,7 @@ impl Model {
                 .as_ref()
                 .map(|_| DevBuf::from_slice(&(0..t.max(head_rows) as i32).collect::<Vec<i32>>()))
                 .transpose()?,
-            logits: b(head_rows * cfg.vocab * 2)?,
+            logits: b(head_rows * logits_width(cfg.vocab, d.vocab, world, opts.full_logits) * 2)?,
             next: b(head_rows * 4)?,
             meta: b(meta.bytes)?,
         })
@@ -2110,7 +2114,7 @@ impl Model {
     /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
     /// (its inputs are recorded for commit); `tree`: the verify rows of each span form a tree (MetaLayout tree_*).
     /// Capturable into a CUDA graph (no host synchronization).
-    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool, tree: bool) -> Result<()> {
+    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool, tree: bool, need_lse: bool) -> Result<()> {
         let t: usize = spans.iter().map(|s| s.len).sum();
         let n = spans.len();
         if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
@@ -2315,7 +2319,7 @@ impl Model {
                 }
             }
             if sample {
-                return self.sample_candidates(w.gnormed.ptr(), n);
+                return self.sample_candidates(w.gnormed.ptr(), n, need_lse);
             }
             if self.tp.world > 1 && !self.opts.full_logits {
                 return self.greedy_sharded(w.gnormed.ptr(), n);
@@ -2462,7 +2466,7 @@ impl Model {
     /// Sampling candidates of `rows` normed states: this rank's vocabulary shard through the head, the rows' penalties,
     /// the shard's top BLZ_TOPK_MAX, packed as (value, id) pairs at the rank's slot of cand_pairs and merged over the
     /// group (cand_pairs: [world][rows][K][2] floats).
-    fn sample_candidates(&self, normed: *const u16, rows: usize) -> Result<()> {
+    fn sample_candidates(&self, normed: *const u16, rows: usize, need_lse: bool) -> Result<()> {
         let (w, s, v, m) = (&self.work, &self.stream, self.dims.vocab, &self.meta);
         let (rank, world, k) = (self.tp.rank, self.tp.world, sys::BLZ_TOPK_MAX);
         self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), v, s)?;
@@ -2480,7 +2484,9 @@ impl Model {
             },
             "token mask",
         )?;
-        check(unsafe { sys::blz_row_lse(w.logits.ptr(), v as i64, rows as c_int, v as c_int, w.cand_lse.ptr(), s.0) }, "lse")?;
+        if need_lse {
+            check(unsafe { sys::blz_row_lse(w.logits.ptr(), v as i64, rows as c_int, v as c_int, w.cand_lse.ptr(), s.0) }, "lse")?;
+        }
         check(
             unsafe {
                 sys::blz_topk(w.logits.ptr(), v as i64, rows as c_int, v as c_int, (rank * v) as c_int, k as c_int, w.cand_vals.ptr(),
@@ -2494,7 +2500,7 @@ impl Model {
         }
         check(
             unsafe {
-                sys::blz_topk_pack(w.cand_vals.ptr(), w.cand_ids.ptr(), w.cand_lse.ptr(), rows as c_int, k as c_int,
+                sys::blz_topk_pack(w.cand_vals.ptr(), w.cand_ids.ptr(), if need_lse { w.cand_lse.ptr() } else { null() }, rows as c_int, k as c_int,
                                    w.cand_pairs.at::<f32>(rank * rows * (k + 1) * 2), s.0)
             },
             "pack",
@@ -2596,6 +2602,7 @@ impl Model {
     }
 
     pub fn last_logits(&self, row: usize) -> Result<Vec<f32>> {
+        ensure!(self.tp.world == 1 || self.opts.full_logits, "last_logits requires full logits with tensor parallelism");
         self.stream.sync()?;
         let v = self.cfg.vocab;
         let raw = self.work.logits.download::<u16>((row + 1) * v)?;
@@ -3282,6 +3289,13 @@ pub fn describe_load(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod stage_tests {
+    #[test]
+    fn logits_buffer_width_matches_the_head_output() {
+        assert_eq!(super::logits_width(32000, 8000, 4, false), 8000);
+        assert_eq!(super::logits_width(32000, 8000, 4, true), 32000);
+        assert_eq!(super::logits_width(32000, 32000, 1, false), 32000);
+    }
+
     #[test]
     fn attention_splits_respect_sparse_workspace_capacity() {
         assert_eq!(super::bounded_mha_splits(16, 1024, 4, 4096).unwrap(),1);

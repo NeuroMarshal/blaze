@@ -1362,41 +1362,7 @@ impl Loop {
     /// generated.
     fn edits_for(&self, i: usize, extra: &[i64]) -> Penalty {
         let a = &self.active[i];
-        let p = &a.req.params;
-        let mut e: HashMap<i32, (f32, f32, f32)> = HashMap::new();
-        let mut counts = a.counts.clone();
-        for &t in extra {
-            *counts.entry(t as i32).or_insert(0) += 1;
-        }
-        if p.repetition_penalty != 1.0 {
-            let r = p.repetition_penalty;
-            for &t in a.prompt_set.iter().chain(counts.keys()) {
-                e.insert(t, (1.0 / r, r, 0.0));
-            }
-        }
-        if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
-            for (&t, &c) in &counts {
-                e.entry(t).or_insert((1.0, 1.0, 0.0)).2 -= p.presence_penalty + p.frequency_penalty * c as f32;
-            }
-        }
-        for &(t, b) in &p.logit_bias {
-            e.entry(t).or_insert((1.0, 1.0, 0.0)).2 += b;
-        }
-        if a.generated.len() + extra.len() < p.min_tokens {
-            for &t in &a.req.stop_ids {
-                e.entry(t).or_insert((1.0, 1.0, 0.0)).2 = f32::NEG_INFINITY;
-            }
-        }
-        if !p.bad_words.is_empty() {
-            let tail: Vec<i32> = a.generated.iter().copied().chain(extra.iter().map(|&t| t as i32)).collect();
-            for w in &p.bad_words {
-                let (last, prefix) = w.split_last().unwrap();
-                if tail.ends_with(prefix) {
-                    e.entry(*last).or_insert((1.0, 1.0, 0.0)).2 = f32::NEG_INFINITY;
-                }
-            }
-        }
-        Penalty { edits: e.into_iter().map(|(t, (a, b, c))| (t, a, b, c)).collect(), mask: None }
+        penalty_edits(&a.req.params, &a.prompt_set, &a.counts, &a.generated, extra, &a.req.stop_ids)
     }
 
     /// One generated token of active request `i`: thinking budget, counts, the event, stop conditions; the token
@@ -2512,9 +2478,78 @@ fn logprob_of(c: &crate::engine::Cands, x: i32, top: Option<usize>) -> Option<To
     Some(TokenLogprob { logprob: lp, top: c.top.iter().take(n).map(|&(l, t)| (t, clamp(l - c.lse))).collect() })
 }
 
+/// Edits for a candidate row without cloning the output histogram or its token history. Draft rows only need
+/// counts of their short extra path; bad-word matching only inspects as much suffix as the banned prefix needs.
+fn penalty_edits(p: &SamplingParams, prompt_set: &[i32], counts: &HashMap<i32, i32>, generated: &[i32],
+                 extra: &[i64], stop_ids: &[i32]) -> Penalty {
+    let mut e: HashMap<i32, (f32, f32, f32)> = HashMap::new();
+    if p.repetition_penalty != 1.0 {
+        let r = p.repetition_penalty;
+        for t in prompt_set.iter().copied().chain(counts.keys().copied()).chain(extra.iter().map(|&t| t as i32)) {
+            e.insert(t, (1.0 / r, r, 0.0));
+        }
+    }
+    if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+        let mut extra_counts: HashMap<i32, i32> = HashMap::new();
+        for &t in extra { *extra_counts.entry(t as i32).or_default() += 1; }
+        for (&t, &c) in counts {
+            let c = c + extra_counts.get(&t).copied().unwrap_or(0);
+            e.entry(t).or_insert((1.0, 1.0, 0.0)).2 -= p.presence_penalty + p.frequency_penalty * c as f32;
+        }
+        for (&t, &c) in &extra_counts {
+            if !counts.contains_key(&t) {
+                e.entry(t).or_insert((1.0, 1.0, 0.0)).2 -= p.presence_penalty + p.frequency_penalty * c as f32;
+            }
+        }
+    }
+    for &(t, b) in &p.logit_bias { e.entry(t).or_insert((1.0, 1.0, 0.0)).2 += b; }
+    if generated.len() + extra.len() < p.min_tokens {
+        for &t in stop_ids { e.entry(t).or_insert((1.0, 1.0, 0.0)).2 = f32::NEG_INFINITY; }
+    }
+    for w in &p.bad_words {
+        if let Some((last, prefix)) = w.split_last() {
+            let tail = extra.iter().rev().map(|&t| t as i32).chain(generated.iter().rev().copied());
+            if prefix.iter().rev().copied().eq(tail.take(prefix.len())) {
+                e.entry(*last).or_insert((1.0, 1.0, 0.0)).2 = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Penalty { edits: e.into_iter().map(|(t, (a, b, c))| (t, a, b, c)).collect(), mask: None, need_lse: p.logprobs.is_some() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn penalty_edits_merge_draft_counts_and_cross_boundary_bad_words() {
+        let p = SamplingParams { repetition_penalty: 2.0, presence_penalty: 0.5, frequency_penalty: 0.25,
+            logit_bias: vec![(7, 1.0), (10, -3.0)], min_tokens: 5,
+            bad_words: vec![vec![8, 7, 9, 7, 12], vec![13], vec![99, 14]], logprobs: Some(0),
+            ..SamplingParams::default() };
+        let counts = HashMap::from([(7, 3), (8, 1)]);
+        let edits = penalty_edits(&p, &[1, 7], &counts, &[7, 7, 7, 8], &[7, 9, 7], &[8]);
+        assert!(edits.need_lse);
+        let edits: HashMap<_, _> = edits.edits.into_iter().map(|(t, a, b, c)| (t, (a, b, c))).collect();
+        assert_eq!(edits.len(), 7);
+        assert_eq!(edits[&1], (0.5, 2.0, 0.0));
+        assert_eq!(edits[&7], (0.5, 2.0, -0.75));
+        assert_eq!(edits[&8], (0.5, 2.0, -0.75));
+        assert_eq!(edits[&9], (0.5, 2.0, -0.75));
+        assert_eq!(edits[&10], (1.0, 1.0, -3.0));
+        assert_eq!(edits[&12].2, f32::NEG_INFINITY);
+        assert_eq!(edits[&13].2, f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn penalty_edits_min_tokens_and_short_suffix() {
+        let p = SamplingParams { min_tokens: 3, bad_words: vec![vec![1, 2, 3, 4]], ..SamplingParams::default() };
+        let e = penalty_edits(&p, &[], &HashMap::from([(1, 1)]), &[1], &[2], &[9]);
+        assert!(!e.need_lse);
+        assert_eq!(e.edits, vec![(9, 1.0, 1.0, f32::NEG_INFINITY)]);
+        let e = penalty_edits(&p, &[], &HashMap::new(), &[1, 2], &[3], &[9]);
+        assert_eq!(e.edits, vec![(4, 1.0, 1.0, f32::NEG_INFINITY)]);
+    }
 
     #[test]
     fn candidate_sets() {

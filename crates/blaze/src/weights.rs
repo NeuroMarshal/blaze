@@ -99,27 +99,39 @@ impl Checkpoint {
             if map.len() < 8 {
                 bail!("{}: too short for a safetensors header", path.display());
             }
-            let n = u64::from_le_bytes(map[..8].try_into().unwrap()) as usize;
-            let header: Value = serde_json::from_slice(&map[8..8 + n])
+            let n = usize::try_from(u64::from_le_bytes(map[..8].try_into().unwrap()))?;
+            let base = n.checked_add(8).filter(|&end| end <= map.len())
+                .ok_or_else(|| anyhow!("{}: header extends beyond the file", path.display()))?;
+            let header: Value = serde_json::from_slice(&map[8..base])
                 .with_context(|| format!("{}: bad header", path.display()))?;
-            let base = 8 + n;
             for (name, v) in header.as_object().ok_or_else(|| anyhow!("{}: header is not an object", path.display()))? {
                 if name == "__metadata__" {
                     continue;
                 }
                 let offsets = v["data_offsets"].as_array().ok_or_else(|| anyhow!("{name}: no data_offsets"))?;
-                let (a, b) = (offsets[0].as_u64().unwrap_or(0) as usize, offsets[1].as_u64().unwrap_or(0) as usize);
+                if offsets.len() != 2 { bail!("{name}: data_offsets must contain two integers"); }
+                let offset = |v: &Value| -> Result<usize> {
+                    v.as_u64().and_then(|x| usize::try_from(x).ok()).ok_or_else(|| anyhow!("{name}: invalid data offset"))
+                };
+                let (a, b) = (offset(&offsets[0])?, offset(&offsets[1])?);
+                if a > b || b > map.len() - base { bail!("{name}: data range is outside the file"); }
+                let shape = v["shape"].as_array().ok_or_else(|| anyhow!("{name}: missing shape"))?
+                    .iter().map(|x| x.as_u64().and_then(|x| usize::try_from(x).ok())
+                        .ok_or_else(|| anyhow!("{name}: invalid shape dimension"))).collect::<Result<Vec<_>>>()?;
                 let info = TensorInfo {
                     file: fi,
                     start: base + a,
                     end: base + b,
                     dtype: Dtype::parse(v["dtype"].as_str().unwrap_or(""))?,
-                    shape: v["shape"].as_array().map(|s| s.iter().filter_map(Value::as_u64).map(|x| x as usize).collect()).unwrap_or_default(),
+                    shape,
                 };
-                if info.end > map.len() || info.numel() * info.dtype.size() != info.bytes() {
+                let bytes = info.shape.iter().try_fold(info.dtype.size(), |n, &dim| n.checked_mul(dim));
+                if bytes != Some(info.bytes()) {
                     bail!("{name}: header range does not match its shape and dtype");
                 }
-                tensors.insert(name.clone(), info);
+                if tensors.insert(name.clone(), info).is_some() {
+                    bail!("{name}: duplicate tensor across checkpoint files");
+                }
             }
             maps.push(map);
         }
@@ -146,5 +158,47 @@ impl Checkpoint {
         } else {
             "model."
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_checkpoint_ranges_return_errors_without_panicking() {
+        let dir = std::env::temp_dir().join(format!("blaze-header-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        for header in [
+            serde_json::json!({"x":{"dtype":"U8","shape":[1],"data_offsets":[]}}),
+            serde_json::json!({"x":{"dtype":"U8","shape":[1],"data_offsets":[4,1]}}),
+            serde_json::json!({"x":{"dtype":"U8","shape":[1],"data_offsets":[0,99]}}),
+            serde_json::json!({"x":{"dtype":"U8","shape":[-1],"data_offsets":[0,1]}}),
+            serde_json::json!({"x":{"dtype":"F64","shape":[u64::MAX,2],"data_offsets":[0,1]}}),
+        ] {
+            let bytes = serde_json::to_vec(&header).unwrap();
+            let mut data = (bytes.len() as u64).to_le_bytes().to_vec();
+            data.extend(bytes);
+            data.push(42);
+            std::fs::write(&path, data).unwrap();
+            assert!(Checkpoint::open(&dir).is_err(), "accepted {header}");
+        }
+        for data in [vec![0; 3], u64::MAX.to_le_bytes().to_vec(), 100u64.to_le_bytes().to_vec()] {
+            std::fs::write(&path, data).unwrap();
+            assert!(Checkpoint::open(&dir).is_err());
+        }
+        let header = serde_json::json!({"x":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}});
+        let bytes = serde_json::to_vec(&header).unwrap();
+        let mut data = (bytes.len() as u64).to_le_bytes().to_vec();
+        data.extend(bytes);
+        data.push(42);
+        std::fs::write(&path, data).unwrap();
+        let c = Checkpoint::open(&dir).unwrap();
+        assert_eq!(c.bytes("x").unwrap(), &[42]);
+        drop(c);
+        std::fs::copy(&path, dir.join("duplicate.safetensors")).unwrap();
+        assert!(Checkpoint::open(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

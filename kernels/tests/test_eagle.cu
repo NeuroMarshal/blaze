@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -307,6 +308,49 @@ int main() {
     }
     std::printf("candidate merge: %d mismatches %s\n", bad, bad ? "FAIL" : "ok");
     fails += bad;
+  }
+  // Invalid entries sort after valid candidates and fill every unused output deterministically.
+  {
+    const int world = 2, rows = 3, k = 4;
+    std::vector<float> pairs(size_t(world) * rows * (k + 1) * 2, 0.0f);
+    for (int w = 0; w < world; ++w)
+      for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < k; ++c) {
+          float* p = &pairs[((size_t(w) * rows + r) * (k + 1) + c) * 2];
+          p[0] = -FLT_MAX, p[1] = -1.0f;
+        }
+    pairs[((size_t(0) * rows + 1) * (k + 1) + 0) * 2] = 1.0f;
+    pairs[((size_t(0) * rows + 1) * (k + 1) + 0) * 2 + 1] = 12.0f;
+    pairs[((size_t(1) * rows + 1) * (k + 1) + 2) * 2] = 3.0f;
+    pairs[((size_t(1) * rows + 1) * (k + 1) + 2) * 2 + 1] = 4.0f;
+    pairs[((size_t(0) * rows + 2) * (k + 1) + 0) * 2] = 2.0f;
+    pairs[((size_t(0) * rows + 2) * (k + 1) + 0) * 2 + 1] = 42.0f;
+    pairs[((size_t(1) * rows + 2) * (k + 1) + 0) * 2] = 2.0f;
+    pairs[((size_t(1) * rows + 2) * (k + 1) + 0) * 2 + 1] = 42.0f;
+    float* dp = up(pairs);
+    int32_t* di;
+    float* dv;
+    check(cudaMalloc(&di, rows * k * sizeof(int32_t)), "malloc");
+    check(cudaMalloc(&dv, rows * k * sizeof(float)), "malloc");
+    std::vector<int32_t> init_ids(rows * k, -99);
+    std::vector<float> init_vals(rows * k, 99.0f);
+    check(cudaMemcpy(di, init_ids.data(), init_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "init ids");
+    check(cudaMemcpy(dv, init_vals.data(), init_vals.size() * sizeof(float), cudaMemcpyHostToDevice), "init vals");
+    check(blz_cand_merge(dp, world, rows, k, di, dv, 0), "merge invalid");
+    const auto gi = down(di, size_t(rows) * k);
+    const auto gv = down(dv, size_t(rows) * k);
+    bool ok = true;
+    for (int j = 0; j < k; ++j) {
+      ok &= gi[j] == -1 && std::isinf(gv[j]) && gv[j] < 0.0f;
+      const int want_id[] = {4, 12, -1, -1};
+      const float want_val[] = {3.0f, 1.0f, -INFINITY, -INFINITY};
+      ok &= gi[k + j] == want_id[j] && gv[k + j] == want_val[j];
+      const int duplicate_ids[] = {42, 42, -1, -1};
+      const float duplicate_vals[] = {2.0f, 2.0f, -INFINITY, -INFINITY};
+      ok &= gi[2 * k + j] == duplicate_ids[j] && gv[2 * k + j] == duplicate_vals[j];
+    }
+    std::printf("candidate merge invalid: %s\n", ok ? "ok" : "FAIL");
+    fails += !ok;
   }
   std::printf("%s\n", fails ? "FAILED" : "PASS");
   return fails ? 1 : 0;

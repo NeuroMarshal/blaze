@@ -590,9 +590,11 @@ impl GpuEncoder {
         })
     }
 
-    /// Activation bytes of an image of `n` patches.
+    /// Allocated activation bytes for `n` patches, including the workspace's minimum capacity.
     pub fn scratch_for(cfg: &VisionConfig, n: usize) -> usize {
-        n * (6 * cfg.hidden + (3 * cfg.hidden).max(cfg.intermediate)) * 2 + n / 4 * cfg.out_hidden * 2
+        let cap = n.max(1024);
+        cap * (6 * cfg.hidden + (3 * cfg.hidden).max(cfg.intermediate).max(cfg.patch_dim())) * 2
+            + cap / (cfg.merge * cfg.merge) * cfg.out_hidden * 2
     }
 
     pub fn encode(&self, px: &[u16], gh: usize, gw: usize) -> Result<Vec<u16>> {
@@ -1109,6 +1111,18 @@ fn check_image(path: &Path, s: &ImageSettings, ref_pixels: &[f32], gh: usize, gw
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_workspace_plan_includes_minimum_capacity_and_patch_staging() {
+        let cfg = VisionConfig { depth: 1, hidden: 32, heads: 4, intermediate: 64, patch: 16,
+            temporal: 2, merge: 2, channels: 3, num_pos: 1024, out_hidden: 128,
+            act_tanh: true, theta: 10000.0, prefix: String::new(), image_token_id: 1 };
+        // Six hidden buffers, the larger pixel staging buffer, and the merged output.
+        let bytes_per_patch = (6 * 32 + 1536) * 2 + 128 * 2 / 4;
+        assert_eq!(GpuEncoder::scratch_for(&cfg, 16), 1024 * bytes_per_patch);
+        assert_eq!(GpuEncoder::scratch_for(&cfg, 1024), 1024 * bytes_per_patch);
+        assert_eq!(GpuEncoder::scratch_for(&cfg, 2048), 2048 * bytes_per_patch);
+    }
 
     fn settings() -> ImageSettings {
         ImageSettings {

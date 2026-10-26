@@ -206,7 +206,7 @@ __global__ void cand_merge_kernel(const float* __restrict__ pairs, int world, in
   int id[2];
   for (int j = 0; j < 2; ++j) {
     const int e = lane + 32 * j;
-    v[j] = -FLT_MAX, id[j] = 0x7fffffff;
+    v[j] = -FLT_MAX, id[j] = -1;
     if (e < n) {
       const int w = e / k, c = e % k;
       const float* p = pairs + ((int64_t(w) * rows + row) * (k + 1) + c) * 2;
@@ -215,15 +215,19 @@ __global__ void cand_merge_kernel(const float* __restrict__ pairs, int world, in
     }
   }
   for (int j = 0; j < 2; ++j) {
+    const int e = lane + 32 * j;
     int rank = 0;
     for (int o = 0; o < 64; ++o) {
       const float ov = __shfl_sync(0xffffffffu, v[o / 32], o % 32);
       const int oi = __shfl_sync(0xffffffffu, id[o / 32], o % 32);
-      rank += ov > v[j] || (ov == v[j] && oi < id[j]);
+      const bool other_valid = oi >= 0, this_valid = id[j] >= 0;
+      rank += other_valid != this_valid ? other_valid
+                                        : (other_valid ? (ov > v[j] || (ov == v[j] && (oi < id[j] || (oi == id[j] && o < e))))
+                                                       : (o < e));
     }
-    if (rank < k && lane + 32 * j < n) {
-      ids[int64_t(row) * k + rank] = id[j] == 0x7fffffff ? 0 : id[j];
-      vals[int64_t(row) * k + rank] = v[j];
+    if (rank < k && e < n) {
+      ids[int64_t(row) * k + rank] = id[j];
+      vals[int64_t(row) * k + rank] = id[j] >= 0 ? v[j] : -INFINITY;
     }
   }
 }

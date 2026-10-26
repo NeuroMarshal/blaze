@@ -16,6 +16,40 @@
 
 namespace blaze {
 
+namespace detail {
+
+void wait_for_warm_readers(std::atomic<int>& busy) {
+  int count = busy.load(std::memory_order_acquire);
+  while (count > 0) {
+    busy.wait(count, std::memory_order_acquire);
+    count = busy.load(std::memory_order_acquire);
+  }
+}
+
+void warm_reader_finished(std::atomic<int>& busy) {
+  busy.fetch_sub(1, std::memory_order_acq_rel);
+  busy.notify_all();
+}
+
+void publish_warm_job(std::atomic<int>& busy, std::atomic<uint32_t>& generation, int readers) {
+  busy.store(readers, std::memory_order_relaxed);
+  generation.fetch_add(1, std::memory_order_release);
+  generation.notify_all();
+}
+
+bool wait_for_warm_job(std::atomic<uint32_t>& generation, uint32_t& seen, std::atomic<bool>& stop,
+                       std::atomic<int>& busy) {
+  for (;;) {
+    generation.wait(seen, std::memory_order_acquire);
+    const uint32_t current = generation.load(std::memory_order_acquire);
+    if (current == seen) continue;
+    seen = current;
+    return !stop.load(std::memory_order_acquire) || busy.load(std::memory_order_acquire) != 0;
+  }
+}
+
+}  // namespace detail
+
 // Kernels (src/cuda/ple.cu).
 cudaError_t ple_request_launch(const int64_t* ids, int n, uint8_t* mail, uint32_t* seq, cudaStream_t s);
 cudaError_t ple_fetch_launch(uint16_t* out, int n, int row_dim, const uint8_t* mail, const uint32_t* seq,
@@ -178,8 +212,11 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
   thread_ = std::thread([this] { run(); });
   file_bytes_ = table_bytes_;
   fd_direct_ = open(path.c_str(), O_RDONLY | O_DIRECT);
-  if (cache_sets_ && fd_direct_ >= 0)
-    for (int t = 0; t < threads_; ++t) warm_pool_.emplace_back([this] { warm_reader(); });
+  if (cache_sets_ && fd_direct_ >= 0) {
+    // Capture before creating any reader: the dispatcher starts afterward, so generation zero is the initial state.
+    const uint32_t seen = warm_gen_.load(std::memory_order_acquire);
+    for (int t = 0; t < threads_; ++t) warm_pool_.emplace_back([this, seen] { warm_reader(seen); });
+  }
   warm_thread_ = std::thread([this] {
     std::vector<int64_t> ids;
     for (;;) {
@@ -193,11 +230,8 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
         // hand the ids to the readers and wait until all are taken and read
         warm_job_.swap(ids);
         warm_next_.store(0, std::memory_order_relaxed);
-        warm_busy_.store(int(warm_pool_.size()), std::memory_order_relaxed);
-        warm_gen_.fetch_add(1, std::memory_order_release);
-        warm_gen_.notify_all();
-        while (warm_busy_.load(std::memory_order_acquire) > 0 && !stop_.load(std::memory_order_acquire))
-          std::this_thread::sleep_for(std::chrono::microseconds(200));
+        detail::publish_warm_job(warm_busy_, warm_gen_, int(warm_pool_.size()));
+        detail::wait_for_warm_readers(warm_busy_);
         warm_job_.clear();
         ids.clear();
         continue;
@@ -220,25 +254,21 @@ PleService::PleService(const std::string& path, int max_ids, int threads, size_t
 
 // One O_DIRECT reader: takes ids of the current job in batches, reads each row's 4 KiB block(s) into an aligned
 // buffer and puts the row into the cache.
-void PleService::warm_reader() {
+void PleService::warm_reader(uint32_t seen) {
   const size_t blk = 4096, row_bytes = size_t(row_dim_) * 2;
   void* buf = nullptr;
-  if (posix_memalign(&buf, blk, 2 * blk) != 0) return;
+  const bool can_read = posix_memalign(&buf, blk, 2 * blk) == 0;
   auto* b = static_cast<uint8_t*>(buf);
-  uint32_t seen = warm_gen_.load(std::memory_order_acquire);
-  while (!stop_.load(std::memory_order_acquire)) {
-    warm_gen_.wait(seen, std::memory_order_acquire);
-    const uint32_t g = warm_gen_.load(std::memory_order_acquire);
-    if (g == seen) continue;
-    seen = g;
-    if (stop_.load(std::memory_order_acquire)) break;
+  while (detail::wait_for_warm_job(warm_gen_, seen, stop_, warm_busy_)) {
+    // A generation with busy readers is an outstanding job even during shutdown. Drain it before the dispatcher
+    // clears warm_job_; the destructor sends a separate idle wake only after the dispatcher has joined.
     const size_t n = warm_job_.size();
     for (;;) {
       const size_t i0 = warm_next_.fetch_add(16, std::memory_order_relaxed);
       if (i0 >= n) break;
       for (size_t i = i0; i < std::min(n, i0 + 16); ++i) {
         const int64_t id = warm_job_[i];
-        if (id < 0 || uint64_t(id) >= rows_) continue;
+        if (!can_read || id < 0 || uint64_t(id) >= rows_) continue;
         if (cache_contains(id)) continue;
         const size_t off = size_t(shard_[size_t(uint64_t(id) / shard_rows_)] - table_) +
                            size_t(uint64_t(id) % shard_rows_) * row_bytes;
@@ -248,7 +278,7 @@ void PleService::warm_reader() {
         warmed_.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    warm_busy_.fetch_sub(1, std::memory_order_acq_rel);
+    detail::warm_reader_finished(warm_busy_);
   }
   free(buf);
 }
@@ -269,9 +299,9 @@ PleService::~PleService() {
     std::lock_guard<std::mutex> lk(warm_mu_);
   }
   warm_cv_.notify_all();
+  warm_thread_.join();
   warm_gen_.fetch_add(1, std::memory_order_release);
   warm_gen_.notify_all();
-  warm_thread_.join();
   for (auto& t : warm_pool_) t.join();
   if (fd_direct_ >= 0) close(fd_direct_);
   thread_.join();

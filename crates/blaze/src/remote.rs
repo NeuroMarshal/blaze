@@ -82,7 +82,7 @@ fn put_meta(w: &mut W, m: &StepMeta) {
     w.bytes(&m.tree_mask);
     let spans: Vec<u64> = m.spans.iter().flat_map(|s| [s.offset, s.len, s.kv_len, s.row].map(|x| x as u64)).collect();
     w.bytes(&spans);
-    for b in [m.sparse, m.sample, m.tree, m.mrope] {
+    for b in [m.sparse, m.sample, m.tree, m.mrope, m.need_lse] {
         w.bool(b);
     }
 }
@@ -105,6 +105,7 @@ fn get_meta(r: &mut R) -> Result<StepMeta> {
     m.sample = r.bool()?;
     m.tree = r.bool()?;
     m.mrope = r.bool()?;
+    m.need_lse = r.bool()?;
     // the images are the first stage's (it replaces their rows), never a remote one's
     Ok(m)
 }
@@ -274,6 +275,42 @@ fn get_reply(r: &mut R) -> Result<Result<Reply>> {
         5 => Ok(Reply::Done),
         t => bail!("unknown reply {t}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{R, W, get_meta, put_meta};
+    use crate::engine::{Span, StepMeta};
+
+    #[test]
+    fn meta_roundtrip_preserves_lse_and_neighbor_flags() {
+        for need_lse in [false, true] {
+            let meta = StepMeta {
+                spans: vec![Span { offset: 3, len: 5, kv_len: 17, row: 2 }],
+                sparse: true,
+                sample: true,
+                tree: false,
+                mrope: true,
+                need_lse,
+                ..Default::default()
+            };
+            let mut wire = W::default();
+            put_meta(&mut wire, &meta);
+            let mut reader = R { b: &wire.0, p: 0 };
+            let decoded = get_meta(&mut reader).unwrap();
+            assert_eq!(reader.p, wire.0.len());
+            assert_eq!(decoded.spans.len(), 1);
+            assert_eq!(decoded.spans[0].offset, 3);
+            assert_eq!(decoded.spans[0].len, 5);
+            assert_eq!(decoded.spans[0].kv_len, 17);
+            assert_eq!(decoded.spans[0].row, 2);
+            assert!(decoded.sparse);
+            assert!(decoded.sample);
+            assert!(!decoded.tree);
+            assert!(decoded.mrope);
+            assert_eq!(decoded.need_lse, need_lse);
+        }
+    }
 }
 
 fn send_frame(s: &mut impl Write, b: &[u8]) -> Result<()> {

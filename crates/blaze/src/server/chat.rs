@@ -349,7 +349,7 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let include_reasoning = body.get("include_reasoning").and_then(Value::as_bool).unwrap_or(true);
     let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning));
     // images: encoded now (the prompt fits the context), their rows in the token list become prefix-cache keys
-    let mut tokens = p.tokens.clone();
+    let mut tokens = p.tokens;
     if !images.is_empty() {
         let mm = super::media::encode(&st, images, p.image_starts.clone()).await?;
         mm.keyed(&mut tokens);
@@ -372,7 +372,7 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
         n,
     )
     .with_reasoning_state((p.starts_in_reasoning && separate).then_some(true));
-    let totals = Totals::new(p.tokens.len());
+    let totals = Totals::new(tokens.len());
     let decoded = futures::stream::select_all(
         gens.into_iter().enumerate().map(|(i, g)| decoded_events(g, i, totals.clone(), st.text.clone())).collect::<Vec<_>>(),
     );

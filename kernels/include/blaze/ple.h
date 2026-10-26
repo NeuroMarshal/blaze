@@ -21,6 +21,16 @@
 
 namespace blaze {
 
+namespace detail {
+// Wait until every reader in the current warm-cache job has finished before its shared ID vector can be reused.
+void wait_for_warm_readers(std::atomic<int>& busy);
+void warm_reader_finished(std::atomic<int>& busy);
+void publish_warm_job(std::atomic<int>& busy, std::atomic<uint32_t>& generation, int readers);
+// Readers keep waiting through shutdown until the dispatcher has drained its current job and sends an idle wake.
+bool wait_for_warm_job(std::atomic<uint32_t>& generation, uint32_t& seen, std::atomic<bool>& stop,
+                       std::atomic<int>& busy);
+}  // namespace detail
+
 struct PleMailHeader {
   uint64_t req;         // (seq << 32) | n
   uint8_t pad0[56];
@@ -106,7 +116,7 @@ class PleService {
   std::atomic<int> warm_busy_{0};
   std::atomic<uint32_t> warm_gen_{0};
   std::atomic<uint64_t> warmed_{0};
-  void warm_reader();
+  void warm_reader(uint32_t seen);
   // Gather job: counter = (generation << 32) | next task, so a helper still on an older job never takes a task of
   // the current one; work_n_ is written before the counter is reset (release).
   std::atomic<uint64_t> work_ctr_{0};

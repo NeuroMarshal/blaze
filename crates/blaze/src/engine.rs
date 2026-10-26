@@ -56,6 +56,8 @@ struct StepMeta {
     sparse: bool,
     /// sampled step: penalty lists per logit row
     sample: bool,
+    /// sampled outputs only need the full-vocabulary normalizer when logprobs were requested
+    need_lse: bool,
     pen_ids: Vec<i32>,
     pen_coef: Vec<f32>,
     pen_off: Vec<i32>,
@@ -160,7 +162,11 @@ impl Drop for Graph {
 
 /// A captured step: the rows of every sequence (decode: all 1), sampled head, sparse attention, speculative verify,
 /// tree verify.
-type GraphKey = (Vec<usize>, bool, bool, bool, bool);
+type GraphKey = (Vec<usize>, bool, bool, bool, bool, bool);
+
+fn graph_key(meta: &StepMeta, verify: bool) -> GraphKey {
+    (meta.spans.iter().map(|sp| sp.len).collect(), meta.sample, meta.sparse, verify, meta.tree, meta.need_lse)
+}
 
 /// Most verify graphs kept (their span shapes vary with the draft lengths); beyond them verify steps run eagerly.
 const MAX_VERIFY_GRAPHS: usize = 128;
@@ -270,8 +276,7 @@ impl Runner {
             )?;
         }
         let n = meta.logit_rows.len();
-        let lens: Vec<usize> = meta.spans.iter().map(|sp| sp.len).collect();
-        let key: GraphKey = (lens, meta.sample, meta.sparse, verify, meta.tree);
+        let key = graph_key(meta, verify);
         let graphable = if verify {
             // verify shapes repeat (the draft lengths), each captured on its second sight
             self.graphs.contains_key(&key) || self.graphs.keys().filter(|k| k.3).count() < MAX_VERIFY_GRAPHS
@@ -299,7 +304,7 @@ impl Runner {
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
-            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree)?;
+            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree, meta.need_lse)?;
         }
         *handed = true;
         if let Some((w, r)) = &self.watch {
@@ -316,7 +321,7 @@ impl Runner {
     /// every kernel, then the capture, then replays. Every rank takes the same path for the same key, so their
     /// all-reduces stay paired.
     fn run_graph(&mut self, key: GraphKey, n: usize, spans: &[Span]) -> Result<()> {
-        let (sample, sparse, verify, tree) = (key.1, key.2, key.3, key.4);
+        let (sample, sparse, verify, tree, need_lse) = (key.1, key.2, key.3, key.4, key.5);
         self.graph_tick += 1;
         if let Some(g) = self.graphs.get(&key) {
             if let Some(b) = self.graph_bytes.get_mut(&key) {
@@ -325,7 +330,7 @@ impl Runner {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
         if self.no_graph.contains(&key) || self.warmed.insert(key.clone()) {
-            return self.model.forward(spans, n, verify, sample, sparse, tree);
+            return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse);
         }
         // The step's own metadata copy is already enqueued; capture after it completes (and earlier replays: graphs
         // may go below).
@@ -334,7 +339,7 @@ impl Runner {
         let budget = *self.graph_budget.get_or_insert(free0 / 2);
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, verify, sample, sparse, tree);
+        let captured = self.model.forward(spans, n, verify, sample, sparse, tree, need_lse);
         let mut graph = null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
         captured?;
@@ -347,7 +352,7 @@ impl Runner {
                 eprintln!("blaze: a CUDA graph did not instantiate ({:.0} MiB free): its step shape runs eagerly", free0 as f64 / 1048576.0);
             }
             self.no_graph.insert(key);
-            return self.model.forward(spans, n, verify, sample, sparse, tree);
+            return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse);
         }
         let used = free0.saturating_sub(crate::gpu::mem_info()?.0);
         let g = Graph { exec, graph };
@@ -519,14 +524,23 @@ impl Snapshot {
 
 /// Logit edits of one sampled item: per token, logit' = (logit > 0 ? logit * a : logit * b) + c (repetition penalty,
 /// presence / frequency penalties, logit bias, bans).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Penalty {
     pub edits: Vec<(i32, f32, f32, f32)>,
     /// structured outputs: the tokens the grammar allows (bit t of word t / 32), as many words as the vocabulary needs
     pub mask: Option<Vec<u32>>,
+    /// Whether this caller will use the exact distribution log-normalizer in the returned candidates.
+    pub need_lse: bool,
+}
+
+impl Default for Penalty {
+    fn default() -> Self {
+        Self { edits: Vec::new(), mask: None, need_lse: true }
+    }
 }
 
 /// Sampling candidates of one row: (logit, token) sorted descending, and the log-sum-exp of the whole (edited) row.
+/// `lse` is zero when every corresponding `Penalty` set `need_lse` to false.
 #[derive(Clone, Default)]
 pub struct Cands {
     pub top: Vec<(f32, i32)>,
@@ -1278,6 +1292,7 @@ impl Engine {
     /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
     /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
     pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Cands>> {
+        let need_lse = pens.iter().any(|p| p.need_lse);
         if let Some(parts) = self.pp_parts(seqs, tokens) {
             let metas = self.plan_parts(seqs, tokens, &parts, Some(pens))?;
             let n: usize = metas.iter().map(|m| m.logit_rows.len()).sum();
@@ -1285,7 +1300,7 @@ impl Engine {
                 Reply::Cands(p) => p,
                 _ => unreachable!(),
             };
-            return Ok(self.merge_candidates(&pairs, n));
+            return Ok(self.merge_candidates(&pairs, n, need_lse));
         }
         let mut m = self.plan(seqs, tokens, false, None)?;
         m.sample = true;
@@ -1296,7 +1311,7 @@ impl Engine {
             Reply::Cands(p) => p,
             _ => unreachable!(),
         };
-        let out = self.merge_candidates(&pairs, n);
+        let out = self.merge_candidates(&pairs, n, need_lse);
         Ok(out)
     }
 
@@ -1395,6 +1410,7 @@ impl Engine {
     /// `verify_many_sampled` of draft trees (see `verify_many_tree`).
     pub fn verify_many_tree_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], parents: Option<&[&[i32]]>,
                                     pens: &[Penalty]) -> Result<Vec<Vec<Cands>>> {
+        let need_lse = pens.iter().any(|p| p.need_lse);
         self.pre_verify(seqs, tokens)?;
         let mut m = self.plan(seqs, tokens, true, parents)?;
         m.sample = true;
@@ -1405,7 +1421,7 @@ impl Engine {
             Reply::Cands(p) => p,
             _ => unreachable!(),
         };
-        Ok(split_rows(self.merge_candidates(&pairs, n), tokens))
+        Ok(split_rows(self.merge_candidates(&pairs, n, need_lse), tokens))
     }
 
     pub fn verify(&mut self, seq: &mut Seq, tokens: &[i64]) -> Result<Vec<i32>> {
@@ -1430,21 +1446,20 @@ impl Engine {
         Ok(())
     }
 
-    fn merge_candidates(&self, pairs: &[f32], n: usize) -> Vec<Cands> {
+    fn merge_candidates(&self, pairs: &[f32], n: usize, need_lse: bool) -> Vec<Cands> {
         // the shards of the vocabulary: the tensor-parallel group (pipeline stages: the last stage's)
         let (k, world) = (sys::BLZ_TOPK_MAX, self.head_shards);
         (0..n)
             .map(|r| {
                 let mut top = Vec::with_capacity(world * k);
-                let mut lse_sum = 0.0f64;
-                let mut lse_max = f64::MIN;
-                let shard_lse: Vec<f32> = (0..world).map(|w| pairs[((w * n + r) * (k + 1) + k) * 2]).collect();
-                for &l in &shard_lse {
-                    lse_max = lse_max.max(l as f64);
-                }
-                for &l in &shard_lse {
-                    lse_sum += (l as f64 - lse_max).exp();
-                }
+                let lse = if need_lse {
+                    let shard_lse: Vec<f32> = (0..world).map(|w| pairs[((w * n + r) * (k + 1) + k) * 2]).collect();
+                    let lse_max = shard_lse.iter().copied().map(f64::from).fold(f64::MIN, f64::max);
+                    let lse_sum: f64 = shard_lse.iter().map(|&l| (l as f64 - lse_max).exp()).sum();
+                    (lse_max + lse_sum.ln()) as f32
+                } else {
+                    0.0
+                };
                 for w in 0..world {
                     let base = (w * n + r) * (k + 1) * 2;
                     for j in 0..k {
@@ -1456,7 +1471,7 @@ impl Engine {
                 }
                 top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
                 top.truncate(k);
-                Cands { top, lse: (lse_max + lse_sum.ln()) as f32 }
+                Cands { top, lse }
             })
             .collect()
     }
@@ -1582,6 +1597,7 @@ fn split_rows<T>(rows: Vec<T>, tokens: &[&[i64]]) -> Vec<Vec<T>> {
 }
 
 fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
+    m.need_lse = pens.iter().any(|p| p.need_lse);
     m.pen_off.push(0);
     for p in pens {
         for &(id, a, b, c) in &p.edits {
@@ -1668,7 +1684,21 @@ fn tree_program(parent: &[i32], row0: usize, levels: usize) -> Result<Vec<i32>> 
 
 #[cfg(test)]
 mod tests {
-    use super::cut_parts;
+    use super::{StepMeta, cut_parts, graph_key};
+
+    #[test]
+    fn sampled_graphs_distinguish_lse_requirement() {
+        let mut meta = StepMeta { sample: true, spans: vec![super::Span { offset: 0, len: 1, kv_len: 1, row: 0 }], ..Default::default() };
+        let without_lse = graph_key(&meta, false);
+        meta.need_lse = true;
+        let with_lse = graph_key(&meta, false);
+        assert_ne!(without_lse, with_lse);
+        assert_eq!(without_lse.0, with_lse.0);
+        assert_eq!(without_lse.1, with_lse.1);
+        assert_eq!(without_lse.2, with_lse.2);
+        assert_eq!(without_lse.3, with_lse.3);
+        assert_eq!(without_lse.4, with_lse.4);
+    }
 
     #[test]
     fn step_parts_cover_every_row_once() {

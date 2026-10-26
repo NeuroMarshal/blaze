@@ -531,8 +531,9 @@ __global__ void dequant_rows_kernel(blz_nvfp4_pool pool, blz_index_ptr slots, in
 }  // namespace blaze
 
 extern "C" int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits) {
-  if (kv_heads <= 0 || q_heads % kv_heads != 0 || q_len < 1) return 0;
-  const int mt = std::min(3, (q_len * (q_heads / kv_heads) + 15) / 16);
+  if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 || q_heads / kv_heads > 16 ||
+      q_len < 1 || splits < 1 || splits > 64) return 0;
+  const int mt = int(std::min<int64_t>(3, (int64_t(q_len) * (q_heads / kv_heads) + 15) / 16));
   return splits * blaze::parts_per_cta(mt);
 }
 
@@ -545,13 +546,13 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
                        int64_t out_stride_head, cudaStream_t stream) {
   if (tree_mask != nullptr && q_len > 64) return cudaErrorNotSupported;
   const bool dim_ok = pool.dim == 256 || (pool.dim == 128 && pool.format == BLZ_KV_BF16);
-  if (dtype != BLZ_BF16 || !dim_ok || pool.heads <= 0 || q_heads % pool.heads != 0 || q_heads / pool.heads > 16 ||
-      q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 || pool.format > BLZ_KV_BF16 || window < 0)
+  if (dtype != BLZ_BF16 || !dim_ok || pool.heads <= 0 || q_heads <= 0 || q_heads % pool.heads != 0 || q_heads / pool.heads > 16 ||
+      batch < 0 || q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 || pool.format > BLZ_KV_BF16 || window < 0)
     return cudaErrorNotSupported;
   if (batch == 0) return cudaSuccess;
   const int group = q_heads / pool.heads;
   // All query tokens of a request in one CTA when they fit three tiles (a verify block of 8 with GQA 6: 48 rows).
-  const int mt = std::min(3, (q_len * group + 15) / 16);
+  const int mt = int(std::min<int64_t>(3, (int64_t(q_len) * group + 15) / 16));
   const int per_tile = std::max(1, 16 * mt / group);
   const int tiles = (q_len + per_tile - 1) / per_tile;
   const dim3 grid(static_cast<unsigned>(batch * tiles), static_cast<unsigned>(pool.heads),

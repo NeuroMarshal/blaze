@@ -11,17 +11,17 @@ enum Prompt {
 /// The `prompt` field: a string, a list of strings, a list of token ids, or a list of such lists.
 fn prompts_of(body: &Value) -> Checked<Vec<Prompt>> {
     let err = || bad_param("prompt", "prompt must be a string, a list of strings, a list of token ids or a list of those");
-    let ids = |v: &Value| -> Option<Vec<u32>> { v.as_array()?.iter().map(|x| x.as_u64().and_then(|x| u32::try_from(x).ok())).collect() };
+    let ids = |a: &[Value]| -> Option<Vec<u32>> { a.iter().map(|x| x.as_u64().and_then(|x| u32::try_from(x).ok())).collect() };
     match body.get("prompt") {
         Some(Value::String(s)) => Ok(vec![Prompt::Text(s.clone())]),
         Some(Value::Array(a)) if !a.is_empty() => {
-            if let Some(p) = ids(&Value::Array(a.clone())) {
+            if let Some(p) = ids(a) {
                 return Ok(vec![Prompt::Ids(p)]);
             }
             a.iter()
                 .map(|p| match p {
                     Value::String(s) => Ok(Prompt::Text(s.clone())),
-                    v => ids(v).map(Prompt::Ids).ok_or_else(err),
+                    v => v.as_array().and_then(|a| ids(a)).map(Prompt::Ids).ok_or_else(err),
                 })
                 .collect()
         }

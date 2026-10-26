@@ -4,15 +4,19 @@
 // layer prefix is found and an MTP block's experts are ignored.
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "blaze/expert.h"
 #include "blaze/hybrid.h"
 #include "blaze/log.h"
+#include "blaze/ple.h"
 #include "blaze/store.h"
 #include "synthetic_checkpoint.h"
 
@@ -76,6 +80,67 @@ bool check_option_validation() {
     ++bad;
   }
   return bad == 0;
+}
+
+bool check_ple_warm_reader_lifecycle(bool start_reader_after_stop, bool stop_during_read) {
+  std::atomic<uint32_t> generation{0};
+  std::atomic<int> busy{0};
+  std::atomic<bool> stop{false}, published{false}, in_read{false}, release_read{false};
+  std::atomic<bool> dispatcher_done{false}, reader_drained{false};
+  uint32_t initial_seen = generation.load(std::memory_order_acquire);
+
+  std::thread dispatcher([&] {
+    detail::publish_warm_job(busy, generation, 1);
+    published.store(true, std::memory_order_release);
+    published.notify_one();
+    detail::wait_for_warm_readers(busy);
+    dispatcher_done.store(true, std::memory_order_release);
+    dispatcher_done.notify_one();
+  });
+
+  while (!published.load(std::memory_order_acquire)) published.wait(false, std::memory_order_acquire);
+  if (start_reader_after_stop) stop.store(true, std::memory_order_release);
+
+  std::thread reader([&] {
+    while (detail::wait_for_warm_job(generation, initial_seen, stop, busy)) {
+      in_read.store(true, std::memory_order_release);
+      in_read.notify_one();
+      if (stop_during_read) {
+        while (!release_read.load(std::memory_order_acquire)) release_read.wait(false, std::memory_order_acquire);
+      }
+      detail::warm_reader_finished(busy);
+    }
+    reader_drained.store(true, std::memory_order_release);
+    reader_drained.notify_one();
+  });
+
+  while (!in_read.load(std::memory_order_acquire)) in_read.wait(false, std::memory_order_acquire);
+  if (stop_during_read) {
+    stop.store(true, std::memory_order_release);
+    const bool dispatcher_waited_for_reader = !dispatcher_done.load(std::memory_order_acquire);
+    release_read.store(true, std::memory_order_release);
+    release_read.notify_one();
+    if (!dispatcher_waited_for_reader) {
+      reader.join();
+      dispatcher.join();
+      return false;
+    }
+  }
+
+  while (!dispatcher_done.load(std::memory_order_acquire)) dispatcher_done.wait(false, std::memory_order_acquire);
+  // Match PleService destruction: the idle termination wake follows the dispatcher join/drain.
+  dispatcher.join();
+  generation.fetch_add(1, std::memory_order_release);
+  generation.notify_all();
+  reader.join();
+  return reader_drained.load(std::memory_order_acquire) && busy.load(std::memory_order_acquire) == 0;
+}
+
+bool check_ple_warm_reader_lifecycle() {
+  // A delayed reader must consume the first published generation even though stop was already requested.
+  if (!check_ple_warm_reader_lifecycle(true, false)) return false;
+  // Shutdown during an active read must keep the dispatcher blocked until the reader decrements busy.
+  return check_ple_warm_reader_lifecycle(false, true);
 }
 
 // One synthetic checkpoint in either exporter's naming; returns the number of wrong experts.
@@ -157,6 +222,7 @@ int check(bool modelopt, const std::string& prefix) {
 
 int main() {
   const int bad = (check_log_callback() ? 0 : 1) + (check_option_validation() ? 0 : 1) +
+                  (check_ple_warm_reader_lifecycle() ? 0 : 1) +
                   check(false, "model.language_model.layers.") +
                   check(true, "model.layers.");
   std::printf(bad ? "FAILED\n" : "PASSED\n");

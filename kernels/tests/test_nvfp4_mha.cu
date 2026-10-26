@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -160,7 +161,7 @@ void test_store_dense(int format, std::mt19937& rng) {
 }
 
 void test_case(const char* what, int kv_heads, int group, int q_len, std::vector<int> kv_lens, int splits,
-               std::mt19937& rng, int format = BLZ_KV_NVFP4) {
+               std::mt19937& rng, int format = BLZ_KV_NVFP4, bool padded = false) {
   const int batch = int(kv_lens.size()), q_heads = kv_heads * group, slots = 8192;
   const int max_len = *std::max_element(kv_lens.begin(), kv_lens.end());
   Pool p = make_pool(slots, kv_heads, rng, format);
@@ -178,12 +179,14 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
   const float scale = 1.0f / std::sqrt(float(kDim));
   Dev<int32_t> d_r2t(r2t), d_lens(lens);
   Dev<int64_t> d_req(req_idx);
-  Dev<__nv_bfloat16> d_q(q), d_out(q.size());
+  const int out_head = kDim + int(padded), out_tok = q_heads * out_head + (padded ? 3 : 0);
+  Dev<__nv_bfloat16> d_q(q), d_out(size_t(tokens) * out_tok);
+  CHECK_CUDA(cudaMemset(d_out.ptr, 0x42, d_out.n * 2));
   const int parts = blz_nvfp4_mha_parts(q_heads, kv_heads, q_len, splits);
   Dev<float> po(size_t(tokens) * q_heads * parts * kDim), pml(size_t(tokens) * q_heads * parts * 2);
   CHECK_CUDA(blz_nvfp4_mha_decode(d_q.ptr, int64_t(q_heads) * kDim, kDim, q_heads, dp.pool, d_r2t.ptr, stride,
                                   {d_req.ptr, BLZ_I64}, {d_lens.ptr, BLZ_I32}, batch, q_len, splits, scale, po.ptr,
-                                  pml.ptr, BLZ_BF16, d_out.ptr, int64_t(q_heads) * kDim, kDim, nullptr));
+                                  pml.ptr, BLZ_BF16, d_out.ptr, out_tok, out_head, nullptr));
   CHECK_CUDA(cudaDeviceSynchronize());
   const auto out = d_out.get();
   double worst = 0, peak = 0;
@@ -207,12 +210,20 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
           double ref = 0;
           for (int t = 0; t < L; ++t) ref += sc[t] * p.value(true, r2t[size_t(req_idx[b]) * stride + t], g, k);
           ref /= sum;
-          const double got = __bfloat162float(out[((size_t(b) * q_len + i) * q_heads + h) * kDim + k]);
+          const double got = __bfloat162float(out[(size_t(b) * q_len + i) * out_tok + h * out_head + k]);
           worst = std::max(worst, std::fabs(got - ref)), peak = std::max(peak, std::fabs(ref));
         }
       }
   const double rel = worst / std::max(peak, 1e-30);
-  const bool ok = rel < 1.5e-2;
+  bool padding_ok = true;
+  if (padded)
+    for (int t = 0; t < tokens; ++t) {
+      for (int h = 0; h < q_heads; ++h)
+        padding_ok &= __bfloat16_as_ushort(out[size_t(t) * out_tok + h * out_head + kDim]) == 0x4242;
+      for (int j = q_heads * out_head; j < out_tok; ++j)
+        padding_ok &= __bfloat16_as_ushort(out[size_t(t) * out_tok + j]) == 0x4242;
+    }
+  const bool ok = rel < 1.5e-2 && padding_ok;
   std::printf("%-5s %-44s splits %2d: max error / max |out| %.2e %s\n", format_name(format), what, splits, rel,
               ok ? "ok" : "FAIL");
   g_failures += !ok;
@@ -355,6 +366,28 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int for
 
 int main() {
   std::mt19937 rng(11);
+  // Fixed-shape prefill measurements, runnable independently of the numerical/reference cases.
+  if (std::getenv("BLAZE_MHA_PREFILL_BENCH")) {
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      bench(8192, 1, 2048, 1, rng);
+      bench(32768, 1, 2048, 1, rng);
+    }
+    return 0;
+  }
+  {
+    blz_nvfp4_pool pool{};
+    pool.heads = 1, pool.dim = kDim, pool.format = BLZ_KV_NVFP4;
+    const auto err = blz_nvfp4_mha_decode(nullptr, 0, 0, 0, pool, nullptr, 0, {nullptr, BLZ_I32},
+                                         {nullptr, BLZ_I32}, 1, 1, 1, 1.0f, nullptr, nullptr,
+                                         BLZ_BF16, nullptr, 0, 0, nullptr);
+    const bool ok = err == cudaErrorNotSupported && blz_nvfp4_mha_parts(0, 1, 1, 1) == 0 &&
+                    blz_nvfp4_mha_parts(-1, 1, 1, 1) == 0 && blz_nvfp4_mha_parts(12, 2, 1, 0) == 0 &&
+                    blz_nvfp4_mha_parts(12, 2, INT_MAX, 1) == 1;
+    std::printf("invalid shapes and overflow-safe parts: %s\n", ok ? "ok" : "FAIL");
+    g_failures += !ok;
+  }
+  for (int f : {BLZ_KV_NVFP4, BLZ_KV_FP8, BLZ_KV_BF16})
+    test_case("single-part prefill, padded strides", 2, 6, 17, {17, 97}, 1, rng, f, true);
   test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 1, rng);
   // Flash Next (24 q heads on 2 KV heads) and its sparse prefill rows: one-row sequences of lengths 1 .. 19
   {
