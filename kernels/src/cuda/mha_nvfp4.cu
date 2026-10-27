@@ -571,16 +571,17 @@ __global__ void dequant_rows_kernel(blz_nvfp4_pool pool, blz_index_ptr slots, in
 namespace {
 bool g_f16_accumulate = false;
 // dense causal NVFP4 calls of more than one MMA tile of rows: 0 the register kernel, 1 / 2 the shared-dequantization
-// kernel (mha_verify.cu) with FP32 / FP16 accumulation
+// kernel (mha_verify.cu) with FP32 / FP16 accumulation, 3 / 4 its pair kernel (two warps a tile) with FP32 / FP16
 int g_verify = 1;
+bool verify_pair() { return g_verify >= 3; }
 }
 
 extern "C" void blz_mha_set_f16_accumulate(int on) { g_f16_accumulate = on != 0; }
 
-extern "C" void blz_mha_set_verify(int mode) { g_verify = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+extern "C" void blz_mha_set_verify(int mode) { g_verify = mode < 0 ? 0 : mode > 4 ? 4 : mode; }
 
 extern "C" int blz_nvfp4_mha_verify_tiles(int q_heads, int kv_heads, int q_len) {
-  return g_verify == 0 ? 0 : blaze::fa::verify_tiles(q_heads, kv_heads, q_len, nullptr, nullptr);
+  return g_verify == 0 ? 0 : blaze::fa::verify_tiles(q_heads, kv_heads, q_len, verify_pair(), nullptr, nullptr);
 }
 
 extern "C" int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits) {
@@ -606,10 +607,10 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
   const int group = q_heads / pool.heads;
   if (g_verify != 0 && pool.format == BLZ_KV_NVFP4 && pool.dim == 256 && window == 0 && causal && tree_mask == nullptr &&
       tail == nullptr && q_stride_tok % 8 == 0 && q_stride_head % 8 == 0 && reinterpret_cast<uintptr_t>(q) % 16 == 0 &&
-      blaze::fa::verify_tiles(q_heads, pool.heads, q_len, nullptr, nullptr) > 0) {
+      blaze::fa::verify_tiles(q_heads, pool.heads, q_len, verify_pair(), nullptr, nullptr) > 0) {
     cudaError_t err = blaze::fa::verify_launch(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride,
-                                               req_indices, kv_lens, batch, q_len, splits, scale, g_verify == 2,
-                                               partial_o, partial_ml, stream);
+                                               req_indices, kv_lens, batch, q_len, splits, scale, g_verify % 2 == 0,
+                                               verify_pair(), partial_o, partial_ml, stream);
     if (err != cudaSuccess) return err;
     const dim3 cgrid(static_cast<unsigned>(batch * q_len), static_cast<unsigned>(q_heads));
     blaze::mha_combine_kernel<__nv_bfloat16, 256><<<cgrid, 256, 0, stream>>>(

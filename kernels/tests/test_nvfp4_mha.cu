@@ -368,6 +368,18 @@ void test_dequant_rows(std::mt19937& rng) {
   g_failures += bad != 0;
 }
 
+// the splits the runtime picks (model.rs attn_splits) for the bench shape on this GPU
+int auto_splits(int batch, int q_len) {
+  const int kv_heads = 2, group = 6, q_heads = 12;
+  int dev = 0, sms = 0;
+  CHECK_CUDA(cudaGetDevice(&dev));
+  CHECK_CUDA(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  const int vt = blz_nvfp4_mha_verify_tiles(q_heads, kv_heads, q_len);
+  if (vt > 0) return std::clamp(sms / (batch * vt * kv_heads), 1, 64);
+  const int mt = std::min(3, (q_len * group + 15) / 16), per = std::max(1, 16 * mt / group);
+  return std::clamp(4 * sms / (batch * ((q_len + per - 1) / per) * kv_heads), 1, 64);
+}
+
 void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int format = BLZ_KV_NVFP4) {
   const int kv_heads = 2, group = 6, q_heads = 12, slots = ctx + 64;
   // Random codes are enough for timing (BF16: small values from random low bytes and a fixed high byte).
@@ -463,8 +475,9 @@ int main() {
   test_window("decode, no window", 4, 1, {2000}, 0, 8, rng);
   test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
   test_window("DFlash block 8, short window", 2, 8, {500}, 37, 2, rng, 0);
-  // the verify shapes on every kernel: the register kernel, the shared-dequantization one in FP32 / FP16 accumulation
-  for (int mode : {0, 1, 2}) {
+  // the verify shapes on every kernel: the register kernel, the shared-dequantization one in FP32 / FP16 accumulation,
+  // its pair kernel in FP32 / FP16
+  for (int mode : {0, 1, 2, 3, 4}) {
     blz_mha_set_verify(mode);
     std::printf("-- verify kernel %d\n", mode);
     test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
@@ -506,14 +519,14 @@ int main() {
   bench(122000, 1, 8, 32, rng);
   bench(122000, 1, 8, 64, rng);
   bench(524000, 1, 1, 64, rng);
-  for (int mode : {0, 1, 2}) {
+  for (int mode : {0, 1, 2, 3, 4}) {
     blz_mha_set_verify(mode);
     std::printf("-- verify kernel %d\n", mode);
-    for (int ql : {8, 9}) {
-      bench(122000, 1, ql, mode ? 12 : 64, rng);
-      bench(524000, 1, ql, mode ? 12 : 64, rng);
+    for (int ql : {3, 8, 9}) {
+      bench(122000, 1, ql, auto_splits(1, ql), rng);
+      bench(524000, 1, ql, auto_splits(1, ql), rng);
     }
-    bench(524000, 2, 9, mode ? 6 : 32, rng);
+    bench(524000, 2, 9, auto_splits(2, 9), rng);
   }
   blz_mha_set_verify(1);
   std::printf("%s\n", g_failures ? "FAILED" : "all passed");

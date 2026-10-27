@@ -1349,11 +1349,13 @@ impl Model {
         let decode_f16 = opts.attn_f16_acc.unwrap_or(crate::gpu::compute_capability().0 == 12);
         unsafe { sys::blz_mha_set_f16_accumulate(decode_f16 as c_int) };
         // verify / short chunks (more than one MMA tile of rows): the shared-dequantization kernel, FP16 accumulation
-        // as prefill; BLAZE_VERIFY_ATTN=old|fp32|fp16 to compare
+        // as prefill; BLAZE_VERIFY_ATTN=old|fp32|fp16|pair32|pair16 to compare (pair: two warps a tile of rows)
         let verify_mode = match std::env::var("BLAZE_VERIFY_ATTN").ok().as_deref() {
             Some("old") => 0,
             Some("fp32") => 1,
             Some("fp16") => 2,
+            Some("pair32") => 3,
+            Some("pair16") => 4,
             _ => 1 + attn_f16 as c_int,
         };
         unsafe { sys::blz_mha_set_verify(verify_mode) };

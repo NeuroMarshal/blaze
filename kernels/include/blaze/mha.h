@@ -83,7 +83,8 @@ void blz_mha_set_f16_accumulate(int on);
 
 /// \brief The kernel of the dense causal NVFP4 calls (blz_nvfp4_mha_decode) of more than one MMA tile of rows per
 /// request (a verify, a short prefill chunk; q_len x GQA group > 16), process-wide: 0 the register-dequantization kernel,
-/// 1 the shared-dequantization kernel with FP32 accumulation (the default), 2 with FP16 accumulation.
+/// 1 the shared-dequantization kernel with FP32 accumulation (the default), 2 with FP16 accumulation, 3 / 4 its pair
+/// kernel (two warps a tile of 16 rows, each half the head dims) with FP32 / FP16 accumulation.
 void blz_mha_set_verify(int mode);
 
 /// \brief CTAs a request takes per context split in a blz_nvfp4_mha_decode call of this shape when the

@@ -116,10 +116,11 @@ __device__ __forceinline__ int64_t index_at(blz_index_ptr p, int64_t i) {
 // The shared-dequantization decode / verify kernel (mha_verify.cu) for the dense causal calls of mha_nvfp4.cu:
 // the query tiles of a request (0: the call stays on the register-dequantization kernel) and the launch, which leaves
 // `splits` parts per row for mha_nvfp4.cu's merge.
-int verify_tiles(int q_heads, int kv_heads, int q_len, int* per_tile, int* mt);
+// `pair`: the kernel of two warps a tile of rows.
+int verify_tiles(int q_heads, int kv_heads, int q_len, bool pair, int* per_tile, int* mt);
 cudaError_t verify_launch(const void* q, int64_t sq_tok, int64_t sq_head, int q_heads, blz_nvfp4_pool pool,
                           const int32_t* req_to_token, int64_t req_stride, blz_index_ptr req_indices,
-                          blz_index_ptr kv_lens, int batch, int q_len, int splits, float scale, bool f16,
+                          blz_index_ptr kv_lens, int batch, int q_len, int splits, float scale, bool f16, bool pair,
                           float* part_o, float* part_ml, cudaStream_t stream);
 
 }  // namespace fa
