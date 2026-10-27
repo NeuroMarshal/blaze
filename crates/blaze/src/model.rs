@@ -65,12 +65,6 @@ pub(crate) fn load_hc(ckpt: &Checkpoint, prefix: &str) -> Result<HcBlock> {
 /// Events of a forward's phase profile (4 marks a layer).
 const PROF_EVENTS: usize = 640;
 
-/// BLAZE_PREFILL_ATTN=split: prefill spans on the split decode kernel (the A / B check of the FlashAttention-2 one).
-fn prefill_attn_split() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("BLAZE_PREFILL_ATTN").is_ok_and(|v| v == "split"))
-}
-
 fn prefill_profile() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *P.get_or_init(|| std::env::var("BLAZE_PREFILL_PROFILE").is_ok_and(|v| v == "1"))
@@ -305,11 +299,11 @@ pub struct PpRank {
     pub tp: usize,
 }
 
-/// Bytes of a pipeline link's header (the flag) before its rows.
 /// Prefill spans of at least this many rows take the FlashAttention-2 kernel (shorter ones, verify and decode the split
 /// decode kernel: a few query tiles cannot fill the GPU without splitting the context).
 const PREFILL_KERNEL_ROWS: usize = 64;
 
+/// Bytes of a pipeline link's header (the flag) before its rows.
 pub const PP_LINK_HEADER: usize = 256;
 
 /// A pipeline link of `rows` rows of `width` values a step: the header and two slots (blaze/pp_link.h).
@@ -371,9 +365,11 @@ pub struct Options {
     pub kv_dtype: KvDtype,
     /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
     pub gemm: crate::linear::GemmRoute,
-    /// prefill attention (the FlashAttention-2 kernel of NVFP4 pools) with FP16 accumulation in short runs: twice the
-    /// MMA rate on GeForce GPUs, the error below the bf16 output's rounding; None: where the GPU runs it faster
+    /// FP16 accumulation in short runs summed in FP32; None: choose by GPU architecture. This changes arithmetic
+    /// relative to FP32 accumulation; quality must be checked on the workload.
     pub attn_f16_acc: Option<bool>,
+    pub prefill_attention: PrefillAttention,
+    pub verify_attention: VerifyAttention,
     /// pipeline parallelism (`--pp`): the stages (1: none), and this rank's stage (set by the engine for each rank)
     pub pp_stages: usize,
     /// tensor-parallel ranks of each pipeline stage
@@ -412,6 +408,41 @@ pub struct Options {
     /// The checkpoint of the MTP head (its `mtp.*` tensors; None: the target's own). A routed MTP layer's experts join the
     /// expert engine after the decoder layers (NVFP4, as the target's).
     pub mtp_model: Option<PathBuf>,
+}
+
+/// Prefill kernel selection. Auto uses FA2 for supported NVFP4 spans of at least 64 tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillAttention {
+    #[default]
+    Auto,
+    Split,
+}
+
+/// Dense causal verify kernel selection; tree, windowed and non-NVFP4 calls retain the register kernel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum VerifyAttention {
+    #[default]
+    Auto,
+    Old,
+    Fp32,
+    Fp16,
+    Pair32,
+    Pair16,
+}
+
+impl VerifyAttention {
+    fn resolve(self, f16: bool, paired_auto: bool) -> c_int {
+        match self {
+            // SM120 measurements: paired warps win at 9 x GQA6 rows but regress at 3/8 tokens.
+            // Modes 5/6 retain the register path through 48 query-head rows.
+            Self::Auto => (if paired_auto { 5 } else { 1 }) + f16 as c_int,
+            Self::Old => 0,
+            Self::Fp32 => 1,
+            Self::Fp16 => 2,
+            Self::Pair32 => 3,
+            Self::Pair16 => 4,
+        }
+    }
 }
 
 /// KV cache format of the softmax layers (vLLM's --kv-cache-dtype).
@@ -857,6 +888,8 @@ pub struct Model {
     num_sms: usize,
     /// prefill attention accumulates in FP16 (Options::attn_f16_acc resolved for this GPU)
     attn_f16: bool,
+    decode_f16: bool,
+    verify_mode: c_int,
     /// image rows of the step being enqueued (set by the engine's runner): the M-RoPE streams differ, and these
     /// embeddings replace the gathered token rows
     mrope_step: Cell<bool>,
@@ -1348,16 +1381,9 @@ impl Model {
         let attn_f16 = opts.attn_f16_acc.unwrap_or_else(crate::gpu::fast_f16_accumulate);
         let decode_f16 = opts.attn_f16_acc.unwrap_or(crate::gpu::compute_capability().0 == 12);
         unsafe { sys::blz_mha_set_f16_accumulate(decode_f16 as c_int) };
-        // verify / short chunks (more than one MMA tile of rows): the shared-dequantization kernel, FP16 accumulation
-        // as prefill; BLAZE_VERIFY_ATTN=old|fp32|fp16|pair32|pair16 to compare (pair: two warps a tile of rows)
-        let verify_mode = match std::env::var("BLAZE_VERIFY_ATTN").ok().as_deref() {
-            Some("old") => 0,
-            Some("fp32") => 1,
-            Some("fp16") => 2,
-            Some("pair32") => 3,
-            Some("pair16") => 4,
-            _ => 1 + attn_f16 as c_int,
-        };
+        // Promote only the measured SM120 / GQA6 geometry; other GPUs and groups retain the existing policy.
+        let paired_auto = crate::gpu::compute_capability() == (12, 0) && dims.heads / dims.kv_heads == 6;
+        let verify_mode = opts.verify_attention.resolve(attn_f16, paired_auto);
         unsafe { sys::blz_mha_set_verify(verify_mode) };
         let mut model = Self {
             cfg,
@@ -1423,6 +1449,8 @@ impl Model {
             opts,
             num_sms: num_sms.max(1) as usize,
             attn_f16,
+            decode_f16,
+            verify_mode,
             mrope_step: Cell::new(false),
             img_segs: Default::default(),
             mrope_comp,
@@ -1452,24 +1480,25 @@ impl Model {
         if model.tp.rank == 0 {
             eprintln!("blaze: NVFP4 layers on many rows (prefill): {}", model.lin.describe());
             let (major, minor) = crate::gpu::compute_capability();
-            eprintln!(
-                "blaze: prefill attention (NVFP4 KV): FlashAttention-2 kernel, a CTA of 16 tokens x a KV head's query heads, {} \
-                 (SM {major}.{minor}{})",
-                if model.attn_f16 { "FP16 accumulation in runs summed in FP32" } else { "FP32 accumulation" },
-                match (model.opts.attn_f16_acc, model.attn_f16) {
-                    (Some(_), _) => ": --attn-f16-acc",
-                    (None, true) => ": FP16 accumulation at twice the MMA rate here",
-                    (None, false) => ": one MMA rate for both here",
-                }
-            );
-            eprintln!(
-                "blaze: decode / verify attention: {}",
-                match (model.opts.attn_f16_acc, major) {
-                    (Some(true), _) | (None, 12) => "FP16 accumulation in runs summed in FP32",
-                    (Some(false), _) => "FP32 accumulation (--attn-f16-acc off)",
-                    _ => "FP32 accumulation (the codes convert in software here: the kernel waits on the ALUs)",
-                }
-            );
+            let fa2 = model.opts.prefill_attention == PrefillAttention::Auto
+                && model.opts.kv_dtype.format() == sys::BLZ_KV_NVFP4 && model.cfg.attn.head_dim == 256
+                && model.cfg.qsa.is_none();
+            let prefill_f16 = if fa2 { model.attn_f16 } else { model.decode_f16 };
+            let prefill_path = if model.cfg.qsa.is_some() { "QSA selection + split decode path" }
+                else if fa2 { "FA2 for supported spans >= 64 tokens" } else { "split decode path" };
+            eprintln!("blaze: attention SM {major}.{minor}: prefill {}, accumulation {}; register decode accumulation {}",
+                prefill_path,
+                if prefill_f16 { "FP16 in short runs" } else { "FP32" },
+                if model.decode_f16 { "FP16 in short runs" } else { "FP32" });
+            eprintln!("blaze: dense causal NVFP4 verify: {} (other geometries use the register kernel)", match model.verify_mode {
+                0 => "register kernel",
+                1 => "shared dequantization, FP32, >48 rows",
+                2 => "shared dequantization, FP16, >48 rows",
+                3 => "experimental paired warps, FP32, >16 rows",
+                4 => "experimental paired warps, FP16, >16 rows",
+                5 => "paired warps, FP32, >48 rows; register kernel for shorter calls",
+                _ => "paired warps, FP16, >48 rows; register kernel for shorter calls",
+            });
         }
         let tuned = model.lin.tune.tune(&weights, model.lin.gemm, &model.stream)?;
         if tuned > 0 && model.tp.rank == 0 {
@@ -2167,6 +2196,12 @@ impl Model {
     /// (its inputs are recorded for commit); `tree`: the verify rows of each span form a tree (MetaLayout tree_*).
     /// Capturable into a CUDA graph (no host synchronization).
     pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool, tree: bool, need_lse: bool) -> Result<()> {
+        // Each worker owns its policy. Reapply on entry so moving a model between threads, or alternating models
+        // on one thread, cannot inherit another model's launch policy. Captured graphs retain their chosen kernels.
+        unsafe {
+            sys::blz_mha_set_f16_accumulate(self.decode_f16 as c_int);
+            sys::blz_mha_set_verify(self.verify_mode);
+        }
         let t: usize = spans.iter().map(|s| s.len).sum();
         let n = spans.len();
         if t == 0 || t > self.meta.max_tokens || n > self.meta.max_seqs || n_logits > self.meta.max_tokens {
@@ -2938,8 +2973,9 @@ impl Model {
         // prefill spans of an NVFP4 pool: the FlashAttention-2 kernel (no split, no workspace)
         let fa2 = !verify
             && !tree
-            && !prefill_attn_split()
+            && self.opts.prefill_attention == PrefillAttention::Auto
             && view.format == sys::BLZ_KV_NVFP4
+            && hd == 256
             && unsafe { sys::blz_nvfp4_mha_prefill_group_ok(heads as c_int, kvh as c_int) } != 0;
         for (first, count, q_len, off) in calls {
             if fa2 && q_len >= PREFILL_KERNEL_ROWS {

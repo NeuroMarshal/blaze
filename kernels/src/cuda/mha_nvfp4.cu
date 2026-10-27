@@ -25,6 +25,7 @@
 #include <cuda_fp8.h>
 
 #include <algorithm>
+#include <climits>
 #include <type_traits>
 
 #include "fa_tile.cuh"
@@ -569,18 +570,22 @@ __global__ void dequant_rows_kernel(blz_nvfp4_pool pool, blz_index_ptr slots, in
 }  // namespace blaze
 
 namespace {
-bool g_f16_accumulate = false;
+// TP ranks load and launch on independent host threads, possibly on different GPU architectures.
+thread_local bool g_f16_accumulate = false;
 // dense causal NVFP4 calls of more than one MMA tile of rows: 0 the register kernel, 1 / 2 the shared-dequantization
-// kernel (mha_verify.cu) with FP32 / FP16 accumulation, 3 / 4 its pair kernel (two warps a tile) with FP32 / FP16
-int g_verify = 1;
+// kernel (mha_verify.cu) with FP32 / FP16 accumulation, 3 / 4 its pair kernel (two warps a tile) with FP32 / FP16,
+// 5 / 6 paired warps only above 48 rows (the register kernel is faster for shorter calls on SM120).
+thread_local int g_verify = 1;
 bool verify_pair() { return g_verify >= 3; }
 }
 
 extern "C" void blz_mha_set_f16_accumulate(int on) { g_f16_accumulate = on != 0; }
 
-extern "C" void blz_mha_set_verify(int mode) { g_verify = mode < 0 ? 0 : mode > 4 ? 4 : mode; }
+extern "C" void blz_mha_set_verify(int mode) { g_verify = std::clamp(mode, 0, 6); }
 
 extern "C" int blz_nvfp4_mha_verify_tiles(int q_heads, int kv_heads, int q_len) {
+  if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads || q_len < 1) return 0;
+  if (g_verify >= 5 && int64_t(q_len) * (q_heads / kv_heads) <= 48) return 0;
   return g_verify == 0 ? 0 : blaze::fa::verify_tiles(q_heads, kv_heads, q_len, verify_pair(), nullptr, nullptr);
 }
 
@@ -604,10 +609,12 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
       batch < 0 || q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 || pool.format > BLZ_KV_BF16 || window < 0)
     return cudaErrorNotSupported;
   if (batch == 0) return cudaSuccess;
+  // Both the final merge grid and query offsets use batch * q_len; reject an overflowing launch before enqueueing.
+  if (int64_t(batch) * q_len > INT_MAX) return cudaErrorNotSupported;
   const int group = q_heads / pool.heads;
   if (g_verify != 0 && pool.format == BLZ_KV_NVFP4 && pool.dim == 256 && window == 0 && causal && tree_mask == nullptr &&
       tail == nullptr && q_stride_tok % 8 == 0 && q_stride_head % 8 == 0 && reinterpret_cast<uintptr_t>(q) % 16 == 0 &&
-      blaze::fa::verify_tiles(q_heads, pool.heads, q_len, verify_pair(), nullptr, nullptr) > 0) {
+      blz_nvfp4_mha_verify_tiles(q_heads, pool.heads, q_len) > 0) {
     cudaError_t err = blaze::fa::verify_launch(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride,
                                                req_indices, kv_lens, batch, q_len, splits, scale, g_verify % 2 == 0,
                                                verify_pair(), partial_o, partial_ml, stream);
@@ -620,7 +627,7 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
   // All query tokens of a request in one CTA when they fit three tiles (a verify block of 8 with GQA 6: 48 rows).
   const int mt = int(std::min<int64_t>(3, (int64_t(q_len) * group + 15) / 16));
   const int per_tile = std::max(1, 16 * mt / group);
-  const int tiles = (q_len + per_tile - 1) / per_tile;
+  const int tiles = 1 + (q_len - 1) / per_tile;
   const dim3 grid(static_cast<unsigned>(batch * tiles), static_cast<unsigned>(pool.heads),
                   static_cast<unsigned>(splits));
   const int D = pool.dim;

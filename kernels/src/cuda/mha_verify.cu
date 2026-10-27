@@ -607,7 +607,7 @@ cudaError_t launch(dim3 grid, cudaStream_t stream, const void* q, int64_t sq_tok
 }  // namespace
 
 int verify_tiles(int q_heads, int kv_heads, int q_len, bool pair, int* per_tile, int* mt) {
-  if (kv_heads <= 0 || q_heads % kv_heads != 0 || q_len < 1) return 0;
+  if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 || q_heads / kv_heads > 16 || q_len < 1) return 0;
   const int group = q_heads / kv_heads;
   // up to 3 MMA tiles of rows the register kernel takes them in one CTA and is faster than the one-warp-a-tile kernel
   // (RTX 4060, 8 tokens x GQA 6 over 524k: 4.5 against 5.4 ms; it runs one CTA of 3-5 warps an SM and waits on its
@@ -615,8 +615,8 @@ int verify_tiles(int q_heads, int kv_heads, int q_len, bool pair, int* per_tile,
   if (int64_t(q_len) * group <= (pair ? 16 : 48) || group > 16 * kMaxTiles) return 0;
   // at most kMaxTiles MMA tiles a CTA, the tokens spread evenly over the CTAs
   const int max_tok = 16 * kMaxTiles / group;
-  const int tiles = (q_len + max_tok - 1) / max_tok;
-  const int pt = (q_len + tiles - 1) / tiles;
+  const int tiles = 1 + (q_len - 1) / max_tok;
+  const int pt = 1 + (q_len - 1) / tiles;
   if (per_tile) *per_tile = pt;
   if (mt) *mt = (pt * group + 15) / 16;
   return tiles;

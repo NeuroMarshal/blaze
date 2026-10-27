@@ -6,6 +6,15 @@
 #include <cstdint>
 
 #include <cstdio>
+#include <cstdlib>
+
+#define CHECK(x) do { \
+  const cudaError_t err = (x); \
+  if (err != cudaSuccess) { \
+    std::fprintf(stderr, "%s: %s\n", #x, cudaGetErrorString(err)); \
+    std::exit(1); \
+  } \
+} while (0)
 
 namespace {
 
@@ -31,10 +40,13 @@ __global__ void peak(float* out) {
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
                      : "+r"(h[j][0]), "+r"(h[j][1])
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-      else
+      else {
+#if __CUDA_ARCH__ >= 890
         asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                      : "+f"(c[j][0]), "+f"(c[j][1]), "+f"(c[j][2]), "+f"(c[j][3])
                      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+      }
     }
   }
   float s = 0;
@@ -46,33 +58,38 @@ __global__ void peak(float* out) {
 template <int K>
 void run(const char* name, double flops_per_mma) {
   int sms = 0;
-  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+  CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0));
   float* out = nullptr;
-  cudaMalloc(&out, 1024 * 4);
+  CHECK(cudaMalloc(&out, 1024 * sizeof(float)));
   const dim3 grid(sms * 8), block(256);
   peak<K><<<grid, block>>>(out);
+  CHECK(cudaGetLastError());
   cudaEvent_t a, b;
-  cudaEventCreate(&a), cudaEventCreate(&b);
-  cudaEventRecord(a);
+  CHECK(cudaEventCreate(&a));
+  CHECK(cudaEventCreate(&b));
+  CHECK(cudaEventRecord(a));
   peak<K><<<grid, block>>>(out);
-  cudaEventRecord(b);
-  cudaEventSynchronize(b);
+  CHECK(cudaGetLastError());
+  CHECK(cudaEventRecord(b));
+  CHECK(cudaEventSynchronize(b));
   float ms = 0;
-  cudaEventElapsedTime(&ms, a, b);
+  CHECK(cudaEventElapsedTime(&ms, a, b));
   const double mmas = double(grid.x) * (block.x / 32) * kChains * kIters;
   std::printf("%-26s %7.1f TFLOPS\n", name, mmas * flops_per_mma / (ms * 1e-3) / 1e12);
-  cudaFree(out);
+  CHECK(cudaEventDestroy(a));
+  CHECK(cudaEventDestroy(b));
+  CHECK(cudaFree(out));
 }
 
 }  // namespace
 
 int main() {
   cudaDeviceProp p{};
-  cudaGetDeviceProperties(&p, 0);
+  CHECK(cudaGetDeviceProperties(&p, 0));
   std::printf("%s, SM %d.%d, %d SMs\n", p.name, p.major, p.minor, p.multiProcessorCount);
   run<0>("bf16 x bf16 -> f32", 2.0 * 16 * 8 * 16);
   run<1>("f16 x f16 -> f32", 2.0 * 16 * 8 * 16);
   run<2>("f16 x f16 -> f16", 2.0 * 16 * 8 * 16);
-  run<3>("e4m3 x e4m3 -> f32", 2.0 * 16 * 8 * 32);
+  if (p.major * 10 + p.minor >= 89) run<3>("e4m3 x e4m3 -> f32", 2.0 * 16 * 8 * 32);
   return 0;
 }

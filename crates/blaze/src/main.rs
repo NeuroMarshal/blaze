@@ -131,10 +131,16 @@ struct EngineArgs {
     /// calibrated NVFP4 activations, else BF16), nvfp4 (W4A4 wherever the GPU can), bf16 (weights widened, cuBLAS)
     #[arg(long, default_value = "auto")]
     gemm: blaze::linear::GemmRoute,
-    /// prefill attention accumulates in FP16 in short runs summed in FP32: auto (where the GPU runs it twice as fast,
-    /// GeForce SM 8.6 / 8.9 / 12.x), on, off
+    /// attention accumulation: auto (FP16 prefill on SM 8.6/8.9/12.x, FP16 decode on SM 12.x), on, off;
+    /// FP16 changes arithmetic relative to FP32 accumulation
     #[arg(long, default_value = "auto")]
     attn_f16_acc: String,
+    /// prefill kernel: auto (FA2 for supported NVFP4 spans), split (split decode path)
+    #[arg(long, value_enum, env = "BLAZE_PREFILL_ATTN", default_value = "auto")]
+    prefill_attention: blaze::model::PrefillAttention,
+    /// dense causal NVFP4 verify kernel; pair32/pair16 are experimental and require GPU validation
+    #[arg(long, value_enum, env = "BLAZE_VERIFY_ATTN", default_value = "auto")]
+    verify_attention: blaze::model::VerifyAttention,
     /// eager decode steps instead of CUDA graphs
     #[arg(long, alias = "enforce-eager")]
     no_graphs: bool,
@@ -302,6 +308,8 @@ impl EngineArgs {
                     "off" | "false" | "0" => Some(false),
                     v => anyhow::bail!("--attn-f16-acc {v}: auto, on or off"),
                 },
+                prefill_attention: self.prefill_attention,
+                verify_attention: self.verify_attention,
                 pp_stages: self.pp,
                 pp_tp: self.tp.max(1),
                 pp: None,

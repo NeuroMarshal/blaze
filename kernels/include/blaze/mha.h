@@ -78,13 +78,16 @@ int blz_nvfp4_mha_prefill_group_ok(int q_heads, int kv_heads);
 
 /// \brief The decode / verify kernels (blz_nvfp4_mha_decode, _tree, blz_mha_decode_window, _tail) accumulate in FP16 in
 /// short runs summed in FP32 from now on (twice the MMA rate on GeForce GPUs: a verify of 8 tokens over a long context
-/// is compute-bound), process-wide; 0: FP32 accumulation (the default).
+/// is compute-bound), for subsequent launches on the calling host thread; 0: FP32 accumulation (the default).
+/// A CUDA graph retains the kernels chosen at capture time.
 void blz_mha_set_f16_accumulate(int on);
 
 /// \brief The kernel of the dense causal NVFP4 calls (blz_nvfp4_mha_decode) of more than one MMA tile of rows per
-/// request (a verify, a short prefill chunk; q_len x GQA group > 16), process-wide: 0 the register-dequantization kernel,
+/// request (a verify, a short prefill chunk), on the calling host thread: 0 the register-dequantization kernel,
 /// 1 the shared-dequantization kernel with FP32 accumulation (the default), 2 with FP16 accumulation, 3 / 4 its pair
 /// kernel (two warps a tile of 16 rows, each half the head dims) with FP32 / FP16 accumulation.
+/// Modes 1/2 take calls with q_len x GQA > 48; modes 3/4 take calls with q_len x GQA > 16.
+/// Modes 5/6 use paired warps with FP32/FP16 only above 48 rows; shorter calls retain the register kernel.
 void blz_mha_set_verify(int mode);
 
 /// \brief CTAs a request takes per context split in a blz_nvfp4_mha_decode call of this shape when the

@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <charconv>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,11 +16,20 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "blaze/mha.h"
-#define BLAZE_PREFILL_ABLATE
+// Optional hand-built ablations; ordinary CMake builds benchmark the production library itself.
+#ifdef BLAZE_PREFILL_ABLATE
+#define blz_nvfp4_mha_prefill blz_bench_nvfp4_mha_prefill
+#define blz_nvfp4_mha_prefill_supported blz_bench_nvfp4_mha_prefill_supported
+#define blz_nvfp4_mha_prefill_group_ok blz_bench_nvfp4_mha_prefill_group_ok
 #include "../src/cuda/mha_prefill.cu"
+#undef blz_nvfp4_mha_prefill
+#undef blz_nvfp4_mha_prefill_supported
+#undef blz_nvfp4_mha_prefill_group_ok
+#endif
 
 #define CHECK(x)                                                                         \
   do {                                                                                   \
@@ -86,14 +97,31 @@ Case make_case(int ctx, int q_len, std::mt19937& rng) {
 
 double causal_flops(int ctx, int q_len) { return 4.0 * q_len * (double(ctx) - q_len / 2.0) * kDim * kQHeads; }
 
+int positive_int(std::string_view s, int maximum) {
+  int value = 0;
+  const auto parsed = std::from_chars(s.data(), s.data() + s.size(), value);
+  if (parsed.ec != std::errc{} || parsed.ptr != s.data() + s.size() || value < 1 || value > maximum) {
+    std::fprintf(stderr, "invalid positive integer: %.*s (max %d)\n", int(s.size()), s.data(), maximum);
+    std::exit(2);
+  }
+  return value;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  const int q_len = argc > 1 ? std::atoi(argv[1]) : 2048;
+  const int q_len = argc > 1 ? positive_int(argv[1], INT_MAX - 64) : 2048;
+  // Disable shared verify dispatch so the baseline remains the old register kernel at every query length.
+  blz_mha_set_verify(0);
+  blz_mha_set_f16_accumulate(0);
   std::vector<int> ctxs;
   {
     std::stringstream ss(argc > 2 ? argv[2] : "8,32,64,128");
-    for (std::string t; std::getline(ss, t, ',');) ctxs.push_back(std::atoi(t.c_str()) * 1000);
+    for (std::string t; std::getline(ss, t, ',');) ctxs.push_back(positive_int(t, (INT_MAX - 64) / 1000) * 1000);
+  }
+  if (ctxs.empty() || std::none_of(ctxs.begin(), ctxs.end(), [&](int n) { return n >= q_len; })) {
+    std::fprintf(stderr, "at least one context must fit q_len\n");
+    return 2;
   }
   const bool check = argc > 3 ? std::atoi(argv[3]) != 0 : true;
   cudaDeviceProp prop{};
@@ -126,6 +154,7 @@ int main(int argc, char** argv) {
       CHECK(blz_nvfp4_mha_prefill(c.q, int64_t(kQHeads) * kDim, kDim, kQHeads, c.pool, c.r2t, ctx + 64, 0, ctx, q_len,
                                   scale, 1, BLZ_BF16, out_h, int64_t(kQHeads) * kDim, kDim, nullptr));
     };
+#ifdef BLAZE_PREFILL_ABLATE
     auto cut = [&](auto k, auto f16) {
       return [&, k, f16] {
         CHECK((blz_prefill_ablate<decltype(k)::value, decltype(f16)::value>(c.q, int64_t(kQHeads) * kDim, kDim, c.pool, c.r2t,
@@ -133,18 +162,22 @@ int main(int argc, char** argv) {
                                                                             kDim)));
       };
     };
+#endif
     auto time = [&](auto&& f) {
       f();
       CHECK(cudaDeviceSynchronize());
       cudaEvent_t a, b;
-      cudaEventCreate(&a), cudaEventCreate(&b);
+      CHECK(cudaEventCreate(&a));
+      CHECK(cudaEventCreate(&b));
       const int iters = ctx >= 64000 ? 3 : 10;
-      cudaEventRecord(a);
+      CHECK(cudaEventRecord(a));
       for (int i = 0; i < iters; ++i) f();
-      cudaEventRecord(b);
+      CHECK(cudaEventRecord(b));
       CHECK(cudaEventSynchronize(b));
       float ms = 0;
-      cudaEventElapsedTime(&ms, a, b);
+      CHECK(cudaEventElapsedTime(&ms, a, b));
+      CHECK(cudaEventDestroy(a));
+      CHECK(cudaEventDestroy(b));
       return ms / iters;
     };
     const double f = causal_flops(ctx, q_len);
@@ -172,6 +205,7 @@ int main(int argc, char** argv) {
       std::printf(", FP16 acc");
       diff(out_dec, out_h);
     }
+#ifdef BLAZE_PREFILL_ABLATE
     if (std::getenv("ABLATE")) {
       using blaze::kNoDequant, blaze::kNoQk, blaze::kNoPv;
       std::printf("\n    cuts (FP32 / FP16 acc, ms): no dequant %.2f / %.2f, no QK %.2f / %.2f, no PV %.2f / %.2f, softmax+loads only %.2f",
@@ -183,12 +217,14 @@ int main(int argc, char** argv) {
                   time(cut(std::integral_constant<int, kNoPv>{}, std::true_type{})),
                   time(cut(std::integral_constant<int, kNoDequant | kNoQk | kNoPv>{}, std::false_type{})));
     }
+#endif
     std::printf("\n");
     cudaFree(out_h);
     cudaFree(out_dec), cudaFree(out_pre), cudaFree(po), cudaFree(pml);
     cudaFree(c.r2t), cudaFree(c.req), cudaFree(c.lens), cudaFree(c.q);
     cudaFree(const_cast<uint8_t*>(c.pool.k_data)), cudaFree(const_cast<uint8_t*>(c.pool.v_data));
     cudaFree(const_cast<uint8_t*>(c.pool.k_scale)), cudaFree(const_cast<uint8_t*>(c.pool.v_scale));
+    cudaFree(const_cast<float*>(c.pool.k_g)), cudaFree(const_cast<float*>(c.pool.v_g));
   }
   return 0;
 }

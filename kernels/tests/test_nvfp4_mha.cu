@@ -9,7 +9,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include <cuda_fp8.h>
@@ -32,6 +34,16 @@ namespace {
 int g_failures = 0;
 constexpr int kDim = 256;
 
+// std::max(worst, abs(NaN)) keeps worst unchanged and can report a corrupt kernel as passing.
+void observe_error(double got, double ref, double& worst, double& peak) {
+  if (!std::isfinite(got) || !std::isfinite(ref)) {
+    worst = std::numeric_limits<double>::infinity();
+    return;
+  }
+  worst = std::max(worst, std::fabs(got - ref));
+  peak = std::max(peak, std::fabs(ref));
+}
+
 template <typename T>
 struct Dev {
   T* ptr = nullptr;
@@ -53,8 +65,9 @@ float e4m3_value(uint8_t b) { return blaze::e4m3_to_float(b); }
 struct Pool {
   int slots, heads, format = BLZ_KV_NVFP4;
   std::vector<uint8_t> kd, vd, ks, vs;
+  std::vector<float> k_ref, v_ref;
   float kg = 1.0f, vg = 0.5f;
-  float value(bool v, int64_t slot, int head, int d) const {  // bf16-rounded, as the kernels store it
+  float decoded_value(bool v, int64_t slot, int head, int d) const {  // bf16-rounded, as the kernels store it
     const int64_t row = slot * heads + head;
     const auto& data = v ? vd : kd;
     const float g = v ? vg : kg;
@@ -70,6 +83,22 @@ struct Pool {
       x = blaze::e2m1_value(code) * blaze::e4m3_to_float((v ? vs : ks)[row * (kDim / 16) + d / 16]) * g;
     }
     return __bfloat162float(__float2bfloat16(x));
+  }
+  // Decode the independent reference once. Repeating E4M3 conversion inside every query's O(N D) reference loop
+  // dominated the test time, while the GPU was idle. No GPU output is used to construct this reference.
+  void cache_reference() {
+    const size_t n = size_t(slots) * heads * kDim;
+    k_ref.resize(n), v_ref.resize(n);
+    for (int slot = 0; slot < slots; ++slot)
+      for (int head = 0; head < heads; ++head)
+        for (int d = 0; d < kDim; ++d) {
+          const size_t i = (size_t(slot) * heads + head) * kDim + d;
+          k_ref[i] = decoded_value(false, slot, head, d);
+          v_ref[i] = decoded_value(true, slot, head, d);
+        }
+  }
+  float value(bool v, int64_t slot, int head, int d) const {
+    return (v ? v_ref : k_ref)[(slot * heads + head) * kDim + d];
   }
 };
 
@@ -92,6 +121,7 @@ Pool make_pool(int slots, int heads, std::mt19937& rng, int format = BLZ_KV_NVFP
           std::memcpy(&data[2 * i], &b, 2);
         }
       }
+    p.cache_reference();
     return p;
   }
   p.kd.resize(size_t(slots) * heads * kDim / 2), p.vd.resize(p.kd.size());
@@ -103,6 +133,7 @@ Pool make_pool(int slots, int heads, std::mt19937& rng, int format = BLZ_KV_NVFP
       blaze::nvfp4_quantize_row_ref(row.data(), kDim, side ? p.vg : p.kg, true,
                                   &(side ? p.vd : p.kd)[size_t(s) * kDim / 2], &(side ? p.vs : p.ks)[size_t(s) * kDim / 16]);
     }
+  p.cache_reference();
   return p;
 }
 
@@ -211,7 +242,7 @@ void test_case(const char* what, int kv_heads, int group, int q_len, std::vector
           for (int t = 0; t < L; ++t) ref += sc[t] * p.value(true, r2t[size_t(req_idx[b]) * stride + t], g, k);
           ref /= sum;
           const double got = __bfloat162float(out[(size_t(b) * q_len + i) * out_tok + h * out_head + k]);
-          worst = std::max(worst, std::fabs(got - ref)), peak = std::max(peak, std::fabs(ref));
+          observe_error(got, ref, worst, peak);
         }
       }
   const double rel = worst / std::max(peak, 1e-30);
@@ -269,7 +300,7 @@ void test_prefill(const char* what, int kv_heads, int group, int q_len, int kv_l
         for (int t = 0; t < L; ++t) ref += sc[t] * p.value(true, r2t[size_t(req) * stride + t], g, k);
         ref /= sum;
         const double got = __bfloat162float(out[(size_t(i) * q_heads + h) * kDim + k]);
-        worst = std::max(worst, std::fabs(got - ref)), peak = std::max(peak, std::fabs(ref));
+        observe_error(got, ref, worst, peak);
       }
     }
   const double rel = worst / std::max(peak, 1e-30);
@@ -335,7 +366,7 @@ void test_window(const char* what, int heads, int q_len, std::vector<int> kv_len
             ref += sc[t] * __bfloat162float(vd[(size_t(r2t[size_t(req_idx[b]) * stride + t]) * heads + h) * D + k]);
           ref /= sum;
           const double got = __bfloat162float(out[((size_t(b) * q_len + i) * heads + h) * D + k]);
-          worst = std::max(worst, std::fabs(got - ref)), peak = std::max(peak, std::fabs(ref));
+          observe_error(got, ref, worst, peak);
         }
       }
   const double rel = worst / std::max(peak, 1e-30);
@@ -416,6 +447,8 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int for
   CHECK_CUDA(cudaEventSynchronize(e));
   float ms = 0;
   cudaEventElapsedTime(&ms, a, e);
+  CHECK_CUDA(cudaEventDestroy(a));
+  CHECK_CUDA(cudaEventDestroy(e));
   const double us = 1000.0 * ms / iters;
   const double bytes = double(batch) * ctx * kv_heads * 2 * (row_bytes + (format == BLZ_KV_NVFP4 ? kDim / 16 : 0));
   std::printf("bench %-5s %d x %d tokens over %dk context, %d splits: %.1f us per layer (%.0f GB/s of KV)\n",
@@ -423,17 +456,77 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int for
               ctx / 1000, splits, us, bytes / us / 1e3);
 }
 
+void check_verify(int mode, std::mt19937& rng) {
+  blz_mha_set_verify(mode);
+  std::printf("-- verify kernel %d\n", mode);
+  if (mode >= 5) {
+    const bool ok = blz_nvfp4_mha_verify_tiles(12, 2, 3) == 0 &&
+                    blz_nvfp4_mha_verify_tiles(12, 2, 8) == 0 &&
+                    blz_nvfp4_mha_verify_tiles(12, 2, 9) == 1;
+    g_failures += !ok;
+    std::printf("hybrid geometry selection: %s\n", ok ? "ok" : "FAIL");
+  }
+  test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
+  test_case("verify 9 tokens, GQA 6, lengths 9 / 33 / 4100", 2, 6, 9, {9, 33, 4100}, 12, rng);
+  test_case("verify 9 tokens, GQA 8, lengths 70 / 3001", 2, 8, 9, {70, 3001}, 7, rng);
+  test_case("verify 9, GQA 6, empty splits / tile tails", 1, 6, 9, {9, 33, 79}, 64, rng);
+  test_case("verify 16 tokens, GQA 6 (two tiles), 40 / 2222", 2, 6, 16, {40, 2222}, 5, rng);
+  test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
+  test_case("chunk 37 tokens, GQA 12, lengths 37 / 1500", 2, 12, 37, {37, 1500}, 3, rng);
+  test_case("verify 2 tokens, GQA 16, splits past the context", 1, 16, 2, {5, 900}, 64, rng);
+}
+
 }  // namespace
 
 int main() {
   std::mt19937 rng(11);
+  if (std::getenv("BLAZE_MHA_HYBRID_CHECK")) {
+    for (int mode : {5, 6}) check_verify(mode, rng);
+    std::printf("%s\n", g_failures ? "FAILED" : "all passed");
+    return g_failures ? 1 : 0;
+  }
+  // Performance measurements are opt-in: correctness tests do not allocate 524k pools or run timing loops.
+  if (std::getenv("BLAZE_MHA_VERIFY_BENCH")) {
+    for (int mode : {0, 1, 2, 3, 4, 5, 6}) {
+      blz_mha_set_verify(mode);
+      std::printf("-- verify kernel %d\n", mode);
+      for (int ql : {3, 8, 9}) {
+        bench(122000, 1, ql, auto_splits(1, ql), rng);
+        bench(524000, 1, ql, auto_splits(1, ql), rng);
+      }
+      bench(524000, 2, 9, auto_splits(2, 9), rng);
+    }
+    return 0;
+  }
+  if (std::getenv("BLAZE_MHA_FORMAT_BENCH")) {
+    blz_mha_set_verify(0);
+    for (int f : {BLZ_KV_NVFP4, BLZ_KV_FP8, BLZ_KV_BF16}) {
+      bench(122000, 1, 1, 64, rng, f);
+      bench(122000, 1, 8, 64, rng, f);
+    }
+    return 0;
+  }
   // Fixed-shape prefill measurements, runnable independently of the numerical/reference cases.
   if (std::getenv("BLAZE_MHA_PREFILL_BENCH")) {
+    blz_mha_set_verify(0);  // measure the actual register baseline, independent of new verify dispatch
     for (int repeat = 0; repeat < 3; ++repeat) {
       bench(8192, 1, 2048, 1, rng);
       bench(32768, 1, 2048, 1, rng);
     }
     return 0;
+  }
+  {
+    blz_mha_set_verify(0);
+    bool child_ok = false;
+    std::thread rank([&] {
+      blz_mha_set_verify(4);
+      child_ok = blz_nvfp4_mha_verify_tiles(12, 2, 3) == 1;
+    });
+    rank.join();
+    const bool ok = child_ok && blz_nvfp4_mha_verify_tiles(12, 2, 3) == 0;
+    std::printf("host thread launch-policy isolation: %s\n", ok ? "ok" : "FAIL");
+    g_failures += !ok;
+    blz_mha_set_verify(1);
   }
   {
     blz_nvfp4_pool pool{};
@@ -443,7 +536,11 @@ int main() {
                                          BLZ_BF16, nullptr, 0, 0, nullptr);
     const bool ok = err == cudaErrorNotSupported && blz_nvfp4_mha_parts(0, 1, 1, 1) == 0 &&
                     blz_nvfp4_mha_parts(-1, 1, 1, 1) == 0 && blz_nvfp4_mha_parts(12, 2, 1, 0) == 0 &&
-                    blz_nvfp4_mha_parts(12, 2, INT_MAX, 1) == 1;
+                    blz_nvfp4_mha_parts(12, 2, INT_MAX, 1) == 1 &&
+                    blz_nvfp4_mha_verify_tiles(0, 2, 9) == 0 &&
+                    blz_nvfp4_mha_verify_tiles(-12, 2, 9) == 0 &&
+                    blz_nvfp4_mha_verify_tiles(34, 2, 9) == 0 &&
+                    blz_nvfp4_mha_verify_tiles(12, 2, INT_MAX) == 1 + (INT_MAX - 1) / 13;
     std::printf("invalid shapes and overflow-safe parts: %s\n", ok ? "ok" : "FAIL");
     g_failures += !ok;
   }
@@ -477,17 +574,7 @@ int main() {
   test_window("DFlash block 8, short window", 2, 8, {500}, 37, 2, rng, 0);
   // the verify shapes on every kernel: the register kernel, the shared-dequantization one in FP32 / FP16 accumulation,
   // its pair kernel in FP32 / FP16
-  for (int mode : {0, 1, 2, 3, 4}) {
-    blz_mha_set_verify(mode);
-    std::printf("-- verify kernel %d\n", mode);
-    test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
-    test_case("verify 9 tokens, GQA 6, lengths 9 / 33 / 4100", 2, 6, 9, {9, 33, 4100}, 12, rng);
-    test_case("verify 9 tokens, GQA 8, lengths 70 / 3001", 2, 8, 9, {70, 3001}, 7, rng);
-    test_case("verify 16 tokens, GQA 6 (two tiles), 40 / 2222", 2, 6, 16, {40, 2222}, 5, rng);
-    test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
-    test_case("chunk 37 tokens, GQA 12, lengths 37 / 1500", 2, 12, 37, {37, 1500}, 3, rng);
-    test_case("verify 2 tokens, GQA 16, splits past the context", 1, 16, 2, {5, 900}, 64, rng);
-  }
+  for (int mode : {0, 1, 2, 3, 4, 5, 6}) check_verify(mode, rng);
   blz_mha_set_verify(1);
   // the decode / verify kernels with FP16 accumulation
   blz_mha_set_f16_accumulate(1);
@@ -499,8 +586,6 @@ int main() {
   for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng, f);
   test_window("verify 9 tokens, lengths 9 / 5000", 8, 9, {9, 5000}, 4096, 8, rng);
   test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
-  bench(524000, 1, 1, 64, rng);
-  bench(524000, 1, 8, 64, rng);
   blz_mha_set_f16_accumulate(0);
   for (bool f16 : {false, true}) {
     test_prefill("GQA 6, 37 tokens, a first chunk", 2, 6, 37, 37, f16, rng);
@@ -510,24 +595,6 @@ int main() {
     test_prefill("MHA, 129 tokens after 2000", 3, 1, 129, 2129, f16, rng);
   }
   test_dequant_rows(rng);
-  for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
-    bench(122000, 1, 1, 64, rng, f);
-    bench(122000, 1, 8, 64, rng, f);
-  }
-  bench(122000, 1, 1, 64, rng);
-  bench(122000, 4, 1, 32, rng);
-  bench(122000, 1, 8, 32, rng);
-  bench(122000, 1, 8, 64, rng);
-  bench(524000, 1, 1, 64, rng);
-  for (int mode : {0, 1, 2, 3, 4}) {
-    blz_mha_set_verify(mode);
-    std::printf("-- verify kernel %d\n", mode);
-    for (int ql : {3, 8, 9}) {
-      bench(122000, 1, ql, auto_splits(1, ql), rng);
-      bench(524000, 1, ql, auto_splits(1, ql), rng);
-    }
-    bench(524000, 2, 9, auto_splits(2, 9), rng);
-  }
   blz_mha_set_verify(1);
   std::printf("%s\n", g_failures ? "FAILED" : "all passed");
   return g_failures ? 1 : 0;

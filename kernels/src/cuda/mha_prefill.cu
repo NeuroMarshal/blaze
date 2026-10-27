@@ -403,7 +403,7 @@ cudaError_t launch(const void* q, int64_t sq_tok, int64_t sq_head, blz_nvfp4_poo
   constexpr size_t smem = smem_bytes<G>();
   cudaError_t err = cudaFuncSetAttribute(prefill_kernel<G, F16, CUT>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem));
   if (err != cudaSuccess) return err;
-  const dim3 grid(static_cast<unsigned>((q_len + kTok - 1) / kTok), static_cast<unsigned>(pool.heads * (group / G)));
+  const dim3 grid(static_cast<unsigned>(1 + (q_len - 1) / kTok), static_cast<unsigned>(pool.heads * (group / G)));
   prefill_kernel<G, F16, CUT><<<grid, 32 * G, smem, stream>>>(static_cast<const __nv_bfloat16*>(q), sq_tok, sq_head, pool, r2t,
                                                     kv_len, q_len, group, scale * kLog2e,
                                                     static_cast<__nv_bfloat16*>(out), so_tok, so_head);
@@ -430,6 +430,7 @@ extern "C" cudaError_t blz_nvfp4_mha_prefill(const void* q, int64_t q_stride_tok
                                              blz_half_t dtype, void* out, int64_t out_stride_tok,
                                              int64_t out_stride_head, cudaStream_t stream) {
   if (dtype != BLZ_BF16 || pool.format != BLZ_KV_NVFP4 || pool.dim != blaze::kD || q_len < 1 || kv_len < q_len ||
+      req < 0 || req_stride < kv_len || q_stride_tok <= 0 || q_stride_head <= 0 || out_stride_tok <= 0 || out_stride_head <= 0 ||
       !blz_nvfp4_mha_prefill_group_ok(q_heads, pool.heads) || q_stride_tok % 8 || q_stride_head % 8 || out_stride_tok % 2 ||
       out_stride_head % 2 || reinterpret_cast<uintptr_t>(q) % 16 || reinterpret_cast<uintptr_t>(out) % 4)
     return cudaErrorNotSupported;
