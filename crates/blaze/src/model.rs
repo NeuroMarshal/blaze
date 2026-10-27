@@ -1348,6 +1348,15 @@ impl Model {
         let attn_f16 = opts.attn_f16_acc.unwrap_or_else(crate::gpu::fast_f16_accumulate);
         let decode_f16 = opts.attn_f16_acc.unwrap_or(crate::gpu::compute_capability().0 == 12);
         unsafe { sys::blz_mha_set_f16_accumulate(decode_f16 as c_int) };
+        // verify / short chunks (more than one MMA tile of rows): the shared-dequantization kernel, FP16 accumulation
+        // as prefill; BLAZE_VERIFY_ATTN=old|fp32|fp16 to compare
+        let verify_mode = match std::env::var("BLAZE_VERIFY_ATTN").ok().as_deref() {
+            Some("old") => 0,
+            Some("fp32") => 1,
+            Some("fp16") => 2,
+            _ => 1 + attn_f16 as c_int,
+        };
+        unsafe { sys::blz_mha_set_verify(verify_mode) };
         let mut model = Self {
             cfg,
             dims,
@@ -2830,8 +2839,8 @@ impl Model {
             let mha = |r0: usize, n: usize, pv: sys::blz_nvfp4_pool, tab: *const i32| -> Result<()> {
                 // as the dense calls (within the partial-result workspace), at most 16
                 let splits = match forced_splits {
-                    Some(requested) => self.attn_splits(n, 1, Some(requested))?,
-                    None => self.attn_splits(n, 1, None)?.min(16),
+                    Some(requested) => self.attn_splits(n, 1, false, Some(requested))?,
+                    None => self.attn_splits(n, 1, false, None)?.min(16),
                 };
                 check(
                     unsafe {
@@ -2959,7 +2968,7 @@ impl Model {
                 )?;
                 continue;
             }
-            let splits = self.attn_splits(count, q_len, None)?;
+            let splits = self.attn_splits(count, q_len, tree && q_len > 1, None)?;
             if tree && q_len > 1 {
                 // a tree verify span: each row sees its ancestors among the span's rows
                 check(
@@ -3029,14 +3038,23 @@ impl Model {
     /// Context splits of an attention call of `count` requests of `q_len` query rows: about four CTAs per SM over the
     /// call's query tiles and KV heads (a verify span of a few rows gets as many as a decode step, not one CTA walking
     /// the whole context), within the partial-result workspace.
-    fn attn_splits(&self, count: usize, q_len: usize, requested: Option<usize>) -> Result<usize> {
+    fn attn_splits(&self, count: usize, q_len: usize, tree: bool, requested: Option<usize>) -> Result<usize> {
         ensure!(count > 0 && q_len > 0, "attention requires nonempty query rows");
         let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, self.cfg.attn.head_dim);
         let group = heads / kvh;
         let mt = (q_len * group).div_ceil(16).min(3);
         let tiles = q_len.div_ceil((16 * mt / group).max(1));
         let cap = (self.work.partial_o.bytes() / (heads * hd * 4)).min(self.work.partial_ml.bytes() / (heads * 2 * 4));
-        let target = requested.unwrap_or_else(|| (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64));
+        // the shared-dequantization kernel (NVFP4 pools) runs one CTA an SM: one full wave
+        let vt = if self.opts.kv_dtype.format() == sys::BLZ_KV_NVFP4 && !tree {
+            (unsafe { sys::blz_nvfp4_mha_verify_tiles(heads as c_int, kvh as c_int, q_len as c_int) }) as usize
+        } else {
+            0
+        };
+        let target = requested.unwrap_or_else(|| match vt {
+            0 => (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64),
+            vt => (self.num_sms / (count * vt * kvh)).clamp(1, 64),
+        });
         let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, 1) } as usize;
         let rows = count.checked_mul(q_len).context("attention row count overflow")?;
         bounded_mha_splits(target, rows, parts, cap)

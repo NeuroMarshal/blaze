@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <type_traits>
 
+#include "fa_tile.cuh"
 #include "nvfp4_attn.cuh"
 #include "blaze/mha.h"
 
@@ -569,9 +570,18 @@ __global__ void dequant_rows_kernel(blz_nvfp4_pool pool, blz_index_ptr slots, in
 
 namespace {
 bool g_f16_accumulate = false;
+// dense causal NVFP4 calls of more than one MMA tile of rows: 0 the register kernel, 1 / 2 the shared-dequantization
+// kernel (mha_verify.cu) with FP32 / FP16 accumulation
+int g_verify = 1;
 }
 
 extern "C" void blz_mha_set_f16_accumulate(int on) { g_f16_accumulate = on != 0; }
+
+extern "C" void blz_mha_set_verify(int mode) { g_verify = mode < 0 ? 0 : mode > 2 ? 2 : mode; }
+
+extern "C" int blz_nvfp4_mha_verify_tiles(int q_heads, int kv_heads, int q_len) {
+  return g_verify == 0 ? 0 : blaze::fa::verify_tiles(q_heads, kv_heads, q_len, nullptr, nullptr);
+}
 
 extern "C" int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits) {
   if (q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 || q_heads / kv_heads > 16 ||
@@ -594,6 +604,18 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
     return cudaErrorNotSupported;
   if (batch == 0) return cudaSuccess;
   const int group = q_heads / pool.heads;
+  if (g_verify != 0 && pool.format == BLZ_KV_NVFP4 && pool.dim == 256 && window == 0 && causal && tree_mask == nullptr &&
+      tail == nullptr && q_stride_tok % 8 == 0 && q_stride_head % 8 == 0 && reinterpret_cast<uintptr_t>(q) % 16 == 0 &&
+      blaze::fa::verify_tiles(q_heads, pool.heads, q_len, nullptr, nullptr) > 0) {
+    cudaError_t err = blaze::fa::verify_launch(q, q_stride_tok, q_stride_head, q_heads, pool, req_to_token, req_stride,
+                                               req_indices, kv_lens, batch, q_len, splits, scale, g_verify == 2,
+                                               partial_o, partial_ml, stream);
+    if (err != cudaSuccess) return err;
+    const dim3 cgrid(static_cast<unsigned>(batch * q_len), static_cast<unsigned>(q_heads));
+    blaze::mha_combine_kernel<__nv_bfloat16, 256><<<cgrid, 256, 0, stream>>>(
+        partial_o, partial_ml, splits, q_heads, static_cast<__nv_bfloat16*>(out), out_stride_tok, out_stride_head);
+    return cudaGetLastError();
+  }
   // All query tokens of a request in one CTA when they fit three tiles (a verify block of 8 with GQA 6: 48 rows).
   const int mt = int(std::min<int64_t>(3, (int64_t(q_len) * group + 15) / 16));
   const int per_tile = std::max(1, 16 * mt / group);

@@ -81,6 +81,15 @@ int blz_nvfp4_mha_prefill_group_ok(int q_heads, int kv_heads);
 /// is compute-bound), process-wide; 0: FP32 accumulation (the default).
 void blz_mha_set_f16_accumulate(int on);
 
+/// \brief The kernel of the dense causal NVFP4 calls (blz_nvfp4_mha_decode) of more than one MMA tile of rows per
+/// request (a verify, a short prefill chunk; q_len x GQA group > 16), process-wide: 0 the register-dequantization kernel,
+/// 1 the shared-dequantization kernel with FP32 accumulation (the default), 2 with FP16 accumulation.
+void blz_mha_set_verify(int mode);
+
+/// \brief CTAs a request takes per context split in a blz_nvfp4_mha_decode call of this shape when the
+/// shared-dequantization kernel takes it (its occupancy is one CTA an SM); 0: the register kernel does.
+int blz_nvfp4_mha_verify_tiles(int q_heads, int kv_heads, int q_len);
+
 /// \brief Context parts of blz_nvfp4_mha_decode (the partial workspaces' third dimension): splits times the warps a CTA
 /// runs along the context for this query geometry; 0 for an unsupported one.
 int blz_nvfp4_mha_parts(int q_heads, int kv_heads, int q_len, int splits);

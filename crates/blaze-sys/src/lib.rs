@@ -300,6 +300,8 @@ unsafe extern "C" {
                                  out_stride_tok: i64, out_stride_head: i64, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_mha_prefill_group_ok(q_heads: c_int, kv_heads: c_int) -> c_int;
     pub fn blz_mha_set_f16_accumulate(on: c_int);
+    pub fn blz_mha_set_verify(mode: c_int);
+    pub fn blz_nvfp4_mha_verify_tiles(q_heads: c_int, kv_heads: c_int, q_len: c_int) -> c_int;
     pub fn blz_mha_decode_window(q: *const c_void, q_stride_tok: i64, q_stride_head: i64, q_heads: c_int,
                                  pool: blz_nvfp4_pool, req_to_token: *const i32, req_stride: i64,
                                  req_indices: blz_index_ptr, kv_lens: blz_index_ptr, batch: c_int, q_len: c_int,

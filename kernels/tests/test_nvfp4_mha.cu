@@ -463,6 +463,19 @@ int main() {
   test_window("decode, no window", 4, 1, {2000}, 0, 8, rng);
   test_window("DFlash block 8", 2, 8, {8, 3000}, 2048, 4, rng, 0);
   test_window("DFlash block 8, short window", 2, 8, {500}, 37, 2, rng, 0);
+  // the verify shapes on every kernel: the register kernel, the shared-dequantization one in FP32 / FP16 accumulation
+  for (int mode : {0, 1, 2}) {
+    blz_mha_set_verify(mode);
+    std::printf("-- verify kernel %d\n", mode);
+    test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
+    test_case("verify 9 tokens, GQA 6, lengths 9 / 33 / 4100", 2, 6, 9, {9, 33, 4100}, 12, rng);
+    test_case("verify 9 tokens, GQA 8, lengths 70 / 3001", 2, 8, 9, {70, 3001}, 7, rng);
+    test_case("verify 16 tokens, GQA 6 (two tiles), 40 / 2222", 2, 6, 16, {40, 2222}, 5, rng);
+    test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
+    test_case("chunk 37 tokens, GQA 12, lengths 37 / 1500", 2, 12, 37, {37, 1500}, 3, rng);
+    test_case("verify 2 tokens, GQA 16, splits past the context", 1, 16, 2, {5, 900}, 64, rng);
+  }
+  blz_mha_set_verify(1);
   // the decode / verify kernels with FP16 accumulation
   blz_mha_set_f16_accumulate(1);
   std::printf("-- decode / verify with FP16 accumulation\n");
@@ -493,7 +506,16 @@ int main() {
   bench(122000, 1, 8, 32, rng);
   bench(122000, 1, 8, 64, rng);
   bench(524000, 1, 1, 64, rng);
-  bench(524000, 1, 8, 64, rng);
+  for (int mode : {0, 1, 2}) {
+    blz_mha_set_verify(mode);
+    std::printf("-- verify kernel %d\n", mode);
+    for (int ql : {8, 9}) {
+      bench(122000, 1, ql, mode ? 12 : 64, rng);
+      bench(524000, 1, ql, mode ? 12 : 64, rng);
+    }
+    bench(524000, 2, 9, mode ? 6 : 32, rng);
+  }
+  blz_mha_set_verify(1);
   std::printf("%s\n", g_failures ? "FAILED" : "all passed");
   return g_failures ? 1 : 0;
 }
