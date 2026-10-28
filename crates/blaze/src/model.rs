@@ -2839,6 +2839,15 @@ impl Model {
                 "attn_prep",
             )?;
         }
+        // BLAZE_DUMP: Q after norm and RoPE, the projection row with K (normed, RoPE) and V as they reach the cache
+        // (scripts/kv_quant_study.py)
+        self.dump(&format!("q_{}", layer.slot), w.q.ptr(), t, heads * hd)?;
+        self.dump(&format!("proj_{}", layer.slot), w.proj.ptr(), t, ld)?;
+        if let Some(dir) = std::env::var_os("BLAZE_DUMP") {
+            let meta = format!("{{\"heads\": {heads}, \"kv_heads\": {kvh}, \"head_dim\": {hd}, \"ld\": {ld}, \"k_offset\": {}, \
+                                \"v_offset\": {}, \"layers\": {}}}\n", heads * 2 * hd, heads * 2 * hd + kvh * hd, self.kv.len());
+            let _ = std::fs::write(std::path::Path::new(&dir).join("attn_meta.json"), meta);
+        }
         if self.kv_rotate {
             // the cache keeps K and V rotated, Q the same: the scores are those of the plain vectors
             let rot = |x: *mut u16, n: usize, tok: usize, what| {
