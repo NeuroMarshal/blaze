@@ -278,6 +278,7 @@ unsafe extern "C" {
 pub const BLZ_KV_NVFP4: c_int = 0;
 pub const BLZ_KV_FP8: c_int = 1;
 pub const BLZ_KV_BF16: c_int = 2;
+pub const BLZ_KV_TQ3: c_int = 3;
 
 unsafe extern "C" {
     pub fn blz_nvfp4_kv_store(k: *const c_void, v: *const c_void, k_stride: i64, v_stride: i64, dtype: c_int,
@@ -290,6 +291,9 @@ unsafe extern "C" {
                        tokens: i64, dim: c_int, kind: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rht_inverse_mul_sigmoid(x: *mut bf16, gate: *const bf16, tokens: i64, heads: c_int, dim: c_int, kind: c_int,
                                        s: cudaStream_t) -> cudaError_t;
+    pub fn blz_tq3_kv_store(k: *const c_void, v: *const c_void, k_stride: i64, v_stride: i64, loc: *const c_void, loc_type: c_int,
+                            tokens: i64, heads: c_int, dim: c_int, k_data: *mut u8, v_data: *mut u8, k_scale: *mut u8, v_scale: *mut u8,
+                            s: cudaStream_t) -> cudaError_t;
     pub fn blz_kv_store_dense(k: *const c_void, v: *const c_void, k_stride: i64, v_stride: i64, loc: *const c_void,
                               loc_type: c_int, tokens: i64, heads: c_int, dim: c_int, format: c_int, k_data: *mut u8,
                               v_data: *mut u8, k_g: *const f32, v_g: *const f32, s: cudaStream_t) -> cudaError_t;

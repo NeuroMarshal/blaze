@@ -118,7 +118,8 @@ struct EngineArgs {
     /// experts in NVFP4 (Flash Next: an NVFP4 MTP checkpoint; its own MTP experts are BF16)
     #[arg(long)]
     mtp_model: Option<PathBuf>,
-    /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
+    /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3), bf16, or tq3 (TurboQuant-style 3 bits a value
+    /// of the rotated rows: KV 32% smaller than NVFP4, coarser)
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
     /// keep K and V rotated in the cache, Q rotated the same way and the output rotated back (outlier channels spread

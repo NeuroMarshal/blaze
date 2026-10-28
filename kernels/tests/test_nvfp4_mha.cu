@@ -19,6 +19,7 @@
 #include "blaze/kv.h"
 #include "blaze/mha.h"
 #include "blaze/nvfp4.h"
+#include "blaze/tq3.h"
 #include "blaze/ops.h"
 
 #define CHECK_CUDA(x)                                                                              \
@@ -73,7 +74,11 @@ struct Pool {
     const auto& data = v ? vd : kd;
     const float g = v ? vg : kg;
     float x;
-    if (format == BLZ_KV_FP8) {
+    if (format == BLZ_KV_TQ3) {
+      uint16_t sc;
+      std::memcpy(&sc, &(v ? vs : ks)[size_t(row) * 2], 2);
+      return blaze::tq3_value_ref(&data[size_t(row) * blaze::kTq3RowBytes], sc, d) * g;  // an FP16 value, as the kernel's
+    } else if (format == BLZ_KV_FP8) {
       x = e4m3_value(data[row * kDim + d]) * g;
     } else if (format == BLZ_KV_BF16) {
       uint16_t b;
@@ -106,6 +111,21 @@ struct Pool {
 Pool make_pool(int slots, int heads, std::mt19937& rng, int format = BLZ_KV_NVFP4) {
   Pool p{slots, heads, format};
   std::normal_distribution<float> n01;
+  if (format == BLZ_KV_TQ3) {
+    const size_t rows = size_t(slots) * heads;
+    p.kd.resize(rows * blaze::kTq3RowBytes), p.vd.resize(p.kd.size());
+    p.ks.resize(rows * 2), p.vs.resize(p.ks.size());
+    std::vector<float> row(kDim);
+    for (size_t r = 0; r < rows; ++r)
+      for (int side = 0; side < 2; ++side) {
+        for (auto& x : row) x = n01(rng) * 2.0f / (side ? p.vg : p.kg);
+        uint16_t sc;
+        blaze::tq3_quantize_row_ref(row.data(), &(side ? p.vd : p.kd)[r * blaze::kTq3RowBytes], &sc);
+        std::memcpy(&(side ? p.vs : p.ks)[r * 2], &sc, 2);
+      }
+    p.cache_reference();
+    return p;
+  }
   if (format != BLZ_KV_NVFP4) {
     const size_t n = size_t(slots) * heads * kDim;
     p.kd.resize(n * (format == BLZ_KV_BF16 ? 2 : 1)), p.vd.resize(p.kd.size());
@@ -148,7 +168,48 @@ struct DevPool {
   }
 };
 
-const char* format_name(int f) { return f == BLZ_KV_FP8 ? "fp8" : f == BLZ_KV_BF16 ? "bf16" : "nvfp4"; }
+const char* format_name(int f) {
+  return f == BLZ_KV_FP8 ? "fp8" : f == BLZ_KV_BF16 ? "bf16" : f == BLZ_KV_TQ3 ? "tq3" : "nvfp4";
+}
+
+// TQ3 store: bf16 rows (strided, some slots skipped) against the CPU reference quantizer; the row scale may differ by
+// an FP16 step (the GPU sums in float), a magnitude only where |x| / rms sits at a cut.
+void test_store_tq3(std::mt19937& rng) {
+  const int heads = 2, tokens = 37, slots = 100, stride = heads * kDim + 64;
+  std::normal_distribution<float> n01;
+  std::vector<__nv_bfloat16> k(size_t(tokens) * stride), v(k.size());
+  for (auto& x : k) x = __float2bfloat16(n01(rng) * 3.0f);
+  for (auto& x : v) x = __float2bfloat16(n01(rng) * 0.05f);
+  std::vector<int32_t> loc(tokens);
+  for (int t = 0; t < tokens; ++t) loc[t] = t % 7 == 3 ? -1 : (t * 13) % slots;
+  Dev<__nv_bfloat16> dk(k), dv(v);
+  Dev<int32_t> dl(loc);
+  Dev<uint8_t> kd(size_t(slots) * heads * blaze::kTq3RowBytes), vd(kd.n), ks(size_t(slots) * heads * 2), vs(ks.n);
+  CHECK_CUDA(blz_tq3_kv_store(dk.ptr, dv.ptr, stride, stride, dl.ptr, BLZ_I32, tokens, heads, kDim, kd.ptr, vd.ptr,
+                              ks.ptr, vs.ptr, nullptr));
+  const auto hk = kd.get(), hv = vd.get(), hks = ks.get(), hvs = vs.get();
+  size_t bad_codes = 0, bad_scale = 0, total = 0;
+  std::vector<float> row(kDim);
+  uint8_t codes[blaze::kTq3RowBytes];
+  for (int t = 0; t < tokens; ++t) {
+    if (loc[t] < 0) continue;
+    for (int side = 0; side < 2; ++side)
+      for (int h = 0; h < heads; ++h) {
+        for (int d = 0; d < kDim; ++d) row[d] = __bfloat162float((side ? v : k)[size_t(t) * stride + h * kDim + d]);
+        uint16_t sc, got;
+        blaze::tq3_quantize_row_ref(row.data(), codes, &sc);
+        const size_t r = size_t(loc[t]) * heads + h;
+        std::memcpy(&got, &(side ? hvs : hks)[r * 2], 2);
+        bad_scale += std::abs(int(got) - int(sc)) > 1;
+        for (int i = 0; i < blaze::kTq3RowBytes; ++i) bad_codes += codes[i] != (side ? hv : hk)[r * blaze::kTq3RowBytes + i];
+        total += blaze::kTq3RowBytes;
+      }
+  }
+  const bool ok = bad_scale == 0 && bad_codes * 1000 <= total;
+  std::printf("store tq3: %zu of %zu code bytes differ, %zu scales off by more than an FP16 step %s\n", bad_codes,
+              total, bad_scale, ok ? "ok" : "FAIL");
+  g_failures += !ok;
+}
 
 // FP8 / BF16 store: bf16 rows (strided, some slots skipped) against a CPU conversion.
 void test_store_dense(int format, std::mt19937& rng) {
@@ -598,6 +659,19 @@ int main() {
     std::printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
   }
+  if (std::getenv("BLAZE_MHA_TQ3_CHECK")) {
+    test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 16, rng, BLZ_KV_TQ3);
+    test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng, BLZ_KV_TQ3);
+    test_case("verify 9 tokens, GQA 6, lengths 9 / 33 / 4100", 2, 6, 9, {9, 33, 4100}, 12, rng, BLZ_KV_TQ3);
+    test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng, BLZ_KV_TQ3);
+    test_case("decode, GQA 16, length 777", 1, 16, 1, {777}, 3, rng, BLZ_KV_TQ3);
+    test_store_tq3(rng);
+    blz_mha_set_f16_accumulate(1);
+    test_case("verify 8 tokens, GQA 6, FP16 accumulation", 2, 6, 8, {8, 2500}, 8, rng, BLZ_KV_TQ3);
+    blz_mha_set_f16_accumulate(0);
+    std::printf("%s\n", g_failures ? "FAILED" : "all passed");
+    return g_failures ? 1 : 0;
+  }
   if (std::getenv("BLAZE_MHA_ROTATION_CHECK")) {
     for (int kind = 0; kind < 4; ++kind) test_rotation(rng, kind);
     std::printf("%s\n", g_failures ? "FAILED" : "all passed");
@@ -683,12 +757,13 @@ int main() {
   test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng);
   test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng);
   test_case("decode, GQA 16, length 777", 1, 16, 1, {777}, 3, rng);
-  for (int f : {BLZ_KV_FP8, BLZ_KV_BF16}) {
+  for (int f : {BLZ_KV_FP8, BLZ_KV_BF16, BLZ_KV_TQ3}) {
     test_case("decode, GQA 6, lengths 1 / 37 / 3000", 2, 6, 1, {1, 37, 3000}, 16, rng, f);
     test_case("verify 8 tokens, GQA 6, lengths 8 / 2500", 2, 6, 8, {8, 2500}, 8, rng, f);
     test_case("verify 3 tokens, GQA 8, lengths 40 / 1200", 1, 8, 3, {40, 1200}, 5, rng, f);
     test_case("decode, GQA 16, length 777", 1, 16, 1, {777}, 3, rng, f);
-    test_store_dense(f, rng);
+    if (f == BLZ_KV_TQ3) test_store_tq3(rng);
+    else test_store_dense(f, rng);
   }
   test_window("decode, MHA 8 heads, lengths 1 / 300 / 9000", 8, 1, {1, 300, 9000}, 4096, 16, rng);
   test_window("verify 9 tokens, lengths 9 / 5000", 8, 9, {9, 5000}, 4096, 8, rng);

@@ -31,6 +31,7 @@
 #include "fa_tile.cuh"
 #include "nvfp4_attn.cuh"
 #include "blaze/mha.h"
+#include "blaze/tq3.h"
 
 namespace blaze {
 namespace {
@@ -171,10 +172,28 @@ struct ChunkV8 {
 };
 struct NoChunk {};
 
+// TQ3 chunks (blaze/tq3.h): K: group c's 24 code bytes of positions gr and 8 + gr (magnitude words 0..3, sign words
+// 4, 5) and their FP16 scales; V: the half of group gr / 2 with dims 32 gr .. 32 gr + 31 (8 magnitude bytes, 4 sign
+// bytes) of positions 2c, 2c + 1, 2c + 8, 2c + 9 and their scales.
+struct ChunkKT {
+  uint32_t w[2][6];
+  uint32_t sc[2];
+};
+struct ChunkVT {
+  uint32_t m[4][2];
+  uint32_t sg[4];
+  uint32_t sc[4];
+};
+
 template <int F>
 struct Chunks {
   using K = NoChunk;
   using V = NoChunk;
+};
+template <>
+struct Chunks<BLZ_KV_TQ3> {
+  using K = ChunkKT;
+  using V = ChunkVT;
 };
 template <>
 struct Chunks<BLZ_KV_NVFP4> {
@@ -195,6 +214,14 @@ __device__ __forceinline__ void load_k_any(const blz_nvfp4_pool& pool, int64_t r
     const uint4* src = reinterpret_cast<const uint4*>(pool.k_data + row * kDim + 64 * c);
 #pragma unroll
     for (int j = 0; j < 4; ++j) k.c[n][j] = row < 0 ? make_uint4(0, 0, 0, 0) : __ldg(src + j);
+  } else if constexpr (F == BLZ_KV_TQ3) {
+    const uint2* src = reinterpret_cast<const uint2*>(pool.k_data + row * kTq3RowBytes + kTq3GroupBytes * c);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+      const uint2 u = row < 0 ? make_uint2(0, 0) : __ldg(src + j);
+      k.w[n][2 * j] = u.x, k.w[n][2 * j + 1] = u.y;
+    }
+    k.sc[n] = row < 0 ? 0u : __ldg(reinterpret_cast<const uint16_t*>(pool.k_scale) + row);
   }
 }
 
@@ -206,6 +233,16 @@ __device__ __forceinline__ void load_v_any(const blz_nvfp4_pool& pool, int64_t r
     const uint4* src = reinterpret_cast<const uint4*>(pool.v_data + row * kDim + 32 * gr);
 #pragma unroll
     for (int j = 0; j < 2; ++j) v.c[i][j] = row < 0 ? make_uint4(0, 0, 0, 0) : __ldg(src + j);
+  } else if constexpr (F == BLZ_KV_TQ3) {
+    if (row < 0) {
+      v.m[i][0] = v.m[i][1] = v.sg[i] = v.sc[i] = 0;
+      return;
+    }
+    const uint8_t* g = pool.v_data + row * kTq3RowBytes + kTq3GroupBytes * (gr / 2);
+    const uint2 m = __ldg(reinterpret_cast<const uint2*>(g + 8 * (gr % 2)));
+    v.m[i][0] = m.x, v.m[i][1] = m.y;
+    v.sg[i] = __ldg(reinterpret_cast<const uint32_t*>(g + 16 + 4 * (gr % 2)));
+    v.sc[i] = __ldg(reinterpret_cast<const uint16_t*>(pool.v_scale) + row);
   }
 }
 
@@ -321,6 +358,9 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
         for (int n = 0; n < 2; ++n)
 #pragma unroll
           for (int j = 0; j < 4; ++j) ks[n][j] = scale_h2(kc.sc[n] >> (8 * j));
+      } else if constexpr (F == BLZ_KV_TQ3) {
+#pragma unroll
+        for (int n = 0; n < 2; ++n) ks[n][0] = __half2half2(__ushort_as_half(uint16_t(kc.sc[n])));
       }
       int64_t krow[2] = {-1, -1};
       if constexpr (F == BLZ_KV_BF16) {
@@ -350,6 +390,11 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
             const uint32_t w = word_of(kc.c[n][ks_ / 4], ks_ % 4);
             b0 = h2_bits(e4m3x2_to_f16x2(w));
             b1 = h2_bits(e4m3x2_to_f16x2(w >> 16));
+          } else if constexpr (F == BLZ_KV_TQ3) {
+            // dims 64c + 4 ks_ .. + 3: magnitude byte ks_ and sign nibble ks_ of group c
+            const uint32_t mb = kc.w[n][ks_ / 4] >> (8 * (ks_ % 4)), sb = kc.w[n][4 + ks_ / 8] >> (4 * (ks_ % 8));
+            b0 = h2_bits(tq3_pair(mb, sb, ks[n][0]));
+            b1 = h2_bits(tq3_pair(mb >> 4, sb >> 2, ks[n][0]));
           } else {
             b0 = h2_bits(bf16x2_to_f16x2(word_of(kb[n], 2 * (ks_ & 1))));
             b1 = h2_bits(bf16x2_to_f16x2(word_of(kb[n], 2 * (ks_ & 1) + 1)));
@@ -447,6 +492,9 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
       if constexpr (F == BLZ_KV_NVFP4) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) vs[i] = scale_h2(vc.sc[i] >> (8 * half));
+      } else if constexpr (F == BLZ_KV_TQ3) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) vs[i] = __half2half2(__ushort_as_half(uint16_t(vc.sc[i])));
       }
       uint4 vb[4];  // BF16: dims (D/8) gr + 2j .. + 7 (pairs j .. j + 3) of the four positions
 #pragma unroll
@@ -465,6 +513,8 @@ __global__ void __launch_bounds__(32 * MT * KW) mha_decode_kernel(
             f[i] = __hmul2(e2m1x2_to_f16x2(word_of(vc.c[i], j / 4) >> (8 * (j % 4))), vs[i]);
           else if constexpr (F == BLZ_KV_FP8)
             f[i] = e4m3x2_to_f16x2(word_of(vc.c[i][j / 8], (j / 2) % 4) >> (16 * (j & 1)));
+          else if constexpr (F == BLZ_KV_TQ3)  // dims 32 gr + 2j, + 1: magnitude byte j / 2, sign nibble j / 2 of the half
+            f[i] = tq3_pair(vc.m[i][j / 8] >> (8 * ((j / 2) % 4) + 4 * (j % 2)), vc.sg[i] >> (4 * (j / 2) + 2 * (j % 2)), vs[i]);
           else
             f[i] = bf16x2_to_f16x2(word_of(vb[i], j % 4));
         }
@@ -606,7 +656,7 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
   if (tree_mask != nullptr && q_len > 64) return cudaErrorNotSupported;
   const bool dim_ok = pool.dim == 256 || (pool.dim == 128 && pool.format == BLZ_KV_BF16);
   if (dtype != BLZ_BF16 || !dim_ok || pool.heads <= 0 || q_heads <= 0 || q_heads % pool.heads != 0 || q_heads / pool.heads > 16 ||
-      batch < 0 || q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 || pool.format > BLZ_KV_BF16 || window < 0)
+      batch < 0 || q_len < 1 || splits < 1 || splits > 64 || pool.format < BLZ_KV_NVFP4 || pool.format > BLZ_KV_TQ3 || window < 0)
     return cudaErrorNotSupported;
   if (batch == 0) return cudaSuccess;
   // Both the final merge grid and query offsets use batch * q_len; reject an overflowing launch before enqueueing.
@@ -658,6 +708,8 @@ cudaError_t mha_launch(const void* q, int64_t q_stride_tok, int64_t q_stride_hea
     by_tiles(std::integral_constant<int, BLZ_KV_FP8>{}, D256{});
   else if (pool.format == BLZ_KV_BF16)
     by_tiles(std::integral_constant<int, BLZ_KV_BF16>{}, D256{});
+  else if (pool.format == BLZ_KV_TQ3)
+    by_tiles(std::integral_constant<int, BLZ_KV_TQ3>{}, D256{});
   else
     by_tiles(std::integral_constant<int, BLZ_KV_NVFP4>{}, D256{});
   cudaError_t err = cudaGetLastError();

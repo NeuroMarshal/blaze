@@ -14,6 +14,7 @@
 
 #include "blaze/kv.h"
 #include "blaze/nvfp4.h"
+#include "blaze/tq3.h"
 
 namespace blaze {
 namespace {
@@ -455,4 +456,78 @@ extern "C" cudaError_t blz_rht_inverse_mul_sigmoid(uint16_t* x, const uint16_t* 
   if (tokens < 0 || heads <= 0) return cudaErrorInvalidValue;
   const blaze::RhtRows a{reinterpret_cast<__nv_bfloat16*>(x), tokens * heads, heads, int64_t(heads) * dim, dim}, none{};
   return blaze::rht_launch(a, none, none, dim, 1, kind, reinterpret_cast<const __nv_bfloat16*>(gate), stream);
+}
+
+namespace blaze {
+namespace {
+
+// A warp a row (token, head, side): lane l holds dims 8l .. 8l + 7, its group l / 8's magnitude bytes 2 (l % 8), + 1
+// and sign byte 16 + l % 8.
+__global__ void tq3_store_kernel(const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+                                 int64_t k_stride, int64_t v_stride, const void* __restrict__ loc, int loc_i64,
+                                 int64_t tokens, int heads, uint8_t* __restrict__ k_data, uint8_t* __restrict__ v_data,
+                                 uint8_t* __restrict__ k_scale, uint8_t* __restrict__ v_scale) {
+  const int lane = threadIdx.x % 32;
+  const int64_t w = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  if (w >= tokens * heads * 2) return;
+  const int side = int(w & 1);
+  const int64_t th = w >> 1, t = th / heads;
+  const int h = int(th % heads);
+  const int64_t slot = loc_i64 ? static_cast<const int64_t*>(loc)[t] : int64_t(static_cast<const int32_t*>(loc)[t]);
+  if (slot < 0) return;
+  const __nv_bfloat16* src = (side ? v + t * v_stride : k + t * k_stride) + int64_t(h) * kTq3Dim + lane * 8;
+  const uint4 raw = *reinterpret_cast<const uint4*>(src);
+  const __nv_bfloat162* b2 = reinterpret_cast<const __nv_bfloat162*>(&raw);
+  float x[8], ss = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float2 f = __bfloat1622float2(b2[i]);
+    x[2 * i] = f.x, x[2 * i + 1] = f.y;
+    ss = fmaf(f.x, f.x, fmaf(f.y, f.y, ss));
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const int64_t row = slot * heads + h;
+  uint8_t* codes = (side ? v_data : k_data) + row * kTq3RowBytes + (lane / 8) * kTq3GroupBytes;
+  uint16_t* scale = reinterpret_cast<uint16_t*>(side ? v_scale : k_scale) + row;
+  const float rms = sqrtf(ss / kTq3Dim);
+  uint32_t mags = 0, signs = 0;
+  float num = 0.0f, den = 0.0f;
+  if (rms > 0.0f) {
+    const float inv = 1.0f / rms;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int m = tq3_magnitude(fabsf(x[i]) * inv);
+      const float level = m == 0 ? 0.245361328125f : m == 1 ? 0.7568359375f : m == 2 ? 1.3447265625f : 2.154296875f;
+      num = fmaf(fabsf(x[i]), level, num), den = fmaf(level, level, den);
+      mags |= uint32_t(m) << (2 * i);
+      signs |= uint32_t(x[i] < 0.0f) << i;
+    }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    num += __shfl_xor_sync(0xffffffffu, num, o);
+    den += __shfl_xor_sync(0xffffffffu, den, o);
+  }
+  *reinterpret_cast<uint16_t*>(codes + 2 * (lane % 8)) = uint16_t(mags);
+  codes[16 + lane % 8] = uint8_t(signs);
+  if (lane == 0) *scale = __half_as_ushort(__float2half_rn(den > 0.0f ? num / den : 0.0f));
+}
+
+}  // namespace
+}  // namespace blaze
+
+extern "C" cudaError_t blz_tq3_kv_store(const void* k, const void* v, int64_t k_stride, int64_t v_stride, const void* loc,
+                                        blz_index_t loc_type, int64_t tokens, int heads, int dim, uint8_t* k_data,
+                                        uint8_t* v_data, uint8_t* k_scale, uint8_t* v_scale, cudaStream_t stream) {
+  if (dim != blaze::kTq3Dim || tokens < 0 || heads <= 0 || k_stride % 8 || v_stride % 8 ||
+      reinterpret_cast<uintptr_t>(k) % 16 || reinterpret_cast<uintptr_t>(v) % 16)
+    return cudaErrorInvalidValue;
+  const int64_t warps = tokens * heads * 2;
+  if (warps == 0) return cudaSuccess;
+  const int per_block = 8;
+  blaze::tq3_store_kernel<<<static_cast<unsigned>((warps + per_block - 1) / per_block), 32 * per_block, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(k), static_cast<const __nv_bfloat16*>(v), k_stride, v_stride, loc,
+      loc_type == BLZ_I64, tokens, heads, k_data, v_data, k_scale, v_scale);
+  return cudaGetLastError();
 }

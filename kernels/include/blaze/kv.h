@@ -12,7 +12,8 @@ typedef enum { BLZ_BF16 = 0, BLZ_FP16 = 1 } blz_half_t;
 typedef enum { BLZ_I32 = 0, BLZ_I64 = 1 } blz_index_t;
 /// KV pool formats: NVFP4 (codes [slots, heads, dim/2] + E4M3 block scales [.., dim/16]); FP8 E4M3 and BF16 rows
 /// [slots, heads, dim] (no block scales). The per-layer global scales k_g / v_g apply to every format.
-typedef enum { BLZ_KV_NVFP4 = 0, BLZ_KV_FP8 = 1, BLZ_KV_BF16 = 2 } blz_kv_format_t;
+/// TQ3 (blaze/tq3.h): 3-bit codes of the rotated rows [slots, heads, 96 bytes] + an FP16 scale per row [slots, heads].
+typedef enum { BLZ_KV_NVFP4 = 0, BLZ_KV_FP8 = 1, BLZ_KV_BF16 = 2, BLZ_KV_TQ3 = 3 } blz_kv_format_t;
 
 /// \brief Quantize K and V rows to NVFP4 and scatter them into a paged pool.
 /// \param k,v          [tokens, heads, dim] 16-bit rows; the inner [heads, dim] block is contiguous
@@ -59,6 +60,12 @@ cudaError_t blz_rht_qkv(uint16_t* q, int q_heads, int64_t q_tok_stride, uint16_t
 /// output back from the rotated cache's basis and its output gate in one pass.
 cudaError_t blz_rht_inverse_mul_sigmoid(uint16_t* x, const uint16_t* gate, int64_t tokens, int heads, int dim,
                                         int kind, cudaStream_t stream);
+
+/// \brief Store bf16 K and V rows (already rotated: blz_rht_rows) into a TQ3 pool (blaze/tq3.h): codes [slots, heads,
+/// 96], FP16 scales [slots, heads]; dim 256; arguments otherwise as blz_nvfp4_kv_store.
+cudaError_t blz_tq3_kv_store(const void* k, const void* v, int64_t k_stride, int64_t v_stride, const void* loc,
+                             blz_index_t loc_type, int64_t tokens, int heads, int dim, uint8_t* k_data, uint8_t* v_data,
+                             uint8_t* k_scale, uint8_t* v_scale, cudaStream_t stream);
 
 /// \brief Dequantize `rows` contiguous NVFP4 rows of `dim` values into 16-bit output [rows, dim].
 cudaError_t blz_nvfp4_dequant(const uint8_t* data, const uint8_t* scale, const float* g, int64_t rows, int dim,

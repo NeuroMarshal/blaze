@@ -504,6 +504,11 @@ pub enum KvDtype {
     /// FP8 E4M3, per-layer scale 1
     Fp8,
     Bf16,
+    /// TurboQuant-style 3 bits a value (blaze/tq3.h): the rotated rows' Lloyd-Max codes of N(0, 1) and a least-squares
+    /// FP16 scale per row; 98 bytes a head vector against NVFP4's 144 (KV 32% smaller), coarser (MSE 0.035 of the
+    /// variance against NVFP4's ~0.008); needs --kv-rotate (Hadamard unless another kind is given), the register
+    /// attention kernel only (no FA2 / shared verify)
+    Tq3,
 }
 
 /// The KV pools of the `n_full` softmax layers ([K codes, V codes, K scales, V scales] each) and the QSA index keys,
@@ -557,7 +562,8 @@ impl std::str::FromStr for KvDtype {
             "nvfp4" => Self::Nvfp4,
             "fp8" | "fp8_e4m3" => Self::Fp8,
             "bf16" | "auto" | "bfloat16" => Self::Bf16,
-            _ => bail!("unknown KV cache dtype {s} (nvfp4_4over6, nvfp4, fp8, bf16)"),
+            "tq3" | "turboquant3" => Self::Tq3,
+            _ => bail!("unknown KV cache dtype {s} (nvfp4_4over6, nvfp4, fp8, bf16, tq3)"),
         })
     }
 }
@@ -568,6 +574,7 @@ impl KvDtype {
             Self::Nvfp4FourOverSix | Self::Nvfp4 => sys::BLZ_KV_NVFP4,
             Self::Fp8 => sys::BLZ_KV_FP8,
             Self::Bf16 => sys::BLZ_KV_BF16,
+            Self::Tq3 => sys::BLZ_KV_TQ3,
         }
     }
 
@@ -577,6 +584,7 @@ impl KvDtype {
             Self::Nvfp4FourOverSix | Self::Nvfp4 => (0.5, 1.0 / 16.0),
             Self::Fp8 => (1.0, 0.0),
             Self::Bf16 => (2.0, 0.0),
+            Self::Tq3 => (3.0 / 8.0, 2.0 / 256.0),
         }
     }
 }
@@ -1442,7 +1450,16 @@ impl Model {
         let paired_auto = crate::gpu::compute_capability() == (12, 0) && dims.heads / dims.kv_heads == 6;
         let verify_mode = opts.verify_attention.resolve(attn_f16, paired_auto);
         unsafe { sys::blz_mha_set_verify(verify_mode) };
-        let kv_rotate = opts.kv_rotate.kind().filter(|_| cfg.qsa.is_none() && matches!(cfg.attn.head_dim, 64 | 128 | 256 | 512));
+        let mut kv_rotate = opts.kv_rotate.kind().filter(|_| cfg.qsa.is_none() && matches!(cfg.attn.head_dim, 64 | 128 | 256 | 512));
+        if opts.kv_dtype == KvDtype::Tq3 {
+            ensure!(cfg.qsa.is_none() && cfg.attn.head_dim == 256, "--kv-cache-dtype tq3 needs dense softmax layers with a head of 256");
+            if kv_rotate.is_none() {
+                if tp.rank == 0 {
+                    eprintln!("blaze: --kv-cache-dtype tq3 quantizes rotated rows: --kv-rotate hadamard");
+                }
+                kv_rotate = Some(0);
+            }
+        }
         if !matches!(opts.kv_rotate, KvRotate::Off | KvRotate::Auto) && kv_rotate.is_none() && tp.rank == 0 {
             eprintln!("blaze: --kv-rotate needs dense softmax layers with a power-of-two head of 64..512: off");
         }
@@ -2923,6 +2940,9 @@ impl Model {
                         sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, pool[0].ptr(), pool[1].ptr(), pool[2].ptr(),
                         pool[3].ptr(), self.kv_global.ptr(), self.kv_global.ptr(),
                         (kvd == KvDtype::Nvfp4FourOverSix) as c_int, s.0),
+                    KvDtype::Tq3 => sys::blz_tq3_kv_store(k.cast(), v.cast(), ld as i64, ld as i64, self.meta_ptr::<i64>(m.locs).cast(),
+                                                         sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, pool[0].ptr(), pool[1].ptr(),
+                                                         pool[2].ptr(), pool[3].ptr(), s.0),
                     _ => sys::blz_kv_store_dense(k.cast(), v.cast(), ld as i64, ld as i64, self.meta_ptr::<i64>(m.locs).cast(),
                                                  sys::BLZ_I64, t as i64, kvh as c_int, hd as c_int, kvd.format(), pool[0].ptr(),
                                                  pool[1].ptr(), self.kv_global.ptr(), self.kv_global.ptr(), s.0),
