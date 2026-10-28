@@ -52,8 +52,9 @@ pub struct Linear {
     parts: Vec<Part>,
     pub n: usize,
     pub k: usize,
-    /// NVFP4 parts keep 16-bit inputs on many rows (W4A16) whatever the route: a projection whose output persists
-    /// (the KV cache, a recurrent state) is computed without the activations' FP4 rounding (Options::prefill_a16)
+    /// NVFP4 parts the W4A16 GEMM takes (their scales fit FP16) keep 16-bit inputs on many rows whatever the route: a
+    /// projection whose output persists (the KV cache, a recurrent state) is computed without the activations' FP4
+    /// rounding (Options::prefill_a16); other parts stay W4A4, since widening them every chunk costs far more
     pub a16: bool,
 }
 
@@ -520,6 +521,11 @@ impl Linear {
         v
     }
 
+    /// Whether --prefill-a16 changes this projection: some NVFP4 part the W4A16 GEMM can take.
+    pub fn a16_applies(&self) -> bool {
+        self.a16 && self.parts.iter().any(|p| matches!(p.store, Store::Nvfp4 { f16: true, .. }) && self.k % 128 == 0)
+    }
+
     /// Elements of the widest NVFP4 part (the scratch an input longer than the GEMV needs).
     pub fn scratch_elems(&self) -> usize {
         self.parts.iter().filter(|p| !matches!(p.store, Store::Bf16(_))).map(|p| p.n * self.k).max().unwrap_or(0)
@@ -538,8 +544,8 @@ impl Linear {
         for p in &self.parts {
             let o = unsafe { out.add(p.col) };
             match &p.store {
-                Store::Nvfp4 { codes, scales, alpha, act4, .. }
-                    if m > sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 && !self.a16 && ctx.use_w4a4(*act4)
+                Store::Nvfp4 { codes, scales, alpha, act4, f16, .. }
+                    if m > sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 && !(self.a16 && *f16) && ctx.use_w4a4(*act4)
                         && m * k / 2 + m * k / 16 + 4 * m + 256 <= ctx.scratch_elems * 2 =>
                 {
                     let (xc, xs, xr) = match xq {
@@ -592,7 +598,7 @@ impl Linear {
                             },
                             "blz_nvfp4_gemv",
                         )?;
-                    } else if ctx.use_gemm16(*f16, p.n, k) && m * k + 2 * m + 8 <= ctx.scratch_elems {
+                    } else if (ctx.use_gemm16(*f16, p.n, k) || self.a16 && *f16) && m * k + 2 * m + 8 <= ctx.scratch_elems {
                         // W4A16: the FP16 rows of x once for every part (x16 keyed by x and its rows)
                         let (xh, sh) = match x16g {
                             Some((key, rows, xh, sh)) if key == x && rows == m => (xh, sh),

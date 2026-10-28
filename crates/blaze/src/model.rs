@@ -1539,6 +1539,16 @@ impl Model {
         if let Some(auto) = model.opts.kv_auto.clone() {
             model.size_kv(&auto)?;
         }
+        if model.opts.prefill_a16 != PrefillA16::None && model.tp.rank == 0 {
+            let (mut on, mut all) = (0, 0);
+            for l in &model.layers {
+                for lin in [l.attn.as_ref().map(|a| &a.qkv), l.gdn.as_ref().map(|g| &g.in_proj)].into_iter().flatten() {
+                    all += lin.a16 as usize;
+                    on += lin.a16_applies() as usize;
+                }
+            }
+            eprintln!("blaze: --prefill-a16: {on} of {all} projections on the W4A16 GEMM (the others' scales leave FP16: W4A4)");
+        }
         let t1 = std::time::Instant::now();
         let measured = model.tune_attention()?;
         if model.tp.rank == 0 && !model.attn_policy.is_empty() {
