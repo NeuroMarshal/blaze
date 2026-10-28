@@ -58,21 +58,14 @@ __global__ void __launch_bounds__(kQuantThreads) quant_rows_kernel(const uint16_
       v[j] = bf16f(row[b * 16 + j]);
       bmax = fmaxf(bmax, fabsf(v[j]));
     }
-    // the KV store's scale search (blaze/nvfp4.h): the block's largest value at 6 or at 4 of the E2M1 grid, and the
-    // E4M3 codes kScaleSearchFirst..kScaleSearchLast steps from max/6's (one below clips the largest value, finer
-    // steps for the rest), the one with the smallest squared error (the first of equals)
-    const int lo6 = __nv_fp8_e4m3(bmax / (6.0f * s)).__x;  // round to nearest, saturating at 448
-    const int lo4 = __nv_fp8_e4m3(bmax / (4.0f * s)).__x;
+    // four over six: the block's largest value at 6 or at 4 of the E2M1 grid (4: finer steps for the rest, the
+    // largest exact), the one with the smaller squared error
     uint32_t lo = 0, hi = 0;
     __nv_fp8_e4m3 sc;
     float best = INFINITY;
 #pragma unroll
-    for (int c = 0; c < 2 + blaze::kScaleSearchLast - blaze::kScaleSearchFirst; ++c) {
-      const int step = blaze::kScaleSearchFirst + c - 2;
-      const int code = c == 0 ? lo6 : c == 1 ? lo4 : lo6 + step + (step >= 0);
-      if (code < 0 || code > 0x7E) continue;
-      __nv_fp8_e4m3 cand;
-      cand.__x = __nv_fp8_storage_t(code);
+    for (int c = 0; c < 2; ++c) {
+      const __nv_fp8_e4m3 cand(bmax / ((c ? 4.0f : 6.0f) * s));  // round to nearest, saturating at 448
       const float bs = float(cand) * s;
       const float inv = bs > 0.0f ? 1.0f / bs : 0.0f;
       uint32_t l = 0, h = 0;
