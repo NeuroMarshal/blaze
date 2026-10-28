@@ -363,10 +363,10 @@ pub struct Options {
     /// every live sequence may verify in the same step); 0: none.
     pub max_verify: usize,
     pub kv_dtype: KvDtype,
-    /// Keep K and V rotated in the cache (randomized Hadamard, blz_rht_rows), Q rotated the same way and the attention
-    /// output rotated back: the scores and output are those of the plain vectors, but a few large channels spread
-    /// over the whole head before the quantizer sees them (QuaRot, TurboQuant); dense attention models only.
-    pub kv_rotate: bool,
+    /// Keep K and V rotated in the cache (blz_rht_rows), Q rotated the same way and the attention output rotated back:
+    /// the scores and output are those of the plain vectors, but large channels spread before the quantizer sees them
+    /// (QuaRot, TurboQuant: Hadamard; RotorQuant's block rotations); dense attention models only.
+    pub kv_rotate: KvRotate,
     pub prefill_a16: PrefillA16,
     /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
     pub gemm: crate::linear::GemmRoute,
@@ -413,6 +413,33 @@ pub struct Options {
     /// The checkpoint of the MTP head (its `mtp.*` tensors; None: the target's own). A routed MTP layer's experts join the
     /// expert engine after the decoder layers (NVFP4, as the target's).
     pub mtp_model: Option<PathBuf>,
+}
+
+/// The rotation of the cached K and V (--kv-rotate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum KvRotate {
+    #[default]
+    Off,
+    /// randomized Hadamard over the whole head (QuaRot, TurboQuant): every value mixes with every other
+    Hadamard,
+    /// Givens rotations of pairs (RotorQuant's PlanarQuant)
+    Planar,
+    /// unit quaternions on groups of 4 (IsoQuant)
+    Iso,
+    /// 3D rotors of Cl(3,0) on groups of 3 (RotorQuant)
+    Rotor,
+}
+
+impl KvRotate {
+    fn kind(self) -> Option<c_int> {
+        match self {
+            Self::Off => None,
+            Self::Hadamard => Some(0),
+            Self::Planar => Some(1),
+            Self::Iso => Some(2),
+            Self::Rotor => Some(3),
+        }
+    }
 }
 
 /// Projections kept at 16-bit inputs on prefill under a W4A4 route (--prefill-a16): their outputs persist over the
@@ -911,8 +938,9 @@ pub struct Model {
     /// The verify kernel and splits of each query length of one request measured at load (attn_tune.rs; index
     /// q_len); empty or None: the built-in rules.
     attn_policy: Vec<Option<crate::attn_tune::Choice>>,
-    /// Options::kv_rotate where the model takes it (dense softmax layers, a power-of-two head of 64..512)
-    kv_rotate: bool,
+    /// Options::kv_rotate's blz_rht_rows kind where the model takes it (dense softmax layers, a power-of-two head of
+    /// 64..512)
+    kv_rotate: Option<c_int>,
     /// image rows of the step being enqueued (set by the engine's runner): the M-RoPE streams differ, and these
     /// embeddings replace the gathered token rows
     mrope_step: Cell<bool>,
@@ -1411,8 +1439,8 @@ impl Model {
         let paired_auto = crate::gpu::compute_capability() == (12, 0) && dims.heads / dims.kv_heads == 6;
         let verify_mode = opts.verify_attention.resolve(attn_f16, paired_auto);
         unsafe { sys::blz_mha_set_verify(verify_mode) };
-        let kv_rotate = opts.kv_rotate && cfg.qsa.is_none() && matches!(cfg.attn.head_dim, 64 | 128 | 256 | 512);
-        if opts.kv_rotate && !kv_rotate && tp.rank == 0 {
+        let kv_rotate = opts.kv_rotate.kind().filter(|_| cfg.qsa.is_none() && matches!(cfg.attn.head_dim, 64 | 128 | 256 | 512));
+        if opts.kv_rotate != KvRotate::Off && kv_rotate.is_none() && tp.rank == 0 {
             eprintln!("blaze: --kv-rotate needs dense softmax layers with a power-of-two head of 64..512: off");
         }
         let mut model = Self {
@@ -2875,10 +2903,10 @@ impl Model {
                                 \"v_offset\": {}, \"layers\": {}}}\n", heads * 2 * hd, heads * 2 * hd + kvh * hd, self.kv.len());
             let _ = std::fs::write(std::path::Path::new(&dir).join("attn_meta.json"), meta);
         }
-        if self.kv_rotate {
+        if let Some(kind) = self.kv_rotate {
             // the cache keeps K and V rotated, Q the same: the scores are those of the plain vectors
             check(
-                unsafe { sys::blz_rht_qkv(w.q.ptr(), heads as c_int, (heads * hd) as i64, k, v.cast_mut(), kvh as c_int, ld as i64, t as i64, hd as c_int, s.0) },
+                unsafe { sys::blz_rht_qkv(w.q.ptr(), heads as c_int, (heads * hd) as i64, k, v.cast_mut(), kvh as c_int, ld as i64, t as i64, hd as c_int, kind, s.0) },
                 "rotate q, k, v",
             )?;
         }
@@ -3152,8 +3180,8 @@ impl Model {
     /// under Options::kv_rotate (one pass).
     fn attn_gate(&self, t: usize) -> Result<()> {
         let (heads, hd, w, s) = (self.dims.heads, self.cfg.attn.head_dim, &self.work, &self.stream);
-        if self.kv_rotate {
-            check(unsafe { sys::blz_rht_inverse_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), t as i64, heads as c_int, hd as c_int, s.0) }, "unrotate + gate")
+        if let Some(kind) = self.kv_rotate {
+            check(unsafe { sys::blz_rht_inverse_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), t as i64, heads as c_int, hd as c_int, kind, s.0) }, "unrotate + gate")
         } else {
             check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")
         }
