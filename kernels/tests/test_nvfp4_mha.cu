@@ -19,6 +19,7 @@
 #include "blaze/kv.h"
 #include "blaze/mha.h"
 #include "blaze/nvfp4.h"
+#include "blaze/ops.h"
 
 #define CHECK_CUDA(x)                                                                              \
   do {                                                                                             \
@@ -530,11 +531,39 @@ void test_rotation(std::mt19937& rng) {
   const double rms = std::sqrt(ref2 / (double(nq) * n));
   e_plain = std::sqrt(e_plain / (double(nq) * n)) / rms, e_rot = std::sqrt(e_rot / (double(nq) * n)) / rms;
   dots /= std::sqrt(raw2 / (double(nq) * n));
-  const bool ok = trip < 2e-2 && dots < 2e-2 && e_rot < e_plain && std::isfinite(e_rot);
+  // the fused launches: Q, K, V in one (bit for bit the separate calls), the inverse with the output gate (within a
+  // bf16 rounding of the inverse followed by blz_mul_sigmoid)
+  bool fused = true;
+  {
+    const int t = 7, qh = 3, kvh = 2, ld = (qh + 2 * kvh) * kDim + 8;
+    std::vector<__nv_bfloat16> h(size_t(t) * ld);
+    for (auto& x : h) x = __float2bfloat16(nd(rng));
+    Dev<__nv_bfloat16> one(h), sep(h);
+    auto* p1 = reinterpret_cast<uint16_t*>(one.ptr);
+    auto* p2 = reinterpret_cast<uint16_t*>(sep.ptr);
+    CHECK_CUDA(blz_rht_qkv(p1, qh, ld, p1 + qh * kDim, p1 + (qh + kvh) * kDim, kvh, ld, t, kDim, nullptr));
+    CHECK_CUDA(blz_rht_rows(p2, t, qh, ld, kDim, kDim, 0, nullptr));
+    CHECK_CUDA(blz_rht_rows(p2 + qh * kDim, t, kvh, ld, kDim, kDim, 0, nullptr));
+    CHECK_CUDA(blz_rht_rows(p2 + (qh + kvh) * kDim, t, kvh, ld, kDim, kDim, 0, nullptr));
+    fused = std::memcmp(one.get().data(), sep.get().data(), h.size() * 2) == 0;
+    std::vector<__nv_bfloat16> x(size_t(t) * qh * kDim), gt(x.size());
+    for (auto& v : x) v = __float2bfloat16(nd(rng));
+    for (auto& v : gt) v = __float2bfloat16(nd(rng));
+    Dev<__nv_bfloat16> a(x), b(x), dg(gt);
+    auto* pa = reinterpret_cast<uint16_t*>(a.ptr);
+    auto* pb = reinterpret_cast<uint16_t*>(b.ptr);
+    CHECK_CUDA(blz_rht_inverse_mul_sigmoid(pa, reinterpret_cast<uint16_t*>(dg.ptr), t, qh, kDim, nullptr));
+    CHECK_CUDA(blz_rht_rows(pb, t, qh, qh * kDim, kDim, kDim, 1, nullptr));
+    CHECK_CUDA(blz_mul_sigmoid(pb, reinterpret_cast<uint16_t*>(dg.ptr), int64_t(x.size()), nullptr));
+    const auto ra = a.get(), rb = b.get();
+    for (size_t i = 0; i < ra.size(); ++i)
+      fused = fused && std::fabs(f(ra[i]) - f(rb[i])) <= 1e-2 * std::max(1.0, std::fabs(f(rb[i])));
+  }
+  const bool ok = trip < 2e-2 && dots < 2e-2 && e_rot < e_plain && std::isfinite(e_rot) && fused;
   g_failures += !ok;
   std::printf("rotated cache: round trip %.2e, dot products %.2e; NVFP4 error of the centred scores plain %.4f, rotated "
-              "%.4f %s\n", trip,
-              dots, e_plain, e_rot, ok ? "ok" : "FAIL");
+              "%.4f; fused launches %s %s\n", trip,
+              dots, e_plain, e_rot, fused ? "match" : "differ", ok ? "ok" : "FAIL");
 }
 
 void check_verify(int mode, std::mt19937& rng) {

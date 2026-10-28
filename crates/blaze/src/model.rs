@@ -2877,12 +2877,10 @@ impl Model {
         }
         if self.kv_rotate {
             // the cache keeps K and V rotated, Q the same: the scores are those of the plain vectors
-            let rot = |x: *mut u16, n: usize, tok: usize, what| {
-                check(unsafe { sys::blz_rht_rows(x, t as i64, n as c_int, tok as i64, hd as i64, hd as c_int, 0, s.0) }, what)
-            };
-            rot(w.q.ptr(), heads, heads * hd, "rotate q")?;
-            rot(k, kvh, ld, "rotate k")?;
-            rot(v.cast_mut(), kvh, ld, "rotate v")?;
+            check(
+                unsafe { sys::blz_rht_qkv(w.q.ptr(), heads as c_int, (heads * hd) as i64, k, v.cast_mut(), kvh as c_int, ld as i64, t as i64, hd as c_int, s.0) },
+                "rotate q, k, v",
+            )?;
         }
         let pool = &self.kv[layer.slot];
         let kvd = self.opts.kv_dtype;
@@ -3025,8 +3023,7 @@ impl Model {
                     }
                 }
             }
-            self.unrotate_attn(t)?;
-            check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
+            self.attn_gate(t)?;
             a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
             return self.prefetch_mlp(layer, t);
         }
@@ -3144,23 +3141,22 @@ impl Model {
                 unsafe { sys::blz_mha_set_verify(self.verify_mode) };
             }
         }
-        self.unrotate_attn(t)?;
+        // (in the cache's rotated basis under --kv-rotate)
         self.dump(&format!("attn_core_{}", layer.slot), w.attn.ptr(), t, heads * hd)?;
-        check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
+        self.attn_gate(t)?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
         self.prefetch_mlp(layer, t)
     }
 
-    /// The attention output of `t` rows back from the rotated basis of the cache (Options::kv_rotate).
-    fn unrotate_attn(&self, t: usize) -> Result<()> {
-        if !self.kv_rotate {
-            return Ok(());
+    /// The output gate of `t` attention rows: attn *= sigmoid(gate), after the rotation back from the cache's basis
+    /// under Options::kv_rotate (one pass).
+    fn attn_gate(&self, t: usize) -> Result<()> {
+        let (heads, hd, w, s) = (self.dims.heads, self.cfg.attn.head_dim, &self.work, &self.stream);
+        if self.kv_rotate {
+            check(unsafe { sys::blz_rht_inverse_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), t as i64, heads as c_int, hd as c_int, s.0) }, "unrotate + gate")
+        } else {
+            check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")
         }
-        let (heads, hd) = (self.dims.heads, self.cfg.attn.head_dim);
-        check(
-            unsafe { sys::blz_rht_rows(self.work.attn.ptr(), t as i64, heads as c_int, (heads * hd) as i64, hd as i64, hd as c_int, 1, self.stream.0) },
-            "unrotate attention",
-        )
     }
 
     /// Measure the dense decode / verify kernels and splits for every query length of one request up to the longest

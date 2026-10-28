@@ -275,15 +275,31 @@ __device__ __forceinline__ float rht_sign(int i) {
   return (x & 1u) ? -1.0f : 1.0f;
 }
 
+// Rows of one tensor for the rotation: row r is (token r / heads, head r % heads).
+struct RhtRows {
+  __nv_bfloat16* x;
+  int64_t rows;
+  int heads;
+  int64_t tok_stride, head_stride;
+};
+
 // A warp a row of 32 E values: lane l holds elements l E .. l E + E - 1; the butterflies of the low log2 E index bits
-// run in registers, those of the lane bits through shuffles.
+// run in registers, those of the lane bits through shuffles. Up to three tensors' rows in one launch (one after the
+// other); `gate` (inverse, one dense tensor): the result times sigmoid(gate) of the same element.
 template <int E>
-__global__ void rht_kernel(__nv_bfloat16* x, int64_t rows, int heads, int64_t tok_stride, int64_t head_stride,
-                           int inverse) {
+__global__ void rht_kernel(RhtRows a, RhtRows b, RhtRows c, int inverse, const __nv_bfloat16* __restrict__ gate) {
   const int lane = threadIdx.x % 32;
-  const int64_t row = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
-  if (row >= rows) return;
-  __nv_bfloat16* p = x + (row / heads) * tok_stride + (row % heads) * head_stride + lane * E;
+  int64_t row = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  const RhtRows* t = &a;
+  if (row >= a.rows) {
+    row -= a.rows, t = &b;
+    if (row >= b.rows) {
+      row -= b.rows, t = &c;
+      if (row >= c.rows) return;
+    }
+  }
+  const int64_t off = (row / t->heads) * t->tok_stride + (row % t->heads) * t->head_stride + lane * E;
+  __nv_bfloat16* p = t->x + off;
   float v[E];
 #pragma unroll
   for (int e = 0; e < E; e += 2) {
@@ -299,8 +315,8 @@ __global__ void rht_kernel(__nv_bfloat16* x, int64_t rows, int heads, int64_t to
 #pragma unroll
     for (int e = 0; e < E; ++e)
       if (!(e & m)) {
-        const float a = v[e], b = v[e + m];
-        v[e] = a + b, v[e + m] = a - b;
+        const float x0 = v[e], x1 = v[e + m];
+        v[e] = x0 + x1, v[e + m] = x0 - x1;
       }
 #pragma unroll
   for (int m = 1; m < 32; m <<= 1) {
@@ -314,9 +330,33 @@ __global__ void rht_kernel(__nv_bfloat16* x, int64_t rows, int heads, int64_t to
   const float norm = rsqrtf(float(32 * E));
 #pragma unroll
   for (int e = 0; e < E; ++e) v[e] *= inverse ? norm * rht_sign(lane * E + e) : norm;
+  if (gate != nullptr) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) v[e] *= 1.0f / (1.0f + __expf(-__bfloat162float(gate[off + e])));
+  }
 #pragma unroll
   for (int e = 0; e < E; e += 2)
     *reinterpret_cast<__nv_bfloat162*>(p + e) = __floats2bfloat162_rn(v[e], v[e + 1]);
+}
+
+cudaError_t rht_launch(RhtRows a, RhtRows b, RhtRows c, int dim, int inverse, const __nv_bfloat16* gate,
+                       cudaStream_t stream) {
+  for (const RhtRows* t : {&a, &b, &c})
+    if (t->rows < 0 || (t->rows > 0 && (t->heads <= 0 || t->tok_stride % 2 || t->head_stride % 2 ||
+                                        reinterpret_cast<uintptr_t>(t->x) % 4)))
+      return cudaErrorInvalidValue;
+  const int64_t rows = a.rows + b.rows + c.rows;
+  if (rows == 0) return cudaSuccess;
+  const int warps = 8;
+  const dim3 grid(static_cast<unsigned>((rows + warps - 1) / warps));
+  switch (dim) {
+    case 64: rht_kernel<2><<<grid, 32 * warps, 0, stream>>>(a, b, c, inverse, gate); break;
+    case 128: rht_kernel<4><<<grid, 32 * warps, 0, stream>>>(a, b, c, inverse, gate); break;
+    case 256: rht_kernel<8><<<grid, 32 * warps, 0, stream>>>(a, b, c, inverse, gate); break;
+    case 512: rht_kernel<16><<<grid, 32 * warps, 0, stream>>>(a, b, c, inverse, gate); break;
+    default: return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
 }
 
 }  // namespace
@@ -324,19 +364,24 @@ __global__ void rht_kernel(__nv_bfloat16* x, int64_t rows, int heads, int64_t to
 
 extern "C" cudaError_t blz_rht_rows(uint16_t* x, int64_t tokens, int heads, int64_t tok_stride, int64_t head_stride,
                                     int dim, int inverse, cudaStream_t stream) {
-  if (tokens < 0 || heads <= 0 || tok_stride % 2 || head_stride % 2 || reinterpret_cast<uintptr_t>(x) % 4)
-    return cudaErrorInvalidValue;
-  const int64_t rows = tokens * heads;
-  if (rows == 0) return cudaSuccess;
-  const int warps = 8;
-  const dim3 grid(static_cast<unsigned>((rows + warps - 1) / warps));
-  auto* p = reinterpret_cast<__nv_bfloat16*>(x);
-  switch (dim) {
-    case 64: blaze::rht_kernel<2><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
-    case 128: blaze::rht_kernel<4><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
-    case 256: blaze::rht_kernel<8><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
-    case 512: blaze::rht_kernel<16><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
-    default: return cudaErrorInvalidValue;
-  }
-  return cudaGetLastError();
+  if (tokens < 0 || heads <= 0) return cudaErrorInvalidValue;
+  const blaze::RhtRows a{reinterpret_cast<__nv_bfloat16*>(x), tokens * heads, heads, tok_stride, head_stride}, none{};
+  return blaze::rht_launch(a, none, none, dim, inverse, nullptr, stream);
+}
+
+extern "C" cudaError_t blz_rht_qkv(uint16_t* q, int q_heads, int64_t q_tok_stride, uint16_t* k, uint16_t* v, int kv_heads,
+                                   int64_t kv_tok_stride, int64_t tokens, int dim, cudaStream_t stream) {
+  if (tokens < 0 || q_heads <= 0 || kv_heads <= 0) return cudaErrorInvalidValue;
+  using blaze::RhtRows;
+  const RhtRows a{reinterpret_cast<__nv_bfloat16*>(q), tokens * q_heads, q_heads, q_tok_stride, dim},
+      b{reinterpret_cast<__nv_bfloat16*>(k), tokens * kv_heads, kv_heads, kv_tok_stride, dim},
+      c{reinterpret_cast<__nv_bfloat16*>(v), tokens * kv_heads, kv_heads, kv_tok_stride, dim};
+  return blaze::rht_launch(a, b, c, dim, 0, nullptr, stream);
+}
+
+extern "C" cudaError_t blz_rht_inverse_mul_sigmoid(uint16_t* x, const uint16_t* gate, int64_t tokens, int heads, int dim,
+                                                   cudaStream_t stream) {
+  if (tokens < 0 || heads <= 0) return cudaErrorInvalidValue;
+  const blaze::RhtRows a{reinterpret_cast<__nv_bfloat16*>(x), tokens * heads, heads, int64_t(heads) * dim, dim}, none{};
+  return blaze::rht_launch(a, none, none, dim, 1, reinterpret_cast<const __nv_bfloat16*>(gate), stream);
 }

@@ -380,6 +380,9 @@ enum Command {
         /// tokens per forward (the logits of a whole chunk are kept)
         #[arg(long, default_value_t = 512)]
         score_chunk: usize,
+        /// the last this many tokens one forward each (the decode path, as generation after a prefilled prompt)
+        #[arg(long, default_value_t = 0)]
+        decode_tail: usize,
     },
     /// Test of the speculative verify / commit path: greedy reference decode, then the same continuation through
     /// verify rounds whose drafts are the reference with a wrong token every few positions; outputs must match.
@@ -590,13 +593,14 @@ fn main() -> Result<()> {
         Command::VisionCheck { model, reference, gpu, cpu, threads, image } => {
             blaze::vision::check_reference(&model, &reference, gpu, cpu, threads, image.as_deref())
         }
-        Command::Score { engine, text_file, score_chunk: chunk } => {
+        Command::Score { engine, text_file, score_chunk: chunk, decode_tail } => {
             let text = blaze::text::Text::load(&engine.model)?;
             let ids: Vec<i64> = text.encode(&std::fs::read_to_string(&text_file)?)?.into_iter().map(i64::from).collect();
             let mut e = engine.load(Some(chunk), true)?;
             let mut seq = e.open()?;
             let mut pos = 0;
-            for c in ids.chunks(chunk) {
+            let head = ids.len().saturating_sub(decode_tail);
+            for c in ids[..head].chunks(chunk).chain(ids[head..].chunks(1)) {
                 let logits = e.score_chunk(&mut seq, c)?;
                 for (i, row) in logits.iter().enumerate() {
                     let p = pos + i;

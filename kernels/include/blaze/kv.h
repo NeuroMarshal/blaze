@@ -47,6 +47,16 @@ cudaError_t blz_kv_store_dense(const void* k, const void* v, int64_t k_stride, i
 cudaError_t blz_rht_rows(uint16_t* x, int64_t tokens, int heads, int64_t tok_stride, int64_t head_stride, int dim,
                          int inverse, cudaStream_t stream);
 
+/// \brief The forward rotation of Q [tokens, q_heads, dim] (rows q_tok_stride apart) and of K and V [tokens, kv_heads,
+/// dim] (rows kv_tok_stride apart) in one launch.
+cudaError_t blz_rht_qkv(uint16_t* q, int q_heads, int64_t q_tok_stride, uint16_t* k, uint16_t* v, int kv_heads,
+                        int64_t kv_tok_stride, int64_t tokens, int dim, cudaStream_t stream);
+
+/// \brief x <- inverse rotation of x, times sigmoid(gate) (x and gate dense [tokens, heads, dim]): the attention
+/// output back from the rotated cache's basis and its output gate in one pass.
+cudaError_t blz_rht_inverse_mul_sigmoid(uint16_t* x, const uint16_t* gate, int64_t tokens, int heads, int dim,
+                                        cudaStream_t stream);
+
 /// \brief Dequantize `rows` contiguous NVFP4 rows of `dim` values into 16-bit output [rows, dim].
 cudaError_t blz_nvfp4_dequant(const uint8_t* data, const uint8_t* scale, const float* g, int64_t rows, int dim,
                               blz_half_t out_dtype, void* out, cudaStream_t stream);

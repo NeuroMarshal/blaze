@@ -286,6 +286,9 @@ unsafe extern "C" {
                               v_g: *const f32, four_over_six: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_rht_rows(x: *mut bf16, tokens: i64, heads: c_int, tok_stride: i64, head_stride: i64, dim: c_int, inverse: c_int,
                         s: cudaStream_t) -> cudaError_t;
+    pub fn blz_rht_qkv(q: *mut bf16, q_heads: c_int, q_tok_stride: i64, k: *mut bf16, v: *mut bf16, kv_heads: c_int, kv_tok_stride: i64,
+                       tokens: i64, dim: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_rht_inverse_mul_sigmoid(x: *mut bf16, gate: *const bf16, tokens: i64, heads: c_int, dim: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_kv_store_dense(k: *const c_void, v: *const c_void, k_stride: i64, v_stride: i64, loc: *const c_void,
                               loc_type: c_int, tokens: i64, heads: c_int, dim: c_int, format: c_int, k_data: *mut u8,
                               v_data: *mut u8, k_g: *const f32, v_g: *const f32, s: cudaStream_t) -> cudaError_t;
