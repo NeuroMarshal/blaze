@@ -456,6 +456,87 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int for
               ctx / 1000, splits, us, bytes / us / 1e3);
 }
 
+// The rotated cache (blz_rht_rows): the inverse undoes the forward and dot products stay. Then keys with a few large
+// channels nearly constant over positions (as LLM keys have) plus the varying part: the softmax sees only the scores'
+// differences between keys (centred per query), and those lose more to NVFP4 unrotated (a block holding a large
+// channel scales its 15 small ones away) than rotated. Both errors are printed.
+void test_rotation(std::mt19937& rng) {
+  const int n = 512, nq = 64;
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<__nv_bfloat16> k(size_t(n) * kDim), q(size_t(nq) * kDim);
+  for (int r = 0; r < n; ++r)
+    for (int d = 0; d < kDim; ++d) k[size_t(r) * kDim + d] = __float2bfloat16(nd(rng) + (d % 64 == 5 ? 40.0f : 0.0f));
+  for (auto& x : q) x = __float2bfloat16(nd(rng));
+  auto f = [](__nv_bfloat16 x) { return double(__bfloat162float(x)); };
+  Dev<__nv_bfloat16> dk(k), dq(q);
+  auto rot = [](Dev<__nv_bfloat16>& x, int rows, int inverse) {
+    CHECK_CUDA(blz_rht_rows(reinterpret_cast<uint16_t*>(x.ptr), rows, 1, kDim, kDim, kDim, inverse, nullptr));
+  };
+  rot(dk, n, 0);
+  rot(dq, nq, 0);
+  const auto rk = dk.get(), rq = dq.get();
+  rot(dk, n, 1);
+  const auto back = dk.get();
+  double trip = 0, dots = 0;
+  for (int r = 0; r < n; ++r) {
+    double norm = 0;
+    for (int d = 0; d < kDim; ++d) norm += f(k[size_t(r) * kDim + d]) * f(k[size_t(r) * kDim + d]);
+    for (int d = 0; d < kDim; ++d)
+      trip = std::max(trip, std::fabs(f(back[size_t(r) * kDim + d]) - f(k[size_t(r) * kDim + d])) / std::sqrt(norm / kDim));
+  }
+  // NVFP4 of the plain and the rotated keys, decoded back
+  auto quantized = [&](const std::vector<__nv_bfloat16>& rows) {
+    Dev<__nv_bfloat16> src(rows), out(rows.size());
+    std::vector<int64_t> loc(n);
+    for (int i = 0; i < n; ++i) loc[i] = i;
+    Dev<int64_t> dloc(loc);
+    Dev<uint8_t> kd(size_t(n) * kDim / 2), vd(kd.n), ks(size_t(n) * kDim / 16), vs(ks.n);
+    Dev<float> g(std::vector<float>{1.0f});
+    CHECK_CUDA(blz_nvfp4_kv_store(src.ptr, src.ptr, kDim, kDim, BLZ_BF16, dloc.ptr, BLZ_I64, n, 1, kDim, kd.ptr, vd.ptr,
+                                  ks.ptr, vs.ptr, g.ptr, g.ptr, 1, nullptr));
+    CHECK_CUDA(blz_nvfp4_dequant(kd.ptr, ks.ptr, g.ptr, n, kDim, BLZ_BF16, out.ptr, nullptr));
+    return out.get();
+  };
+  const auto qk = quantized(k), qrk = quantized(rk);
+  double e_plain = 0, e_rot = 0, ref2 = 0, raw2 = 0;
+  std::vector<double> exact(n), plain(n), rotated(n);
+  auto centre = [](std::vector<double>& x) {
+    double m = 0;
+    for (double v : x) m += v;
+    m /= double(x.size());
+    for (double& v : x) v -= m;
+  };
+  for (int i = 0; i < nq; ++i) {
+    for (int r = 0; r < n; ++r) {
+      double e = 0, rdot = 0, p = 0, rr = 0;
+      for (int d = 0; d < kDim; ++d) {
+        const size_t a = size_t(i) * kDim + d, b = size_t(r) * kDim + d;
+        e += f(q[a]) * f(k[b]);
+        rdot += f(rq[a]) * f(rk[b]);
+        p += f(q[a]) * f(qk[b]);
+        rr += f(rq[a]) * f(qrk[b]);
+      }
+      raw2 += e * e;
+      dots = std::max(dots, std::fabs(rdot - e));
+      exact[r] = e, plain[r] = p, rotated[r] = rr;
+    }
+    centre(exact), centre(plain), centre(rotated);
+    for (int r = 0; r < n; ++r) {
+      ref2 += exact[r] * exact[r];
+      e_plain += (plain[r] - exact[r]) * (plain[r] - exact[r]);
+      e_rot += (rotated[r] - exact[r]) * (rotated[r] - exact[r]);
+    }
+  }
+  const double rms = std::sqrt(ref2 / (double(nq) * n));
+  e_plain = std::sqrt(e_plain / (double(nq) * n)) / rms, e_rot = std::sqrt(e_rot / (double(nq) * n)) / rms;
+  dots /= std::sqrt(raw2 / (double(nq) * n));
+  const bool ok = trip < 2e-2 && dots < 2e-2 && e_rot < e_plain && std::isfinite(e_rot);
+  g_failures += !ok;
+  std::printf("rotated cache: round trip %.2e, dot products %.2e; NVFP4 error of the centred scores plain %.4f, rotated "
+              "%.4f %s\n", trip,
+              dots, e_plain, e_rot, ok ? "ok" : "FAIL");
+}
+
 void check_verify(int mode, std::mt19937& rng) {
   blz_mha_set_verify(mode);
   std::printf("-- verify kernel %d\n", mode);
@@ -482,6 +563,11 @@ int main() {
   std::mt19937 rng(11);
   if (std::getenv("BLAZE_MHA_HYBRID_CHECK")) {
     for (int mode : {5, 6}) check_verify(mode, rng);
+    std::printf("%s\n", g_failures ? "FAILED" : "all passed");
+    return g_failures ? 1 : 0;
+  }
+  if (std::getenv("BLAZE_MHA_ROTATION_CHECK")) {
+    test_rotation(rng);
     std::printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
   }
@@ -602,6 +688,7 @@ int main() {
     test_prefill("MHA, 129 tokens after 2000", 3, 1, 129, 2129, f16, rng);
   }
   test_dequant_rows(rng);
+  test_rotation(rng);
   blz_mha_set_verify(1);
   std::printf("%s\n", g_failures ? "FAILED" : "all passed");
   return g_failures ? 1 : 0;

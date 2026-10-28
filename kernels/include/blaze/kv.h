@@ -38,6 +38,15 @@ cudaError_t blz_kv_store_dense(const void* k, const void* v, int64_t k_stride, i
                                uint8_t* k_data, uint8_t* v_data, const float* k_g, const float* v_g,
                                cudaStream_t stream);
 
+/// \brief Randomized Hadamard rotation of bf16 head vectors in place: x <- H D x / sqrt(dim) (forward) or
+/// D H x / sqrt(dim) (inverse), H the Walsh-Hadamard matrix, D a fixed +-1 diagonal (a hash of the index), so the
+/// inverse undoes the forward exactly in real arithmetic. A cache of rotated K and V with Q rotated the same way gives
+/// the same scores and a rotated output (orthogonal map): a few large channels spread over all of them before the
+/// quantizer sees them (QuaRot, TurboQuant). Row (token t, head h) starts at x + t * tok_stride + h * head_stride.
+/// \param dim 64, 128, 256 or 512
+cudaError_t blz_rht_rows(uint16_t* x, int64_t tokens, int heads, int64_t tok_stride, int64_t head_stride, int dim,
+                         int inverse, cudaStream_t stream);
+
 /// \brief Dequantize `rows` contiguous NVFP4 rows of `dim` values into 16-bit output [rows, dim].
 cudaError_t blz_nvfp4_dequant(const uint8_t* data, const uint8_t* scale, const float* g, int64_t rows, int dim,
                               blz_half_t out_dtype, void* out, cudaStream_t stream);

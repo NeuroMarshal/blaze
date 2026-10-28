@@ -264,3 +264,79 @@ extern "C" cudaError_t blz_nvfp4_dequant(const uint8_t* data, const uint8_t* sca
   }
   return cudaGetLastError();
 }
+
+namespace blaze {
+namespace {
+
+// D: the sign of index i, a hash of it (fixed: the cache and the queries must agree across processes)
+__device__ __forceinline__ float rht_sign(int i) {
+  uint32_t x = uint32_t(i) * 0x9E3779B1u + 0x7F4A7C15u;
+  x ^= x >> 15, x *= 0x2C1B3C6Du, x ^= x >> 12, x *= 0x297A2D39u, x ^= x >> 15;
+  return (x & 1u) ? -1.0f : 1.0f;
+}
+
+// A warp a row of 32 E values: lane l holds elements l E .. l E + E - 1; the butterflies of the low log2 E index bits
+// run in registers, those of the lane bits through shuffles.
+template <int E>
+__global__ void rht_kernel(__nv_bfloat16* x, int64_t rows, int heads, int64_t tok_stride, int64_t head_stride,
+                           int inverse) {
+  const int lane = threadIdx.x % 32;
+  const int64_t row = int64_t(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
+  if (row >= rows) return;
+  __nv_bfloat16* p = x + (row / heads) * tok_stride + (row % heads) * head_stride + lane * E;
+  float v[E];
+#pragma unroll
+  for (int e = 0; e < E; e += 2) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(p + e));
+    v[e] = f.x, v[e + 1] = f.y;
+  }
+  if (!inverse) {
+#pragma unroll
+    for (int e = 0; e < E; ++e) v[e] *= rht_sign(lane * E + e);
+  }
+#pragma unroll
+  for (int m = 1; m < E; m <<= 1)
+#pragma unroll
+    for (int e = 0; e < E; ++e)
+      if (!(e & m)) {
+        const float a = v[e], b = v[e + m];
+        v[e] = a + b, v[e + m] = a - b;
+      }
+#pragma unroll
+  for (int m = 1; m < 32; m <<= 1) {
+    const bool high = lane & m;
+#pragma unroll
+    for (int e = 0; e < E; ++e) {
+      const float o = __shfl_xor_sync(0xffffffffu, v[e], m);
+      v[e] = high ? o - v[e] : v[e] + o;
+    }
+  }
+  const float norm = rsqrtf(float(32 * E));
+#pragma unroll
+  for (int e = 0; e < E; ++e) v[e] *= inverse ? norm * rht_sign(lane * E + e) : norm;
+#pragma unroll
+  for (int e = 0; e < E; e += 2)
+    *reinterpret_cast<__nv_bfloat162*>(p + e) = __floats2bfloat162_rn(v[e], v[e + 1]);
+}
+
+}  // namespace
+}  // namespace blaze
+
+extern "C" cudaError_t blz_rht_rows(uint16_t* x, int64_t tokens, int heads, int64_t tok_stride, int64_t head_stride,
+                                    int dim, int inverse, cudaStream_t stream) {
+  if (tokens < 0 || heads <= 0 || tok_stride % 2 || head_stride % 2 || reinterpret_cast<uintptr_t>(x) % 4)
+    return cudaErrorInvalidValue;
+  const int64_t rows = tokens * heads;
+  if (rows == 0) return cudaSuccess;
+  const int warps = 8;
+  const dim3 grid(static_cast<unsigned>((rows + warps - 1) / warps));
+  auto* p = reinterpret_cast<__nv_bfloat16*>(x);
+  switch (dim) {
+    case 64: blaze::rht_kernel<2><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
+    case 128: blaze::rht_kernel<4><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
+    case 256: blaze::rht_kernel<8><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
+    case 512: blaze::rht_kernel<16><<<grid, 32 * warps, 0, stream>>>(p, rows, heads, tok_stride, head_stride, inverse); break;
+    default: return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}

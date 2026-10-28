@@ -363,6 +363,10 @@ pub struct Options {
     /// every live sequence may verify in the same step); 0: none.
     pub max_verify: usize,
     pub kv_dtype: KvDtype,
+    /// Keep K and V rotated in the cache (randomized Hadamard, blz_rht_rows), Q rotated the same way and the attention
+    /// output rotated back: the scores and output are those of the plain vectors, but a few large channels spread
+    /// over the whole head before the quantizer sees them (QuaRot, TurboQuant); dense attention models only.
+    pub kv_rotate: bool,
     /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
     pub gemm: crate::linear::GemmRoute,
     /// FP16 accumulation in short runs summed in FP32; None: choose by GPU architecture. This changes arithmetic
@@ -893,6 +897,8 @@ pub struct Model {
     /// The verify kernel and splits of each query length of one request measured at load (attn_tune.rs; index
     /// q_len); empty or None: the built-in rules.
     attn_policy: Vec<Option<crate::attn_tune::Choice>>,
+    /// Options::kv_rotate where the model takes it (dense softmax layers, a power-of-two head of 64..512)
+    kv_rotate: bool,
     /// image rows of the step being enqueued (set by the engine's runner): the M-RoPE streams differ, and these
     /// embeddings replace the gathered token rows
     mrope_step: Cell<bool>,
@@ -1388,6 +1394,10 @@ impl Model {
         let paired_auto = crate::gpu::compute_capability() == (12, 0) && dims.heads / dims.kv_heads == 6;
         let verify_mode = opts.verify_attention.resolve(attn_f16, paired_auto);
         unsafe { sys::blz_mha_set_verify(verify_mode) };
+        let kv_rotate = opts.kv_rotate && cfg.qsa.is_none() && matches!(cfg.attn.head_dim, 64 | 128 | 256 | 512);
+        if opts.kv_rotate && !kv_rotate && tp.rank == 0 {
+            eprintln!("blaze: --kv-rotate needs dense softmax layers with a power-of-two head of 64..512: off");
+        }
         let mut model = Self {
             cfg,
             dims,
@@ -1454,6 +1464,7 @@ impl Model {
             attn_f16,
             decode_f16,
             attn_policy: Vec::new(),
+            kv_rotate,
             verify_mode,
             mrope_step: Cell::new(false),
             img_segs: Default::default(),
@@ -2828,6 +2839,15 @@ impl Model {
                 "attn_prep",
             )?;
         }
+        if self.kv_rotate {
+            // the cache keeps K and V rotated, Q the same: the scores are those of the plain vectors
+            let rot = |x: *mut u16, n: usize, tok: usize, what| {
+                check(unsafe { sys::blz_rht_rows(x, t as i64, n as c_int, tok as i64, hd as i64, hd as c_int, 0, s.0) }, what)
+            };
+            rot(w.q.ptr(), heads, heads * hd, "rotate q")?;
+            rot(k, kvh, ld, "rotate k")?;
+            rot(v.cast_mut(), kvh, ld, "rotate v")?;
+        }
         let pool = &self.kv[layer.slot];
         let kvd = self.opts.kv_dtype;
         check(
@@ -2969,6 +2989,7 @@ impl Model {
                     }
                 }
             }
+            self.unrotate_attn(t)?;
             check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
             a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
             return self.prefetch_mlp(layer, t);
@@ -3087,10 +3108,23 @@ impl Model {
                 unsafe { sys::blz_mha_set_verify(self.verify_mode) };
             }
         }
+        self.unrotate_attn(t)?;
         self.dump(&format!("attn_core_{}", layer.slot), w.attn.ptr(), t, heads * hd)?;
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
         self.prefetch_mlp(layer, t)
+    }
+
+    /// The attention output of `t` rows back from the rotated basis of the cache (Options::kv_rotate).
+    fn unrotate_attn(&self, t: usize) -> Result<()> {
+        if !self.kv_rotate {
+            return Ok(());
+        }
+        let (heads, hd) = (self.dims.heads, self.cfg.attn.head_dim);
+        check(
+            unsafe { sys::blz_rht_rows(self.work.attn.ptr(), t as i64, heads as c_int, (heads * hd) as i64, hd as i64, hd as c_int, 1, self.stream.0) },
+            "unrotate attention",
+        )
     }
 
     /// Measure the dense decode / verify kernels and splits for every query length of one request up to the longest

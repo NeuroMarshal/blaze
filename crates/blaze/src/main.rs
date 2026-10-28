@@ -117,6 +117,10 @@ struct EngineArgs {
     /// KV cache of the softmax layers: nvfp4_4over6, nvfp4, fp8 (E4M3) or bf16
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
+    /// keep K and V rotated in the cache (randomized Hadamard; Q rotated the same way, the output rotated back):
+    /// outlier channels spread before quantization (QuaRot / TurboQuant); dense attention models
+    #[arg(long)]
+    kv_rotate: bool,
     /// pipeline stages: the model's layers split over this many GPUs (one GPU a stage; instead of --tp)
     #[arg(long, aliases = ["pipeline-parallel-size", "pp-size"], default_value_t = 1)]
     pp: usize,
@@ -301,6 +305,7 @@ impl EngineArgs {
                 ple_cache_gib: self.ple_cache_gib,
                 max_verify: self.spec_defaults()?.0,
                 kv_dtype: self.kv_cache_dtype,
+                kv_rotate: self.kv_rotate,
                 gemm: self.gemm,
                 attn_f16_acc: match self.attn_f16_acc.as_str() {
                     "auto" => None,
