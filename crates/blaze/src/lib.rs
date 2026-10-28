@@ -28,4 +28,5 @@ pub mod text;
 pub mod tree;
 pub mod vision;
 pub mod tune;
+pub mod attn_tune;
 pub mod weights;

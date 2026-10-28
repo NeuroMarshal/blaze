@@ -890,6 +890,9 @@ pub struct Model {
     attn_f16: bool,
     decode_f16: bool,
     verify_mode: c_int,
+    /// The verify kernel and splits of each query length of one request measured at load (attn_tune.rs; index
+    /// q_len); empty or None: the built-in rules.
+    attn_policy: Vec<Option<crate::attn_tune::Choice>>,
     /// image rows of the step being enqueued (set by the engine's runner): the M-RoPE streams differ, and these
     /// embeddings replace the gathered token rows
     mrope_step: Cell<bool>,
@@ -1450,6 +1453,7 @@ impl Model {
             num_sms: num_sms.max(1) as usize,
             attn_f16,
             decode_f16,
+            attn_policy: Vec::new(),
             verify_mode,
             mrope_step: Cell::new(false),
             img_segs: Default::default(),
@@ -1506,6 +1510,14 @@ impl Model {
         }
         if let Some(auto) = model.opts.kv_auto.clone() {
             model.size_kv(&auto)?;
+        }
+        let t1 = std::time::Instant::now();
+        let measured = model.tune_attention()?;
+        if model.tp.rank == 0 && !model.attn_policy.is_empty() {
+            let lens: Vec<String> = model.attn_policy.iter().enumerate()
+                .filter_map(|(q, c)| c.map(|c| format!("{q}: {} x{}", c.describe(), c.splits))).collect();
+            eprintln!("blaze: verify attention by query length{} ({})", if measured > 0 {
+                format!(", measured in {:.1} s", t1.elapsed().as_secs_f64()) } else { String::new() }, lens.join(", "));
         }
         if model.opts.kv_host && model.cfg.qsa.is_some() {
             model.init_host_kv()?;
@@ -3039,6 +3051,11 @@ impl Model {
                 )?;
                 continue;
             }
+            // the kernel measured for this length (attn_tune.rs); the model's mode again after the call
+            let tuned = self.attn_policy.get(q_len).copied().flatten();
+            if let Some(c) = tuned {
+                unsafe { sys::blz_mha_set_verify(c.mode) };
+            }
             check(
                 unsafe {
                     sys::blz_nvfp4_mha_decode(
@@ -3066,11 +3083,119 @@ impl Model {
                 },
                 "mha",
             )?;
+            if tuned.is_some() {
+                unsafe { sys::blz_mha_set_verify(self.verify_mode) };
+            }
         }
         self.dump(&format!("attn_core_{}", layer.slot), w.attn.ptr(), t, heads * hd)?;
         check(unsafe { sys::blz_mul_sigmoid(w.attn.ptr(), w.gate.ptr(), (t * heads * hd) as i64, s.0) }, "gate")?;
         a.o.run(&self.lin, w.attn.ptr(), heads * hd, t, w.x.ptr(), cfg.hidden, s)?;
         self.prefetch_mlp(layer, t)
+    }
+
+    /// Measure the dense decode / verify kernels and splits for every query length of one request up to the longest
+    /// verify (attn_tune.rs) on the first softmax layer's pool near its longest context, or take them from the cache.
+    /// Returns the lengths measured (0: cached, or the built-in rules apply).
+    fn tune_attention(&mut self) -> Result<usize> {
+        use crate::attn_tune::{self, Choice};
+        let (heads, kvh, hd) = (self.dims.heads, self.dims.kv_heads, self.cfg.attn.head_dim);
+        let enabled = std::env::var("BLAZE_TUNE").map(|v| v != "0").unwrap_or(true);
+        let format = self.opts.kv_dtype.format();
+        if !enabled || self.opts.verify_attention != VerifyAttention::Auto || format != sys::BLZ_KV_NVFP4 || hd != 256
+            || self.cfg.qsa.is_some() || self.kv.is_empty() || kvh == 0 || heads % kvh != 0 {
+            return Ok(0);
+        }
+        let max_q = self.opts.max_verify.clamp(1, PREFILL_KERNEL_ROWS - 1);
+        // near the longest context (attention dominates there), capped so that measuring stays a fraction of a second
+        let ctx = (self.ctx_stride().min(self.opts.max_tokens).saturating_sub(64) / 4096 * 4096).min(262_144);
+        if ctx < 16_384 {
+            return Ok(0);
+        }
+        let key = attn_tune::key(heads, kvh, hd, format, self.attn_f16, self.decode_f16, ctx);
+        if let Some(t) = attn_tune::load(self.tp.rank, &key, max_q) {
+            self.attn_policy = t;
+            return Ok(0);
+        }
+        let s = &self.stream;
+        // one request over `ctx` positions, its cache pages of 64 slots in a scattered order as a filled pool's
+        let pages = ctx / 64;
+        let mut order: Vec<usize> = (0..pages).collect();
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for i in (1..pages).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            order.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        let r2t: Vec<i32> = (0..ctx).map(|p| (order[p / 64] * 64 + p % 64) as i32).collect();
+        let d_r2t = DevBuf::from_slice(&r2t)?;
+        let d_req = DevBuf::from_slice(&[0i32])?;
+        let d_len = DevBuf::from_slice(&[ctx as i32])?;
+        let pool = &self.kv[0];
+        let view = pool_view(pool, &self.kv_global, kvh, hd, format);
+        let w = &self.work;
+        let cap = (w.partial_o.bytes() / (heads * hd * 4)).min(w.partial_ml.bytes() / (heads * 2 * 4));
+        let group = heads / kvh;
+        let timer = crate::gpu::Timer::new()?;
+        let mut table = vec![None; max_q + 1];
+        for q in 1..=max_q {
+            let rows = q * group;
+            let mut modes = vec![0];
+            if rows > 16 {
+                modes.push(3 + self.attn_f16 as c_int);
+            }
+            if rows > 48 {
+                modes.push(1 + self.attn_f16 as c_int);
+            }
+            let mut best: Option<(f32, Choice)> = None;
+            for mode in modes {
+                unsafe { sys::blz_mha_set_verify(mode) };
+                let vt = unsafe { sys::blz_nvfp4_mha_verify_tiles(heads as c_int, kvh as c_int, q as c_int) } as usize;
+                if mode != 0 && vt == 0 {
+                    continue;
+                }
+                let base = if vt == 0 {
+                    let mt = rows.div_ceil(16).min(3);
+                    (4 * self.num_sms / (q.div_ceil((16 * mt / group).max(1)) * kvh)).clamp(1, 64)
+                } else {
+                    (self.num_sms / (vt * kvh)).clamp(1, 64)
+                };
+                let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q as c_int, 1) } as usize;
+                for splits in attn_tune::split_candidates(base) {
+                    if bounded_mha_splits(splits, q, parts, cap)? != splits {
+                        continue;
+                    }
+                    let run = || {
+                        check(
+                            unsafe {
+                                sys::blz_nvfp4_mha_decode(
+                                    w.q.ptr(), (heads * hd) as i64, hd as i64, heads as c_int, view, d_r2t.ptr(), ctx as i64,
+                                    sys::blz_index_ptr { ptr: d_req.ptr(), kind: sys::BLZ_I32 },
+                                    sys::blz_index_ptr { ptr: d_len.ptr(), kind: sys::BLZ_I32 },
+                                    1, q as c_int, splits as c_int, 1.0 / (hd as f32).sqrt(), w.partial_o.ptr(),
+                                    w.partial_ml.ptr(), sys::BLZ_BF16, w.attn.ptr(), (heads * hd) as i64, hd as i64, s.0,
+                                )
+                            },
+                            "attention tuning",
+                        )
+                    };
+                    run()?;
+                    timer.start(s)?;
+                    for _ in 0..3 {
+                        run()?;
+                    }
+                    let ms = timer.stop(s)?;
+                    if best.is_none_or(|(b, _)| ms < b) {
+                        best = Some((ms, Choice { mode, splits }));
+                    }
+                }
+            }
+            table[q] = best.map(|b| b.1);
+        }
+        unsafe { sys::blz_mha_set_verify(self.verify_mode) };
+        attn_tune::store(self.tp.rank, &key, &table);
+        self.attn_policy = table;
+        Ok(max_q)
     }
 
     /// Context splits of an attention call of `count` requests of `q_len` query rows: about four CTAs per SM over the
@@ -3089,9 +3214,11 @@ impl Model {
         } else {
             0
         };
-        let target = requested.unwrap_or_else(|| match vt {
-            0 => (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64),
-            vt => (self.num_sms / (count * vt * kvh)).clamp(1, 64),
+        let tuned = if tree { None } else { self.attn_policy.get(q_len).copied().flatten() };
+        let target = requested.unwrap_or_else(|| match (tuned, vt) {
+            (Some(c), _) => (c.splits / count).max(1),
+            (None, 0) => (4 * self.num_sms / (count * tiles * kvh)).clamp(1, 64),
+            (None, vt) => (self.num_sms / (count * vt * kvh)).clamp(1, 64),
         });
         let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, 1) } as usize;
         let rows = count.checked_mul(q_len).context("attention row count overflow")?;

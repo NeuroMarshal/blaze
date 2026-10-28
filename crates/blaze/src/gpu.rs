@@ -50,6 +50,16 @@ pub fn compute_capability() -> (i32, i32) {
     (major, minor)
 }
 
+/// Streaming multiprocessors of the current device.
+pub fn multiprocessors() -> usize {
+    let (mut sms, mut dev) = (0, 0);
+    unsafe {
+        let _ = sys::cudaGetDevice(&mut dev);
+        sys::cudaDeviceGetAttribute(&mut sms, sys::ATTR_MULTIPROCESSOR_COUNT, dev);
+    }
+    sms.max(1) as usize
+}
+
 /// GeForce-class tensor cores: FP16 accumulation runs at twice the rate of FP32 accumulation (SM 8.6, 8.9, 12.x;
 /// the data-centre parts 8.0, 9.0, 10.x run both at one rate).
 pub fn fast_f16_accumulate() -> bool {
