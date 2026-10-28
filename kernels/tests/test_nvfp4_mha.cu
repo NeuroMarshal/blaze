@@ -476,7 +476,7 @@ int auto_splits(int batch, int q_len) {
 void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int format = BLZ_KV_NVFP4) {
   const int kv_heads = 2, group = 6, q_heads = 12, slots = ctx + 64;
   // Random codes are enough for timing (BF16: small values from random low bytes and a fixed high byte).
-  const size_t row_bytes = format == BLZ_KV_NVFP4 ? kDim / 2 : format == BLZ_KV_FP8 ? kDim : 2 * kDim;
+  const size_t row_bytes = format == BLZ_KV_NVFP4 ? kDim / 2 : format == BLZ_KV_FP8 ? kDim : format == BLZ_KV_TQ3 ? blaze::kTq3RowBytes : 2 * kDim;
   std::vector<uint8_t> kd(size_t(slots) * kv_heads * row_bytes), ks(size_t(slots) * kv_heads * kDim / 16, 0x38);
   for (size_t i = 0; i < kd.size(); ++i) kd[i] = format == BLZ_KV_BF16 && i % 2 ? 0x3f : uint8_t(rng() & 0x77);
   Dev<uint8_t> dkd(kd), dvd(kd), dks(ks), dvs(ks);
@@ -512,7 +512,7 @@ void bench(int ctx, int batch, int q_len, int splits, std::mt19937& rng, int for
   CHECK_CUDA(cudaEventDestroy(a));
   CHECK_CUDA(cudaEventDestroy(e));
   const double us = 1000.0 * ms / iters;
-  const double bytes = double(batch) * ctx * kv_heads * 2 * (row_bytes + (format == BLZ_KV_NVFP4 ? kDim / 16 : 0));
+  const double bytes = double(batch) * ctx * kv_heads * 2 * (row_bytes + (format == BLZ_KV_NVFP4 ? kDim / 16 : format == BLZ_KV_TQ3 ? 2 : 0));
   std::printf("bench %-5s %d x %d tokens over %dk context, %d splits: %.1f us per layer (%.0f GB/s of KV)\n",
               format_name(format), batch, q_len,
               ctx / 1000, splits, us, bytes / us / 1e3);
@@ -699,9 +699,10 @@ int main() {
   }
   if (std::getenv("BLAZE_MHA_FORMAT_BENCH")) {
     blz_mha_set_verify(0);
-    for (int f : {BLZ_KV_NVFP4, BLZ_KV_FP8, BLZ_KV_BF16}) {
+    for (int f : {BLZ_KV_NVFP4, BLZ_KV_FP8, BLZ_KV_BF16, BLZ_KV_TQ3}) {
       bench(122000, 1, 1, 64, rng, f);
       bench(122000, 1, 8, 64, rng, f);
+      bench(524000, 1, 1, 64, rng, f);
     }
     return 0;
   }
