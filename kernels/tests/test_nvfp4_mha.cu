@@ -485,6 +485,13 @@ int main() {
     std::printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
   }
+  // only the verify cases of the listed kernels (BLAZE_MHA_VERIFY_MODES=3,4): a quick check of one kernel's change
+  if (const char* modes = std::getenv("BLAZE_MHA_VERIFY_MODES")) {
+    for (const char* m = modes; *m; ++m)
+      if (*m >= '0' && *m <= '9') check_verify(*m - '0', rng);
+    std::printf("%s\n", g_failures ? "FAILED" : "all passed");
+    return g_failures ? 1 : 0;
+  }
   // Performance measurements are opt-in: correctness tests do not allocate 524k pools or run timing loops.
   if (std::getenv("BLAZE_MHA_VERIFY_BENCH")) {
     for (int mode : {0, 1, 2, 3, 4, 5, 6}) {

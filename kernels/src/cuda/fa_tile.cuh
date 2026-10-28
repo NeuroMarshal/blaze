@@ -91,10 +91,10 @@ __device__ __forceinline__ __half2 e2m1x2_to_f16x2(uint32_t byte) {
 }
 
 // One NVFP4 block (8 code bytes, its E4M3 scale) as 16 f16 values into shared memory (exact: an E2M1 value times an
-// E4M3 scale fits FP16).
-__device__ __forceinline__ void dequant_block(const uint8_t* codes, uint8_t scale, __half* dst) {
+// E4M3 scale fits FP16), times `pow2` (a power of two, exact too).
+__device__ __forceinline__ void dequant_block(const uint8_t* codes, uint8_t scale, __half* dst, float pow2 = 1.0f) {
   const uint2 w = *reinterpret_cast<const uint2*>(codes);
-  const __half2 s2 = e4m3_h2(scale);
+  const __half2 s2 = pow2 == 1.0f ? e4m3_h2(scale) : __hmul2(e4m3_h2(scale), __float2half2_rn(pow2));
   uint4 lo, hi;
   uint32_t* l = reinterpret_cast<uint32_t*>(&lo);
   uint32_t* h = reinterpret_cast<uint32_t*>(&hi);

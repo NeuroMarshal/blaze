@@ -313,6 +313,23 @@ __global__ void __launch_bounds__(32 * MT, 1)
 constexpr int kHalfD = kD / 2;
 constexpr int kPairStages = 5;
 
+// Phase clocks of the pair kernel (bench_verify_prof.cu builds this file with BLZ_VERIFY_PROFILE): per warp the clock64
+// time from one mark to the next, summed over the warps of every CTA; the last entry counts the warps.
+constexpr int kProfPhases = 7;  // copies issued, Q K^T, score exchange, softmax, wait + barrier, P V, barrier
+#ifdef BLZ_VERIFY_PROFILE
+__device__ unsigned long long g_verify_prof[kProfPhases + 1];
+#define BLZ_PROF_MARK(ph)                  \
+  do {                                     \
+    const long long now_ = clock64();      \
+    prof[ph] += now_ - prof_t;             \
+    prof_t = now_;                         \
+  } while (0)
+#else
+#define BLZ_PROF_MARK(ph) \
+  do {                    \
+  } while (0)
+#endif
+
 // K and V [kN][kStride] in f16; the partial scores [2 MT warps][4 n8 tiles][32 lanes] float4; kPairStages raw stages
 template <int MT>
 constexpr size_t pair_smem_bytes() {
@@ -375,14 +392,28 @@ __global__ void __launch_bounds__(64 * MT, 1)
     }
   }
 
+  // The cache slots of this thread's copies in the tile load_tile issues next, fetched one call ahead so that a
+  // copy's address does not wait for its req_to_token load.
+  constexpr int kCopyIters = (kN * kCopies + kThreads - 1) / kThreads;
+  int32_t slot[kCopyIters];
+  auto fetch_slots = [&](int64_t t) {
+#pragma unroll
+    for (int k = 0; k < kCopyIters; ++k) {
+      const int i = int(threadIdx.x) + kThreads * k;
+      const int64_t p = t * kN + i / kCopies;
+      slot[k] = t < t_end && i < kN * kCopies && p < vis_end ? __ldg(r2t + p) : -1;
+    }
+  };
   auto load_tile = [&](int64_t t) {
     if (t < t_end) {
       uint8_t* st = ring + int(t % NS) * (kN * kPosRaw);
-      for (int i = threadIdx.x; i < kN * kCopies; i += kThreads) {
+#pragma unroll
+      for (int k = 0; k < kCopyIters; ++k) {
+        const int i = int(threadIdx.x) + kThreads * k;
+        if (i >= kN * kCopies) break;
         const int pos = i / kCopies, j = i % kCopies, side = j / (kCopies / 2), jj = j % (kCopies / 2);
-        const int64_t p = t * kN + pos;
-        const bool ok = p < vis_end;
-        const int64_t row = ok ? int64_t(__ldg(r2t + p)) * heads + g : 0;
+        const bool ok = slot[k] >= 0;
+        const int64_t row = ok ? int64_t(slot[k]) * heads + g : 0;
         const uint8_t* src;
         uint8_t* dst;
         if (jj < kRawRow / 16) {
@@ -396,8 +427,12 @@ __global__ void __launch_bounds__(64 * MT, 1)
       }
     }
     cp_commit();
+    fetch_slots(t + 1);
   };
 
+  // FP16 accumulation sums P V over a tile's 32 positions in f16: V is converted at half its value (|v| <= 6 x 448 / 2,
+  // P <= 1 with the exact running max, so a sum stays below 32 x 1344 < 65504) and the output takes the 2 back.
+  constexpr float kVHalf = F16 ? 0.5f : 1.0f;
   constexpr int kUnits = kN * (kD / 16);
   constexpr int kUnitSteps = (kUnits + kThreads - 1) / kThreads;
   auto dequant_unit = [&](int64_t t, bool v, int i) {
@@ -407,7 +442,7 @@ __global__ void __launch_bounds__(64 * MT, 1)
     const uint8_t* st = ring + int(t % NS) * (kN * kPosRaw);
     const uint8_t* codes = st + (v ? kN * kRawRow : 0) + pos * kRawRow + 8 * blk;
     const uint8_t scale = st[2 * kN * kRawRow + (v ? kN * kRawScale : 0) + pos * kRawScale + blk];
-    dequant_block(codes, scale, (v ? sv : sk) + pos * kStride + 16 * blk);
+    dequant_block(codes, scale, (v ? sv : sk) + pos * kStride + 16 * blk, v ? kVHalf : 1.0f);
   };
 
   float o[kHalfD / 8][4];
@@ -423,6 +458,7 @@ __global__ void __launch_bounds__(64 * MT, 1)
   float4* mine = sx + warp * 128 + lane;
   const float4* other = sx + (warp ^ 1) * 128 + lane;
 
+  fetch_slots(t_begin);
 #pragma unroll
   for (int i = 0; i < NS - 1; ++i) load_tile(t_begin + i);
   cp_wait<NS - 2>();
@@ -432,8 +468,12 @@ __global__ void __launch_bounds__(64 * MT, 1)
     for (int i = 0; i < kUnitSteps; ++i) dequant_unit(t_begin, false, i);
   }
   __syncthreads();
+#ifdef BLZ_VERIFY_PROFILE
+  long long prof[kProfPhases] = {}, prof_t = clock64();
+#endif
   for (int64_t t = t_begin; t < t_end; ++t) {
     load_tile(t + NS - 1);
+    BLZ_PROF_MARK(0);
     const bool more = t + 1 < t_end;
     auto dq_v = [&](int ks) {
 #pragma unroll
@@ -475,6 +515,7 @@ __global__ void __launch_bounds__(64 * MT, 1)
         }
       }
     }
+    BLZ_PROF_MARK(1);
     // the pair's sum: both warps add the same two values (addition commutes exactly), so both see the same scores
 #pragma unroll
     for (int nt = 0; nt < 4; ++nt) mine[32 * nt] = make_float4(sc[nt][0], sc[nt][1], sc[nt][2], sc[nt][3]);
@@ -484,6 +525,7 @@ __global__ void __launch_bounds__(64 * MT, 1)
       const float4 x = other[32 * nt];
       sc[nt][0] += x.x, sc[nt][1] += x.y, sc[nt][2] += x.z, sc[nt][3] += x.w;
     }
+    BLZ_PROF_MARK(2);
 
     const int64_t p0 = t * kN;
     const bool masked = p0 + kN > free_end;
@@ -538,8 +580,10 @@ __global__ void __launch_bounds__(64 * MT, 1)
     }
     lrow[0] = lrow[0] * alpha[0] + sum[0];
     lrow[1] = lrow[1] * alpha[1] + sum[1];
+    BLZ_PROF_MARK(3);
     cp_wait<NS - 2>();
     __syncthreads();  // this tile's V in f16 and the next tile's bytes in; every warp is done with K and the scores
+    BLZ_PROF_MARK(4);
     auto dq_k = [&](int step) {
       if (more) {
 #pragma unroll
@@ -548,30 +592,41 @@ __global__ void __launch_bounds__(64 * MT, 1)
       }
     };
 
-    // O += P V into this warp's dims d0 ..
+    // O += P V into this warp's dims d0 ..: n8 tiles 2 dp, 2 dp + 1 over both k-steps j of the tile's positions
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+    for (int dp = 0; dp < kHalfD / 16; ++dp) {
+      uint32_t h0[2] = {0, 0}, h1[2] = {0, 0};
 #pragma unroll
-      for (int dp = 0; dp < kHalfD / 16; ++dp) {
-        dq_k(j * (kHalfD / 16) + dp);
+      for (int j = 0; j < 2; ++j) {
+        dq_k(2 * dp + j);
         uint32_t bb[4];
         ldsm4t(bb, sv + (16 * j + (lane & 7) + ((lane >> 3) & 1) * 8) * kStride + d0 + 16 * dp + (lane >> 4) * 8);
         if constexpr (F16) {
-          uint32_t h0[2] = {0, 0}, h1[2] = {0, 0};
           mma_f16h(h0, pa[j], bb[0], bb[1]);
           mma_f16h(h1, pa[j], bb[2], bb[3]);
-          add_h2(o[2 * dp][0], o[2 * dp][1], h0[0]), add_h2(o[2 * dp][2], o[2 * dp][3], h0[1]);
-          add_h2(o[2 * dp + 1][0], o[2 * dp + 1][1], h1[0]), add_h2(o[2 * dp + 1][2], o[2 * dp + 1][3], h1[1]);
         } else {
           mma_f16(o[2 * dp], pa[j], bb[0], bb[1]);
           mma_f16(o[2 * dp + 1], pa[j], bb[2], bb[3]);
         }
       }
+      if constexpr (F16) {
+        add_h2(o[2 * dp][0], o[2 * dp][1], h0[0]), add_h2(o[2 * dp][2], o[2 * dp][3], h0[1]);
+        add_h2(o[2 * dp + 1][0], o[2 * dp + 1][1], h1[0]), add_h2(o[2 * dp + 1][2], o[2 * dp + 1][3], h1[1]);
+      }
+    }
+    BLZ_PROF_MARK(5);
     __syncthreads();  // the next tile's K in f16; every warp is done with this tile's V
+    BLZ_PROF_MARK(6);
   }
   cp_wait<0>();
+#ifdef BLZ_VERIFY_PROFILE
+  if (lane == 0) {
+    for (int i = 0; i < kProfPhases; ++i) atomicAdd(&g_verify_prof[i], (unsigned long long)prof[i]);
+    atomicAdd(&g_verify_prof[kProfPhases], 1ull);
+  }
+#endif
 
-  const float vg = __ldg(pool.v_g);
+  const float vg = __ldg(pool.v_g) / kVHalf;
 #pragma unroll
   for (int h = 0; h < 2; ++h) {
     float l = lrow[h];
