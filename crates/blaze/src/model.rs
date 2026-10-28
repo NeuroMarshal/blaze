@@ -418,7 +418,10 @@ pub struct Options {
 /// The rotation of the cached K and V (--kv-rotate).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum KvRotate {
+    /// Hadamard where the model takes a rotation (dense softmax layers), else off: measured closer to a BF16 cache
+    /// on both test models (35B ppl gap to BF16 KV 0.39% -> 0.21%; 27B per-token divergence -2.3%), same memory
     #[default]
+    Auto,
     Off,
     /// randomized Hadamard over the whole head (QuaRot, TurboQuant): every value mixes with every other
     Hadamard,
@@ -434,7 +437,7 @@ impl KvRotate {
     fn kind(self) -> Option<c_int> {
         match self {
             Self::Off => None,
-            Self::Hadamard => Some(0),
+            Self::Auto | Self::Hadamard => Some(0),
             Self::Planar => Some(1),
             Self::Iso => Some(2),
             Self::Rotor => Some(3),
@@ -1440,7 +1443,7 @@ impl Model {
         let verify_mode = opts.verify_attention.resolve(attn_f16, paired_auto);
         unsafe { sys::blz_mha_set_verify(verify_mode) };
         let kv_rotate = opts.kv_rotate.kind().filter(|_| cfg.qsa.is_none() && matches!(cfg.attn.head_dim, 64 | 128 | 256 | 512));
-        if opts.kv_rotate != KvRotate::Off && kv_rotate.is_none() && tp.rank == 0 {
+        if !matches!(opts.kv_rotate, KvRotate::Off | KvRotate::Auto) && kv_rotate.is_none() && tp.rank == 0 {
             eprintln!("blaze: --kv-rotate needs dense softmax layers with a power-of-two head of 64..512: off");
         }
         let mut model = Self {

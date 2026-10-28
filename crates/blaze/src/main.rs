@@ -122,9 +122,9 @@ struct EngineArgs {
     #[arg(long, default_value = "nvfp4_4over6")]
     kv_cache_dtype: blaze::model::KvDtype,
     /// keep K and V rotated in the cache, Q rotated the same way and the output rotated back (outlier channels spread
-    /// before quantization; dense attention models): off, hadamard (QuaRot / TurboQuant; the flag alone), planar,
-    /// iso, rotor (RotorQuant's block rotations)
-    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "hadamard", default_value = "off")]
+    /// before quantization; dense attention models): auto (hadamard where the model takes it), off, hadamard (QuaRot /
+    /// TurboQuant; the flag alone), planar, iso, rotor (RotorQuant's block rotations)
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "hadamard", default_value = "auto")]
     kv_rotate: blaze::model::KvRotate,
     /// under a W4A4 --gemm: projections kept at 16-bit inputs on prefill: none, kv (the softmax layers' q/k/v: the KV
     /// cache), state (also the GDN input projections: their recurrent state)
