@@ -52,6 +52,9 @@ pub struct Linear {
     parts: Vec<Part>,
     pub n: usize,
     pub k: usize,
+    /// NVFP4 parts keep 16-bit inputs on many rows (W4A16) whatever the route: a projection whose output persists
+    /// (the KV cache, a recurrent state) is computed without the activations' FP4 rounding (Options::prefill_a16)
+    pub a16: bool,
 }
 
 /// What every linear launch needs: the cuBLAS handle and the scratch matrix NVFP4 weights are widened into for
@@ -226,7 +229,7 @@ pub(crate) fn nvfp4_mma(ctx: &LinCtx, w: &Nvfp4Ref, x: *const u16, ldx: usize, m
 impl Linear {
     /// A layer with no weights (`run` writes nothing): a part of the model another pipeline stage computes.
     pub fn empty(n: usize, k: usize) -> Self {
-        Self { parts: Vec::new(), n, k }
+        Self { parts: Vec::new(), n, k, a16: false }
     }
 
     /// Load `modules` (name without `.weight`, cut) stacked in order.
@@ -283,7 +286,7 @@ impl Linear {
             col += n;
             i = j;
         }
-        Ok(Self { parts, n: col, k })
+        Ok(Self { parts, n: col, k, a16: false })
     }
 
     fn load_nvfp4(ckpt: &Checkpoint, group: &[Module], n: usize, k: usize) -> Result<Store> {
@@ -536,7 +539,7 @@ impl Linear {
             let o = unsafe { out.add(p.col) };
             match &p.store {
                 Store::Nvfp4 { codes, scales, alpha, act4, .. }
-                    if m > sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 && ctx.use_w4a4(*act4)
+                    if m > sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 && !self.a16 && ctx.use_w4a4(*act4)
                         && m * k / 2 + m * k / 16 + 4 * m + 256 <= ctx.scratch_elems * 2 =>
                 {
                     let (xc, xs, xr) = match xq {

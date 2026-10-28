@@ -1,4 +1,4 @@
-//! Flat JSON configuration -> the same validated clap arguments as the CLI.
+//! Flat JSON configuration -> the same validated clap arguments as the CLI; `--preset` bundles of options below it.
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser};
 use serde_json::{Map, Value};
@@ -37,7 +37,44 @@ pub fn parse<T: Parser + CommandFactory + FromArgMatches>() -> Result<(T, Value)
     Ok((parsed, effective))
 }
 
+/// Named bundles of serving options (`--preset NAME`): defaults below a --config file and explicit flags. Speed and
+/// accuracy trade in the arithmetic of prefill GEMMs (W4A4 rounds the activations to FP4) and attention accumulation.
+pub const PRESETS: &[(&str, &[(&str, &str)])] = &[
+    // FP4 activations everywhere, FP16 accumulation in attention
+    ("fast", &[("gemm", "nvfp4"), ("attn-f16-acc", "on"), ("prefill-a16", "none")]),
+    // as fast, but the projections whose outputs persist (KV cache) from 16-bit activations
+    ("balanced", &[("gemm", "nvfp4"), ("attn-f16-acc", "auto"), ("prefill-a16", "kv")]),
+    // 16-bit activations everywhere (W4A16), FP32 accumulation in attention
+    ("quality", &[("gemm", "fp16"), ("attn-f16-acc", "off"), ("prefill-a16", "none")]),
+];
+
+fn take_preset(args: &mut Vec<OsString>) -> Result<Option<&'static [(&'static str, &'static str)]>> {
+    let mut name = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].to_string_lossy().into_owned();
+        if arg == "--preset" {
+            if i + 1 >= args.len() {
+                bail!("--preset requires a name ({})", PRESETS.iter().map(|p| p.0).collect::<Vec<_>>().join(", "));
+            }
+            name = Some(args[i + 1].to_string_lossy().into_owned());
+            args.drain(i..i + 2);
+        } else if let Some(v) = arg.strip_prefix("--preset=") {
+            name = Some(v.to_owned());
+            args.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    let Some(name) = name else { return Ok(None) };
+    match PRESETS.iter().find(|p| p.0 == name) {
+        Some(p) => Ok(Some(p.1)),
+        None => bail!("--preset {name}: {}", PRESETS.iter().map(|p| p.0).collect::<Vec<_>>().join(", ")),
+    }
+}
+
 fn resolve(command: clap::Command, mut args: Vec<OsString>) -> Result<(Vec<OsString>, Value)> {
+    let preset = take_preset(&mut args)?;
     let exe = std::path::Path::new(&args[0]).file_stem().and_then(|x| x.to_str()).unwrap_or("");
     let subcommands: Vec<_> = command.get_subcommands().map(|c| c.get_name()).collect();
     let mut i = 1;
@@ -83,12 +120,24 @@ fn resolve(command: clap::Command, mut args: Vec<OsString>) -> Result<(Vec<OsStr
             i += 1;
         }
     }
-    let Some(path) = path else { return Ok((args, Value::Object(Map::new()))) };
-    if args.get(1).is_none_or(|x| x != "serve") {
-        bail!("--config is supported for serving");
+    if path.is_none() && preset.is_none() {
+        return Ok((args, Value::Object(Map::new())));
     }
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).with_context(|| format!("config {}", path.display()))?)?;
-    let obj = value.as_object().context("--config must contain a flat JSON object of CLI options")?;
+    if args.get(1).is_none_or(|x| x != "serve") {
+        bail!("--config and --preset are supported for serving");
+    }
+    let mut value = match &path {
+        Some(path) => serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("config {}", path.display()))?)?,
+        None => Value::Object(Map::new()),
+    };
+    let obj = value.as_object_mut().context("--config must contain a flat JSON object of CLI options")?;
+    // the preset's options under the file's
+    for (key, v) in preset.unwrap_or_default() {
+        if !obj.keys().any(|k| k.replace('_', "-") == *key) {
+            obj.insert((*key).into(), Value::String((*v).into()));
+        }
+    }
+    let obj = &*obj;
     let serve = command.get_subcommands().find(|c| c.get_name() == "serve").context("no serve command")?;
     let mut defaults = Vec::<OsString>::new();
     for (key, value) in obj {
@@ -187,5 +236,41 @@ mod tests {
         std::fs::write(&path, r#"{"unknown-option":true}"#).unwrap();
         assert!(resolve(Cli::command(), vec!["server".into(), "--config".into(), path.as_os_str().to_owned()]).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[derive(Parser)]
+    struct PresetCli {
+        #[command(subcommand)]
+        command: PresetCmd,
+    }
+    #[derive(clap::Subcommand)]
+    enum PresetCmd {
+        Serve {
+            #[arg(long)]
+            model: String,
+            #[arg(long, default_value = "auto")]
+            gemm: String,
+            #[arg(long, default_value = "auto")]
+            attn_f16_acc: String,
+            #[arg(long, default_value = "none")]
+            prefill_a16: String,
+        },
+    }
+    fn preset(args: &[&str]) -> Result<(String, String, String)> {
+        let (args, _) = resolve(PresetCli::command(), args.iter().map(OsString::from).collect())?;
+        let PresetCmd::Serve { gemm, attn_f16_acc, prefill_a16, .. } = PresetCli::try_parse_from(args)?.command;
+        Ok((gemm, attn_f16_acc, prefill_a16))
+    }
+    #[test]
+    fn presets_sit_below_config_and_flags() {
+        let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+        assert_eq!(preset(&["server", "--model", "m", "--preset", "balanced"]).unwrap(), s("nvfp4", "auto", "kv"));
+        assert_eq!(preset(&["server", "--model", "m", "--preset=quality", "--gemm", "bf16"]).unwrap(), s("bf16", "off", "none"));
+        let path = std::env::temp_dir().join(format!("blaze-config-{}.json", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&path, r#"{"model":"m","attn_f16_acc":"off"}"#).unwrap();
+        let p = path.to_str().unwrap();
+        assert_eq!(preset(&["server", "--config", p, "--preset", "fast"]).unwrap(), s("nvfp4", "off", "none"));
+        std::fs::remove_file(path).unwrap();
+        assert!(preset(&["server", "--model", "m", "--preset", "nonesuch"]).is_err());
     }
 }

@@ -367,6 +367,7 @@ pub struct Options {
     /// output rotated back: the scores and output are those of the plain vectors, but a few large channels spread
     /// over the whole head before the quantizer sees them (QuaRot, TurboQuant); dense attention models only.
     pub kv_rotate: bool,
+    pub prefill_a16: PrefillA16,
     /// NVFP4 layers on many rows: W4A4 on FP4 tensor cores or BF16 (linear::GemmRoute)
     pub gemm: crate::linear::GemmRoute,
     /// FP16 accumulation in short runs summed in FP32; None: choose by GPU architecture. This changes arithmetic
@@ -412,6 +413,19 @@ pub struct Options {
     /// The checkpoint of the MTP head (its `mtp.*` tensors; None: the target's own). A routed MTP layer's experts join the
     /// expert engine after the decoder layers (NVFP4, as the target's).
     pub mtp_model: Option<PathBuf>,
+}
+
+/// Projections kept at 16-bit inputs on prefill under a W4A4 route (--prefill-a16): their outputs persist over the
+/// context, so the activations' FP4 rounding would stay in every later token's attention or recurrence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillA16 {
+    /// every NVFP4 weight as --gemm routes it
+    #[default]
+    None,
+    /// the softmax layers' q / k / v projection (the KV cache)
+    Kv,
+    /// that and the GDN layers' input projection (their recurrent state)
+    State,
 }
 
 /// Prefill kernel selection. Auto uses FA2 for supported NVFP4 spans of at least 64 tokens.
@@ -1058,7 +1072,8 @@ impl Model {
                         }
                         mods.push(all(format!("{a}indexer.index_qk_proj")));
                     }
-                    let qkv = Linear::load(&ckpt, &quant, &mods, s)?;
+                    let mut qkv = Linear::load(&ckpt, &quant, &mods, s)?;
+                    qkv.a16 = opts.prefill_a16 != PrefillA16::None;
                     let index = match &cfg.qsa {
                         Some(_) => Some((
                             load_vec(&ckpt, &format!("{a}indexer.q_layernorm.weight"))?,
@@ -1099,6 +1114,8 @@ impl Model {
                         s,
                     )?;
                     let cut = |v: Vec<Range<usize>>| if w == 1 { None } else { Some(v) };
+                    let mut in_proj = in_proj;
+                    in_proj.a16 = opts.prefill_a16 == PrefillA16::State;
                     let gdn = Gdn {
                         in_proj,
                         out: Linear::load(&ckpt, &quant, &[cols(format!("{g}out_proj"), vr.start * gc.v_dim..vr.end * gc.v_dim)], s)?,

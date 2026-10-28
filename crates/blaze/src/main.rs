@@ -11,6 +11,10 @@ struct Cli {
     /// Flat JSON serving configuration; explicit flags override it
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// bundle of serving options below --config and explicit flags: fast (W4A4, FP16 attention accumulation),
+    /// balanced (W4A4, the KV projections from 16-bit activations), quality (W4A16, FP32 attention accumulation)
+    #[arg(long, global = true)]
+    preset: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -121,6 +125,10 @@ struct EngineArgs {
     /// outlier channels spread before quantization (QuaRot / TurboQuant); dense attention models
     #[arg(long)]
     kv_rotate: bool,
+    /// under a W4A4 --gemm: projections kept at 16-bit inputs on prefill: none, kv (the softmax layers' q/k/v: the KV
+    /// cache), state (also the GDN input projections: their recurrent state)
+    #[arg(long, value_enum, default_value = "none")]
+    prefill_a16: blaze::model::PrefillA16,
     /// pipeline stages: the model's layers split over this many GPUs (one GPU a stage; instead of --tp)
     #[arg(long, aliases = ["pipeline-parallel-size", "pp-size"], default_value_t = 1)]
     pp: usize,
@@ -306,6 +314,7 @@ impl EngineArgs {
                 max_verify: self.spec_defaults()?.0,
                 kv_dtype: self.kv_cache_dtype,
                 kv_rotate: self.kv_rotate,
+                prefill_a16: self.prefill_a16,
                 gemm: self.gemm,
                 attn_f16_acc: match self.attn_f16_acc.as_str() {
                     "auto" => None,
