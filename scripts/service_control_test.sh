@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 # Exercises a real GPU server with intentionally short deadlines and small admission/body limits.
-# scripts/service_control_test.sh target/release/server --config configs/27b.json
+# scripts/service_control_test.sh ~/serve_blaze_27b.sh
 if [ -z "${BLAZE_LOCKED:-}" ]; then
   exec env BLAZE_LOCKED=1 flock /tmp/blaze-gpu.lock "$0" "$@"
 fi

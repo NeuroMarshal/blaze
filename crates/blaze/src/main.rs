@@ -420,6 +420,8 @@ enum Command {
         draft: usize,
     },
     /// OpenAI-compatible server (chat completions with reasoning and tool calls, completions).
+    // a flag given twice takes its last value (as vLLM's argparse): a launcher's flags, then the caller's overrides
+    #[command(args_override_self = true)]
     Serve {
         #[command(flatten)]
         engine: EngineArgs,
