@@ -62,6 +62,8 @@ pub(super) struct Prepared {
     pub tools_enabled: bool,
     /// the prompt ends inside a reasoning section (the output starts with reasoning)
     pub starts_in_reasoning: bool,
+    /// a reasoning model's prompt with thinking switched off (the instruct sampling defaults)
+    pub instruct: bool,
     /// tool_choice forces a call: a grammar for the start of the answer
     pub forced_call: Option<String>,
     /// where each image's rows start in `tokens` (one per image, in prompt order)
@@ -209,10 +211,10 @@ pub(super) fn prepare(st: &AppState, body: &mut Value, enforce_context: bool, im
     if enforce_context {
         check_fits(st, tokens.len())?;
     }
-    let starts_in_reasoning = !continue_final
-        && matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"))
-        && prompt.trim_end_matches('\n').ends_with("<think>");
-    Ok(Prepared { request, tokens, tools_enabled, starts_in_reasoning, forced_call, image_starts })
+    let reasoning_model = !continue_final && matches!(st.cfg.reasoning_parser.as_deref(), Some("qwen3" | "deepseek-r1" | "glm45"));
+    let starts_in_reasoning = reasoning_model && prompt.trim_end_matches('\n').ends_with("<think>");
+    let instruct = reasoning_model && !starts_in_reasoning;
+    Ok(Prepared { request, tokens, tools_enabled, starts_in_reasoning, instruct, forced_call, image_starts })
 }
 
 fn finish_of(f: Finish) -> ChatFinishReason {
@@ -347,7 +349,7 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let stream = p.request.stream.unwrap_or(false);
     let include_usage = p.request.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let include_reasoning = body.get("include_reasoning").and_then(Value::as_bool).unwrap_or(true);
-    let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning));
+    let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning), p.instruct);
     // images: encoded now (the prompt fits the context), their rows in the token list become prefix-cache keys
     let mut tokens = p.tokens;
     if !images.is_empty() {

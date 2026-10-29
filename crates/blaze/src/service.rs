@@ -68,6 +68,10 @@ pub struct ServiceArgs {
     /// JSON sampling defaults over generation_config (explicit CLI and request parameters take precedence)
     #[arg(long, alias = "preferred-sampling-params")]
     pub override_generation_config: Option<String>,
+    /// JSON sampling defaults of chat requests with thinking off, over the defaults above (Qwen's instruct mode:
+    /// {"temperature":0.7,"top_p":0.8,"presence_penalty":1.5}); request parameters take precedence
+    #[arg(long)]
+    pub instruct_sampling: Option<String>,
     #[arg(long, allow_hyphen_values = true)]
     pub frequency_penalty: Option<f32>,
     #[arg(long)]
@@ -138,6 +142,19 @@ impl ServiceArgs {
     }
 
     pub fn sampling(&self, model: &Path, overrides: &Value) -> Result<SamplingParams> {
+        Ok(params_of(&self.sampling_value(model, overrides)?))
+    }
+
+    /// Defaults of chat requests with thinking off: --instruct-sampling over `sampling` (None without the flag).
+    pub fn instruct_sampling(&self, model: &Path, overrides: &Value) -> Result<Option<SamplingParams>> {
+        let Some(s) = &self.instruct_sampling else { return Ok(None) };
+        let mut defaults = self.sampling_value(model, overrides)?;
+        merge_sampling(&mut defaults, &serde_json::from_str(s).context("--instruct-sampling must be a JSON object")?, true)?;
+        validate_sampling(&defaults).map_err(anyhow::Error::msg)?;
+        Ok(Some(params_of(&defaults)))
+    }
+
+    fn sampling_value(&self, model: &Path, overrides: &Value) -> Result<Value> {
         let mut defaults = json!({"temperature": 0.8, "top_p": 0.95, "top_k": 20, "min_p": 0.0,
             "presence_penalty": 0.5, "frequency_penalty": 0.0, "repetition_penalty": 1.0, "min_tokens": 0});
         let path = match self.generation_config.as_str() {
@@ -170,18 +187,23 @@ impl ServiceArgs {
             defaults["min_tokens"] = json!(x);
         }
         validate_sampling(&defaults).map_err(anyhow::Error::msg)?;
-        Ok(SamplingParams {
-            temperature: defaults["temperature"].as_f64().unwrap() as f32,
-            top_p: defaults["top_p"].as_f64().unwrap() as f32,
-            top_k: defaults["top_k"].as_i64().unwrap() as i32,
-            min_p: defaults["min_p"].as_f64().unwrap() as f32,
-            presence_penalty: defaults["presence_penalty"].as_f64().unwrap() as f32,
-            frequency_penalty: defaults["frequency_penalty"].as_f64().unwrap() as f32,
-            repetition_penalty: defaults["repetition_penalty"].as_f64().unwrap() as f32,
-            min_tokens: defaults["min_tokens"].as_u64().unwrap() as usize,
-            seed: defaults.get("seed").and_then(Value::as_u64),
-            ..Default::default()
-        })
+        Ok(defaults)
+    }
+}
+
+/// Sampling parameters of validated defaults.
+fn params_of(defaults: &Value) -> SamplingParams {
+    SamplingParams {
+        temperature: defaults["temperature"].as_f64().unwrap() as f32,
+        top_p: defaults["top_p"].as_f64().unwrap() as f32,
+        top_k: defaults["top_k"].as_i64().unwrap() as i32,
+        min_p: defaults["min_p"].as_f64().unwrap() as f32,
+        presence_penalty: defaults["presence_penalty"].as_f64().unwrap() as f32,
+        frequency_penalty: defaults["frequency_penalty"].as_f64().unwrap() as f32,
+        repetition_penalty: defaults["repetition_penalty"].as_f64().unwrap() as f32,
+        min_tokens: defaults["min_tokens"].as_u64().unwrap() as usize,
+        seed: defaults.get("seed").and_then(Value::as_u64),
+        ..Default::default()
     }
 }
 
@@ -294,5 +316,25 @@ mod tests {
         assert_eq!(defaults.frequency_penalty, -0.1);
         assert_eq!(defaults.seed, Some(0));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn instruct_defaults_go_over_the_thinking_ones() {
+        use clap::Parser;
+        let none = TestCli::parse_from(["test", "--generation-config", "none"]);
+        assert!(none.args.instruct_sampling(Path::new("."), &json!({})).unwrap().is_none());
+        let cli = TestCli::parse_from([
+            "test",
+            "--generation-config",
+            "none",
+            "--instruct-sampling",
+            r#"{"temperature":0.7,"top_p":0.8,"presence_penalty":1.5}"#,
+        ]);
+        let cli_flags = json!({"temperature":0.6,"top_k":20,"presence_penalty":0.0});
+        let thinking = cli.args.sampling(Path::new("."), &cli_flags).unwrap();
+        let instruct = cli.args.instruct_sampling(Path::new("."), &cli_flags).unwrap().unwrap();
+        assert_eq!((thinking.temperature, thinking.presence_penalty), (0.6, 0.0));
+        assert_eq!((instruct.temperature, instruct.top_p, instruct.top_k, instruct.presence_penalty), (0.7, 0.8, 20, 1.5));
+        let bad = TestCli::parse_from(["test", "--instruct-sampling", r#"{"temperatur":0.7}"#]);
+        assert!(bad.args.instruct_sampling(Path::new("."), &json!({})).is_err());
     }
 }

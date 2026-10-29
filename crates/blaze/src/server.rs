@@ -59,6 +59,8 @@ pub struct ServeConfig {
     pub host: String,
     pub port: u16,
     pub defaults: SamplingParams,
+    /// defaults of chat requests with thinking off (None: `defaults`)
+    pub instruct_defaults: Option<SamplingParams>,
     pub default_max_tokens: usize,
     pub tool_parser: Option<String>,
     pub reasoning_parser: Option<String>,
@@ -493,9 +495,11 @@ struct Spec {
 }
 
 impl Spec {
-    fn of(st: &AppState, body: &Value, max_tokens: usize, think: Option<ThinkBudget>) -> Self {
+    /// `instruct`: a chat prompt with thinking off (its own defaults, --instruct-sampling)
+    fn of(st: &AppState, body: &Value, max_tokens: usize, think: Option<ThinkBudget>, instruct: bool) -> Self {
+        let defaults = st.cfg.instruct_defaults.as_ref().filter(|_| instruct).unwrap_or(&st.cfg.defaults);
         Self {
-            params: sampling_of(body, &st.cfg.defaults, &st.text),
+            params: sampling_of(body, defaults, &st.text),
             max_tokens,
             stops: stop_strings(body),
             include_stop: ["include_stop_str_in_output", "no_stop_trim"].iter().any(|k| body.get(*k).and_then(Value::as_bool) == Some(true)),

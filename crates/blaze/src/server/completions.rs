@@ -133,7 +133,7 @@ async fn run(st: Arc<AppState>, body: Value) -> Checked<Response> {
     let max_tokens = ["max_tokens", "max_completion_tokens"].iter().find_map(|k| body.get(*k).and_then(Value::as_u64)).map(|x| x as usize).unwrap_or(16);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Value::as_bool).unwrap_or(false);
-    let spec = Spec::of(&st, &body, max_tokens, None);
+    let spec = Spec::of(&st, &body, max_tokens, None, false);
     let mut gens = Vec::new();
     for (pi, job) in jobs.iter().enumerate() {
         gens.extend(submit_n(&st, &job.tokens, &spec, n, pi * n, &|| constraint_of(&st, &body, None, None))?);

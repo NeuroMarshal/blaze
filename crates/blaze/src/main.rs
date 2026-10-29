@@ -858,7 +858,9 @@ fn main() -> Result<()> {
                 engine.suffix_assist=Some(0);
             }
             if engine.disable_prefix_caching { engine.prompt_cache_slots = 0; }
-            let defaults = service.sampling(&engine.model, &serde_json::json!({"temperature":temperature,"top_p":top_p,"top_k":top_k,"min_p":min_p,"presence_penalty":presence_penalty}))?;
+            let cli_sampling = serde_json::json!({"temperature":temperature,"top_p":top_p,"top_k":top_k,"min_p":min_p,"presence_penalty":presence_penalty});
+            let defaults = service.sampling(&engine.model, &cli_sampling)?;
+            let instruct_defaults = service.instruct_sampling(&engine.model, &cli_sampling)?;
             let api_keys = service.keys()?;
             if spec_method == "mtp" {
                 // the checkpoint's own MTP head drafts chains
@@ -945,6 +947,7 @@ fn main() -> Result<()> {
                 host,
                 port,
                 defaults,
+                instruct_defaults,
                 api_keys,
                 max_concurrent_requests: service.max_concurrent_requests,
                 request_timeout: std::time::Duration::from_secs_f64(service.request_timeout),
