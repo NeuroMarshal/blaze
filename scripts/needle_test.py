@@ -1,4 +1,4 @@
-# External test client (from server-llm-runtime/scripts): long-context retrieval, the same test as the SGLang fork ran.
+# Long-context retrieval client, shared with qrt validation.
 """Long-context retrieval: secret codes hidden at several depths of an N-token prompt must all be found.
 
     python3 scripts/needle_test.py N [--url http://127.0.0.1:8000] [--needles 5]

@@ -1,4 +1,4 @@
-# The needle_test.py prompt (server-llm-runtime: same filler and needles) as a raw chat prompt file for
+# The needle_test.py filler and needles as a raw chat prompt file for
 # `blaze generate --prompt-file`; --report asks for a long answer instead of the codes (decode at long context).
 #   python3 scripts/long_prompt.py TOKENS OUT [--report]
 import random, sys
