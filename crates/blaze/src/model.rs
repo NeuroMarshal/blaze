@@ -5,6 +5,7 @@ use crate::config::{QSA_TABLE_STRIDE, LayerKind, MlpConfig, ModelConfig, RopeSca
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check, stream_after};
 use std::cell::{Cell, RefCell};
 use crate::linear::{Cut, LinCtx, Linear};
+use crate::logging::{self, Level, Stage};
 use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -1092,6 +1093,15 @@ impl Model {
         // a pipeline stage loads its own layers; the KV pools and GDN states follow them
         let held = opts.pp.as_ref().map_or(0..cfg.layers.len(), |p| p.layers.clone());
         let layer0 = held.start;
+        let moe = matches!(cfg.mlp, MlpConfig::Moe { .. });
+        let backbone = if r == 0 {
+            logging::stage(format!("{} → GPU{}{}", if moe { "backbone weights (routed experts come later)" } else { "model weights" },
+                                   if w > 1 { format!("s 0..{w}, a shard each") } else { crate::gpu::device().unwrap_or(0).to_string() },
+                                   if opts.pp.is_some() { format!(", layers {}..{}", held.start, held.end) } else { String::new() }))
+                .total(held.len() as f64, "layers")
+        } else {
+            Stage::none()
+        };
         for (i, kind) in cfg.layers.iter().enumerate().filter(|(i, _)| held.contains(i)) {
             let l = format!("{p}layers.{i}.");
             let (attn, gdn, slot) = match kind {
@@ -1248,6 +1258,7 @@ impl Model {
                 mlp,
                 slot,
             });
+            backbone.progress((i + 1 - layer0) as f64);
         }
         let final_mix = if cfg.hc.is_some() {
             FinalMix::Hyper(load_hc(&ckpt, &format!("{p}hyper_connection_mixer."))?)
@@ -1269,6 +1280,8 @@ impl Model {
         let mrope_comp = DevBuf::from_slice(&mrope_components(&cfg.rope))?;
         let inv_freq = DevBuf::from_slice(&freqs)?;
         mark("weights (no routed experts)", s)?;
+        backbone.done(format!("{} layers, {n_full} softmax + {n_gdn} GDN, and the LM head", held.len()));
+        let buffers = if r == 0 { logging::stage("KV cache, recurrent states, activation buffers") } else { Stage::none() };
 
         // KV pools for every softmax layer, GDN states for every linear layer, this rank's heads.
         let (code_bytes, scale_bytes) = opts.kv_dtype.bytes();
@@ -1395,8 +1408,8 @@ impl Model {
         if tp.rank == 0 {
             let mut big = work.sizes();
             big.sort_by(|a, b| b.1.cmp(&a.1));
-            let top: Vec<String> = big.iter().take(10).map(|(k, b)| format!("{k} {:.0}", *b as f64 / (1u64 << 20) as f64)).collect();
-            eprintln!("blaze: largest activation buffers (MiB): {}", top.join(", "));
+            let top: Vec<String> = big.iter().take(10).map(|(k, b)| format!("{k} {:.0} MiB", *b as f64 / (1u64 << 20) as f64)).collect();
+            eprintln!("blaze: largest activation buffers: {}", top.join(", "));
         }
         // Scratch NVFP4 weights are widened into for prefill GEMMs.
         let mut scratch_elems = lm_head.scratch_elems();
@@ -1424,9 +1437,12 @@ impl Model {
         }
         s.sync()?;
         mark("widening scratch + cuBLAS", s)?;
+        buffers.done("");
         if tp.rank == 0 {
-            let parts: Vec<String> = vram.iter().filter(|v| v.1 >= 0.005).map(|(k, g)| format!("{k} {g:.2}")).collect();
-            eprintln!("blaze: VRAM (GiB) on GPU{}: {}; free {:.2}", tp.rank, parts.join(", "), free_at as f64 / (1u64 << 30) as f64);
+            let mut rows: Vec<(String, String)> = vram.iter().filter(|v| v.1 >= 0.005).map(|(k, g)| (k.to_string(), format!("{g:6.2} GiB"))).collect();
+            let used: f64 = vram.iter().map(|v| v.1).sum();
+            rows.push(("free now".into(), format!("{:6.2} GiB", free_at as f64 / (1u64 << 30) as f64)));
+            logging::block(Level::Info, "memory", &format!("VRAM of GPU{} so far: {used:.2} GiB in these parts", crate::gpu::device().unwrap_or(0)), &rows);
         }
 
         let mut num_sms: c_int = 0;
@@ -1557,56 +1573,59 @@ impl Model {
             }
         }
         let t0 = std::time::Instant::now();
+        let tuned = model.lin.tune.tune(&weights, model.lin.gemm, &model.stream)?;
+        let gemv_secs = t0.elapsed().as_secs_f64();
+        if let Some(auto) = model.opts.kv_auto.clone() {
+            model.size_kv(&auto)?;
+        }
+        let t1 = std::time::Instant::now();
+        let measured = model.tune_attention()?;
         if model.tp.rank == 0 {
-            eprintln!("blaze: NVFP4 layers on many rows (prefill): {}", model.lin.describe());
             let (major, minor) = crate::gpu::compute_capability();
             let fa2 = model.opts.prefill_attention == PrefillAttention::Auto
                 && model.opts.kv_dtype.format() == sys::BLZ_KV_NVFP4 && model.cfg.attn.head_dim == 256
                 && model.cfg.qsa.is_none();
             let prefill_f16 = if fa2 { model.attn_f16 } else { model.decode_f16 };
             let prefill_path = if model.cfg.qsa.is_some() { "QSA selection + split decode path" }
-                else if fa2 { "FA2 for supported spans >= 64 tokens" } else { "split decode path" };
-            eprintln!("blaze: attention SM {major}.{minor}: prefill {}, accumulation {}; register decode accumulation {}",
-                prefill_path,
-                if prefill_f16 { "FP16 in short runs" } else { "FP32" },
-                if model.decode_f16 { "FP16 in short runs" } else { "FP32" });
-            eprintln!("blaze: dense causal NVFP4 verify: {} (other geometries use the register kernel)", match model.verify_mode {
-                0 => "register kernel",
-                1 => "shared dequantization, FP32, >48 rows",
-                2 => "shared dequantization, FP16, >48 rows",
-                3 => "experimental paired warps, FP32, >16 rows",
-                4 => "experimental paired warps, FP16, >16 rows",
-                5 => "paired warps, FP32, >48 rows; register kernel for shorter calls",
-                _ => "paired warps, FP16, >48 rows; register kernel for shorter calls",
-            });
-        }
-        let tuned = model.lin.tune.tune(&weights, model.lin.gemm, &model.stream)?;
-        if tuned > 0 && model.tp.rank == 0 {
-            eprintln!("blaze: tuned the GEMV launches of {tuned} weight shapes in {:.1} s", t0.elapsed().as_secs_f64());
-        }
-        if let Some(auto) = model.opts.kv_auto.clone() {
-            model.size_kv(&auto)?;
-        }
-        if model.opts.prefill_a16 != PrefillA16::None && model.tp.rank == 0 {
-            let (mut on, mut all) = (0, 0);
-            for l in &model.layers {
-                for lin in [l.attn.as_ref().map(|a| &a.qkv), l.gdn.as_ref().map(|g| &g.in_proj)].into_iter().flatten() {
-                    all += lin.a16 as usize;
-                    on += lin.a16_applies() as usize;
-                }
+                else if fa2 { "FlashAttention-2 for spans >= 64 tokens" } else { "split decode path" };
+            let acc = |f16: bool| if f16 { "FP16 accumulation in short runs (summed in FP32)" } else { "FP32 accumulation" };
+            let mut rows = vec![
+                ("prefill GEMMs".to_string(), model.lin.describe()),
+                ("prefill attention".to_string(), format!("{prefill_path}, {}", acc(prefill_f16))),
+                ("decode attention".to_string(), format!("register kernel, {}", acc(model.decode_f16))),
+                ("verify attention".to_string(), format!("dense causal NVFP4: {} (other geometries: the register kernel)", match model.verify_mode {
+                    0 => "register kernel",
+                    1 => "shared dequantization, FP32, > 48 rows",
+                    2 => "shared dequantization, FP16, > 48 rows",
+                    3 => "experimental paired warps, FP32, > 16 rows",
+                    4 => "experimental paired warps, FP16, > 16 rows",
+                    5 => "paired warps, FP32, > 48 rows; register kernel for shorter calls",
+                    _ => "paired warps, FP16, > 48 rows; register kernel for shorter calls",
+                })),
+            ];
+            if !model.attn_policy.is_empty() {
+                let lens: Vec<String> = model.attn_policy.iter().enumerate()
+                    .filter_map(|(q, c)| c.map(|c| format!("{q}: {} x{}", c.describe(), c.splits))).collect();
+                rows.push(("verify by query length".into(), format!("{} ({})", lens.join(", "), if measured > 0 {
+                    format!("measured now in {:.1} s", t1.elapsed().as_secs_f64()) } else { "from the cache".into() })));
             }
-            eprintln!("blaze: --prefill-a16: {on} of {all} projections on the W4A16 GEMM (the others' scales leave FP16: W4A4)");
-        }
-        let t1 = std::time::Instant::now();
-        let measured = model.tune_attention()?;
-        if model.tp.rank == 0 && !model.attn_policy.is_empty() {
-            let lens: Vec<String> = model.attn_policy.iter().enumerate()
-                .filter_map(|(q, c)| c.map(|c| format!("{q}: {} x{}", c.describe(), c.splits))).collect();
-            eprintln!("blaze: verify attention by query length{} ({})", if measured > 0 {
-                format!(", measured in {:.1} s", t1.elapsed().as_secs_f64()) } else { String::new() }, lens.join(", "));
+            rows.push(("GEMV launches".into(), if tuned > 0 { format!("{tuned} weight shapes measured now in {gemv_secs:.1} s") } else { "from the cache".into() }));
+            if model.opts.prefill_a16 != PrefillA16::None {
+                let (mut on, mut all) = (0, 0);
+                for l in &model.layers {
+                    for lin in [l.attn.as_ref().map(|a| &a.qkv), l.gdn.as_ref().map(|g| &g.in_proj)].into_iter().flatten() {
+                        all += lin.a16 as usize;
+                        on += lin.a16_applies() as usize;
+                    }
+                }
+                rows.push(("--prefill-a16".into(), format!("{on} of {all} projections on the W4A16 GEMM (the others' scales leave FP16: W4A4)")));
+            }
+            logging::block(Level::Info, "kernels", &format!("kernels for SM {major}.{minor} ({num_sms} SMs)"), &rows);
         }
         if model.opts.kv_host && model.cfg.qsa.is_some() {
+            let st = if model.tp.rank == 0 { logging::stage("KV cache in pinned host RAM") } else { Stage::none() };
             model.init_host_kv()?;
+            st.done("");
         }
         if let MlpConfig::Moe { top_k, .. } = model.cfg.mlp {
             model.moe = Some(model.start_moe(dir, top_k)?);
@@ -1834,22 +1853,22 @@ impl Model {
         let mut engine = null_mut();
         let mut err = vec![0i8; 1024];
         let free_before = free;
+        let stage = logging::stage(format!("routed experts → GPU{gpu0}{} slots, pinned RAM{} ({threads} CPU expert workers)",
+                                           if gpu1 >= 0 { format!(" + GPU{gpu1}") } else { String::new() },
+                                           if self.opts.moe_ram_gib >= 0.0 { ", SSD" } else { "" }));
         if unsafe { sys::blz_moe_engine_create(&cfg, &mut engine, err.as_mut_ptr().cast(), err.len()) } != 0 {
             let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr().cast()) }.to_string_lossy().into_owned();
             return Err(anyhow!("MoE engine: {msg}"));
         }
         let free_after = crate::gpu::mem_info()?.0;
-        eprintln!(
-            "blaze: VRAM (GiB) on GPU0: MoE engine {:.2} (budget {gib:.2}); free {:.2}",
-            free_before.saturating_sub(free_after) as f64 / (1u64 << 30) as f64,
-            free_after as f64 / (1u64 << 30) as f64
-        );
-        eprintln!(
-            "blaze: MoE engine: {:.2} GiB of expert slots on GPU0, {:.2} GiB on GPU1, the rest in pinned RAM{}",
-            gib,
-            self.opts.moe_gpu1_gib.max(0.0),
-            if self.opts.moe_ram_gib >= 0.0 { " and on the SSD" } else { "" }
-        );
+        let gib_of = |b: usize| b as f64 / (1u64 << 30) as f64;
+        stage.done(format!(
+            "slots: GPU{gpu0} {gib:.2} GiB{}, the rest in pinned RAM{}; GPU{gpu0}: the engine took {:.2} GiB with its tables, {:.2} GiB free",
+            if gpu1 >= 0 { format!(", GPU{gpu1} {:.2} GiB", self.opts.moe_gpu1_gib.max(0.0)) } else { String::new() },
+            if self.opts.moe_ram_gib >= 0.0 { " and on the SSD" } else { "" },
+            gib_of(free_before.saturating_sub(free_after)),
+            gib_of(free_after)
+        ));
         Ok(MoeEngine(engine))
     }
 

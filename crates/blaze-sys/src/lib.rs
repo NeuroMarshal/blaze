@@ -19,6 +19,10 @@ pub const STREAM_NON_BLOCKING: u32 = 1;
 // CUDA runtime
 unsafe extern "C" {
     pub fn blaze_set_log_callback(callback: Option<unsafe extern "C" fn(message: *const c_char)>);
+    /// Load stages (kernels/include/blaze/log.h): op begin 0 (returns the id), progress 1, end 2.
+    pub fn blaze_set_stage_callback(
+        callback: Option<unsafe extern "C" fn(op: c_int, id: i64, text: *const c_char, done: f64, total: f64, unit: *const c_char, ok: c_int) -> i64>,
+    );
     pub fn cudaGetErrorString(err: cudaError_t) -> *const c_char;
     pub fn cudaSetDevice(device: c_int) -> cudaError_t;
     pub fn cudaGetDeviceCount(count: *mut c_int) -> cudaError_t;

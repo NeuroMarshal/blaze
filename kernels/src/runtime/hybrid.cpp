@@ -68,9 +68,10 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   if (heat_long.size() != n) heat_long = heat;
   placement_ = place_experts(L, E, heat, capacity_[0] - spare[0], capacity_[1] - spare[1], capacity_[2] - spare[2],
                              heat_long, cfg_.layer_begin, cfg_.layer_end);
-  log("blaze: %d layers x %d experts (%s%s) -> GPU0 %d, GPU1 %d, RAM %d%s", L, E, store_->prefix().c_str(),
-      heat.empty() ? "" : ", placement from the routing profile", placement_.used[0], placement_.used[1],
-      placement_.used[2], placement_.used[3] ? (", SSD " + std::to_string(placement_.used[3])).c_str() : "");
+  log("blaze: routed experts: %d layers x %d = %zu experts of %.2f MiB (%s): GPU0 %d, GPU1 %d, RAM %d%s; placement %s",
+      L, E, held, stride_ / double(1 << 20), store_->prefix().c_str(), placement_.used[0], placement_.used[1],
+      placement_.used[2], placement_.used[3] ? (", SSD " + std::to_string(placement_.used[3])).c_str() : "",
+      heat.empty() ? "by layer order (no routing profile yet)" : "from the routing profile (hottest experts on the GPUs)");
   for (int t = 0; t < 3; ++t)
     for (int s = placement_.used[t]; s < capacity_[t]; ++s) free_[t].push_back(s);
   for (int t = 0; t < 4; ++t) stat_resident_[t] = placement_.used[t];
@@ -95,9 +96,15 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
     throw std::runtime_error("blaze hybrid: RAM tier of " + std::to_string(arena >> 20) + " MiB does not fit: " +
                              std::to_string(avail >> 20) + " MiB available, " + std::to_string(host_reserve >> 20) +
                              " MiB must stay free (lower the RAM budget)");
-  if (capacity_[2] > 0)
-    check(cudaHostAlloc(reinterpret_cast<void**>(&ram_), size_t(capacity_[2]) * stride_, cudaHostAllocPortable),
-          "RAM arena");
+  if (capacity_[2] > 0) {
+    // the kernel zeroes and pins every page: about 1 GiB/s
+    char label[96];
+    std::snprintf(label, sizeof(label), "pinning %.1f GiB of host RAM for %d RAM-tier expert slots",
+                  arena / double(1 << 30), capacity_[2]);
+    Stage stage(label);
+    check(cudaHostAlloc(reinterpret_cast<void**>(&ram_), arena, cudaHostAllocPortable), "RAM arena");
+    stage.end("%.2f GiB/s", arena / double(1 << 30) / std::max(1e-9, stage.seconds()));
+  }
   for (size_t i = 0; i < n; ++i)
     if (placement_.tier[i] == Tier::kRam) host_records_[i] = ram_slot(placement_.slot[i]);
   const blz_mail_layout ml = blz_mail_layout_for(geo.hidden);
@@ -252,14 +259,24 @@ void HybridMoe::load_tiers() {
       if (!failed.exchange(true)) error = ex.what();
     }
   };
-  const auto t0 = std::chrono::steady_clock::now();
+  size_t total = 0;
+  for (size_t i = 0; i < n; ++i) total += placement_.tier[i] == Tier::kSsd ? 0 : stride_;
+  const int threads = std::max(1, cfg_.load_threads);
+  char label[96];
+  std::snprintf(label, sizeof(label), "reading %.1f GiB of experts from the checkpoint (%d threads, O_DIRECT)",
+                total / double(1 << 30), threads);
+  Stage stage(label, double(total), "B");
+  std::atomic<int> running{threads};
   std::vector<std::thread> pool;
-  for (int t = 0; t < std::max(1, cfg_.load_threads); ++t) pool.emplace_back(work);
+  for (int t = 0; t < threads; ++t) pool.emplace_back([&] { work(), --running; });
+  while (running > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    stage.progress(double(done_bytes));
+  }
   for (auto& t : pool) t.join();
   if (failed) throw std::runtime_error(error);
-  const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  log("blaze: loaded %.1f GiB of experts from the checkpoint in %.1f s (%.2f GB/s)",
-              done_bytes / double(1 << 30), s, done_bytes / s / 1e9);
+  const double s = stage.seconds();
+  stage.end("%.1f GiB at %.2f GB/s", done_bytes / double(1 << 30), done_bytes / std::max(1e-9, s) / 1e9);
 }
 
 cudaError_t HybridMoe::forward(int layer, const uint16_t* x, int tokens, const int32_t* ids, const float* w,

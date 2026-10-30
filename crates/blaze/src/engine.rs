@@ -743,21 +743,20 @@ fn worker_main(
         let draft_dir = opts.draft.clone();
         let model = Model::load(&dir, opts, Tp { rank: tp_rank, world: tp_world, ar, ar_bytes }, embed)?;
         let staging = HostMapped::new(model.meta.bytes)?;
+        let stage = |what: String| if rank == 0 { crate::logging::stage(what) } else { crate::logging::Stage::none() };
         let draft = match draft_dir {
             Some(d) => {
                 let head = draft_head;
+                let st = stage(format!("draft model {}", d.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())));
                 let dr = crate::drafter::Drafter::load(&d, &model, model.opts.max_seqs, model.ctx_stride(), head)?;
-                if rank == 0 {
-                    eprintln!("blaze: {}", dr.describe());
-                }
+                st.done(dr.describe());
                 Some(dr)
             }
             None if model.opts.mtp_window > 0 => {
                 let mtp = model.opts.mtp_model.clone().unwrap_or_else(|| dir.clone());
+                let st = stage("MTP draft head".into());
                 let dr = crate::drafter::Drafter::load_mtp(&mtp, &model, model.opts.max_seqs, model.ctx_stride(), model.opts.mtp_window)?;
-                if rank == 0 {
-                    eprintln!("blaze: {}", dr.describe());
-                }
+                st.done(dr.describe());
                 Some(dr)
             }
             _ => None,
@@ -832,7 +831,9 @@ impl Engine {
         if opts.mtp_window > 0 && opts.draft.is_some() {
             bail!("--mtp-window with --draft-model: one drafter at a time");
         }
+        let st = crate::logging::stage("token embeddings → pinned host RAM");
         let embed = Arc::new(Model::load_embedding(dir)?);
+        st.done(crate::logging::bytes(embed.bytes() as f64));
         // the EAGLE-4 LM head as one pinned table for every rank (DFlash uses the target's head)
         let draft_head = match opts.draft.as_deref() {
             Some(d) if crate::drafter::kind(d)? == crate::drafter::Kind::Eagle => Some(Arc::new(crate::eagle::load_lm_head(d)?)),

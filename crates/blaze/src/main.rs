@@ -233,9 +233,10 @@ impl EngineArgs {
     /// `vision_gpu`: --vision gpu, the tower's VRAM is kept from the expert slots of a model with routed experts too.
     fn load_with(&self, chunk: Option<usize>, full_logits: bool, gpu0_later: usize, vision_gpu: bool) -> Result<blaze::engine::Engine> {
         let (opts, world) = self.options(chunk, full_logits, gpu0_later, vision_gpu)?;
-        let t0 = Instant::now();
+        let name = self.model.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        let stage = blaze::logging::stage(format!("engine: {name} on {world} GPU{}", if world > 1 { "s" } else { "" }));
         let e = blaze::engine::Engine::new(&self.model, opts, world, !self.no_graphs)?;
-        eprintln!("blaze: loaded in {:.1} s", t0.elapsed().as_secs_f64());
+        stage.done(format!("KV pool {} tokens, context {}", e.info.max_tokens, e.info.ctx_stride));
         Ok(e)
     }
 
@@ -565,10 +566,71 @@ fn exit_on_thread_panic() {
     }));
 }
 
+/// The serving configuration at the top of the log: what will load, where it listens, the request defaults.
+#[allow(clippy::too_many_arguments)]
+fn startup_summary(engine: &EngineArgs, service: &blaze::service::ServiceArgs, sampling: &blaze::sampler::SamplingParams,
+                   instruct: Option<&blaze::sampler::SamplingParams>, host: &str, port: u16, served: Option<&str>, spec_method: &str,
+                   thinking_budget: Option<usize>, max_tokens: usize, step_tokens: usize, vision: blaze::vision::VisionMode) {
+    let compact = |p: &blaze::sampler::SamplingParams| {
+        let v = serde_json::to_value(p).unwrap_or_default();
+        let mut parts = Vec::new();
+        for (k, short) in [("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"), ("min_p", "min_p"),
+                           ("presence_penalty", "presence"), ("frequency_penalty", "frequency"), ("repetition_penalty", "repetition")] {
+            if let Some(x) = v.get(k).and_then(|x| x.as_f64()) {
+                parts.push(format!("{short} {}", blaze::logging::num(x)));
+            }
+        }
+        parts.join(" · ")
+    };
+    let model_name = engine.model.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    let mut rows = vec![
+        ("model".to_string(), engine.model.display().to_string()),
+        ("served as".to_string(), served.unwrap_or(&model_name).to_string()),
+        ("listen".to_string(), format!("http://{host}:{port}/v1")),
+        ("GPUs".to_string(), match (engine.tp.max(1), engine.pp.max(1)) {
+            (1, 1) => "1".to_string(),
+            (t, 1) => format!("{t} (tensor parallel)"),
+            (t, p) => format!("{} ({p} pipeline stages of {t})", t * p),
+        }),
+        ("context".to_string(), format!("{}{}", engine.max_model_len.map_or("the checkpoint's".to_string(), |n| n.to_string()),
+                                        engine.yarn_factor.map_or(String::new(), |f| format!(" (YaRN x{})", blaze::logging::num(f))))),
+        ("KV cache".to_string(), format!("{} · {} · {}", match engine.kv_tokens.as_str() {
+            "auto" | "" => "auto (what the VRAM holds after the weights)".to_string(),
+            n => format!("{n} tokens"),
+        }, match engine.kv_cache_dtype {
+            blaze::model::KvDtype::Nvfp4FourOverSix => "nvfp4_4over6",
+            blaze::model::KvDtype::Nvfp4 => "nvfp4",
+            blaze::model::KvDtype::Fp8 => "fp8",
+            blaze::model::KvDtype::Bf16 => "bf16",
+            blaze::model::KvDtype::Tq3 => "tq3",
+        },
+                                         if engine.kv_host { "in pinned host RAM" } else { "in VRAM" })),
+        ("batching".to_string(), format!("{} sequence{} · prefill chunk {} · step {} tokens · prefix cache {} snapshots",
+                                         engine.max_seqs, if engine.max_seqs == 1 { "" } else { "s" }, engine.chunk, step_tokens,
+                                         if engine.disable_prefix_caching { 0 } else { engine.prompt_cache_slots })),
+        ("speculation".to_string(), spec_method.to_string()),
+    ];
+    if engine.expert_gpu1_gib > 0.0 || engine.expert_defer >= 0 || !engine.expert_cores.is_empty() {
+        rows.push(("routed experts".to_string(), format!("GPU1 {} GiB · {} CPU workers{}{}", blaze::logging::num(engine.expert_gpu1_gib),
+            engine.expert_threads, if engine.expert_cores.is_empty() { String::new() } else { format!(" on cores {}", engine.expert_cores) },
+            if engine.expert_defer >= 0 { format!(" · defer rank >= {}", engine.expert_defer) } else { String::new() })));
+    }
+    rows.push(("vision".to_string(), format!("{vision:?}").to_lowercase()));
+    rows.push(("sampling".to_string(), compact(sampling)));
+    if let Some(i) = instruct {
+        rows.push(("thinking off".to_string(), compact(i)));
+    }
+    rows.push(("limits".to_string(), format!("max tokens {max_tokens} · thinking budget {} · timeout {} · queue {} · {} HTTP at once",
+        thinking_budget.map_or("none".to_string(), |b| b.to_string()), blaze::logging::dur(service.request_timeout),
+        service.max_queued_requests, service.max_concurrent_requests)));
+    blaze::logging::block(blaze::logging::Level::Info, "blaze", &format!("blaze {} · serve {model_name}", env!("CARGO_PKG_VERSION")), &rows);
+}
+
 fn main() -> Result<()> {
     exit_on_thread_panic();
     let (cli, mut effective) = blaze::cli::parse::<Cli>()?;
-    if let Command::Serve { service, engine, temperature, top_p, top_k, min_p, presence_penalty, step_tokens, max_tokens, .. } = &cli.command {
+    if let Command::Serve { service, engine, temperature, top_p, top_k, min_p, presence_penalty, step_tokens, max_tokens, host, port,
+                            served_model_name, spec_method, thinking_budget, vision, .. } = &cli.command {
         service.validate()?;
         engine.validate()?;
         for (name,x) in [("temperature",temperature),("top-p",top_p),("min-p",min_p),("presence-penalty",presence_penalty)] {
@@ -582,10 +644,16 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&effective)?);
             return Ok(());
         }
-        blaze::logging::event(blaze::logging::Level::Info, "startup", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),
-            "model":engine.model,"tp":engine.tp,"prefill_chunk":engine.chunk,"kv_tokens":engine.kv_tokens,
-            "max_model_len":engine.max_model_len,"max_queued_requests":service.max_queued_requests,
-            "request_timeout_s":service.request_timeout,"sampling":sampling}));
+        if service.log_format == blaze::logging::Format::Json {
+            blaze::logging::event(blaze::logging::Level::Info, "startup", serde_json::json!({"version":env!("CARGO_PKG_VERSION"),
+                "model":engine.model,"tp":engine.tp,"prefill_chunk":engine.chunk,"kv_tokens":engine.kv_tokens,
+                "max_model_len":engine.max_model_len,"max_queued_requests":service.max_queued_requests,
+                "request_timeout_s":service.request_timeout,"sampling":sampling}));
+        } else {
+            let instruct = service.instruct_sampling(&engine.model, &serde_json::json!({"temperature":temperature,"top_p":top_p,"top_k":top_k,"min_p":min_p,"presence_penalty":presence_penalty}))?;
+            startup_summary(engine, service, &sampling, instruct.as_ref(), host, *port, served_model_name.as_deref(), spec_method,
+                            *thinking_budget, *max_tokens, *step_tokens, *vision);
+        }
         blaze::logging::event(blaze::logging::Level::Debug, "startup.config", serde_json::json!({"config":effective}));
     }
     match cli.command {
@@ -877,7 +945,23 @@ fn main() -> Result<()> {
                     anyhow::bail!("--spec-method mtp uses the target's own head: no --draft-model");
                 }
             }
+            // the API's port first: a port in use fails now, not after minutes of load, and until the model is ready every
+            // request gets 503 with the load's progress
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
+            let early = rt.block_on(blaze::server::listen(&host, port))?;
+            let st = blaze::logging::stage("tokenizer and chat template");
             let text = blaze::text::Text::load(&engine.model)?;
+            let vocab = blaze::config::ModelConfig::load(&engine.model)?.vocab;
+            st.done(format!("vocabulary {vocab}, end tokens {:?}", text.eos));
+            // the grammar compiler of structured outputs and forced tool calls (llguidance's token trie: about 1.5 s for a
+            // 248k vocabulary) works next to the load
+            let grammar_job = {
+                let (path, eos) = (engine.model.join("tokenizer.json"), text.eos.clone());
+                std::thread::Builder::new().name("grammars".into()).spawn(move || {
+                    let t0 = Instant::now();
+                    (blaze::structured::Grammars::load(&path, &eos, vocab), t0.elapsed().as_secs_f64())
+                })?
+            };
             let mm_kwargs: blaze::vision::Overrides = match mm_processor_kwargs.as_deref().filter(|s| !s.trim().is_empty()) {
                 Some(j) => blaze::vision::Overrides::parse(&serde_json::from_str(j).map_err(|e| anyhow::anyhow!("--mm-processor-kwargs: {e}"))?)
                     .map_err(|e| anyhow::anyhow!("--mm-processor-kwargs: {e}"))?,
@@ -888,9 +972,13 @@ fn main() -> Result<()> {
             // after the model, so that `auto` sees the VRAM that is left; on the first GPU, whatever the tensor parallelism
             // (the embeddings go to every rank through host memory)
             let cores = std::thread::available_parallelism().map_or(8, |n| n.get());
+            let st = (vision != blaze::vision::VisionMode::Off).then(|| blaze::logging::stage(format!("vision tower ({})", format!("{vision:?}").to_lowercase())));
             let tower =
                 blaze::vision::Vision::load(&engine.model, vision, vision_threads.unwrap_or((cores / 2).max(4)), 0, mm_kwargs.max_pixels,
                                             blaze::vision::EncoderBatch { patches: mm_encoder_patches, images: mm_encoder_batch })?;
+            if let Some(st) = st {
+                st.done(if tower.is_some() { "" } else { "none in the checkpoint" });
+            }
             let mm = blaze::server::MmConfig::new(
                 tower.map(std::sync::Arc::new),
                 mm_kwargs,
@@ -961,9 +1049,25 @@ fn main() -> Result<()> {
                 thinking_budget,
                 grammar_whitespace,
             };
-            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
+            let grammars = {
+                let st = (!grammar_job.is_finished()).then(|| blaze::logging::stage("grammar compiler (finishing)"));
+                let (grammars, secs) = grammar_job.join().map_err(|_| anyhow::anyhow!("the grammar compiler panicked"))?;
+                if let Some(st) = st {
+                    st.done("");
+                }
+                match grammars {
+                    Ok(g) => {
+                        eprintln!("blaze: grammar compiler (structured outputs, forced tool calls) ready in {secs:.2} s, next to the load");
+                        Some(g)
+                    }
+                    Err(e) => {
+                        eprintln!("blaze: structured outputs disabled: {e}");
+                        None
+                    }
+                }
+            };
             let shutdown = sched.clone();
-            let result = rt.block_on(blaze::server::serve(sched, &engine.model, text, cfg, max_context, vocab, mm));
+            let result = rt.block_on(blaze::server::serve(early, sched, &engine.model, text, grammars, cfg, max_context, vocab, mm));
             // Join the scheduler (which joins rank workers) before the runtime and process begin teardown. It stops
             // admitting work immediately and waits only for an in-flight engine step and GPU resource destruction.
             let stopping = Instant::now();

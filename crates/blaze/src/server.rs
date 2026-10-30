@@ -171,8 +171,82 @@ fn parse_body(bytes: &Bytes) -> std::result::Result<Value, Response> {
     }
 }
 
-pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cfg: ServeConfig, max_context: usize,
-                   vocab: usize, mm: MmConfig) -> Result<()> {
+/// The HTTP port, open from the start of the load. Until `serve` hands it the API, every request except /version gets
+/// 503 (`/health` and `/ping` too, so that health checks wait for the model) with the stage the load is in; a shutdown
+/// signal during the load ends the process.
+pub struct Early {
+    app: Arc<std::sync::OnceLock<Router>>,
+    serving: tokio::task::JoinHandle<std::io::Result<()>>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    signal: tokio::sync::watch::Receiver<bool>,
+    listen: std::net::SocketAddr,
+    started: std::time::Instant,
+}
+
+pub async fn listen(host: &str, port: u16) -> Result<Early> {
+    use anyhow::Context;
+    use std::future::IntoFuture;
+    use tower::ServiceExt;
+    let listener = tokio::net::TcpListener::bind((host, port)).await.with_context(|| format!("listening on {host}:{port}"))?;
+    let listen = listener.local_addr()?;
+    let app: Arc<std::sync::OnceLock<Router>> = Arc::default();
+    let started = std::time::Instant::now();
+    let front = Router::new().fallback({
+        let app = app.clone();
+        move |req: Request| {
+            let app = app.clone();
+            async move {
+                match app.get() {
+                    Some(r) => r.clone().oneshot(req).await.unwrap_or_else(|e| match e {}),
+                    None => loading(&req, started),
+                }
+            }
+        }
+    });
+    let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = tokio::spawn(
+        axum::serve(listener, front.into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .with_graceful_shutdown(async { let _ = stop_rx.await; })
+            .into_future(),
+    );
+    let (signal_tx, signal) = tokio::sync::watch::channel(false);
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            control::shutdown_signal().await;
+            if app.get().is_none() {
+                crate::logging::event(crate::logging::Level::Warn, "server.interrupted", json!({"message":"stopped during the load"}));
+                std::process::exit(130);
+            }
+            let _ = signal_tx.send(true);
+        });
+    }
+    crate::logging::event(crate::logging::Level::Info, "http.listening", json!({"message":format!(
+        "listening on http://{listen}: until the model is ready, requests get 503 with the load's progress (GET /health)")}));
+    Ok(Early { app, serving, stop, signal, listen, started })
+}
+
+/// The answer of a loading server: 503, the running stages and their progress, Retry-After.
+fn loading(req: &Request, started: std::time::Instant) -> Response {
+    if req.uri().path() == "/version" {
+        return Json(json!({"version": env!("CARGO_PKG_VERSION")})).into_response();
+    }
+    let what = crate::logging::running_text().unwrap_or_else(|| "starting".into());
+    let mut r = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {"message": format!("the model is loading: {what}"), "type": "service_unavailable", "param": null,
+                              "code": "model_loading"},
+                    "status": "loading", "elapsed_s": (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+                    "stages": crate::logging::running()})),
+    )
+        .into_response();
+    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve(early: Early, sched: Scheduler, model_dir: &std::path::Path, text: Text, grammars: Option<Grammars>, cfg: ServeConfig,
+                   max_context: usize, vocab: usize, mm: MmConfig) -> Result<()> {
     let template = model_dir.join("chat_template.jinja");
     let config = model_dir.join("tokenizer_config.json");
     let formatter = blaze_chat::load_chat_formatter(
@@ -189,14 +263,6 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         Some(c.get("chat_template")?.to_string())
     });
     let developer_as_system = template_text.is_some_and(|t| !t.contains("developer"));
-    let t0 = std::time::Instant::now();
-    let grammars = Grammars::load(&model_dir.join("tokenizer.json"), &text.eos, vocab)
-        .map_err(|e| eprintln!("blaze: structured outputs disabled: {e}"))
-        .ok();
-    if grammars.is_some() {
-        eprintln!("blaze: grammar compiler ready in {:.2} s", t0.elapsed().as_secs_f64());
-    }
-    let addr = (cfg.host.clone(), cfg.port);
     let body_limit = cfg.body_limit;
     let state = Arc::new(AppState {
         http_slots: Arc::new(tokio::sync::Semaphore::new(cfg.max_concurrent_requests)),
@@ -236,21 +302,48 @@ pub async fn serve(sched: Scheduler, model_dir: &std::path::Path, text: Text, cf
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(axum::middleware::from_fn_with_state(state.clone(), control::request))
         .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    crate::logging::event(crate::logging::Level::Info,"server.ready",json!({"listen":listener.local_addr()?.to_string(),
-        "model":state.cfg.served_name,"max_model_len":max_context,"api_auth":!state.key_hashes.is_empty(),
-        "endpoints":["/v1/chat/completions","/v1/completions","/v1/responses","/v1/messages","/v1/embeddings","/metrics","/server_info"]}));
-    use std::future::IntoFuture;
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let serving = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(async { let _ = stop_rx.await; }).into_future();
-    tokio::pin!(serving);
+    let Early { app: slot, mut serving, stop, mut signal, listen, started } = early;
+    let _ = slot.set(app);
+    let endpoints = ["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/v1/embeddings"];
+    if crate::logging::options().format == crate::logging::Format::Json {
+        crate::logging::event(crate::logging::Level::Info,"server.ready",json!({"listen":listen.to_string(),
+            "model":state.cfg.served_name,"max_model_len":max_context,"api_auth":!state.key_hashes.is_empty(),
+            "load_s":started.elapsed().as_secs_f64(),
+            "endpoints":["/v1/chat/completions","/v1/completions","/v1/responses","/v1/messages","/v1/embeddings","/metrics","/server_info"]}));
+    } else {
+        let mut rows = vec![
+            ("API".to_string(), endpoints.join("  ")),
+            ("service".to_string(), "/health  /metrics  /server_info  /v1/models  /tokenize  /detokenize  /version".to_string()),
+            ("API keys".to_string(), if state.key_hashes.is_empty() { "none: any client".to_string() } else { format!("{} accepted", state.key_hashes.len()) }),
+            ("structured outputs".to_string(), if state.grammars.is_some() { "on".into() } else { "off (no grammar compiler)".into() }),
+            ("chat template".to_string(), if state.formatter.is_some() { "from the checkpoint".into() } else { "none: /v1/chat/completions disabled".into() }),
+        ];
+        let stages = {
+            let mut f = crate::logging::finished();
+            f.sort_by_key(|x| x.id);
+            f
+        };
+        for st in stages.iter().filter(|st| st.depth <= 2) {
+            let mut label: String = st.label.chars().take(60).collect();
+            if st.label.chars().count() > 60 {
+                label.pop();
+                label.push('…');
+            }
+            rows.push((format!("{}{label}", "  ".repeat(st.depth + 1)), format!("{:>8}{}", crate::logging::dur(st.secs), if st.ok { "" } else { "  failed" })));
+        }
+        rows.insert(5, ("load".to_string(), format!("{:>8} in all", crate::logging::dur(started.elapsed().as_secs_f64()))));
+        let host = if listen.ip().is_unspecified() { format!("<this host>:{}", listen.port()) } else { listen.to_string() };
+        crate::logging::block(crate::logging::Level::Info, "server",
+            &format!("\u{2714} ready in {} · http://{host}/v1 · model {} · context {max_context}",
+                     crate::logging::dur(started.elapsed().as_secs_f64()), state.cfg.served_name), &rows);
+    }
     tokio::select! {
-        result = &mut serving => result?,
-        _ = control::shutdown() => {
-            let _ = stop_tx.send(());
+        result = &mut serving => result??,
+        _ = signal.wait_for(|stop| *stop) => {
+            crate::logging::event(crate::logging::Level::Info, "server.shutdown", json!({"message":"draining active HTTP requests"}));
+            let _ = stop.send(());
             match tokio::time::timeout(state.cfg.shutdown_timeout, &mut serving).await {
-                Ok(result) => result?,
+                Ok(result) => result??,
                 Err(_) => crate::logging::event(crate::logging::Level::Warn,"server.shutdown_timeout",
                     json!({"active_http":state.metrics.http_active.load(Ordering::Relaxed),"drain_seconds":state.cfg.shutdown_timeout.as_secs_f64()})),
             }
@@ -901,6 +994,37 @@ fn truncate_prompt(st: &AppState, body: &Value, tokens: &mut Vec<i64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn get(url: String) -> (u16, String) {
+        match ureq::get(&url).call() {
+            Ok(r) => (r.status(), r.into_string().unwrap()),
+            Err(ureq::Error::Status(code, r)) => (code, r.into_string().unwrap()),
+            Err(e) => panic!("{url}: {e}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_port_answers_during_the_load_and_hands_over_to_the_api() {
+        let early = listen("127.0.0.1", 0).await.unwrap();
+        let base = format!("http://{}", early.listen);
+        let stage = crate::logging::stage("test: reading weights").total(10.0, "layers");
+        stage.progress(4.0);
+        let b = base.clone();
+        let (status, body) = tokio::task::spawn_blocking(move || get(format!("{b}/health"))).await.unwrap();
+        assert_eq!(status, 503);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["error"]["code"], "model_loading");
+        assert!(v["error"]["message"].as_str().unwrap().contains("test: reading weights (40% · 4/10 layers"), "{v}");
+        assert!(v["stages"].as_array().unwrap().iter().any(|s| s["stage"] == "test: reading weights" && s["progress_pct"] == 40.0), "{v}");
+        let b = base.clone();
+        let (status, _) = tokio::task::spawn_blocking(move || get(format!("{b}/version"))).await.unwrap();
+        assert_eq!(status, 200);
+        stage.done("");
+        // the API in place: requests reach it through the same port
+        let _ = early.app.set(Router::new().route("/health", axum::routing::get(|| async { "ok" })));
+        let (status, body) = tokio::task::spawn_blocking(move || get(format!("{base}/health"))).await.unwrap();
+        assert_eq!((status, body.as_str()), (200, "ok"));
+    }
 
     fn cut(stops: &[&str], include: bool, chunks: &[&str]) -> (String, bool) {
         let mut c = StopCutter::new(stops.iter().map(|s| s.to_string()).collect(), include);

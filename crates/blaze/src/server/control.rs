@@ -242,7 +242,7 @@ pub(super) async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
         "kv_pages_total":s.kv_pages_total.load(Ordering::Relaxed),"cache_entries":s.cache_entries.load(Ordering::Relaxed)}}))
 }
 
-pub(super) async fn shutdown() {
+pub(super) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
@@ -252,7 +252,6 @@ pub(super) async fn shutdown() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-    logging::event(Level::Info, "server.shutdown", json!({"message":"draining active HTTP requests"}));
 }
 
 #[cfg(test)]

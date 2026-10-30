@@ -453,6 +453,7 @@ dependencies = [
  "tokenizers 0.22.2",
  "tokio",
  "toktrie_hf_tokenizers",
+ "tower",
  "ureq",
  "url",
  "uuid",
