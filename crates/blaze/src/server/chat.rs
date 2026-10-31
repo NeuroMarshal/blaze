@@ -349,7 +349,7 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let stream = p.request.stream.unwrap_or(false);
     let include_usage = p.request.stream_options.as_ref().is_some_and(|o| o.include_usage);
     let include_reasoning = body.get("include_reasoning").and_then(Value::as_bool).unwrap_or(true);
-    let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning), p.instruct);
+    let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning), p.instruct)?;
     // images: encoded now (the prompt fits the context), their rows in the token list become prefix-cache keys
     let mut tokens = p.tokens;
     if !images.is_empty() {

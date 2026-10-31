@@ -509,7 +509,11 @@ fn n_of(body: &Value) -> usize {
 
 /// Sampling parameters of a request body: the OpenAI fields, vLLM / SGLang extras (top_k, min_p, repetition_penalty,
 /// min_tokens, bad_words), server defaults.
-fn sampling_of(body: &Value, d: &SamplingParams, text: &Text) -> SamplingParams {
+fn sampling_of(body: &Value, d: &SamplingParams, text: &Text) -> Checked<SamplingParams> {
+    let pipeline = body.get("samplers").filter(|v| !v.is_null())
+        .map(crate::sampler::SamplingPipeline::from_value).transpose()
+        .map_err(|e| bad_param("samplers", e.to_string()))?.unwrap_or_else(|| d.samplers.clone());
+    crate::service::validate_pipeline_fields(body, &pipeline).map_err(|e| bad_param("samplers", e.to_string()))?;
     let f = |k: &str| body.get(k).and_then(Value::as_f64).map(|x| x as f32);
     let logit_bias = body
         .get("logit_bias")
@@ -535,7 +539,10 @@ fn sampling_of(body: &Value, d: &SamplingParams, text: &Text) -> SamplingParams 
         Some(Value::Number(n)) => n.as_u64().map(|x| x as usize),
         _ => None,
     };
-    SamplingParams {
+    Ok(SamplingParams {
+        samplers: pipeline,
+        top_nsigma: f("top_nsigma").unwrap_or(d.top_nsigma),
+        top_h: f("top_h").unwrap_or(d.top_h),
         temperature: f("temperature").unwrap_or(d.temperature),
         top_p: f("top_p").unwrap_or(d.top_p),
         top_k: body.get("top_k").and_then(Value::as_i64).map(|x| x as i32).unwrap_or(d.top_k),
@@ -548,7 +555,7 @@ fn sampling_of(body: &Value, d: &SamplingParams, text: &Text) -> SamplingParams 
         min_tokens: body.get("min_tokens").and_then(Value::as_u64).map_or(d.min_tokens, |x| x as usize),
         bad_words,
         logprobs,
-    }
+    })
 }
 
 /// Stop tokens of a request: the model's EOS (unless ignore_eos) and stop_token_ids.
@@ -589,10 +596,10 @@ struct Spec {
 
 impl Spec {
     /// `instruct`: a chat prompt with thinking off (its own defaults, --instruct-sampling)
-    fn of(st: &AppState, body: &Value, max_tokens: usize, think: Option<ThinkBudget>, instruct: bool) -> Self {
+    fn of(st: &AppState, body: &Value, max_tokens: usize, think: Option<ThinkBudget>, instruct: bool) -> Checked<Self> {
         let defaults = st.cfg.instruct_defaults.as_ref().filter(|_| instruct).unwrap_or(&st.cfg.defaults);
-        Self {
-            params: sampling_of(body, defaults, &st.text),
+        Ok(Self {
+            params: sampling_of(body, defaults, &st.text)?,
             max_tokens,
             stops: stop_strings(body),
             include_stop: ["include_stop_str_in_output", "no_stop_trim"].iter().any(|k| body.get(*k).and_then(Value::as_bool) == Some(true)),
@@ -600,7 +607,7 @@ impl Spec {
             stop_ids: stop_ids_of(body, &st.text),
             think,
             mm: None,
-        }
+        })
     }
 }
 

@@ -44,9 +44,25 @@ HTTP endpoints include chat/completions, Responses, Messages, embeddings and tok
 Discover the model id at `/v1/models`. Configure `BLAZE_API_KEY` or `--api-key-file` for authentication;
 without keys, the service is unauthenticated.
 
-The sampler uses at most the best 64 candidates. Quantized compute, FP16 accumulation, TQ3 KV and
-expert deferral can change outputs. Pipeline stages currently run without a drafter. Check the intended
-model/configuration before relying on it.
+Sampling covers the eligible vocabulary; API logprob alternatives are limited to 20.
+Quantized compute, FP16 accumulation, TQ3 KV and expert deferral can change outputs.
+Pipeline-parallel stages currently run without a drafter. Check the intended model/configuration.
+
+Sampling stages run in order. The default is `penalties,logit_bias,temperature,top_k,top_p,min_p`.
+Set `--samplers penalties,logit_bias,top_nsigma,temperature` on the server, or send
+`"samplers": ["penalties", "logit_bias", "top_nsigma", "temperature"]` in a request.
+An empty array samples without these transforms; grammar, bad-word and EOS masks still apply.
+A scalar only affects its listed stage. Explicit active parameters for omitted stages are rejected.
+
+`top_nsigma` (default 1.0, nonnegative) keeps logits within that many population standard deviations
+of the current maximum. `top_h` (default 0.4, in (0, 1]) keeps the largest sorted prefix whose
+renormalized entropy fits that fraction of the current entropy. Both operate on the currently
+eligible tokens. Temperature zero keeps one token at its position in the chain; later stages cannot
+restore removed tokens. Logprobs describe the canonical penalties-then-bias distribution before
+sampling filters. Neither sampler establishes factual correctness.
+
+Methods: [Top-nσ](https://arxiv.org/abs/2411.07641),
+[Top-H](https://arxiv.org/abs/2509.02510).
 
 ## Check
 

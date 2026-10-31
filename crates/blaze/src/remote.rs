@@ -77,7 +77,9 @@ fn put_meta(w: &mut W, m: &StepMeta) {
               &m.tree_prog] {
         w.bytes(v);
     }
-    w.bytes(&m.pen_coef);
+    w.bytes(&m.sampling_coef);
+    w.bytes(&m.sampling_rows);
+    w.u64(m.sampling_execution as u64);
     w.bytes(&m.mask);
     w.bytes(&m.tree_mask);
     let spans: Vec<u64> = m.spans.iter().flat_map(|s| [s.offset, s.len, s.kv_len, s.row].map(|x| x as u64)).collect();
@@ -96,7 +98,9 @@ fn get_meta(r: &mut R) -> Result<StepMeta> {
               &mut m.pen_off, &mut m.mask_row, &mut m.tree_parent, &mut m.tree_prog] {
         *v = r.vec()?;
     }
-    m.pen_coef = r.vec()?;
+    m.sampling_coef = r.vec()?;
+    m.sampling_rows = r.vec()?;
+    m.sampling_execution = r.u64()? as u32;
     m.mask = r.vec()?;
     m.tree_mask = r.vec()?;
     let spans: Vec<u64> = r.vec()?;
@@ -292,6 +296,9 @@ mod tests {
                 tree: false,
                 mrope: true,
                 need_lse,
+                sampling_execution: 0x01010101,
+                sampling_rows: vec![crate::sampler::SamplingParams::default().row(0.375)],
+                sampling_coef: vec![1.0, 1.0, -0.5, 2.0, 0.0],
                 ..Default::default()
             };
             let mut wire = W::default();
@@ -309,6 +316,10 @@ mod tests {
             assert!(!decoded.tree);
             assert!(decoded.mrope);
             assert_eq!(decoded.need_lse, need_lse);
+            assert_eq!(decoded.sampling_execution, meta.sampling_execution);
+            assert_eq!(decoded.sampling_rows[0].draw, 0.375);
+            assert_eq!(decoded.sampling_rows[0].stages, meta.sampling_rows[0].stages);
+            assert_eq!(decoded.sampling_coef, meta.sampling_coef);
         }
     }
 }

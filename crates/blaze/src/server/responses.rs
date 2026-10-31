@@ -157,6 +157,10 @@ fn chat_body(body: &Value) -> Checked<(Value, Vec<Value>, Custom)> {
             o.insert(to.into(), v.clone());
         }
     }
+    for key in ["samplers", "top_nsigma", "top_h", "top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "logit_bias", "seed"] {
+        if let Some(v) = body.get(key).filter(|v| !v.is_null()) { o.insert(key.into(), v.clone()); }
+    }
+
     let mut custom = Custom::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array).filter(|t| !t.is_empty()) {
         let mut out = Vec::new();

@@ -157,6 +157,10 @@ fn chat_body(body: &Value, stream: bool) -> Checked<Value> {
             o.insert(to.into(), v.clone());
         }
     }
+    for key in ["samplers", "top_nsigma", "top_h", "top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "logit_bias", "seed"] {
+        if let Some(v) = body.get(key).filter(|v| !v.is_null()) { o.insert(key.into(), v.clone()); }
+    }
+
     if let Some(s) = body.get("stop_sequences").filter(|v| v.is_array()) {
         o.insert("stop".into(), s.clone());
     }

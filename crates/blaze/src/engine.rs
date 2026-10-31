@@ -59,7 +59,9 @@ struct StepMeta {
     /// sampled outputs only need the full-vocabulary normalizer when logprobs were requested
     need_lse: bool,
     pen_ids: Vec<i32>,
-    pen_coef: Vec<f32>,
+    sampling_rows: Vec<crate::sampler::SamplingRow>,
+    sampling_coef: Vec<f32>,
+    sampling_execution: u32,
     pen_off: Vec<i32>,
     /// grammar masks of the sampled rows and the mask row of each logit row (-1: none)
     mask: Vec<u32>,
@@ -162,10 +164,10 @@ impl Drop for Graph {
 
 /// A captured step: the rows of every sequence (decode: all 1), sampled head, sparse attention, speculative verify,
 /// tree verify.
-type GraphKey = (Vec<usize>, bool, bool, bool, bool, bool);
+type GraphKey = (Vec<usize>, bool, bool, bool, bool, bool, u32);
 
 fn graph_key(meta: &StepMeta, verify: bool) -> GraphKey {
-    (meta.spans.iter().map(|sp| sp.len).collect(), meta.sample, meta.sparse, verify, meta.tree, meta.need_lse)
+    (meta.spans.iter().map(|sp| sp.len).collect(), meta.sample, meta.sparse, verify, meta.tree, meta.need_lse, meta.sampling_execution)
 }
 
 /// Most verify graphs kept (their span shapes vary with the draft lengths); beyond them verify steps run eagerly.
@@ -245,9 +247,10 @@ impl Runner {
             self.put(m.pen_off, &meta.pen_off);
             self.put(m.mask_row, &meta.mask_row);
             self.put(m.pen_ids, &meta.pen_ids);
-            self.put(m.pen_coef, &meta.pen_coef);
+            self.put(m.sampling_rows, &meta.sampling_rows);
+            self.put(m.sampling_coef, &meta.sampling_coef);
             self.put(m.mask, &meta.mask);
-            tail = vec![(m.pen_ids, meta.pen_ids.len() * 4), (m.pen_coef, meta.pen_coef.len() * 4), (m.mask, meta.mask.len() * 4)];
+            tail = vec![(m.sampling_coef, meta.sampling_coef.len() * 4), (m.pen_ids, meta.pen_ids.len() * 4), (m.mask, meta.mask.len() * 4)];
         }
         if meta.tree {
             self.put(m.tree_mask, &meta.tree_mask);
@@ -304,7 +307,7 @@ impl Runner {
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
-            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree, meta.need_lse)?;
+            self.model.forward(&meta.spans, n, verify, meta.sample, meta.sparse, meta.tree, meta.need_lse, meta.sampling_execution)?;
         }
         *handed = true;
         if let Some((w, r)) = &self.watch {
@@ -322,6 +325,7 @@ impl Runner {
     /// all-reduces stay paired.
     fn run_graph(&mut self, key: GraphKey, n: usize, spans: &[Span]) -> Result<()> {
         let (sample, sparse, verify, tree, need_lse) = (key.1, key.2, key.3, key.4, key.5);
+        let execution = key.6;
         self.graph_tick += 1;
         if let Some(g) = self.graphs.get(&key) {
             if let Some(b) = self.graph_bytes.get_mut(&key) {
@@ -330,7 +334,7 @@ impl Runner {
             return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
         }
         if self.no_graph.contains(&key) || self.warmed.insert(key.clone()) {
-            return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse);
+            return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution);
         }
         // The step's own metadata copy is already enqueued; capture after it completes (and earlier replays: graphs
         // may go below).
@@ -339,7 +343,7 @@ impl Runner {
         let budget = *self.graph_budget.get_or_insert(free0 / 2);
         let s = self.model.stream.0;
         check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, verify, sample, sparse, tree, need_lse);
+        let captured = self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution);
         let mut graph = null_mut();
         let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
         captured?;
@@ -352,7 +356,7 @@ impl Runner {
                 eprintln!("blaze: a CUDA graph did not instantiate ({:.0} MiB free): its step shape runs eagerly", free0 as f64 / 1048576.0);
             }
             self.no_graph.insert(key);
-            return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse);
+            return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution);
         }
         let used = free0.saturating_sub(crate::gpu::mem_info()?.0);
         let g = Graph { exec, graph };
@@ -527,6 +531,9 @@ impl Snapshot {
 #[derive(Clone)]
 pub struct Penalty {
     pub edits: Vec<(i32, f32, f32, f32)>,
+    /// Split stage coefficients, in the same order as edits. Empty uses legacy combined edits.
+    pub separate: Vec<[f32; 5]>,
+    pub row: crate::sampler::SamplingRow,
     /// structured outputs: the tokens the grammar allows (bit t of word t / 32), as many words as the vocabulary needs
     pub mask: Option<Vec<u32>>,
     /// Whether this caller will use the exact distribution log-normalizer in the returned candidates.
@@ -535,16 +542,18 @@ pub struct Penalty {
 
 impl Default for Penalty {
     fn default() -> Self {
-        Self { edits: Vec::new(), mask: None, need_lse: true }
+        Self { edits: Vec::new(), separate: Vec::new(), row: Default::default(), mask: None, need_lse: true }
     }
 }
 
-/// Sampling candidates of one row: (logit, token) sorted descending, and the log-sum-exp of the whole (edited) row.
-/// `lse` is zero when every corresponding `Penalty` set `need_lse` to false.
+/// A chosen token and up to 64 alternatives. With need_lse, alternatives and LSE describe the canonical edited row;
+/// otherwise top contains sampling diagnostics and lse is zero. selected_logit is always canonical.
 #[derive(Clone, Default)]
 pub struct Cands {
     pub top: Vec<(f32, i32)>,
     pub lse: f32,
+    pub selected: i32,
+    pub selected_logit: f32,
 }
 
 pub struct Engine {
@@ -561,7 +570,6 @@ pub struct Engine {
     deferred: std::cell::RefCell<Vec<Deferred>>,
     /// the rank whose replies count (the last pipeline stage: it holds the head) and the shards of the head's vocabulary
     lead: usize,
-    head_shards: usize,
     /// what the ranks do, for the hang report (its watchdog thread ends with the engine)
     watch: Arc<Watch>,
     /// pipeline stages: rows of a step's parts (0: one forward a step)
@@ -716,13 +724,13 @@ fn worker_main(
         own_context(rank, world)?;
         let cfg = crate::config::ModelConfig::load(&dir)?;
         let tokens = opts.max_chunk.max(opts.max_seqs);
-        let ar_bytes = (tokens * cfg.hidden * 2).max(opts.max_seqs * cfg.vocab * 2).next_multiple_of(16);
         let mut ar = null_mut();
         // pipeline stages: the tensor-parallel group of the stage (its own all-reduce buffer)
         let (tp_rank, tp_world, group) = match &opts.pp {
             Some(p) => (p.tp_rank, p.tp.max(1), p.stage),
             None => (rank, world, 0),
         };
+        let ar_bytes = (tokens * cfg.hidden * 2).max(opts.max_seqs.max(opts.verify_rows()) * cfg.vocab.next_multiple_of(tp_world) * 4).next_multiple_of(16);
         if tp_world > 1 {
             // the group's rank 0 creates the shared buffer before the others map it; every rank passes both barriers
             let name = CString::new(format!("/blaze_ar_{}_{group}", std::process::id()))?;
@@ -990,7 +998,6 @@ impl Engine {
         let lead = if stages > 1 { world - tp } else { 0 };
         let mut engine = Self {
             lead,
-            head_shards: tp,
             pp_chunk: if stages > 1 { opts_pp_chunk } else { 0 },
             workers,
             last_verify: Vec::new(),
@@ -1290,8 +1297,7 @@ impl Engine {
         Ok(())
     }
 
-    /// A sampled step: like `step`, but every item gets its sampling candidates (the top BLZ_TOPK_MAX logits after
-    /// its penalties, merged over the ranks, sorted descending) instead of a greedy pick.
+    /// A sampled step returns each row's chosen token and up to 64 logprob alternatives.
     pub fn step_sampled(&mut self, seqs: &mut [&mut Seq], tokens: &[&[i64]], pens: &[Penalty]) -> Result<Vec<Cands>> {
         let need_lse = pens.iter().any(|p| p.need_lse);
         if let Some(parts) = self.pp_parts(seqs, tokens) {
@@ -1448,33 +1454,15 @@ impl Engine {
     }
 
     fn merge_candidates(&self, pairs: &[f32], n: usize, need_lse: bool) -> Vec<Cands> {
-        // the shards of the vocabulary: the tensor-parallel group (pipeline stages: the last stage's)
-        let (k, world) = (sys::BLZ_TOPK_MAX, self.head_shards);
-        (0..n)
-            .map(|r| {
-                let mut top = Vec::with_capacity(world * k);
-                let lse = if need_lse {
-                    let shard_lse: Vec<f32> = (0..world).map(|w| pairs[((w * n + r) * (k + 1) + k) * 2]).collect();
-                    let lse_max = shard_lse.iter().copied().map(f64::from).fold(f64::MIN, f64::max);
-                    let lse_sum: f64 = shard_lse.iter().map(|&l| (l as f64 - lse_max).exp()).sum();
-                    (lse_max + lse_sum.ln()) as f32
-                } else {
-                    0.0
-                };
-                for w in 0..world {
-                    let base = (w * n + r) * (k + 1) * 2;
-                    for j in 0..k {
-                        let id = pairs[base + 2 * j + 1] as i32;
-                        if id >= 0 {
-                            top.push((pairs[base + 2 * j], id));
-                        }
-                    }
-                }
-                top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1)));
-                top.truncate(k);
-                Cands { top, lse }
-            })
-            .collect()
+        let k = sys::BLZ_TOPK_MAX;
+        (0..n).map(|r| {
+            let row = &pairs[r * (k + 2) * 2..(r + 1) * (k + 2) * 2];
+            let top = row[..k * 2].chunks_exact(2)
+                .filter(|p| p[1] >= 0.0 && p[0].is_finite())
+                .map(|p| (p[0], p[1] as i32)).collect();
+            Cands { top, lse: if need_lse { row[k * 2] } else { 0.0 },
+                selected_logit: row[(k + 1) * 2], selected: row[(k + 1) * 2 + 1] as i32 }
+        }).collect()
     }
 
     /// After `verify_many`: keep the first `accepted[i]` rows of every verified sequence (the pending token and the
@@ -1599,11 +1587,14 @@ fn split_rows<T>(rows: Vec<T>, tokens: &[&[i64]]) -> Vec<Vec<T>> {
 
 fn fill_edits(m: &mut StepMeta, pens: &[Penalty]) {
     m.need_lse = pens.iter().any(|p| p.need_lse);
+    m.sampling_execution = pens.iter().fold(0, |mask, p| mask | p.row.execution());
+    if !pens.is_empty() && pens.iter().all(|p| p.row.bounded()) { m.sampling_execution |= 1 << 24; }
     m.pen_off.push(0);
     for p in pens {
-        for &(id, a, b, c) in &p.edits {
+        m.sampling_rows.push(p.row);
+        for (j, &(id, a, b, c)) in p.edits.iter().enumerate() {
+            m.sampling_coef.extend(p.separate.get(j).copied().unwrap_or([a, b, if c.is_finite() { c } else { 0.0 }, 0.0, if c.is_finite() { 0.0 } else { 1.0 }]));
             m.pen_ids.push(id);
-            m.pen_coef.extend([a, b, c]);
         }
         m.pen_off.push(m.pen_ids.len() as i32);
         match &p.mask {
@@ -1694,6 +1685,8 @@ mod tests {
         meta.need_lse = true;
         let with_lse = graph_key(&meta, false);
         assert_ne!(without_lse, with_lse);
+        meta.sampling_execution = 1 << 24;
+        assert_ne!(with_lse, graph_key(&meta, false));
         assert_eq!(without_lse.0, with_lse.0);
         assert_eq!(without_lse.1, with_lse.1);
         assert_eq!(without_lse.2, with_lse.2);

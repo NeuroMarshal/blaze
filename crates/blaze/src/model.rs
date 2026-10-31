@@ -615,7 +615,8 @@ pub struct MetaLayout {
     /// bytes copied every step; the lists below go up as far as filled
     pub base_bytes: usize,
     pub pen_ids: usize,
-    pub pen_coef: usize,
+    pub sampling_rows: usize,
+    pub sampling_coef: usize,
     pub mask_words: usize,
     pub mask: usize,
     /// tree verify (copied on tree steps only): ancestor mask per token (u64, bit j: row j of its sequence), parent row
@@ -655,9 +656,10 @@ impl MetaLayout {
         let max_pen = (head_rows * 32768).clamp(1 << 16, 1 << 21).max(vocab + 64);
         let pen_off = take((max_tokens + 1) * 4);
         let mask_row = take(max_tokens * 4);
+        let sampling_rows = take(head_rows * std::mem::size_of::<crate::sampler::SamplingRow>());
         let base_bytes = take(0);
         let pen_ids = take(max_pen * 4);
-        let pen_coef = take(max_pen * 12);
+        let sampling_coef = take(max_pen * 20);
         let mask_words = vocab.div_ceil(32);
         let mask = take(max_seqs * mask_words * 4);
         let tree_mask = take(max_tokens * 8);
@@ -684,7 +686,8 @@ impl MetaLayout {
             mask_row,
             base_bytes,
             pen_ids,
-            pen_coef,
+            sampling_rows,
+            sampling_coef,
             mask_words,
             mask,
             tree_mask,
@@ -795,10 +798,11 @@ struct Work {
     ple_gated: Option<DevBuf>,
     ple_gatedn: Option<DevBuf>,
     pairs: DevBuf,
-    // sampling candidates of this rank's vocabulary shard, and every rank's packed (value, id) pairs
-    cand_vals: DevBuf,
-    cand_ids: DevBuf,
-    cand_lse: DevBuf,
+    // Full-vocabulary FP32 sampling scratch; only alternatives and the chosen token cross to the host.
+    sampling_valid_ids: DevBuf,
+    sampling_mask_rows: DevBuf,
+    sampling_logits: DevBuf,
+    sampling_work: DevBuf,
     cand_pairs: DevBuf,
     // QSA: index queries [t, heads, 128], block scores [score rows, max blocks], selected KV slots [t, table stride] with
     // their counts, the identity row list of the selection table
@@ -853,9 +857,10 @@ impl Work {
             ("ple_gated", self.ple_gated.as_ref().map_or(0, |b| b.owned_bytes())),
             ("ple_gatedn", self.ple_gatedn.as_ref().map_or(0, |b| b.owned_bytes())),
             ("pairs", self.pairs.owned_bytes()),
-            ("cand_vals", self.cand_vals.owned_bytes()),
-            ("cand_ids", self.cand_ids.owned_bytes()),
-            ("cand_lse", self.cand_lse.owned_bytes()),
+            ("sampling_valid_ids", self.sampling_valid_ids.owned_bytes()),
+            ("sampling_mask_rows", self.sampling_mask_rows.owned_bytes()),
+            ("sampling_logits", self.sampling_logits.owned_bytes()),
+            ("sampling_work", self.sampling_work.owned_bytes()),
             ("cand_pairs", self.cand_pairs.owned_bytes()),
             ("qsa_q", self.qsa_q.as_ref().map_or(0, |b| b.owned_bytes())),
             ("qsa_scores", self.qsa_scores.as_ref().map_or(0, |b| b.owned_bytes())),
@@ -1403,7 +1408,16 @@ impl Model {
         }
         let tree_pairs = DevBuf::zeroed(opts.max_seqs.max(1) * 4 * opts.max_verify.max(1) * 4, s)?;
         mark("draft-tree scratch", s)?;
-        let work = Self::alloc_work(&cfg, &dims, w, &layers, &opts, &meta, s)?;
+        let tokenizer = dir.join("tokenizer.json");
+        let mut valid_ids = vec![u32::MAX; cfg.vocab.div_ceil(32)];
+        if tokenizer.is_file() {
+            valid_ids.fill(0);
+            let tokenizer = tokenizers::Tokenizer::from_file(tokenizer).map_err(|e| anyhow!("sampling vocabulary: {e}"))?;
+            for &id in tokenizer.get_vocab(true).values() {
+                if (id as usize) < cfg.vocab { valid_ids[id as usize / 32] |= 1 << (id % 32); }
+            }
+        }
+        let work = Self::alloc_work(&cfg, &dims, w, &layers, &opts, &meta, &valid_ids, s)?;
         mark("activations (chunk + head rows)", s)?;
         if tp.rank == 0 {
             let mut big = work.sizes();
@@ -1872,7 +1886,7 @@ impl Model {
         Ok(MoeEngine(engine))
     }
 
-    fn alloc_work(cfg: &ModelConfig, d: &Dims, world: usize, layers: &[Layer], opts: &Options, meta: &MetaLayout, s: &Stream) -> Result<Work> {
+    fn alloc_work(cfg: &ModelConfig, d: &Dims, world: usize, layers: &[Layer], opts: &Options, meta: &MetaLayout, valid_ids: &[u32], s: &Stream) -> Result<Work> {
         // every forward forward() lets through: a prefill chunk, or a verify step of max_seqs x verify rows
         let t = meta.max_tokens;
         let h = cfg.hidden;
@@ -1967,10 +1981,11 @@ impl Model {
             ple_gated,
             ple_gatedn,
             pairs: b((head_rows * 8 * 8).next_multiple_of(16))?,
-            cand_vals: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
-            cand_ids: b(head_rows * sys::BLZ_TOPK_MAX * 4)?,
-            cand_lse: b(head_rows * 4)?,
-            cand_pairs: b((world * head_rows * (sys::BLZ_TOPK_MAX + 1) * 8).next_multiple_of(16))?,
+            sampling_valid_ids: DevBuf::from_slice(valid_ids)?,
+            sampling_mask_rows: DevBuf::zeroed(head_rows * 4, s)?,
+            sampling_logits: b((head_rows * d.vocab * world * 4).next_multiple_of(16))?,
+            sampling_work: b(unsafe { sys::blz_sampling_workspace_bytes(head_rows as c_int, (d.vocab * world) as c_int) })?,
+            cand_pairs: b((head_rows * (sys::BLZ_TOPK_MAX + 2) * 8).next_multiple_of(16))?,
             qsa_q: cfg.qsa.as_ref().map(|q| b(t.max(head_rows) * q.heads * q.head_dim * 2)).transpose()?,
             qsa_scores: cfg.qsa.as_ref().map(|q| b(QSA_SCORE_ROWS * (ctx / q.compress_ratio + 1) * 4)).transpose()?,
             qsa_table: cfg.qsa.as_ref().map(|_| b(t.max(head_rows) * QSA_TABLE_STRIDE * 4)).transpose()?,
@@ -2312,7 +2327,7 @@ impl Model {
     /// logit_rows and leaves greedy picks in `next`. `verify`: one span of draft rows whose GDN state is only read
     /// (its inputs are recorded for commit); `tree`: the verify rows of each span form a tree (MetaLayout tree_*).
     /// Capturable into a CUDA graph (no host synchronization).
-    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool, tree: bool, need_lse: bool) -> Result<()> {
+    pub fn forward(&self, spans: &[Span], n_logits: usize, verify: bool, sample: bool, sparse: bool, tree: bool, need_lse: bool, execution: u32) -> Result<()> {
         // Each worker owns its policy. Reapply on entry so moving a model between threads, or alternating models
         // on one thread, cannot inherit another model's launch policy. Captured graphs retain their chosen kernels.
         unsafe {
@@ -2523,12 +2538,13 @@ impl Model {
                 }
             }
             if sample {
-                return self.sample_candidates(w.gnormed.ptr(), n, need_lse);
+                return self.sample_candidates(w.gnormed.ptr(), n, need_lse, execution);
             }
             if self.tp.world > 1 && !self.opts.full_logits {
                 return self.greedy_sharded(w.gnormed.ptr(), n);
             }
             self.head(w.gnormed.ptr(), n, w.logits.ptr())?;
+            self.mask_padding(n, cfg.vocab, 0)?;
             check(unsafe { sys::blz_argmax_bf16(w.logits.ptr(), n as c_int, cfg.vocab as c_int, cfg.vocab as i64, w.next.ptr(), s.0) }, "argmax")?;
         }
         Ok(())
@@ -2654,6 +2670,7 @@ impl Model {
         let (w, s, v) = (&self.work, &self.stream, self.dims.vocab);
         let (rank, world) = (self.tp.rank, self.tp.world);
         self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), v, s)?;
+        self.mask_padding(rows, v, rank * v)?;
         let bytes = (world * rows * 8).next_multiple_of(16);
         check(unsafe { sys::cudaMemsetAsync(w.pairs.ptr(), 0, bytes, s.0) }, "memset pairs")?;
         check(
@@ -2667,60 +2684,34 @@ impl Model {
         check(unsafe { sys::blz_argmax_merge(w.pairs.ptr(), world as c_int, rows as c_int, w.next.ptr(), s.0) }, "argmax merge")
     }
 
-    /// Sampling candidates of `rows` normed states: this rank's vocabulary shard through the head, the rows' penalties,
-    /// the shard's top BLZ_TOPK_MAX, packed as (value, id) pairs at the rank's slot of cand_pairs and merged over the
-    /// group (cand_pairs: [world][rows][K][2] floats).
-    fn sample_candidates(&self, normed: *const u16, rows: usize, need_lse: bool) -> Result<()> {
-        let (w, s, v, m) = (&self.work, &self.stream, self.dims.vocab, &self.meta);
-        let (rank, world, k) = (self.tp.rank, self.tp.world, sys::BLZ_TOPK_MAX);
-        self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), v, s)?;
-        check(
-            unsafe {
-                sys::blz_logit_edits(w.logits.ptr(), v as i64, rows as c_int, (rank * v) as c_int, v as c_int, self.meta_ptr(m.pen_ids),
-                                     self.meta_ptr(m.pen_coef), self.meta_ptr(m.pen_off), s.0)
-            },
-            "logit edits",
-        )?;
-        check(
-            unsafe {
-                sys::blz_token_mask(w.logits.ptr(), v as i64, rows as c_int, (rank * v) as c_int, v as c_int, m.mask_words as c_int,
-                                    self.meta_ptr(m.mask), self.meta_ptr(m.mask_row), s.0)
-            },
-            "token mask",
-        )?;
-        if need_lse {
-            check(unsafe { sys::blz_row_lse(w.logits.ptr(), v as i64, rows as c_int, v as c_int, w.cand_lse.ptr(), s.0) }, "lse")?;
-        }
-        check(
-            unsafe {
-                sys::blz_topk(w.logits.ptr(), v as i64, rows as c_int, v as c_int, (rank * v) as c_int, k as c_int, w.cand_vals.ptr(),
-                              w.cand_ids.ptr(), null_mut(), s.0)
-            },
-            "top-k",
-        )?;
-        let bytes = (world * rows * (k + 1) * 8).next_multiple_of(16);
-        if world > 1 {
-            check(unsafe { sys::cudaMemsetAsync(w.cand_pairs.ptr(), 0, bytes, s.0) }, "memset")?;
-        }
-        check(
-            unsafe {
-                sys::blz_topk_pack(w.cand_vals.ptr(), w.cand_ids.ptr(), if need_lse { w.cand_lse.ptr() } else { null() }, rows as c_int, k as c_int,
-                                   w.cand_pairs.at::<f32>(rank * rows * (k + 1) * 2), s.0)
-            },
-            "pack",
-        )?;
-        if world > 1 {
-            check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, w.cand_pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "all-reduce")?;
-        }
-        Ok(())
+    fn mask_padding(&self, rows: usize, width: usize, col0: usize) -> Result<()> {
+        check(unsafe { sys::blz_token_mask(self.work.logits.ptr(), width as i64, rows as c_int,
+            col0 as c_int, width as c_int, self.meta.mask_words as c_int, self.work.sampling_valid_ids.ptr(),
+            self.work.sampling_mask_rows.ptr(), self.stream.0) }, "padding mask")
     }
 
-    /// The merged candidate pairs of the last sampled forward: [world][rows][K + 1][2] floats (the last pair of a row:
-    /// the shard's log-sum-exp).
+    fn sample_candidates(&self, normed: *const u16, rows: usize, need_lse: bool, execution: u32) -> Result<()> {
+        let (w, s, local, m) = (&self.work, &self.stream, self.dims.vocab, &self.meta);
+        let vocab = local * self.tp.world;
+        self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), local, s)?;
+        let bytes = (rows * vocab * 4).next_multiple_of(16);
+        check(unsafe { sys::cudaMemsetAsync(w.sampling_logits.ptr(), 0, bytes, s.0) }, "sampling memset")?;
+        check(unsafe { sys::blz_sampling_pack(w.logits.ptr(), local as c_int, vocab as c_int, self.tp.rank as c_int,
+            rows as c_int, w.sampling_logits.ptr(), s.0) }, "sampling pack")?;
+        if self.tp.world > 1 {
+            ensure!(bytes <= self.tp.ar_bytes, "sampling all-reduce exceeds its buffer");
+            check(unsafe { sys::blz_host_ar_all_reduce(self.tp.ar, w.sampling_logits.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "sampling all-reduce")?;
+        }
+        check(unsafe { sys::blz_sampling_run(w.sampling_logits.ptr(), rows as c_int, vocab as c_int, self.cfg.vocab as c_int, w.sampling_valid_ids.ptr(),
+            self.meta_ptr(m.sampling_rows), self.meta_ptr(m.pen_ids), self.meta_ptr(m.sampling_coef), self.meta_ptr(m.pen_off),
+            self.meta_ptr(m.mask), self.meta_ptr(m.mask_row), m.mask_words as c_int, execution, need_lse,
+            w.sampling_work.ptr(), w.sampling_work.owned_bytes(), w.cand_pairs.ptr(), s.0) }, "sampling pipeline")
+    }
+
     pub fn candidates(&self, rows: usize) -> Result<Vec<f32>> {
         self.stream.sync()?;
         self.prefill_report();
-        self.work.cand_pairs.download::<f32>(self.tp.world * rows * (sys::BLZ_TOPK_MAX + 1) * 2)
+        self.work.cand_pairs.download::<f32>(rows * (sys::BLZ_TOPK_MAX + 2) * 2)
     }
 
     /// Copy the recurrent state (GDN conv and recurrent, PLE conv and n-gram history) of row `src` to row `dst`.

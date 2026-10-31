@@ -235,7 +235,7 @@ pub(super) async fn request(State(st): State<Arc<AppState>>, mut req: Request, n
 pub(super) async fn info(State(st): State<Arc<AppState>>) -> Json<Value> {
     let s = &st.sched.stats;
     Json(json!({"model":st.cfg.served_name,"version":env!("CARGO_PKG_VERSION"),"max_model_len":st.max_context,
-        "sampling_candidate_limit":64,
+        "sampling_candidate_limit":null,
         "sampling_defaults":st.cfg.defaults,"instruct_sampling_defaults":st.cfg.instruct_defaults,"config":st.cfg.effective,"api_key_count":st.key_hashes.len(),
         "scheduler":{"running":s.running.load(Ordering::Relaxed),"waiting":s.waiting.load(Ordering::Relaxed),
         "outstanding":s.outstanding.load(Ordering::Relaxed),"kv_pages_free":s.kv_pages_free.load(Ordering::Relaxed),

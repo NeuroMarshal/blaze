@@ -1362,13 +1362,20 @@ impl Loop {
     /// generated.
     fn edits_for(&self, i: usize, extra: &[i64]) -> Penalty {
         let a = &self.active[i];
-        penalty_edits(&a.req.params, &a.prompt_set, &a.counts, &a.generated, extra, &a.req.stop_ids)
+        let mut edits = penalty_edits(&a.req.params, &a.prompt_set, &a.counts, &a.generated, extra, &a.req.stop_ids);
+        edits.row = a.req.params.row(a.rng.lookahead(extra.len()));
+        edits
     }
 
     /// One generated token of active request `i`: thinking budget, counts, the event, stop conditions; the token
     /// actually emitted (the budget may replace it) and the finish reason if the request ends here.
     fn emit(&mut self, i: usize, pick: i32, lp: Option<TokenLogprob>) -> (i32, Option<Finish>) {
         let a = &mut self.active[i];
+        if pick < 0 {
+            let message = if pick == -2 { "nonfinite sampling distribution" } else { "empty sampling support" };
+            let _ = a.req.events.send(GenEvent::Error(message.into()));
+            return (pick, Some(Finish::Cancelled));
+        }
         let now = Instant::now();
         if a.first_token.is_none() {
             a.first_token = Some(now);
@@ -1625,7 +1632,7 @@ impl Loop {
                     let a = &mut self.active[i];
                     let (mut out, mut lps) = (Vec::new(), Vec::new());
                     for (j, c) in cs.iter().enumerate() {
-                        let x = sample(&c.top, &a.req.params, &mut a.rng);
+                        let x = sample(c, &a.req.params, &mut a.rng);
                         out.push(x);
                         lps.push(logprob_of(c, x, a.req.params.logprobs));
                         if j < drafts[i].len() && x as i64 != drafts[i][j] {
@@ -1826,7 +1833,7 @@ impl Loop {
                     Picks::Greedy(p) => (p[r], None),
                     Picks::Sampled(cs) => {
                         let a = &mut self.active[i];
-                        let x = sample(&cs[r].top, &a.req.params, &mut a.rng);
+                        let x = sample(&cs[r], &a.req.params, &mut a.rng);
                         (x, logprob_of(&cs[r], x, a.req.params.logprobs))
                     }
                 };
@@ -2292,7 +2299,7 @@ impl Loop {
                     let a = &mut self.active[i];
                     // Intermediate prefill chunks produce no output: never consume this request's RNG there.
                     let real_output = a.pending.is_some() || a.fed + chunk_len >= a.req.tokens.len();
-                    let x = if real_output { sample(&c.top, &a.req.params, &mut a.rng) } else { c.top.first().map_or(0, |c|c.1) };
+                    let x = if real_output { sample(&c, &a.req.params, &mut a.rng) } else { c.top.first().map_or(0, |c|c.1) };
                     if glog && a.req.constraint.is_some() {
                         let top: Vec<String> = c.top.iter().take(4).map(|(v, t)| format!("{t}:{v:.2}")).collect();
                         eprintln!("blaze grammar: step {} mask {:?} allowed, pick {x}, top {}", a.generated.len(), allowed, top.join(" "));
@@ -2474,7 +2481,7 @@ pub const MIN_LOGPROB: f32 = -9999.0;
 fn logprob_of(c: &crate::engine::Cands, x: i32, top: Option<usize>) -> Option<TokenLogprob> {
     let n = top?;
     let clamp = |l: f32| if l.is_finite() { l.max(MIN_LOGPROB) } else { MIN_LOGPROB };
-    let lp = c.top.iter().find(|&&(_, t)| t == x).map(|&(l, _)| clamp(l - c.lse)).unwrap_or(MIN_LOGPROB);
+    let lp = if x == c.selected { clamp(c.selected_logit - c.lse) } else { c.top.iter().find(|&&(_, t)| t == x).map(|&(l, _)| clamp(l - c.lse)).unwrap_or(MIN_LOGPROB) };
     Some(TokenLogprob { logprob: lp, top: c.top.iter().take(n).map(|&(l, t)| (t, clamp(l - c.lse))).collect() })
 }
 
@@ -2482,44 +2489,57 @@ fn logprob_of(c: &crate::engine::Cands, x: i32, top: Option<usize>) -> Option<To
 /// counts of their short extra path; bad-word matching only inspects as much suffix as the banned prefix needs.
 fn penalty_edits(p: &SamplingParams, prompt_set: &[i32], counts: &HashMap<i32, i32>, generated: &[i32],
                  extra: &[i64], stop_ids: &[i32]) -> Penalty {
-    let mut e: HashMap<i32, (f32, f32, f32)> = HashMap::new();
-    if p.repetition_penalty != 1.0 {
+    let mut e: HashMap<i32, [f32; 5]> = HashMap::new();
+    if p.samplers.contains(crate::sampler::Stage::Penalties) && p.repetition_penalty != 1.0 {
         let r = p.repetition_penalty;
         for t in prompt_set.iter().copied().chain(counts.keys().copied()).chain(extra.iter().map(|&t| t as i32)) {
-            e.insert(t, (1.0 / r, r, 0.0));
+            e.insert(t, [1.0 / r, r, 0.0, 0.0, 0.0]);
         }
     }
-    if p.presence_penalty != 0.0 || p.frequency_penalty != 0.0 {
+    if p.samplers.contains(crate::sampler::Stage::Penalties) && (p.presence_penalty != 0.0 || p.frequency_penalty != 0.0) {
         let mut extra_counts: HashMap<i32, i32> = HashMap::new();
         for &t in extra { *extra_counts.entry(t as i32).or_default() += 1; }
         for (&t, &c) in counts {
             let c = c + extra_counts.get(&t).copied().unwrap_or(0);
-            e.entry(t).or_insert((1.0, 1.0, 0.0)).2 -= p.presence_penalty + p.frequency_penalty * c as f32;
+            e.entry(t).or_insert([1.0, 1.0, 0.0, 0.0, 0.0])[2] -= p.presence_penalty + p.frequency_penalty * c as f32;
         }
         for (&t, &c) in &extra_counts {
             if !counts.contains_key(&t) {
-                e.entry(t).or_insert((1.0, 1.0, 0.0)).2 -= p.presence_penalty + p.frequency_penalty * c as f32;
+                e.entry(t).or_insert([1.0, 1.0, 0.0, 0.0, 0.0])[2] -= p.presence_penalty + p.frequency_penalty * c as f32;
             }
         }
     }
-    for &(t, b) in &p.logit_bias { e.entry(t).or_insert((1.0, 1.0, 0.0)).2 += b; }
+    if p.samplers.contains(crate::sampler::Stage::LogitBias) {
+        for &(t, b) in &p.logit_bias { e.entry(t).or_insert([1.0, 1.0, 0.0, 0.0, 0.0])[3] += b; }
+    }
     if generated.len() + extra.len() < p.min_tokens {
-        for &t in stop_ids { e.entry(t).or_insert((1.0, 1.0, 0.0)).2 = f32::NEG_INFINITY; }
+        for &t in stop_ids { e.entry(t).or_insert([1.0, 1.0, 0.0, 0.0, 0.0])[4] = 1.0; }
     }
     for w in &p.bad_words {
         if let Some((last, prefix)) = w.split_last() {
             let tail = extra.iter().rev().map(|&t| t as i32).chain(generated.iter().rev().copied());
             if prefix.iter().rev().copied().eq(tail.take(prefix.len())) {
-                e.entry(*last).or_insert((1.0, 1.0, 0.0)).2 = f32::NEG_INFINITY;
+                e.entry(*last).or_insert([1.0, 1.0, 0.0, 0.0, 0.0])[4] = 1.0;
             }
         }
     }
-    Penalty { edits: e.into_iter().map(|(t, (a, b, c))| (t, a, b, c)).collect(), mask: None, need_lse: p.logprobs.is_some() }
+    let mut entries: Vec<_> = e.into_iter().collect();
+    entries.sort_by_key(|(t, _)| *t);
+    Penalty { edits: entries.iter().map(|&(t, c)| (t, c[0], c[1], if c[4] != 0.0 { f32::NEG_INFINITY } else { c[2] + c[3] })).collect(),
+        separate: entries.into_iter().map(|(_, c)| c).collect(), row: p.row(0.0), mask: None, need_lse: p.logprobs.is_some() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chosen_logprob_is_available_outside_alternatives() {
+        let c = crate::engine::Cands { top: vec![(3.0, 0)], lse: 4.0, selected: 999, selected_logit: -2.0 };
+        let lp = logprob_of(&c, 999, Some(1)).unwrap();
+        assert_eq!(lp.logprob, -6.0);
+        assert_eq!(lp.top, vec![(0, -1.0)]);
+    }
 
     #[test]
     fn penalty_edits_merge_draft_counts_and_cross_boundary_bad_words() {

@@ -581,3 +581,12 @@ unsafe extern "C" {
     #[link_name = "cuCtxCreate_v2"]
     pub fn cuCtxCreate(ctx: *mut CUcontext, flags: u32, device: c_int) -> c_int;
 }
+
+unsafe extern "C" {
+    pub fn blz_sampling_workspace_bytes(rows: c_int, vocab: c_int) -> usize;
+    pub fn blz_sampling_pack(local: *const bf16, local_vocab: c_int, vocab: c_int, rank: c_int, rows: c_int, full: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_sampling_run(raw: *const f32, rows: c_int, vocab: c_int, true_vocab: c_int, valid_ids: *const u32, programs: *const std::ffi::c_void,
+        edit_ids: *const i32, edits: *const f32, offsets: *const i32, masks: *const u32, mask_rows: *const i32,
+        mask_words: c_int, execution: u32, logprobs: bool, workspace: *mut std::ffi::c_void, bytes: usize,
+        results: *mut f32, s: cudaStream_t) -> cudaError_t;
+}

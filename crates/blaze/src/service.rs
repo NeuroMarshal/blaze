@@ -1,5 +1,5 @@
 //! Serving policy and sampling defaults, independent of the inference backend.
-use crate::{logging, sampler::SamplingParams};
+use crate::{logging, sampler::{SamplingParams, SamplingPipeline, Stage}};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use serde_json::{Value, json};
@@ -72,6 +72,13 @@ pub struct ServiceArgs {
     /// {"temperature":0.7,"top_p":0.8,"presence_penalty":1.5}); request parameters take precedence
     #[arg(long)]
     pub instruct_sampling: Option<String>,
+    /// Ordered sampling stages, as a comma-separated list or JSON array
+    #[arg(long)]
+    pub samplers: Option<SamplingPipeline>,
+    #[arg(long)]
+    pub top_nsigma: Option<f32>,
+    #[arg(long)]
+    pub top_h: Option<f32>,
     #[arg(long, allow_hyphen_values = true)]
     pub frequency_penalty: Option<f32>,
     #[arg(long)]
@@ -151,7 +158,9 @@ impl ServiceArgs {
         let mut defaults = self.sampling_value(model, overrides)?;
         merge_sampling(&mut defaults, &serde_json::from_str(s).context("--instruct-sampling must be a JSON object")?, true)?;
         validate_sampling(&defaults).map_err(anyhow::Error::msg)?;
-        Ok(Some(params_of(&defaults)))
+        let params = params_of(&defaults);
+        validate_pipeline_fields(&serde_json::from_str::<Value>(s)?, &params.samplers)?;
+        Ok(Some(params))
     }
 
     fn sampling_value(&self, model: &Path, overrides: &Value) -> Result<Value> {
@@ -186,7 +195,26 @@ impl ServiceArgs {
         if let Some(x) = self.min_tokens {
             defaults["min_tokens"] = json!(x);
         }
+        if let Some(stages) = &self.samplers { defaults["samplers"] = json!(stages); }
+        if let Some(n) = self.top_nsigma { defaults["top_nsigma"] = json!(n); }
+        if let Some(h) = self.top_h { defaults["top_h"] = json!(h); }
         validate_sampling(&defaults).map_err(anyhow::Error::msg)?;
+        let pipeline = params_of(&defaults).samplers;
+        let mut explicit = overrides.clone();
+        if let Some(s) = &self.override_generation_config {
+            let mut merged: Value = serde_json::from_str(s)?;
+            merge_sampling(&mut merged, &explicit, true)?;
+            explicit = merged;
+        }
+        for (key, value) in [
+            ("frequency_penalty", self.frequency_penalty.map(|v| json!(v))),
+            ("repetition_penalty", self.repetition_penalty.map(|v| json!(v))),
+            ("top_nsigma", self.top_nsigma.map(|v| json!(v))),
+            ("top_h", self.top_h.map(|v| json!(v))),
+        ] {
+            if let Some(v) = value { explicit[key] = v; }
+        }
+        validate_pipeline_fields(&explicit, &pipeline)?;
         Ok(defaults)
     }
 }
@@ -194,6 +222,9 @@ impl ServiceArgs {
 /// Sampling parameters of validated defaults.
 fn params_of(defaults: &Value) -> SamplingParams {
     SamplingParams {
+        samplers: defaults.get("samplers").filter(|v| !v.is_null()).map(|v| SamplingPipeline::from_value(v).expect("validated pipeline")).unwrap_or_default(),
+        top_nsigma: defaults["top_nsigma"].as_f64().unwrap_or(1.0) as f32,
+        top_h: defaults["top_h"].as_f64().unwrap_or(0.4) as f32,
         temperature: defaults["temperature"].as_f64().unwrap() as f32,
         top_p: defaults["top_p"].as_f64().unwrap() as f32,
         top_k: defaults["top_k"].as_i64().unwrap() as i32,
@@ -208,7 +239,7 @@ fn params_of(defaults: &Value) -> SamplingParams {
 }
 
 const SAMPLING_KEYS: &[&str] =
-    &["temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "min_tokens", "seed"];
+    &["temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "min_tokens", "seed", "samplers", "top_nsigma", "top_h"];
 
 fn merge_sampling(out: &mut Value, value: &Value, strict: bool) -> Result<()> {
     let obj = value.as_object().context("generation defaults must be a JSON object")?;
@@ -239,14 +270,18 @@ impl std::fmt::Display for SamplingError {
 
 pub fn validate_sampling(value: &Value) -> std::result::Result<(), SamplingError> {
     let error = |field, message| SamplingError { field, message };
-    for k in ["temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"] {
+    if let Some(v) = value.get("samplers").filter(|v| !v.is_null()) {
+        SamplingPipeline::from_value(v).map_err(|e| error("samplers", e.to_string()))?;
+    }
+    for k in ["temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty", "top_nsigma", "top_h"] {
         let Some(v) = value.get(k).filter(|v| !v.is_null()) else { continue };
         let x = v
             .as_f64()
             .filter(|x| x.is_finite() && (*x as f32).is_finite())
             .ok_or_else(|| error(k, format!("{k} must be a finite number")))?;
         let valid = match k {
-            "temperature" => x >= 0.,
+            "temperature" | "top_nsigma" => x >= 0.,
+            "top_h" => (x as f32) > 0. && x <= 1.,
             "top_p" => x > 0. && x <= 1.,
             "min_p" => (0. ..=1.).contains(&x),
             "repetition_penalty" => x > 0.,
@@ -269,6 +304,25 @@ pub fn validate_sampling(value: &Value) -> std::result::Result<(), SamplingError
     Ok(())
 }
 
+pub fn validate_pipeline_fields(value: &Value, pipeline: &SamplingPipeline) -> Result<()> {
+    for (key, stage, neutral) in [
+        ("temperature", Stage::Temperature, 1.0), ("top_k", Stage::TopK, 0.0),
+        ("top_p", Stage::TopP, 1.0), ("min_p", Stage::MinP, 0.0),
+        ("presence_penalty", Stage::Penalties, 0.0), ("frequency_penalty", Stage::Penalties, 0.0),
+        ("repetition_penalty", Stage::Penalties, 1.0), ("top_nsigma", Stage::TopNsigma, -1.0),
+        ("top_h", Stage::TopH, 1.0),
+    ] {
+        if let Some(x) = value.get(key).and_then(Value::as_f64) {
+            let disabled = x == neutral || (key == "top_k" && x <= 0.0);
+            ensure!(disabled || pipeline.contains(stage), "{key} is active but its stage is missing from samplers");
+        }
+    }
+    if value.get("logit_bias").and_then(Value::as_object).is_some_and(|v| !v.is_empty()) {
+        ensure!(pipeline.contains(Stage::LogitBias), "logit_bias is active but its stage is missing from samplers");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +331,21 @@ mod tests {
         #[command(flatten)]
         args: ServiceArgs,
     }
+    #[test]
+    fn sampling_pipeline_defaults_and_explicit_omitted_stages() {
+        use clap::Parser;
+        let cli = TestCli::parse_from(["test", "--generation-config", "none", "--samplers", "top_nsigma,temperature"]);
+        let p = cli.args.sampling(Path::new("."), &json!({})).unwrap();
+        assert_eq!(p.samplers.0, vec![Stage::TopNsigma, Stage::Temperature]);
+        assert_eq!(p.top_nsigma, 1.0);
+        assert!(cli.args.sampling(Path::new("."), &json!({"top_p":0.8})).is_err());
+        assert!(validate_pipeline_fields(&json!({"top_k":-1, "top_p":1.0}), &p.samplers).is_ok());
+        for value in [json!({"samplers":["unknown"]}), json!({"samplers":["top_h","top_h"]}),
+            json!({"top_h":0}), json!({"top_h":1.1}), json!({"top_nsigma":-0.1})] {
+            assert!(validate_sampling(&value).is_err(), "{value}");
+        }
+    }
+
     #[test]
     fn invalid_types_never_become_defaults() {
         for v in [json!({"temperature":"cold"}), json!({"top_k":1.2}), json!({"seed":-1}), json!({"min_p":2}), json!({"temperature":1e300})]

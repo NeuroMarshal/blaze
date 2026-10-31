@@ -25,6 +25,7 @@ find_package(Threads REQUIRED)
 file(GLOB BLAZE_CUDA_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda/*.cu)
 add_library(blaze_kernels STATIC ${BLAZE_CUDA_SOURCES})
 target_include_directories(blaze_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(blaze_kernels PRIVATE ${CUDAToolkit_INCLUDE_DIRS}/cccl)
 target_link_libraries(blaze_kernels PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_options(blaze_kernels PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo --expt-relaxed-constexpr -Xcompiler=-Wall>

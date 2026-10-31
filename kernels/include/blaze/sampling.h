@@ -1,10 +1,9 @@
-// Sampling support: penalties applied to the logits in place, and the exact top-K candidates of each row (K <= 64),
-// from which the host draws with temperature / top-k / top-p / min-p. C API (raw device pointers, caller's stream;
-// CUDA-graph capturable).
+// Device-side sampling and logit utilities. Raw device pointers, caller's stream, CUDA-graph capturable.
 #pragma once
 
 #include <cuda_runtime.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -12,7 +11,7 @@ extern "C" {
 #endif
 
 #define BLZ_TOPK_MAX 64
-/// largest k of blz_topk (the sampling candidates stay at BLZ_TOPK_MAX)
+/// Largest k of the standalone BF16 blz_topk utility.
 #define BLZ_TOPK_LIMIT 128
 
 /// \brief Per-token logit edits (vLLM's logits processors in one pass): for every entry e of row r's list
@@ -52,6 +51,25 @@ size_t blz_topk_workspace_bytes(int rows, int vocab);
 cudaError_t blz_topk(const uint16_t* logits, int64_t ld, int rows, int vocab, int col0, int k, float* vals,
                      int32_t* ids, void* workspace, cudaStream_t stream);
 
+typedef struct {
+  int32_t stages[8], len, top_k;
+  float temperature, top_p, min_p, top_nsigma, top_h, draw;
+  int32_t need_lse;
+} blz_sampling_row;
+
+size_t blz_sampling_workspace_bytes(int rows, int vocab);
+cudaError_t blz_sampling_pack(const uint16_t* local, int local_vocab, int vocab, int rank,
+                             int rows, float* full, cudaStream_t stream);
+/// Full logits stay on the device. Results are 64 alternatives, their LSE, and (canonical chosen logit, id).
+/// Alternatives and LSE are canonical when logprobs is true; otherwise alternatives are sampling diagnostics.
+/// execution: slot bits 0..7 active, 8..15 need ranking, 16..23 edit logits. Bit 24 permits top-64 selection
+/// only when every row's first active prefix filter is top_k <= 64. valid_ids may be null (all IDs exist).
+cudaError_t blz_sampling_run(const float* raw, int rows, int vocab, int true_vocab, const uint32_t* valid_ids,
+                            const blz_sampling_row* programs, const int32_t* edit_ids,
+                            const float* edits, const int32_t* offsets,
+                            const uint32_t* masks, const int32_t* mask_rows, int mask_words,
+                            uint32_t execution, bool logprobs, void* workspace, size_t bytes,
+                            float* results, cudaStream_t stream);
 #ifdef __cplusplus
 }
 #endif
