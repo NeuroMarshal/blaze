@@ -1,0 +1,10 @@
+blaze-chat
+
+This component was copied from SGLang's Rust processor and adapted for Blaze.
+Upstream: https://github.com/sgl-project/sglang/tree/main/rust/sglang-processor
+Upstream license: Apache-2.0 (the original license text is retained in LICENSE).
+
+Local changes include crate renaming, workspace integration, chat rendering,
+reasoning handling and tool-call parsing. Modified Rust files carry a change
+notice. This component remains Apache-2.0; Blaze's MIT option does not apply
+to the copied source.

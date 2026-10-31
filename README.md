@@ -69,7 +69,10 @@ PY=/path/to/python scripts/check.sh "$MODEL" --tp 2 --vision off
 reference computations, prefix-cache, KV-pressure and soak tests.
 
 `crates/blaze` contains the host/server; `crates/blaze-sys` provides the native C ABI;
-`kernels` contains native implementations and tests. `crates/blaze-chat` is a vendored chat frontend.
+`kernels` contains native implementations and tests. `crates/blaze-chat` contains chat frontend code
+copied from SGLang and adapted for Blaze; see its [origin](crates/blaze-chat/ORIGIN).
 
-Blaze-authored code uses Apache-2.0; see [LICENSE](LICENSE). The bundled chat frontend retains its
-[upstream license](crates/blaze-chat/LICENSE). Checkpoints and dependencies retain their own licenses.
+Original Blaze code is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option. Copied third-party code retains its original terms: `blaze-chat` remains
+[Apache-2.0](crates/blaze-chat/LICENSE). The MIT option does not apply to that copied code.
+Checkpoints and dependencies retain their own licenses.
