@@ -14,6 +14,16 @@ pub fn check(err: sys::cudaError_t, what: &str) -> Result<()> {
     bail!("{what}: {msg} ({err})")
 }
 
+fn map_host_allocation(host: *mut c_void) -> Result<*mut c_void> {
+    let mut dev = null_mut();
+    let status = unsafe { sys::cudaHostGetDevicePointer(&mut dev, host, 0) };
+    if let Err(err) = check(status, "cudaHostGetDevicePointer") {
+        unsafe { sys::cudaFreeHost(host) };
+        return Err(err);
+    }
+    Ok(dev)
+}
+
 pub fn set_device(device: i32) -> Result<()> {
     check(unsafe { sys::cudaSetDevice(device) }, "cudaSetDevice")
 }
@@ -219,9 +229,8 @@ impl DevBuf {
             unsafe { sys::cudaHostAlloc(&mut host, bytes.max(1), sys::HOST_ALLOC_MAPPED | sys::HOST_ALLOC_PORTABLE) },
             &format!("cudaHostAlloc({bytes} B)"),
         )?;
+        let ptr = map_host_allocation(host)?;
         unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
-        let mut ptr = null_mut();
-        check(unsafe { sys::cudaHostGetDevicePointer(&mut ptr, host, 0) }, "cudaHostGetDevicePointer")?;
         Ok(Self { ptr, bytes, owned: true, host })
     }
 
@@ -332,8 +341,8 @@ impl HostMapped {
             unsafe { sys::cudaHostAlloc(&mut host, bytes.max(1), sys::HOST_ALLOC_MAPPED | sys::HOST_ALLOC_PORTABLE) },
             &format!("cudaHostAlloc({bytes} B)"),
         )?;
-        let mut dev = null_mut();
-        check(unsafe { sys::cudaHostGetDevicePointer(&mut dev, host, 0) }, "cudaHostGetDevicePointer")?;
+        let dev = map_host_allocation(host)?;
+        unsafe { std::ptr::write_bytes(host.cast::<u8>(), 0, bytes) };
         Ok(Self { host, dev, bytes })
     }
 

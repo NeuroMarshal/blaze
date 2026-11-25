@@ -1,3 +1,4 @@
+use super::{KvDtype, cpu};
 use super::cuda::{AttentionScratch, Compute, Dense, Kv, expert_size, from_bf16, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
@@ -9,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use std::path::Path;
 
 const PREFIX: &str = "model.llm";
+const SHORT_KV_TOKENS: usize = 8192;
 
 struct Shape {
     hidden: usize,
@@ -164,7 +166,15 @@ impl Conv {
         })
     }
 
-    fn run(&self, gpu: &Compute, state: &mut ConvState, x: &[f32], input: &[f32], pos: usize, dim: usize) -> Result<Vec<f32>> {
+    fn run(
+        &self,
+        gpu: &mut Compute,
+        state: &mut ConvState,
+        x: &[f32],
+        input: &[f32],
+        pos: usize,
+        dim: usize,
+    ) -> Result<Vec<f32>> {
         let k = self.taps.len();
         let dyn_weights = self.dynamic.as_ref().map(|m| gpu.linear(m, input)).transpose()?;
         let mut out = x.to_vec();
@@ -224,20 +234,22 @@ impl Controller {
         })
     }
 
-    fn merge(&self, gpu: &Compute, x: &mut [f32], message: &[f32], eps: f32) -> Result<()> {
-        let input: Vec<_> = normalized(x, None, eps)
+    fn input(x: &[f32], message: &[f32], eps: f32) -> Vec<f32> {
+        normalized(x, None, eps)
             .into_iter()
             .chain(normalized(message, None, eps))
-            .collect();
-        let h = gpu.linear(&self.down, &input)?;
-        for (((x, &msg), forget), gain) in x
-            .iter_mut()
-            .zip(message)
-            .zip(self.forget.chunks_exact(h.len()))
-            .zip(self.gain.chunks_exact(h.len()))
-        {
-            *x = (1.0 - dot(forget, &h).tanh()) * *x + dot(gain, &h).tanh() * msg;
-        }
+            .collect()
+    }
+
+    fn apply(&self, x: &mut [f32], message: &[f32], h: &[f32]) {
+        let forget: Vec<_> = self.forget.chunks_exact(h.len()).map(|row| dot(row, h)).collect();
+        let gain: Vec<_> = self.gain.chunks_exact(h.len()).map(|row| dot(row, h)).collect();
+        cpu::controller_mix(x, message, &forget, &gain);
+    }
+
+    fn merge(&self, gpu: &mut Compute, x: &mut [f32], message: &[f32], eps: f32) -> Result<()> {
+        let h = gpu.linear(&self.down, &Self::input(x, message, eps))?;
+        self.apply(x, message, &h);
         Ok(())
     }
 }
@@ -245,6 +257,23 @@ impl Controller {
 struct LoopInputs {
     queries: [Vec<f32>; 4],
     controllers: [Controller; 4],
+}
+
+impl LoopInputs {
+    fn mix_attention(&self, gpu: &mut Compute, qkv: &mut [Vec<f32>], memory: &[Vec<f32>], eps: f32) -> Result<()> {
+        let messages: [Vec<f32>; 3] = std::array::from_fn(|i| mix_normalized(memory, &self.queries[i]));
+        let inputs: [Vec<f32>; 3] = std::array::from_fn(|i| Controller::input(&qkv[i], &messages[i], eps));
+        let inputs = inputs.each_ref().map(Vec::as_slice).map(|row| [row]);
+        let gates = gpu.project_three(
+            std::array::from_fn(|i| &self.controllers[i].down),
+            inputs.each_ref().map(|row| row.as_slice()),
+        )?;
+        for (i, gate) in gates.into_iter().enumerate() {
+            let h: Vec<_> = gate.into_iter().map(from_bf16).collect();
+            self.controllers[i].apply(&mut qkv[i], &messages[i], &h);
+        }
+        Ok(())
+    }
 }
 
 struct Layer {
@@ -392,6 +421,18 @@ struct VisitState {
     mlp: ConvState,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum Readout {
+    None,
+    Greedy,
+    Scores,
+}
+
+pub(super) enum Prediction {
+    Token(u32),
+    Scores(Vec<f32>),
+}
+
 pub struct Sequence {
     position: usize,
     capacity: usize,
@@ -411,7 +452,7 @@ pub struct Options {
     pub expert_cache_mib: usize,
     pub expert_threads: Option<usize>,
     pub host_kv: bool,
-    pub q8_kv: bool,
+    pub kv_dtype: KvDtype,
     pub max_image_tokens: usize,
     pub prefill_chunk: usize,
 }
@@ -441,7 +482,7 @@ pub struct Model {
     placement: Vec<usize>,
     context: usize,
     global_kv_host: bool,
-    q8_kv: bool,
+    kv_dtype: KvDtype,
     vision: Option<Vision>,
     prefill_chunk: usize,
 }
@@ -455,7 +496,7 @@ impl Model {
             expert_cache_mib,
             expert_threads,
             host_kv,
-            q8_kv,
+            kv_dtype,
             max_image_tokens,
             prefill_chunk,
         } = opts;
@@ -542,11 +583,11 @@ impl Model {
                 let slots = if layer.local {
                     loops.window.min(context)
                 } else if host_kv {
-                    0
+                    context.min(SHORT_KV_TOKENS)
                 } else {
                     context
                 };
-                kv_bytes += slots * Kv::row_bytes(s.kv_heads, !layer.local && q8_kv) * 2;
+                kv_bytes += slots * Kv::row_bytes(s.kv_heads, kv_dtype) * 2;
                 sizes[packing] = sizes[packing].max(expert_size(&layer.experts));
                 visits[packing] += 1;
             }
@@ -601,7 +642,7 @@ impl Model {
             placement,
             context,
             global_kv_host: host_kv,
-            q8_kv,
+            kv_dtype,
             vision,
             prefill_chunk,
         })
@@ -637,8 +678,8 @@ impl Model {
                     kv: Kv::new(
                         if local { capacity.min(self.loops.window) } else { capacity },
                         s.kv_heads,
-                        !local && self.global_kv_host,
-                        !local && self.q8_kv,
+                        !local && self.global_kv_host && capacity > SHORT_KV_TOKENS,
+                        self.kv_dtype,
                     )?,
                     key: ConvState::new(s.conv, s.kv_width()),
                     value: ConvState::new(s.conv, s.kv_width()),
@@ -682,12 +723,12 @@ impl Model {
         vision.encode(&device.compute, bytes)
     }
 
-    pub fn forward(&mut self, seq: &mut Sequence, token: u32, want_logits: bool) -> Result<Option<Vec<f32>>> {
+    pub(super) fn forward(&mut self, seq: &mut Sequence, token: u32, readout: Readout) -> Result<Option<Prediction>> {
         let x = self.embedding(token)?;
-        self.forward_rows(seq, vec![ForwardRow::new(x)], want_logits)
+        self.forward_rows(seq, vec![ForwardRow::new(x)], readout)
     }
 
-    pub fn prefill(&mut self, seq: &mut Sequence, input: &[Input], want_logits: bool) -> Result<Option<Vec<f32>>> {
+    pub(super) fn prefill(&mut self, seq: &mut Sequence, input: &[Input], readout: Readout) -> Result<Option<Prediction>> {
         let rows = input
             .iter()
             .map(|item| {
@@ -701,10 +742,10 @@ impl Model {
                 Ok(ForwardRow::new(x))
             })
             .collect::<Result<_>>()?;
-        self.forward_rows(seq, rows, want_logits)
+        self.forward_rows(seq, rows, readout)
     }
 
-    fn forward_rows(&mut self, seq: &mut Sequence, mut rows: Vec<ForwardRow>, want_logits: bool) -> Result<Option<Vec<f32>>> {
+    fn forward_rows(&mut self, seq: &mut Sequence, mut rows: Vec<ForwardRow>, readout: Readout) -> Result<Option<Prediction>> {
         ensure!(
             !rows.is_empty() && rows.len() <= seq.capacity.saturating_sub(seq.position),
             "Inkling chunk exceeds the sequence context limit of {}",
@@ -760,14 +801,10 @@ impl Model {
                 if qkv.len() == 1 && controller.is_some() {
                     qkv.resize(3, qkv[0].clone());
                 }
-                let read_message = |slot: usize| mix_normalized(messages, controller.unwrap().queries[slot].as_slice());
                 if let Some(c) = controller {
-                    for (slot, input) in qkv.iter_mut().enumerate() {
-                        c.controllers[slot].merge(compute, input, &read_message(slot), s.eps)?;
-                    }
+                    c.mix_attention(compute, &mut qkv, messages, s.eps)?;
                 }
-                let norm =
-                    |x: &[f32], weight: &[f32]| normalized(x, Some(weight), s.eps).into_iter().map(round).collect::<Vec<_>>();
+                let norm = |x: &[f32], weight: &[f32]| normalized(x, Some(weight), s.eps);
                 let q_in = norm(&qkv[0], &layer.norm_q);
                 let k_in = qkv
                     .get(1)
@@ -779,19 +816,19 @@ impl Model {
                 k_inputs.push(k_in);
                 v_inputs.push(v_in);
             }
-            let q_batch = compute.linear_rows(&layer.query, &q_inputs)?;
+            let q_refs: Vec<_> = q_inputs.iter().map(Vec::as_slice).collect();
             let k_refs: Vec<_> = k_inputs
                 .iter()
-                .zip(&q_inputs)
-                .map(|(k, q)| k.as_deref().unwrap_or(q))
+                .zip(&q_refs)
+                .map(|(k, &q)| k.as_deref().unwrap_or(q))
                 .collect();
             let v_refs: Vec<_> = v_inputs
                 .iter()
-                .zip(&q_inputs)
-                .map(|(v, q)| v.as_deref().unwrap_or(q))
+                .zip(&q_refs)
+                .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
-            let k_batch = compute.linear_rows(&layer.key, &k_refs)?;
-            let v_batch = compute.linear_rows(&layer.value, &v_refs)?;
+            let [q_batch, k_batch, v_batch] =
+                compute.project_three([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs])?;
             for (offset, row) in rows.iter_mut().enumerate() {
                 let position = seq.position + offset;
                 let ForwardRow { x, blocks, messages, .. } = row;
@@ -829,10 +866,19 @@ impl Model {
                         row.iter().map(move |&v| to_bf16(v * scale))
                     })
                     .collect();
-                state.kv.store(position, &key, &value)?;
-                let attn = device
-                    .scratch
-                    .run(compute, &state.kv, &q, gate, sink, &rel, &layer.bias, &layer.output, position)?;
+                let attn = device.scratch.run(
+                    compute,
+                    &state.kv,
+                    &q,
+                    gate,
+                    sink,
+                    &rel,
+                    &key,
+                    &value,
+                    &layer.bias,
+                    &layer.output,
+                    position,
+                )?;
                 let mut residual = layer
                     .attn_conv
                     .run(compute, &mut state.attention, &attn, &[], position, s.dim)?;
@@ -873,16 +919,22 @@ impl Model {
                 row.x = residual.into_iter().zip(mlp).map(|(a, b)| round(a + b)).collect();
             }
         }
-        let result = if want_logits {
+        let result = if matches!(readout, Readout::None) {
+            None
+        } else {
             let row = rows.last().unwrap();
             let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);
             let x = normalized(&x, Some(&self.norm_final), s.eps);
-            let mut logits = self.devices[*self.placement.last().unwrap()].compute.linear(&self.head, &x)?;
-            logits.truncate(s.unpadded_vocab);
-            logits.iter_mut().for_each(|l| *l = s.logit_cap * (*l / s.logit_cap).tanh());
-            Some(logits)
-        } else {
-            None
+            let gpu = &mut self.devices[*self.placement.last().unwrap()].compute;
+            // The model's tanh softcap is monotonic, so greedy decoding can select on the BF16 head output.
+            if matches!(readout, Readout::Greedy) {
+                Some(Prediction::Token(gpu.argmax(&self.head, &x, s.unpadded_vocab)?))
+            } else {
+                let mut logits = gpu.linear(&self.head, &x)?;
+                logits.truncate(s.unpadded_vocab);
+                cpu::softcap(&mut logits, s.logit_cap);
+                Some(Prediction::Scores(logits))
+            }
         };
         seq.position += rows.len();
         Ok(result)

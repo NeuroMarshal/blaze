@@ -123,8 +123,12 @@ fn resolve(command: clap::Command, mut args: Vec<OsString>) -> Result<(Vec<OsStr
     if path.is_none() && preset.is_none() {
         return Ok((args, Value::Object(Map::new())));
     }
-    if args.get(1).is_none_or(|x| x != "serve") {
+    let subcommand = args.get(1).and_then(|arg| arg.to_str()).unwrap_or_default();
+    if !matches!(subcommand, "serve" | "serve-inkling") {
         bail!("--config and --preset are supported for serving");
+    }
+    if preset.is_some() && subcommand != "serve" {
+        bail!("--preset is supported by serve");
     }
     let mut value = match &path {
         Some(path) => serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("config {}", path.display()))?)?,
@@ -138,7 +142,7 @@ fn resolve(command: clap::Command, mut args: Vec<OsString>) -> Result<(Vec<OsStr
         }
     }
     let obj = &*obj;
-    let serve = command.get_subcommands().find(|c| c.get_name() == "serve").context("no serve command")?;
+    let serve = command.find_subcommand(subcommand).context("missing serving subcommand")?;
     let mut defaults = Vec::<OsString>::new();
     for (key, value) in obj {
         let key = key.replace('_', "-");

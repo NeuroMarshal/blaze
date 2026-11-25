@@ -599,10 +599,11 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn blz_inkling_attention(q: *const u16, keys: *const c_void, values: *const c_void, relative: *const u16,
-                                 sinks: *const u16, gate: *const u16, out: *mut u16, scratch: *mut f32,
-                                 heads: c_int, kv_heads: c_int, capacity: c_int, position: c_int,
-                                 extent: c_int, tiles: c_int, q8: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_attention(q: *const u16, keys: *const u8, values: *const u8, key_scales: *const u8,
+                                 value_scales: *const u8, relative: *const u16, sinks: *const u16,
+                                 gate: *const u16, out: *mut u16, scratch: *mut f32, heads: c_int,
+                                 kv_heads: c_int, capacity: c_int, position: c_int, extent: c_int,
+                                 tiles: c_int, global_scale: f32, stream: cudaStream_t) -> cudaError_t;
 }
 
 unsafe extern "C" {

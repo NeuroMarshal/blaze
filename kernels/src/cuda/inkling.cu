@@ -3,6 +3,8 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "blaze/nvfp4.h"
+
 namespace {
 
 __global__ void softcapped_swiglu(const __nv_bfloat162* gate_up, __nv_bfloat16* out,
@@ -45,11 +47,13 @@ __device__ inline float warp_sum(float x) {
     return x;
 }
 
-template <bool Quantized>
-__global__ void attention_tiles(const __nv_bfloat16* q, const void* keys,
-                                const void* values, const __nv_bfloat16* relative,
+template <bool Packed>
+__global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, const uint8_t* values,
+                                const uint8_t* key_scales, const uint8_t* value_scales,
+                                const __nv_bfloat16* relative, const __nv_bfloat16* sinks,
+                                const __nv_bfloat16* gate, __nv_bfloat16* output,
                                 float* scratch, int kv_heads, int capacity, int position,
-                                int extent, int tile) {
+                                int extent, int tile, float global_scale) {
     const int head = blockIdx.x;
     const int kv_head = head / (gridDim.x / kv_heads);
     const int lane = threadIdx.x % 32;
@@ -58,42 +62,56 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const void* keys,
     const int end = min(first + tile, position + 1);
     float query[4], accum[4] = {};
 #pragma unroll
-    for (int j = 0; j < 4; ++j) query[j] = __bfloat162float(q[head * HEAD_DIM + j * 32 + lane]);
+    for (int j = 0; j < 4; ++j) query[j] = __bfloat162float(q[head * HEAD_DIM + lane * 4 + j]);
 
     float max_logit = -CUDART_INF_F;
     float sum = 0.0f;
+    int slot = (first + warp) % capacity;
     for (int t = first + warp; t < end; t += WARPS) {
-        const size_t row = size_t(t % capacity) * kv_heads + kv_head;
-        float key_scale = 1.0f, value_scale = 1.0f;
-        const int8_t* kb = nullptr;
-        const int8_t* vb = nullptr;
-        if constexpr (Quantized) {
-            kb = static_cast<const int8_t*>(keys) + row * (HEAD_DIM + 4);
-            vb = static_cast<const int8_t*>(values) + row * (HEAD_DIM + 4);
-            key_scale = *reinterpret_cast<const float*>(kb + HEAD_DIM);
-            value_scale = *reinterpret_cast<const float*>(vb + HEAD_DIM);
-        }
+        const size_t row = size_t(slot) * kv_heads + kv_head;
+        slot += WARPS;
+        if (slot >= capacity) slot -= capacity;
         float dot = 0.0f;
+        if constexpr (Packed) {
+            constexpr int codes = HEAD_DIM / 2;
+            constexpr int scales = HEAD_DIM / blaze::kNvfp4Block;
+            const int group = lane / (blaze::kNvfp4Block / 4);
+            const float ks = blaze::e4m3_to_float(key_scales[row * scales + group]);
+            const uint16_t kb = reinterpret_cast<const uint16_t*>(keys + row * codes)[lane];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int c = j * 32 + lane;
-            const float k = Quantized ? float(kb[c]) : __bfloat162float(static_cast<const __nv_bfloat16*>(keys)[row * HEAD_DIM + c]);
-            dot = fmaf(query[j], k, dot);
+            for (int j = 0; j < 4; ++j) dot = fmaf(query[j], blaze::e2m1_value((kb >> (j * 4)) & 15), dot);
+            dot *= ks;
+        } else {
+            const auto* k = reinterpret_cast<const __nv_bfloat162*>(keys) + row * (HEAD_DIM / 2) + lane * 2;
+            const float2 lo = __bfloat1622float2(k[0]), hi = __bfloat1622float2(k[1]);
+            dot = fmaf(query[0], lo.x, dot);
+            dot = fmaf(query[1], lo.y, dot);
+            dot = fmaf(query[2], hi.x, dot);
+            dot = fmaf(query[3], hi.y, dot);
         }
-        dot *= key_scale;
-        dot = warp_sum(dot) * rsqrtf(float(HEAD_DIM));
+        dot = warp_sum(dot) * ((Packed ? global_scale : 1.0f) * rsqrtf(float(HEAD_DIM)));
         const int distance = position - t;
         if (distance < extent) dot += __bfloat162float(relative[head * extent + distance]);
         const float next_max = fmaxf(max_logit, dot);
-        const float keep = expf(max_logit - next_max);
-        const float add = expf(dot - next_max);
-        sum = sum * keep + add;
+        const float keep = __expf(max_logit - next_max);
+        const float add = __expf(dot - next_max);
+        sum = fmaf(sum, keep, add);
         max_logit = next_max;
+        if constexpr (Packed) {
+            constexpr int codes = HEAD_DIM / 2;
+            constexpr int scales = HEAD_DIM / blaze::kNvfp4Block;
+            const int group = lane / (blaze::kNvfp4Block / 4);
+            const float vs = blaze::e4m3_to_float(value_scales[row * scales + group]) * (global_scale * add);
+            const uint16_t vb = reinterpret_cast<const uint16_t*>(values + row * codes)[lane];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int c = j * 32 + lane;
-            const float v = Quantized ? float(vb[c]) : __bfloat162float(static_cast<const __nv_bfloat16*>(values)[row * HEAD_DIM + c]);
-            accum[j] = fmaf(add * value_scale, v, keep * accum[j]);
+            for (int j = 0; j < 4; ++j) accum[j] = fmaf(vs, blaze::e2m1_value((vb >> (j * 4)) & 15), keep * accum[j]);
+        } else {
+            const auto* v = reinterpret_cast<const __nv_bfloat162*>(values) + row * (HEAD_DIM / 2) + lane * 2;
+            const float2 lo = __bfloat1622float2(v[0]), hi = __bfloat1622float2(v[1]);
+            accum[0] = fmaf(add, lo.x, keep * accum[0]);
+            accum[1] = fmaf(add, lo.y, keep * accum[1]);
+            accum[2] = fmaf(add, hi.x, keep * accum[2]);
+            accum[3] = fmaf(add, hi.y, keep * accum[3]);
         }
     }
 
@@ -105,7 +123,7 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const void* keys,
         sums[warp] = sum;
     }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) partials[warp][j * 32 + lane] = accum[j];
+    for (int j = 0; j < 4; ++j) partials[warp][lane * 4 + j] = accum[j];
     __syncthreads();
 
     const float maximum = fmaxf(fmaxf(maxima[0], maxima[1]), fmaxf(maxima[2], maxima[3]));
@@ -116,11 +134,20 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const void* keys,
         out = fmaf(factor, partials[w][threadIdx.x], out);
         denom = fmaf(factor, sums[w], denom);
     }
-    float* slot = scratch + (head * gridDim.y + blockIdx.y) * (HEAD_DIM + 2);
-    slot[threadIdx.x] = out;
+    if (gridDim.y == 1) {
+        const float sink = __bfloat162float(sinks[head]);
+        const float m = fmaxf(maximum, sink);
+        const float factor = __expf(maximum - m);
+        const int i = head * HEAD_DIM + threadIdx.x;
+        output[i] = __float2bfloat16(out * factor / (fmaf(denom, factor, __expf(sink - m))
+                                      * (1.0f + __expf(-__bfloat162float(gate[i])))));
+        return;
+    }
+    float* partial = scratch + (head * gridDim.y + blockIdx.y) * (HEAD_DIM + 2);
+    partial[threadIdx.x] = out;
     if (threadIdx.x == 0) {
-        slot[HEAD_DIM] = maximum;
-        slot[HEAD_DIM + 1] = denom;
+        partial[HEAD_DIM] = maximum;
+        partial[HEAD_DIM + 1] = denom;
     }
 }
 
@@ -146,27 +173,32 @@ __global__ void attention_merge(const float* scratch, const __nv_bfloat16* sinks
 
 } // namespace
 
-extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const void* keys, const void* values,
+extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const uint8_t* keys, const uint8_t* values,
+                                            const uint8_t* key_scales, const uint8_t* value_scales,
                                             const uint16_t* relative, const uint16_t* sinks, const uint16_t* gate,
                                             uint16_t* out, float* scratch, int heads, int kv_heads, int capacity,
-                                            int position, int extent, int tiles, int q8, cudaStream_t stream) {
+                                            int position, int extent, int tiles, float global_scale, cudaStream_t stream) {
+    if (kv_heads < 1 || heads < 1 || heads % kv_heads != 0 || capacity < 1 || position < 0 || tiles < 1)
+        return cudaErrorInvalidValue;
     const int valid = min(capacity, position + 1);
     const int tile = (valid + tiles - 1) / tiles;
     const int blocks = (valid + tile - 1) / tile;
     const dim3 grid(heads, blocks);
     auto query = reinterpret_cast<const __nv_bfloat16*>(q);
     auto biases = reinterpret_cast<const __nv_bfloat16*>(relative);
-    if (q8) {
-        attention_tiles<true><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, biases, scratch,
-            kv_heads, capacity, position, extent, tile);
+    auto sink = reinterpret_cast<const __nv_bfloat16*>(sinks);
+    auto gated = reinterpret_cast<const __nv_bfloat16*>(gate);
+    auto result = reinterpret_cast<__nv_bfloat16*>(out);
+    if (key_scales) {
+        attention_tiles<true><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, key_scales, value_scales,
+            biases, sink, gated, result, scratch, kv_heads, capacity, position, extent, tile, global_scale);
     } else {
-        attention_tiles<false><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, biases, scratch,
-            kv_heads, capacity, position, extent, tile);
+        attention_tiles<false><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, nullptr, nullptr,
+            biases, sink, gated, result, scratch, kv_heads, capacity, position, extent, tile, global_scale);
     }
     const cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    attention_merge<<<heads, HEAD_DIM, 0, stream>>>(scratch, reinterpret_cast<const __nv_bfloat16*>(sinks),
-        reinterpret_cast<const __nv_bfloat16*>(gate), reinterpret_cast<__nv_bfloat16*>(out), blocks);
+    if (err != cudaSuccess || blocks == 1) return err;
+    attention_merge<<<heads, HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, blocks);
     return cudaGetLastError();
 }
 

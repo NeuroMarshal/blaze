@@ -32,6 +32,7 @@ struct StateData {
     name: String,
     max_tokens: usize,
     context: usize,
+    vision: bool,
 }
 
 struct Job {
@@ -70,6 +71,7 @@ pub async fn serve(config: Config) -> Result<()> {
         name: config.name,
         max_tokens: config.max_tokens,
         context: config.options.context,
+        vision: config.options.max_image_tokens > 0,
     });
     let (ready, status) = oneshot::channel();
     std::thread::Builder::new().name("blaze-inkling".into()).spawn(move || {
@@ -189,6 +191,9 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
         return Err(bad_param("n", "the Inkling runner generates one choice"));
     }
     let urls = media::image_parts(&body)?;
+    if !st.vision && !urls.is_empty() {
+        return Err(bad_param("messages", "Inkling vision is disabled"));
+    }
     if urls.len() > 4 {
         return Err(bad_param("messages", "at most four images per request"));
     }

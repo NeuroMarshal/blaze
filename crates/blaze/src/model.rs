@@ -498,12 +498,12 @@ impl VerifyAttention {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum KvDtype {
     /// NVFP4 with the block scale searched per block (max/6, max/4 and E4M3 steps around: four over six)
-    #[default]
     Nvfp4FourOverSix,
     /// NVFP4 with the block maximum mapped to 6
     Nvfp4,
     /// FP8 E4M3, per-layer scale 1
     Fp8,
+    #[default]
     Bf16,
     /// TurboQuant-style 3 bits a value (blaze/tq3.h): the rotated rows' Lloyd-Max codes of N(0, 1) and a least-squares
     /// FP16 scale per row; 98 bytes a head vector against NVFP4's 144 (KV 32% smaller), coarser (MSE 0.035 of the

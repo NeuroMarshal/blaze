@@ -1,6 +1,7 @@
+use super::KvDtype;
 use super::cpu::Routed;
 use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
-use crate::gpu::{DevBuf, Stream, check};
+use crate::gpu::{DevBuf, HostMapped, Stream, check};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, ensure};
 use blaze_sys as sys;
@@ -59,13 +60,42 @@ impl Dense {
     }
 
     pub(super) fn run(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize) -> Result<()> {
+        let (n, k) = (self.rows as i32, self.cols as i32);
+        let weight = self.weight.ptr::<u16>();
+        if m == 1 && (x as usize).is_multiple_of(16) {
+            if self.rows > 4096 && crate::tune::wide_fits(m, self.cols, self.cols) {
+                return check(
+                    unsafe { sys::blz_gemv_wide(x.cast(), k.into(), weight.cast(), out.cast(), n.into(), 1, n, k, gpu.stream.0) },
+                    "Inkling wide GEMV",
+                );
+            }
+            if self.rows <= 4096 && crate::tune::skinny_fits(m, self.cols, self.cols) {
+                return check(
+                    unsafe {
+                        sys::blz_skinny_gemm_ex(
+                            x.cast(),
+                            k.into(),
+                            weight.cast(),
+                            out.cast(),
+                            n.into(),
+                            1,
+                            n,
+                            k,
+                            sys::BLZ_BF16,
+                            gpu.stream.0,
+                        )
+                    },
+                    "Inkling skinny GEMV",
+                );
+            }
+        }
         check(
             unsafe {
                 sys::blz_gemm_bf16(
                     gpu.gemm,
                     x,
                     self.cols as i64,
-                    self.weight.ptr(),
+                    weight,
                     out,
                     self.rows as i64,
                     m as i32,
@@ -134,27 +164,46 @@ impl OnDevice {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Heat {
+    count: usize,
+    epoch: usize,
+}
+
+impl Heat {
+    fn at(self, epoch: usize) -> usize {
+        self.count >> epoch.saturating_sub(self.epoch).min(usize::BITS as usize - 1)
+    }
+
+    fn add(&mut self, epoch: usize, observations: usize) {
+        self.count = self.at(epoch).saturating_add(observations);
+        self.epoch = epoch;
+    }
+}
+
 struct DeviceExpert {
     gate_up: OnDevice,
     down: OnDevice,
     slot: usize,
     last_used: usize,
+    heat: Heat,
 }
 
 struct ExpertPool {
     buffer: DevBuf,
     stride: usize,
-    next_slot: usize,
+    free_slots: Vec<usize>,
     entries: HashMap<(usize, usize), DeviceExpert>,
-    hits: HashMap<(usize, usize), usize>,
+    hits: HashMap<(usize, usize), Heat>,
 }
 
 impl ExpertPool {
     fn new(bytes: usize, stride: usize) -> Result<Self> {
+        let slots = bytes / stride;
         Ok(Self {
-            buffer: DevBuf::new(bytes / stride * stride)?,
+            buffer: DevBuf::new(slots * stride)?,
             stride,
-            next_slot: 0,
+            free_slots: (0..slots).rev().collect(),
             entries: HashMap::new(),
             hits: HashMap::new(),
         })
@@ -164,77 +213,73 @@ impl ExpertPool {
         &mut self,
         ckpt: &Checkpoint,
         weights: &Experts,
-        layer: usize,
-        id: usize,
+        key: (usize, usize),
         tick: usize,
-        observations: usize,
-        cpu_enabled: bool,
+        epoch: usize,
+        observations: Option<usize>,
+        preserve_group: bool,
     ) -> Result<bool> {
-        if cpu_enabled {
-            let key = (layer, id);
-            let count = self.hits.entry(key).or_default();
-            *count = count.saturating_add(observations);
-            let count = *count;
-            if !self.entries.contains_key(&key) {
-                if count < 2 {
-                    return Ok(false);
-                }
-                if self.next_slot >= self.buffer.bytes() / self.stride {
-                    // Changing a resident expert costs PCIe traffic. Only replace a less-used slot when
-                    // this expert has accumulated a clear lead, outside the active route group.
-                    let replace = self
-                        .entries
-                        .iter()
-                        .filter(|(_, e)| e.last_used != tick)
-                        .min_by_key(|(key, e)| (self.hits.get(key).copied().unwrap_or(0), e.last_used))
-                        .map(|(&key, _)| key);
-                    let Some(old) = replace else {
-                        return Ok(false);
-                    };
-                    if count < self.hits[&old].saturating_add(16) {
-                        return Ok(false);
-                    }
-                    let victim = self.entries.get_mut(&old).unwrap();
-                    victim.last_used = 0;
-                }
-            }
+        let mut heat = Heat::default();
+        if let Some(observations) = observations {
+            let hits = self.hits.entry(key).or_default();
+            hits.add(epoch, observations);
+            heat = *hits;
         }
-        self.prepare(ckpt, weights, layer, id, tick)?;
-        Ok(true)
-    }
-
-    fn prepare(&mut self, ckpt: &Checkpoint, weights: &Experts, layer: usize, id: usize, tick: usize) -> Result<()> {
-        let key = (layer, id);
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = tick;
-            return Ok(());
+            entry.heat = heat;
+            return Ok(true);
         }
-        let slot = if self.next_slot < self.buffer.bytes() / self.stride {
-            let slot = self.next_slot;
-            self.next_slot += 1;
-            slot
-        } else {
-            let (&oldest, _) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_used)
-                .expect("non-empty expert pool");
-            self.entries.remove(&oldest).unwrap().slot
+        if observations.is_some() && heat.count < 2 {
+            return Ok(false);
+        }
+        let slot = match self.free_slots.pop() {
+            Some(slot) => slot,
+            None => {
+                let victim = self
+                    .entries
+                    .iter()
+                    .filter(|(_, e)| !preserve_group || e.last_used != tick)
+                    .min_by_key(|(key, e)| (e.heat.at(epoch), e.last_used, **key));
+                let Some((&old, entry)) = victim else {
+                    ensure!(observations.is_some(), "Inkling GPU expert slots exhausted");
+                    return Ok(false);
+                };
+                let old_count = entry.heat.at(epoch);
+                if observations.is_some() && heat.count < old_count.saturating_add(16.max(old_count / 4)) {
+                    return Ok(false);
+                }
+                self.entries.remove(&old).unwrap().slot
+            }
         };
+        let id = key.1;
         let offset = slot * self.stride;
-        let gate_up = OnDevice::store(&self.buffer, offset, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
-        let offset_down = offset + weights.gate_up.gpu_bytes().next_multiple_of(64);
-        let down = OnDevice::store(&self.buffer, offset_down, &weights.down, weights.down.expert(ckpt, id)?)?;
-        self.entries.insert(
-            key,
-            DeviceExpert {
-                gate_up,
-                down,
-                slot,
-                last_used: tick,
-            },
-        );
-        Ok(())
+        let data = (|| -> Result<_> {
+            let gate_up = OnDevice::store(&self.buffer, offset, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
+            let offset_down = offset + weights.gate_up.gpu_bytes().next_multiple_of(64);
+            let down = OnDevice::store(&self.buffer, offset_down, &weights.down, weights.down.expert(ckpt, id)?)?;
+            Ok((gate_up, down))
+        })();
+        match data {
+            Ok((gate_up, down)) => {
+                self.entries.insert(
+                    key,
+                    DeviceExpert {
+                        gate_up,
+                        down,
+                        slot,
+                        last_used: tick,
+                        heat,
+                    },
+                );
+                Ok(true)
+            }
+            Err(err) => {
+                // A partially copied record cannot be dispatched. Its slot is reusable on the next call.
+                self.free_slots.push(slot);
+                Err(err)
+            }
+        }
     }
 }
 
@@ -245,6 +290,7 @@ pub(super) fn expert_size(weights: &Experts) -> usize {
 struct ExpertCache {
     pools: [Option<ExpertPool>; 2],
     generation: usize,
+    visits: usize,
 }
 
 impl ExpertCache {
@@ -263,11 +309,17 @@ impl ExpertCache {
                 pools[i] = Some(ExpertPool::new(budget, sizes[i])?);
             }
         }
-        Ok(Self { pools, generation: 0 })
+        Ok(Self {
+            pools,
+            generation: 0,
+            visits: 0,
+        })
     }
 }
 
 const EXPERT_BATCH: usize = 64;
+// Count token visits, so a prefill chunk advances the heat clock by its length.
+const HEAT_EPOCH_VISITS: usize = 48 * 512;
 
 pub(super) struct Compute {
     pub stream: Stream,
@@ -279,6 +331,8 @@ pub(super) struct Compute {
     sum: DevBuf,
     scatter_ids: DevBuf,
     scatter_weights: DevBuf,
+    transfer: HostMapped,
+    next_id: DevBuf,
     cache: ExpertCache,
     cpu: Option<Arc<rayon::ThreadPool>>,
     cpu_routes: u64,
@@ -299,13 +353,15 @@ impl Compute {
     ) -> Result<Self> {
         let stream = Stream::new()?;
         let batch = prefill_chunk.min(EXPERT_BATCH);
-        let input = DevBuf::new(max_in.max(hidden * prefill_chunk) * 2)?;
+        let input = DevBuf::new((max_in * 3).max(hidden * prefill_chunk * 3) * 2)?;
         let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk) * 2)?;
         let gate = DevBuf::new((intermediate * 2 * batch).max(max_in) * 2)?;
         let glu = DevBuf::new(intermediate * batch * 2)?;
         let sum = DevBuf::new(prefill_chunk * hidden * 4)?;
         let scatter_ids = DevBuf::new(batch * 4)?;
         let scatter_weights = DevBuf::new(batch * 4)?;
+        let transfer = HostMapped::new(input.bytes().max(result.bytes()))?;
+        let next_id = DevBuf::new(4)?;
         let cache = ExpertCache::new(expert_bytes, expert_sizes, layer_visits, top_k)?;
         let mut gemm = null_mut();
         check(unsafe { sys::blz_gemm_create(&mut gemm) }, "Inkling cuBLAS handle")?;
@@ -319,31 +375,154 @@ impl Compute {
             sum,
             scatter_ids,
             scatter_weights,
+            transfer,
+            next_id,
             cache,
             cpu,
             cpu_routes: 0,
         })
     }
 
-    pub fn linear_bf16(&self, matrix: &Dense, x: &[u16], m: usize) -> Result<Vec<u16>> {
+    fn stage_input(&mut self, values: &[u16]) -> Result<()> {
+        // SAFETY: all source u16 values are initialized and the staging buffer remains live until stream sync.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) };
+        self.transfer.host_slice_mut()[..bytes.len()].copy_from_slice(bytes);
+        check(
+            unsafe {
+                sys::cudaMemcpyAsync(
+                    self.input.ptr(),
+                    self.transfer.host_ptr(),
+                    bytes.len(),
+                    sys::MEMCPY_H2D,
+                    self.stream.0,
+                )
+            },
+            "Inkling projection input",
+        )
+    }
+
+    fn queue_result<T: Copy>(&mut self, result: *const T, count: usize) -> Result<()> {
+        let bytes = count * std::mem::size_of::<T>();
+        ensure!(bytes <= self.transfer.bytes(), "Inkling readback exceeds staging capacity");
+        check(
+            unsafe {
+                sys::cudaMemcpyAsync(
+                    self.transfer.host_ptr().cast_mut(),
+                    result.cast(),
+                    bytes,
+                    sys::MEMCPY_D2H,
+                    self.stream.0,
+                )
+            },
+            "Inkling projection readback",
+        )
+    }
+
+    fn read_result<T: Copy>(&self, count: usize) -> Vec<T> {
+        // The caller has synchronized a copy of these values into the initialized, page-aligned buffer.
+        unsafe { std::slice::from_raw_parts(self.transfer.host_ptr().cast::<T>(), count) }.to_vec()
+    }
+
+    pub fn linear_bf16(&mut self, matrix: &Dense, x: &[u16], m: usize) -> Result<Vec<u16>> {
+        let rows = matrix.rows * m;
         ensure!(
-            x.len() == matrix.cols * m && matrix.rows * m * 2 <= self.result.bytes(),
+            x.len() == matrix.cols * m && x.len() * 2 <= self.input.bytes() && rows * 2 <= self.result.bytes(),
             "Inkling projection shape exceeds scratch"
         );
-        self.input.upload(x)?;
-        matrix.run(self, self.input.ptr(), self.result.ptr(), m)?;
-        self.stream.sync()?;
-        self.result.download(matrix.rows * m)
+        let work = (|| -> Result<()> {
+            self.stage_input(x)?;
+            matrix.run(self, self.input.ptr(), self.result.ptr(), m)?;
+            self.queue_result::<u16>(self.result.ptr(), rows)
+        })();
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        Ok(self.read_result(rows))
     }
 
-    pub fn linear_rows(&self, matrix: &Dense, rows: &[impl AsRef<[f32]>]) -> Result<Vec<u16>> {
-        let x: Vec<_> = rows.iter().flat_map(|r| r.as_ref().iter().copied().map(to_bf16)).collect();
-        self.linear_bf16(matrix, &x, rows.len())
+    pub fn project_three(&mut self, matrices: [&Dense; 3], inputs: [&[&[f32]]; 3]) -> Result<[Vec<u16>; 3]> {
+        let m = inputs[0].len();
+        let cols = matrices[0].cols;
+        let rows = matrices.map(|w| w.rows * m);
+        let output_values: usize = rows.iter().sum();
+        ensure!(
+            m != 0
+                && inputs.iter().all(|x| x.len() == m && x.iter().all(|r| r.len() == cols))
+                && matrices.iter().all(|w| w.cols == cols)
+                && m * cols * 6 <= self.input.bytes()
+                && output_values * 2 <= self.result.bytes(),
+            "Inkling grouped projection shape exceeds scratch"
+        );
+
+        let host = self.transfer.host_ptr().cast_mut().cast::<u16>();
+        let mut end = 0;
+        let mut offsets = [0; 3];
+        for i in 0..3 {
+            if i > 0 && inputs[i].iter().zip(inputs[0]).all(|(&a, &b)| std::ptr::eq(a, b)) {
+                continue;
+            }
+            offsets[i] = end;
+            let size = m * cols;
+            // The page-aligned staging area is idle and initialized before this write.
+            let dst = unsafe { std::slice::from_raw_parts_mut(host.add(end), size) };
+            for (out, v) in dst.iter_mut().zip(inputs[i].iter().flat_map(|r| r.iter())) {
+                *out = to_bf16(*v);
+            }
+            end += size;
+        }
+        let work = (|| -> Result<()> {
+            check(
+                unsafe { sys::cudaMemcpyAsync(self.input.ptr(), host.cast(), end * 2, sys::MEMCPY_H2D, self.stream.0) },
+                "Inkling grouped projection inputs",
+            )?;
+            let mut out = 0;
+            for i in 0..3 {
+                matrices[i].run(self, self.input.at(offsets[i]), self.result.at(out), m)?;
+                out += rows[i];
+            }
+            self.queue_result::<u16>(self.result.ptr(), output_values)
+        })();
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        let mut offset = 0;
+        Ok(rows.map(|len| {
+            // Read the requested range of the completed D2H copy.
+            let dst = unsafe { std::slice::from_raw_parts(host.add(offset), len) }.to_vec();
+            offset += len;
+            dst
+        }))
     }
 
-    pub fn linear(&self, matrix: &Dense, x: &[f32]) -> Result<Vec<f32>> {
-        let x: Vec<_> = x.iter().map(|&x| to_bf16(x)).collect();
+    pub fn linear(&mut self, matrix: &Dense, x: &[f32]) -> Result<Vec<f32>> {
+        let x: Vec<_> = x.iter().copied().map(to_bf16).collect();
         Ok(self.linear_bf16(matrix, &x, 1)?.into_iter().map(from_bf16).collect())
+    }
+
+    pub fn argmax(&mut self, matrix: &Dense, x: &[f32], vocab: usize) -> Result<u32> {
+        let x: Vec<_> = x.iter().copied().map(to_bf16).collect();
+        let work = (|| -> Result<()> {
+            self.stage_input(&x)?;
+            matrix.run(self, self.input.ptr(), self.result.ptr(), 1)?;
+            check(
+                unsafe {
+                    sys::blz_argmax_bf16(
+                        self.result.ptr(),
+                        1,
+                        vocab as i32,
+                        matrix.rows as i64,
+                        self.next_id.ptr(),
+                        self.stream.0,
+                    )
+                },
+                "Inkling argmax",
+            )?;
+            self.queue_result::<i32>(self.next_id.ptr(), 1)
+        })();
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        Ok(self.read_result::<i32>(1)[0] as u32)
     }
 
     pub fn cpu_routes(&self) -> u64 {
@@ -363,6 +542,8 @@ impl Compute {
         let x_bf16: Vec<_> = x.iter().map(|&x| to_bf16(x)).collect();
         self.cache.generation += 1;
         let tick = self.cache.generation;
+        self.cache.visits += 1;
+        let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
         // Touch hits first. Cache misses then evict only experts outside this route group.
         for &(id, _) in routes {
@@ -373,7 +554,7 @@ impl Compute {
         let mut cold = Vec::new();
         let mut resident = Vec::new();
         for &(id, weight) in routes {
-            if pool.use_gpu(ckpt, weights, layer, id, tick, 1, self.cpu.is_some())? {
+            if pool.use_gpu(ckpt, weights, (layer, id), tick, epoch, self.cpu.is_some().then_some(1), true)? {
                 resident.push((id, weight));
             } else {
                 cold.push((Routed::read(ckpt, weights, id)?, x, 0, weight));
@@ -441,13 +622,23 @@ impl Compute {
         self.sum.zero(&self.stream)?;
         self.cache.generation += 1;
         let tick = self.cache.generation;
+        self.cache.visits += activations.len();
+        let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
         let mut input = Vec::with_capacity(hidden * EXPERT_BATCH);
         let mut ids = Vec::with_capacity(EXPERT_BATCH);
         let mut probs = Vec::with_capacity(EXPERT_BATCH);
         let mut cold = Vec::new();
         for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            if !pool.use_gpu(ckpt, weights, layer, id, tick, rows.len(), self.cpu.is_some())? {
+            if !pool.use_gpu(
+                ckpt,
+                weights,
+                (layer, id),
+                tick,
+                epoch,
+                self.cpu.is_some().then_some(rows.len()),
+                false,
+            )? {
                 for &(row, weight) in rows {
                     cold.push((
                         Routed::read(ckpt, weights, id)?,
@@ -558,62 +749,121 @@ pub(super) fn to_bf16(x: f32) -> u16 {
 const HEAD_DIM: usize = 128;
 const MAX_TILES: usize = 256;
 
+// A power-of-two global scale keeps the E4M3 step usable for small blocks while covering
+// both the model's clipped K heads and its RMS-normalized V heads.
+const KV_GLOBAL_SCALE: f32 = 1.0 / 16.0;
+const KV_CODE_BYTES: usize = HEAD_DIM / 2;
+const KV_SCALE_BYTES: usize = HEAD_DIM / 16;
+
 pub(super) struct Kv {
-    keys: DevBuf,
-    values: DevBuf,
+    storage: DevBuf,
     capacity: usize,
-    row_bytes: usize,
-    q8: bool,
+    heads: usize,
+    dtype: KvDtype,
 }
 
 impl Kv {
-    pub fn row_bytes(heads: usize, q8: bool) -> usize {
-        heads * if q8 { HEAD_DIM + 4 } else { HEAD_DIM * 2 }
+    pub fn row_bytes(heads: usize, dtype: KvDtype) -> usize {
+        heads * match dtype {
+            KvDtype::Bf16 => HEAD_DIM * 2,
+            _ => KV_CODE_BYTES + KV_SCALE_BYTES,
+        }
     }
 
-    pub fn new(capacity: usize, heads: usize, host: bool, q8: bool) -> Result<Self> {
-        let row_bytes = Self::row_bytes(heads, q8);
-        let bytes = capacity * row_bytes;
+    pub fn new(capacity: usize, heads: usize, host: bool, dtype: KvDtype) -> Result<Self> {
+        let bytes = capacity
+            .checked_mul(Self::row_bytes(heads, dtype) * 2)
+            .ok_or_else(|| anyhow::anyhow!("Inkling KV size overflows"))?;
         let alloc = if host { DevBuf::host_mapped } else { DevBuf::new };
         Ok(Self {
-            keys: alloc(bytes)?,
-            values: alloc(bytes)?,
+            storage: alloc(bytes)?,
             capacity,
-            row_bytes,
-            q8,
+            heads,
+            dtype,
         })
     }
 
-    pub fn store(&self, position: usize, key: &[u16], value: &[u16]) -> Result<()> {
-        let off = (position % self.capacity) * self.row_bytes;
-        if self.q8 {
-            self.keys.upload_at(off, &quantize_kv(key))?;
-            self.values.upload_at(off, &quantize_kv(value))
-        } else {
-            self.keys.upload_at(off, key)?;
-            self.values.upload_at(off, value)
+    fn pointers(&self, slot: usize) -> [*mut u8; 4] {
+        if self.dtype == KvDtype::Bf16 {
+            let row_bytes = Self::row_bytes(self.heads, self.dtype);
+            return [
+                self.storage.at(slot * row_bytes),
+                self.storage.at((self.capacity + slot) * row_bytes),
+                null_mut(),
+                null_mut(),
+            ];
         }
+        let rows = self.capacity * self.heads;
+        let code_pool = rows * KV_CODE_BYTES;
+        let scale_pool = rows * KV_SCALE_BYTES;
+        let row = slot * self.heads;
+        let codes = row * KV_CODE_BYTES;
+        let scales = row * KV_SCALE_BYTES;
+        [
+            self.storage.at(codes),
+            self.storage.at(code_pool + codes),
+            self.storage.at(2 * code_pool + scales),
+            self.storage.at(2 * code_pool + scale_pool + scales),
+        ]
     }
-}
 
-fn quantize_kv(row: &[u16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(row.len() / HEAD_DIM * (HEAD_DIM + 4));
-    for head in row.chunks_exact(HEAD_DIM) {
-        let max = head.iter().map(|&x| from_bf16(x).abs()).fold(0.0, f32::max);
-        let scale = max / 127.0;
-        let inv = if scale > 0.0 { scale.recip() } else { 0.0 };
-        bytes.extend(head.iter().map(|&x| (from_bf16(x) * inv).round_ties_even() as i8 as u8));
-        bytes.extend_from_slice(&scale.to_ne_bytes());
+    fn store(
+        &self,
+        position: usize,
+        key: *const u16,
+        value: *const u16,
+        zero: &DevBuf,
+        scale: &DevBuf,
+        stream: &Stream,
+    ) -> Result<()> {
+        let [keys, values, key_scales, value_scales] = self.pointers(position % self.capacity);
+        let stride = (self.heads * HEAD_DIM) as i64;
+        if self.dtype == KvDtype::Bf16 {
+            return check(
+                unsafe {
+                    sys::blz_kv_store_dense(
+                        key.cast(), value.cast(), stride, stride, zero.ptr(), sys::BLZ_I32,
+                        1, self.heads as i32, HEAD_DIM as i32, sys::BLZ_KV_BF16,
+                        keys, values, scale.ptr(), scale.ptr(), stream.0,
+                    )
+                },
+                "Inkling BF16 KV store",
+            );
+        }
+        check(
+            unsafe {
+                sys::blz_nvfp4_kv_store(
+                    key.cast(),
+                    value.cast(),
+                    stride,
+                    stride,
+                    sys::BLZ_BF16,
+                    zero.ptr(),
+                    sys::BLZ_I32,
+                    1,
+                    self.heads as i32,
+                    HEAD_DIM as i32,
+                    keys,
+                    values,
+                    key_scales,
+                    value_scales,
+                    scale.ptr(),
+                    scale.ptr(),
+                    i32::from(self.dtype == KvDtype::Nvfp4FourOverSix),
+                    stream.0,
+                )
+            },
+            "Inkling NVFP4 KV store",
+        )
     }
-    bytes
 }
 
 pub(super) struct AttentionScratch {
-    query: DevBuf,
-    gate: DevBuf,
-    sink: DevBuf,
+    input: DevBuf,
+    staging: HostMapped,
     relative: DevBuf,
-    rel_input: DevBuf,
+    zero: DevBuf,
+    kv_scale: DevBuf,
     tiles: DevBuf,
     heads: usize,
     kv_heads: usize,
@@ -621,12 +871,13 @@ pub(super) struct AttentionScratch {
 
 impl AttentionScratch {
     pub fn new(heads: usize, kv_heads: usize, extent: usize, relative: usize) -> Result<Self> {
+        let values = heads * (HEAD_DIM * 2 + relative + 1) + kv_heads * HEAD_DIM * 2;
         Ok(Self {
-            query: DevBuf::new(heads * HEAD_DIM * 2)?,
-            gate: DevBuf::new(heads * HEAD_DIM * 2)?,
-            sink: DevBuf::new(heads * 2)?,
+            input: DevBuf::new(values * 2 + 6 * 16)?,
+            staging: HostMapped::new(values * 2 + 6 * 16)?,
             relative: DevBuf::new(heads * extent * 2)?,
-            rel_input: DevBuf::new(heads * relative * 2)?,
+            zero: DevBuf::from_slice(&[0i32])?,
+            kv_scale: DevBuf::from_slice(&[KV_GLOBAL_SCALE])?,
             tiles: DevBuf::new(heads * MAX_TILES * (HEAD_DIM + 2) * 4)?,
             heads,
             kv_heads,
@@ -634,49 +885,79 @@ impl AttentionScratch {
     }
 
     pub fn run(
-        &self,
-        gpu: &Compute,
+        &mut self,
+        gpu: &mut Compute,
         kv: &Kv,
         q: &[u16],
         gate: &[u16],
         sink: &[u16],
         relative: &[u16],
+        key: &[u16],
+        value: &[u16],
         bias: &Dense,
         output: &Dense,
         position: usize,
     ) -> Result<Vec<f32>> {
-        self.query.upload(q)?;
-        self.gate.upload(gate)?;
-        self.sink.upload(sink)?;
-        self.rel_input.upload(relative)?;
-        bias.run(gpu, self.rel_input.ptr(), self.relative.ptr(), self.heads)?;
-        let tiles = kv.capacity.min(position + 1).div_ceil(64).clamp(1, MAX_TILES);
-        check(
-            unsafe {
-                sys::blz_inkling_attention(
-                    self.query.ptr(),
-                    kv.keys.ptr(),
-                    kv.values.ptr(),
-                    self.relative.ptr(),
-                    self.sink.ptr(),
-                    self.gate.ptr(),
-                    gpu.gate.ptr(),
-                    self.tiles.ptr(),
-                    self.heads as i32,
-                    self.kv_heads as i32,
-                    kv.capacity as i32,
-                    position as i32,
-                    bias.rows as i32,
-                    tiles as i32,
-                    i32::from(kv.q8),
-                    gpu.stream.0,
-                )
-            },
-            "Inkling relative attention",
-        )?;
-        output.run(gpu, gpu.gate.ptr(), gpu.result.ptr(), 1)?;
-        gpu.stream.sync()?;
-        Ok(gpu.result.download::<u16>(output.rows)?.into_iter().map(from_bf16).collect())
+        let mut offset = 0usize;
+        let staging = self.staging.host_slice_mut();
+        let [q, gate, sink, relative, key, value] = [q, gate, sink, relative, key, value].map(|row| {
+            offset = offset.next_multiple_of(16);
+            let ptr = self.input.at::<u16>(offset / 2);
+            // SAFETY: these initialized u16 values are read as native-endian bytes.
+            let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr().cast::<u8>(), std::mem::size_of_val(row)) };
+            staging[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len();
+            ptr
+        });
+        let work = (|| -> Result<()> {
+            check(
+                unsafe {
+                    sys::cudaMemcpyAsync(
+                        self.input.ptr(),
+                        self.staging.host_ptr(),
+                        offset,
+                        sys::MEMCPY_H2D,
+                        gpu.stream.0,
+                    )
+                },
+                "Inkling attention inputs",
+            )?;
+            kv.store(position, key, value, &self.zero, &self.kv_scale, &gpu.stream)?;
+            bias.run(gpu, relative, self.relative.ptr(), self.heads)?;
+            let tiles = kv.capacity.min(position + 1).div_ceil(64).clamp(1, MAX_TILES);
+            let [keys, values, key_scales, value_scales] = kv.pointers(0);
+            check(
+                unsafe {
+                    sys::blz_inkling_attention(
+                        q,
+                        keys,
+                        values,
+                        key_scales,
+                        value_scales,
+                        self.relative.ptr(),
+                        sink,
+                        gate,
+                        gpu.gate.ptr(),
+                        self.tiles.ptr(),
+                        self.heads as i32,
+                        self.kv_heads as i32,
+                        kv.capacity as i32,
+                        position as i32,
+                        bias.rows as i32,
+                        tiles as i32,
+                        KV_GLOBAL_SCALE,
+                        gpu.stream.0,
+                    )
+                },
+                "Inkling relative attention",
+            )?;
+            output.run(gpu, gpu.gate.ptr(), gpu.result.ptr(), 1)?;
+            gpu.queue_result::<u16>(gpu.result.ptr(), output.rows)
+        })();
+        let synced = gpu.stream.sync();
+        work?;
+        synced?;
+        Ok(gpu.read_result::<u16>(output.rows).into_iter().map(from_bf16).collect())
     }
 }
 
@@ -689,7 +970,9 @@ mod tests {
     fn relative_attention_ring_and_sink_match_scalar_reference() {
         crate::gpu::set_device(0).unwrap();
         let s = Stream::new().unwrap();
-        let q = DevBuf::from_slice(&[0u16; HEAD_DIM]).unwrap();
+        let sign = |i: usize| if i % 2 == 0 { 1.0 } else { -1.0 };
+        let query: [f32; HEAD_DIM] = std::array::from_fn(|i| sign(i) * 0.25);
+        let q = DevBuf::from_slice(&query.map(to_bf16)).unwrap();
         let gate = DevBuf::from_slice(&[0u16; HEAD_DIM]).unwrap();
         let b = [to_bf16(3.0f32.ln()), to_bf16(2.0f32.ln())];
         let relative = DevBuf::from_slice(&b).unwrap();
@@ -697,39 +980,71 @@ mod tests {
         let sink = DevBuf::from_slice(&[sink_logit]).unwrap();
         let out = DevBuf::new(HEAD_DIM * 2).unwrap();
         let scratch = DevBuf::new((HEAD_DIM + 2) * 2 * 4).unwrap();
-        for q8 in [false, true] {
-            let kv = Kv::new(2, 1, q8, q8).unwrap();
-            for (position, value) in [(3, -10.0), (4, 2.0), (5, 5.0)] {
-                kv.store(position, &[0u16; HEAD_DIM], &[to_bf16(value); HEAD_DIM]).unwrap();
+        let zero = DevBuf::from_slice(&[0i32]).unwrap();
+        let scale = DevBuf::from_slice(&[KV_GLOBAL_SCALE]).unwrap();
+        let keys_in = DevBuf::new(HEAD_DIM * 2).unwrap();
+        let values_in = DevBuf::new(HEAD_DIM * 2).unwrap();
+        let key = |i: usize, value: f32| sign(i) * value * if i / 16 % 2 == 0 { 0.5 } else { 1.0 };
+        let value = |i: usize, n: f32| sign(i) * n * if i / 16 % 2 == 0 { 0.5 } else { 1.0 };
+        for (dtype, host) in [KvDtype::Bf16, KvDtype::Nvfp4, KvDtype::Nvfp4FourOverSix]
+            .into_iter()
+            .flat_map(|dtype| [(dtype, false), (dtype, true)])
+        {
+            let kv = Kv::new(2, 1, host, dtype).unwrap();
+            for (position, k, v) in [(3, 0.5, -10.0), (4, -0.125, 2.0), (5, 0.25, 5.0)] {
+                let ks: [u16; HEAD_DIM] = std::array::from_fn(|i| to_bf16(key(i, k)));
+                let vs: [u16; HEAD_DIM] = std::array::from_fn(|i| to_bf16(value(i, v)));
+                keys_in.upload(&ks).unwrap();
+                values_in.upload(&vs).unwrap();
+                kv.store(position, keys_in.ptr(), values_in.ptr(), &zero, &scale, &s).unwrap();
+                s.sync().unwrap();
             }
-            check(
-                unsafe {
-                    sys::blz_inkling_attention(
-                        q.ptr(),
-                        kv.keys.ptr(),
-                        kv.values.ptr(),
-                        relative.ptr(),
-                        sink.ptr(),
-                        gate.ptr(),
-                        out.ptr(),
-                        scratch.ptr(),
-                        1,
-                        1,
-                        2,
-                        5,
-                        2,
-                        2,
-                        i32::from(q8),
-                        s.0,
-                    )
-                },
-                "test Inkling attention",
-            )
-            .unwrap();
-            s.sync().unwrap();
-            let (near, far, sink) = (from_bf16(b[0]).exp(), from_bf16(b[1]).exp(), from_bf16(sink_logit).exp());
-            let expected = to_bf16((5.0 * near + 2.0 * far) / (2.0 * (near + far + sink)));
-            assert_eq!(out.download::<u16>(HEAD_DIM).unwrap(), vec![expected; HEAD_DIM]);
+            let [keys, values, key_scales, value_scales] = kv.pointers(0);
+            for tiles in [1, 2] {
+                check(
+                    unsafe {
+                        sys::blz_inkling_attention(
+                            q.ptr(),
+                            keys,
+                            values,
+                            key_scales,
+                            value_scales,
+                            relative.ptr(),
+                            sink.ptr(),
+                            gate.ptr(),
+                            out.ptr(),
+                            scratch.ptr(),
+                            1,
+                            1,
+                            2,
+                            5,
+                            2,
+                            tiles,
+                            KV_GLOBAL_SCALE,
+                            s.0,
+                        )
+                    },
+                    "test Inkling attention",
+                )
+                .unwrap();
+                s.sync().unwrap();
+                let weight = |k, bias| {
+                    let dot: f32 = query.iter().enumerate().map(|(i, &q)| q * key(i, k)).sum();
+                    (dot / (HEAD_DIM as f32).sqrt() + from_bf16(bias)).exp()
+                };
+                let (near, far, sink) = (weight(0.25, b[0]), weight(-0.125, b[1]), from_bf16(sink_logit).exp());
+                let expected: Vec<_> = (0..HEAD_DIM)
+                    .map(|i| to_bf16((value(i, 5.0) * near + value(i, 2.0) * far) / (2.0 * (near + far + sink))))
+                    .collect();
+                let actual = out.download::<u16>(HEAD_DIM).unwrap();
+                if dtype == KvDtype::Nvfp4 {
+                    for (a, e) in actual.into_iter().zip(expected) {
+                        assert!((from_bf16(a) - from_bf16(e)).abs() < 0.15, "{dtype:?}, host={host}, tiles={tiles}");
+                    }
+                } else {
+                    assert_eq!(actual, expected, "{dtype:?}, host={host}, tiles={tiles}");
+                }
+            }
         }
     }
 }

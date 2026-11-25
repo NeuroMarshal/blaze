@@ -1,4 +1,5 @@
 use super::Model;
+use super::forward::{Prediction, Readout};
 use crate::sampler::{Rng, SamplingParams};
 use crate::text::Text;
 use anyhow::{Context, Result, ensure};
@@ -67,9 +68,10 @@ pub fn render_chat(model: &Path, body: &Value) -> Result<String> {
             }
         }
     }
-    let effort = body["chat_template_kwargs"]["reasoning_effort"]
-        .as_str()
-        .map(Value::from)
+    let effort = body["chat_template_kwargs"]
+        .get("reasoning_effort")
+        .filter(|value| !value.is_null())
+        .cloned()
         .or_else(|| body.get("reasoning_effort").cloned())
         .unwrap_or(Value::Null);
     Ok(env.get_template("inkling")?.render(minijinja::context! {
@@ -92,15 +94,17 @@ pub fn generate(
     );
     let capacity = prompt.len().checked_add(max_tokens).context("context budget overflows")?;
     let start = Instant::now();
+    ensure!(!cancelled(), "request cancelled");
     let mut seq = model.sequence(capacity)?;
-    let mut logits = Vec::new();
+    let mut prediction = None;
+    let readout = if sampling.greedy() { Readout::Greedy } else { Readout::Scores };
     let chunk_size = model.prefill_chunk();
     let chunks = prompt.chunks(chunk_size);
     let total_chunks = chunks.len();
     for (i, chunk) in chunks.enumerate() {
         ensure!(!cancelled(), "request cancelled");
-        if let Some(out) = model.prefill(&mut seq, chunk, i + 1 == total_chunks)? {
-            logits = out;
+        if let Some(out) = model.prefill(&mut seq, chunk, if i + 1 == total_chunks { readout } else { Readout::None })? {
+            prediction = Some(out);
         }
     }
     let prompt_elapsed = start.elapsed();
@@ -109,7 +113,10 @@ pub fn generate(
     let mut ids = Vec::new();
     let mut stop = false;
     for i in 0..max_tokens {
-        let id = draw(&logits, sampling, &mut rng);
+        let id = match prediction.as_ref().context("Inkling generated no prediction")? {
+            Prediction::Token(id) => *id,
+            Prediction::Scores(logits) => draw(logits, sampling, &mut rng),
+        };
         ids.push(id);
         if text.eos.contains(&id) {
             stop = true;
@@ -119,7 +126,7 @@ pub fn generate(
             break;
         }
         if i + 1 < max_tokens {
-            logits = model.forward(&mut seq, id, true)?.unwrap();
+            prediction = model.forward(&mut seq, id, readout)?;
         }
     }
     Ok(Generation {
