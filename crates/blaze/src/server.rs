@@ -4,6 +4,8 @@
 mod chat;
 mod completions;
 mod media;
+mod inkling;
+pub use inkling::{Config as InklingConfig, serve as serve_inkling};
 mod embeddings;
 mod messages;
 mod responses;

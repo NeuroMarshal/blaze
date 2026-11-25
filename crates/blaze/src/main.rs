@@ -373,6 +373,72 @@ enum Command {
     },
     /// Describe a checkpoint: architecture, layers, weight formats per module.
     Inspect { model: PathBuf },
+    /// Run native Inkling 2 Mini text generation and report prefill and decode time.
+    InklingRun {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        raw: bool,
+        #[arg(long, conflicts_with = "raw")]
+        image: Option<PathBuf>,
+        #[arg(long, default_value = "none")]
+        reasoning_effort: String,
+        #[arg(long, default_value_t = 32768)]
+        context: usize,
+        #[arg(long, default_value_t = 32)]
+        max_tokens: usize,
+        #[arg(long, default_value_t = 0)]
+        device: i32,
+        #[arg(long, default_value_t = 0)]
+        expert_cache_mib: usize,
+        #[arg(long)]
+        host_kv: bool,
+        #[arg(long)]
+        q8_kv: bool,
+        #[arg(long, default_value_t = 32)]
+        prefill_chunk: usize,
+        #[arg(long, default_value_t = 1)]
+        gpus: usize,
+        #[arg(long, default_value_t = 1.0)]
+        temperature: f32,
+        #[arg(long)]
+        seed: Option<u64>,
+    },
+    /// Serve Inkling 2 Mini with its native Rust/CUDA looped backend.
+    ServeInkling {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        #[arg(long, default_value = "inkling-2-mini")]
+        served_model_name: String,
+        #[arg(long, alias = "max-model-len", default_value_t = 32768)]
+        context: usize,
+        #[arg(long, default_value_t = 8192)]
+        max_tokens: usize,
+        #[arg(long, default_value_t = 0)]
+        device: i32,
+        #[arg(long, default_value_t = 1)]
+        gpus: usize,
+        #[arg(long, default_value_t = 0)]
+        expert_cache_mib: usize,
+        #[arg(long)]
+        host_kv: bool,
+        #[arg(long)]
+        q8_kv: bool,
+        #[arg(long, default_value_t = 32)]
+        prefill_chunk: usize,
+        #[arg(long, default_value_t = 1024)]
+        max_image_tokens: usize,
+        #[arg(long, default_value_t = 16)]
+        max_queued_requests: usize,
+        #[arg(long)]
+        allowed_media_domain: Vec<String>,
+    },
     /// Teacher-forced scoring of a text file: per position the log-probability of the next token and the argmax,
     /// as JSON lines (for comparisons against a reference engine).
     Score {
@@ -662,6 +728,39 @@ fn main() -> Result<()> {
             blaze::engine::remote::serve(&listen, &engine.model, opts, !engine.no_graphs)
         }
         Command::Inspect { model } => blaze::inspect::run(&model),
+        Command::ServeInkling { model, host, port, served_model_name, context, max_tokens, device, gpus,
+                                expert_cache_mib, host_kv, q8_kv, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
+            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            runtime.block_on(blaze::server::serve_inkling(blaze::server::InklingConfig {
+                path: model, host, port, name: served_model_name, max_tokens, queue: max_queued_requests,
+                options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, host_kv, q8_kv, prefill_chunk, max_image_tokens },
+                allowed_media_domains: allowed_media_domain,
+            }))
+        }
+        Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, host_kv, q8_kv, prefill_chunk, temperature, seed } => {
+            anyhow::ensure!(temperature.is_finite() && temperature >= 0.0, "--temperature must be finite and nonnegative");
+            let text = blaze::text::Text::load(&model)?;
+            let images = image.map(std::fs::read).transpose()?.into_iter().collect::<Vec<_>>();
+            let rendered = if raw { prompt } else {
+                let content = if images.is_empty() { serde_json::json!(prompt) } else {
+                    serde_json::json!([{"type": "image"}, {"type": "text", "text": prompt}])
+                };
+                blaze::inkling::render_chat(&model, &serde_json::json!({
+                    "messages": [{"role": "user", "content": content}], "reasoning_effort": reasoning_effort,
+                }))?
+            };
+            let mut engine = blaze::inkling::Model::load(&model, blaze::inkling::Options {
+                device, gpus, context, expert_cache_mib, host_kv, q8_kv, prefill_chunk, max_image_tokens: if images.is_empty() { 0 } else { 1024 },
+            })?;
+            let ids = blaze::inkling::tokenize_prompt(&engine, &text, &rendered, &images)?;
+            let params = blaze::sampler::SamplingParams { temperature, seed, ..Default::default() };
+            let generated = blaze::inkling::generate(&mut engine, &text, &ids, max_tokens, &params, || false, |_| true)?;
+            let visible: Vec<_> = generated.ids.iter().copied().filter(|id| !text.eos.contains(id)).collect();
+            println!("{}", text.decode(&visible)?);
+            eprintln!("{} prompt tokens in {:.3}s, {} generated tokens in {:.3}s",
+                ids.len(), generated.prompt_elapsed.as_secs_f64(), generated.ids.len(), generated.decode_elapsed.as_secs_f64());
+            Ok(())
+        }
         Command::VisionCheck { model, reference, gpu, cpu, threads, image } => {
             blaze::vision::check_reference(&model, &reference, gpu, cpu, threads, image.as_deref())
         }

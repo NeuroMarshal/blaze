@@ -248,15 +248,15 @@ impl ImageSettings {
     /// The size an image of `w` x `h` is resized to, as the processor's `smart_resize` (HF Qwen2VL): both sides multiples
     /// of patch * merge, the pixel count within [min_pixels, max_pixels], the aspect ratio kept as well as the grid allows.
     pub fn target_size(&self, w: usize, h: usize) -> std::result::Result<(usize, usize), String> {
-        let factor = self.patch * self.merge;
+        let factor = self.patch.checked_mul(self.merge).filter(|&n| n > 0).ok_or("invalid image patch size")?;
+        if w == 0 || h == 0 {
+            return Err("the image is empty".into());
+        }
         if !self.do_resize {
             if h % factor != 0 || w % factor != 0 {
                 return Err(format!("with do_resize false the image size {w}x{h} must be a multiple of {factor}"));
             }
             return Ok((h, w));
-        }
-        if w == 0 || h == 0 {
-            return Err("the image is empty".into());
         }
         if w.max(h) as f64 / w.min(h) as f64 > 200.0 {
             return Err(format!("absolute aspect ratio must be smaller than 200, got {}", w.max(h) as f64 / w.min(h) as f64));
@@ -265,14 +265,20 @@ impl ImageSettings {
         let (hf, wf) = (h as f64, w as f64);
         let mut hb = ((hf / f).round_ties_even() * f) as u64;
         let mut wb = ((wf / f).round_ties_even() * f) as u64;
-        if hb * wb > self.max_pixels {
+        if self.max_pixels < (factor as u64).saturating_mul(factor as u64) {
+            return Err("max_pixels is smaller than one merged patch".into());
+        }
+        if hb.saturating_mul(wb) > self.max_pixels {
             let beta = (hf * wf / self.max_pixels as f64).sqrt();
             hb = factor.max(((hf / beta / f).floor() * f) as usize) as u64;
             wb = factor.max(((wf / beta / f).floor() * f) as usize) as u64;
-        } else if hb * wb < self.min_pixels {
+        } else if hb.saturating_mul(wb) < self.min_pixels || hb == 0 || wb == 0 {
             let beta = (self.min_pixels as f64 / (hf * wf)).sqrt();
             hb = ((hf * beta / f).ceil() * f) as u64;
             wb = ((wf * beta / f).ceil() * f) as u64;
+        }
+        if hb.saturating_mul(wb) > MAX_DECODE_PIXELS {
+            return Err("resized image exceeds the maximum pixel count".into());
         }
         Ok((hb as usize, wb as usize))
     }
@@ -299,17 +305,28 @@ pub const MAX_DECODE_PIXELS: u64 = 178_956_970;
 /// Decode PNG, JPEG, GIF (first frame), WebP or BMP. Transparency is composited over white (vLLM's default
 /// `rgba_background_color`).
 pub fn decode_image(bytes: &[u8]) -> std::result::Result<RgbImage, String> {
+    decode_rgb(bytes, MAX_DECODE_PIXELS, |_, _| 255)
+}
+
+pub(crate) fn decode_rgb(bytes: &[u8], max_pixels: u64, background: impl Fn(usize, usize) -> u32) -> std::result::Result<RgbImage, String> {
     let open = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| format!("cannot read the image: {e}"));
     let (w, h) = open()?.into_dimensions().map_err(|e| format!("cannot decode the image: {e}"))?;
-    if u64::from(w) * u64::from(h) > MAX_DECODE_PIXELS {
-        return Err(format!("image dimensions {w}x{h} ({} pixels) exceed the maximum of {MAX_DECODE_PIXELS} pixels", u64::from(w) * u64::from(h)));
+    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > max_pixels {
+        return Err(format!("image dimensions {w}x{h} are invalid for a maximum of {max_pixels} pixels"));
     }
-    let rgba = open()?.decode().map_err(|e| format!("cannot decode the image: {e}"))?.to_rgba8();
+    let decoded = open()?.decode().map_err(|e| format!("cannot decode the image: {e}"))?;
+    if !decoded.color().has_alpha() {
+        return Ok(RgbImage { w: w as usize, h: h as usize, data: decoded.into_rgb8().into_raw() });
+    }
+    let rgba = decoded.into_rgba8();
     let mut data = Vec::with_capacity(rgba.len() / 4 * 3);
-    for px in rgba.as_raw().chunks_exact(4) {
+    for (i, px) in rgba.as_raw().chunks_exact(4).enumerate() {
         let a = u32::from(px[3]);
-        for &c in &px[..3] {
-            data.push(if a == 255 { c } else { ((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8 });
+        if a == 255 {
+            data.extend_from_slice(&px[..3]);
+        } else {
+            let bg = background(i / w as usize, i % w as usize);
+            data.extend(px[..3].iter().map(|&c| ((u32::from(c) * a + bg * (255 - a) + 127) / 255) as u8));
         }
     }
     Ok(RgbImage { w: w as usize, h: h as usize, data })
@@ -370,13 +387,17 @@ fn resize_bicubic(src: &RgbImage, dw: usize, dh: usize) -> Vec<u8> {
         }
     }
     let mut out = vec![0u8; dh * dw * 3];
-    for (y, (lo, w)) in ty.iter().enumerate() {
-        for x in 0..dw * 3 {
-            let mut acc = 0f32;
-            for (k, &wk) in w.iter().enumerate() {
-                acc += mid[(lo + k) * dw * 3 + x] * wk;
+    let stride = dw * 3;
+    let mut acc = vec![0.0; stride];
+    for (dst, (lo, weights)) in out.chunks_exact_mut(stride).zip(ty) {
+        acc.fill(0.0);
+        for (row, wk) in mid[lo * stride..].chunks_exact(stride).zip(weights) {
+            for (a, &v) in acc.iter_mut().zip(row) {
+                *a += v * wk;
             }
-            out[y * dw * 3 + x] = acc.round_ties_even().clamp(0.0, 255.0) as u8;
+        }
+        for (v, &a) in dst.iter_mut().zip(&acc) {
+            *v = a.round_ties_even().clamp(0.0, 255.0) as u8;
         }
     }
     out
@@ -409,7 +430,11 @@ impl Patches {
 /// Resize, rescale, normalize and patchify one image (HF Qwen2VLImageProcessor).
 pub fn preprocess(img: &RgbImage, s: &ImageSettings) -> std::result::Result<Patches, String> {
     let (th, tw) = s.target_size(img.w, img.h)?;
-    let px = if s.do_resize { resize_bicubic(img, tw, th) } else { img.data.clone() };
+    let px = if (img.h, img.w) == (th, tw) {
+        std::borrow::Cow::Borrowed(img.data.as_slice())
+    } else {
+        std::borrow::Cow::Owned(resize_bicubic(img, tw, th))
+    };
     let (p, m, t) = (s.patch, s.merge, s.temporal);
     let (gh, gw) = (th / p, tw / p);
     // x -> (x * rescale - mean) / std with rescale and mean fused as torchvision's fast path does:
@@ -427,6 +452,12 @@ pub fn preprocess(img: &RgbImage, s: &ImageSettings) -> std::result::Result<Patc
     let norm = |v: u8, c: usize| -> f32 {
         if rescale_only { (f64::from(v) * rescale) as f32 } else { (f32::from(v) - m_f[c]) / s_f[c] }
     };
+    if s.do_rescale && (!rescale.is_finite() || rescale <= 0.0) || s.do_normalize
+        && (!mean.iter().all(|v| v.is_finite()) || !std.iter().all(|v| v.is_finite() && *v > 0.0))
+    {
+        return Err("invalid image rescale factor, mean or standard deviation".into());
+    }
+    let table: [[u16; 256]; 3] = std::array::from_fn(|c| std::array::from_fn(|v| to_bf16(norm(v as u8, c))));
     let dim = s.temporal * p * p * 3;
     let mut out = vec![0u16; gh * gw * dim];
     let bw = gw / m;
@@ -437,7 +468,7 @@ pub fn preprocess(img: &RgbImage, s: &ImageSettings) -> std::result::Result<Patc
         for c in 0..3 {
             for y in 0..p {
                 for x in 0..p {
-                    let v = to_bf16(norm(px[((row * p + y) * tw + col * p + x) * 3 + c], c));
+                    let v = table[c][px[((row * p + y) * tw + col * p + x) * 3 + c] as usize];
                     for tt in 0..t {
                         dst[((c * t + tt) * p + y) * p + x] = v;
                     }

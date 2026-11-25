@@ -139,9 +139,6 @@ __global__ void qkv_rope_kernel(const uint16_t* __restrict__ qkv, const uint16_t
 
 constexpr int kBQ = 64;   // queries per block (4 warps x 16 rows)
 constexpr int kBK = 64;   // keys per tile
-constexpr int kD = 72;    // head dim
-constexpr int kDP = 80;   // padded to the mma's k = 16 steps
-constexpr int kLD = 88;   // shared row stride (bf16): 176 B, ldmatrix and 32-bit fragment loads are conflict free
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, int bytes) {
   const uint32_t s = uint32_t(__cvta_generic_to_shared(smem));
@@ -171,9 +168,12 @@ __device__ __forceinline__ uint32_t pack_bf(float lo, float hi) { return uint32_
 
 // Flash-style softmax attention, grid (query tiles, heads), 4 warps of 16 query rows. K and V tiles double-buffered
 // through cp.async; the score tile lives in registers and is reused as the A operand of P V.
+template <int kD>
 __global__ void __launch_bounds__(128) attention_kernel(const uint16_t* __restrict__ q, const uint16_t* __restrict__ k,
                                                         const uint16_t* __restrict__ v, uint16_t* __restrict__ o, int n,
                                                         int heads, float scale_log2) {
+  constexpr int kDP = (kD + 15) / 16 * 16;
+  constexpr int kLD = kDP + 8;
   __shared__ __align__(16) uint16_t ks[2][kBK * kLD];
   __shared__ __align__(16) uint16_t vs[2][kBK * kLD];
   const int tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -368,10 +368,14 @@ extern "C" cudaError_t blz_vis_qkv_rope(const uint16_t* qkv, const uint16_t* bia
 
 extern "C" cudaError_t blz_vis_attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, int n, int heads,
                                          int head_dim, uint16_t* o, cudaStream_t stream) {
-  if (head_dim != kD) return cudaErrorInvalidValue;
   if (n == 0) return cudaSuccess;
-  const float scale_log2 = 1.4426950408889634f / sqrtf(float(kD));
-  attention_kernel<<<dim3(unsigned((n + kBQ - 1) / kBQ), unsigned(heads)), 128, 0, stream>>>(q, k, v, o, n, heads, scale_log2);
+  const dim3 grid(unsigned((n + kBQ - 1) / kBQ), unsigned(heads));
+  const float scale_log2 = 1.4426950408889634f / sqrtf(float(head_dim));
+  switch (head_dim) {
+    case 64: attention_kernel<64><<<grid, 128, 0, stream>>>(q, k, v, o, n, heads, scale_log2); break;
+    case 72: attention_kernel<72><<<grid, 128, 0, stream>>>(q, k, v, o, n, heads, scale_log2); break;
+    default: return cudaErrorInvalidValue;
+  }
   return cudaGetLastError();
 }
 

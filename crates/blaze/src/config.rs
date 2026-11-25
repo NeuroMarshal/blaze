@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
+use std::ops::Range;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +84,70 @@ pub struct QsaConfig {
     pub compress_ratio: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerVisit {
+    pub layer: usize,
+    pub pass: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct InklingLoop {
+    pub core: Range<usize>,
+    pub passes: usize,
+    pub gate_rank: usize,
+    pub variable: bool,
+    pub window: usize,
+    local: Vec<bool>,
+    /// Indexed in execution order. KV and convolution state are indexed by visit, weights by layer.
+    pub visits: Vec<LayerVisit>,
+}
+
+impl InklingLoop {
+    fn parse(t: &Value, layers: usize) -> Result<Self> {
+        let c = t.get("loop_config").context("Inkling: missing loop_config")?;
+        let core = need(c, "core_start")?..need(c, "core_end")?;
+        let passes = need(c, "num_passes")?;
+        let gate_rank = need(c, "gate_rank")?;
+        let window = need(t, "sliding_window_size")?;
+        anyhow::ensure!(core.start < core.end && core.end <= layers, "Inkling: invalid core layer range {core:?}");
+        anyhow::ensure!(passes > 0 && gate_rank > 0 && window > 0, "Inkling: loop passes, gate rank and sliding window must be positive");
+        let ids = t.get("local_layer_ids").and_then(Value::as_array).context("Inkling: missing local_layer_ids")?;
+        let mut local = vec![false; layers];
+        for id in ids {
+            let id = id.as_u64().and_then(|id| usize::try_from(id).ok()).context("Inkling: invalid local attention layer ID")?;
+            let slot = local.get_mut(id).with_context(|| format!("Inkling: local attention layer {id} is out of range"))?;
+            anyhow::ensure!(!*slot, "Inkling: duplicate local attention layer {id}");
+            *slot = true;
+        }
+        let count = core.len().checked_mul(passes).and_then(|n| n.checked_add(layers - core.len()))
+            .context("Inkling: loop visit count overflows")?;
+        let visit = |layer| LayerVisit { layer, pass: 0 };
+        let mut visits = Vec::new();
+        visits.try_reserve_exact(count).context("Inkling: allocating layer visits")?;
+        visits.extend((0..core.start).map(visit));
+        for pass in 0..passes {
+            visits.extend(core.clone().map(|layer| LayerVisit { layer, pass }));
+        }
+        visits.extend((core.end..layers).map(visit));
+        Ok(Self { core, passes, gate_rank, variable: c["is_varloop"].as_bool().unwrap_or(false), window, local, visits })
+    }
+
+    pub fn is_local(&self, layer: usize) -> bool {
+        self.local[layer]
+    }
+
+    pub fn global_visits(&self) -> usize {
+        self.visits.iter().filter(|v| !self.is_local(v.layer)).count()
+    }
+}
+
+pub fn is_inkling_loop(root: &Value) -> bool {
+    root["model_type"].as_str() == Some("inkling2_loop")
+        || root["text_config"]["model_type"].as_str() == Some("inkling2_loop_text")
+        || root["model_type"].as_str() == Some("inkling2_loop_text")
+        || matches!(root["architectures"][0].as_str(), Some("Inkling2LoopForConditionalGeneration" | "Inkling2LoopForCausalLM"))
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub architecture: String,
@@ -100,6 +165,7 @@ pub struct ModelConfig {
     pub hc: Option<HcConfig>,
     pub ple: Option<PleConfig>,
     pub qsa: Option<QsaConfig>,
+    pub inkling_loop: Option<InklingLoop>,
     pub eos: Option<i64>,
     /// The text part of the config (`text_config` of multimodal checkpoints).
     pub raw: Value,
@@ -115,10 +181,13 @@ fn need(v: &Value, key: &str) -> Result<usize> {
 
 impl ModelConfig {
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::from_json(&Self::read_json(dir)?)
+    }
+
+    pub(crate) fn read_json(dir: &Path) -> Result<Value> {
         let path = dir.join("config.json");
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let root: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Self::from_json(&root)
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 
     pub fn from_json(root: &Value) -> Result<Self> {
@@ -131,6 +200,7 @@ impl ModelConfig {
         let t = root.get("text_config").unwrap_or(root).clone();
         let hidden = need(&t, "hidden_size")?;
         let n = need(&t, "num_hidden_layers")?;
+        let inkling_loop = is_inkling_loop(root).then(|| InklingLoop::parse(&t, n)).transpose()?;
         let layers = match t.get("layer_types").and_then(Value::as_array) {
             Some(kinds) => kinds
                 .iter()
@@ -141,7 +211,7 @@ impl ModelConfig {
                     other => Err(anyhow!("config: unknown layer type {other:?}")),
                 })
                 .collect::<Result<Vec<_>>>()?,
-            None => match usize_of(&t, "full_attention_interval") {
+            None => match usize_of(&t, "full_attention_interval").filter(|&n| n > 0) {
                 Some(every) => (0..n).map(|i| if (i + 1) % every == 0 { LayerKind::Full } else { LayerKind::Linear }).collect(),
                 None => vec![LayerKind::Full; n],
             },
@@ -150,6 +220,7 @@ impl ModelConfig {
             bail!("config: {} layer types for {n} layers", layers.len());
         }
         let heads = need(&t, "num_attention_heads")?;
+        anyhow::ensure!(heads > 0, "config: num_attention_heads must be positive");
         let attn = AttnConfig {
             heads,
             kv_heads: usize_of(&t, "num_key_value_heads").unwrap_or(heads),
@@ -167,17 +238,34 @@ impl ModelConfig {
         } else {
             None
         };
-        let mlp = match usize_of(&t, "num_experts") {
-            Some(experts) if experts > 0 => MlpConfig::Moe {
+        let mlp = if inkling_loop.is_some() {
+            let experts = need(&t, "n_routed_experts")?;
+            let top_k = need(&t, "num_experts_per_tok")?;
+            anyhow::ensure!(top_k > 0 && top_k <= experts, "Inkling: invalid top-k {top_k} for {experts} experts");
+            MlpConfig::Moe {
                 experts,
-                top_k: need(&t, "num_experts_per_tok")?,
-                intermediate: need(&t, "moe_intermediate_size")?,
-                shared_intermediate: usize_of(&t, "shared_expert_intermediate_size").unwrap_or(0),
-                norm_topk: t.get("norm_topk_prob").and_then(Value::as_bool).unwrap_or(true),
-            },
-            _ => MlpConfig::Dense { intermediate: need(&t, "intermediate_size")? },
+                top_k,
+                intermediate: need(&t, "intermediate_size")?,
+                shared_intermediate: 0,
+                norm_topk: true,
+            }
+        } else {
+            match usize_of(&t, "num_experts") {
+                Some(experts) if experts > 0 => MlpConfig::Moe {
+                    experts,
+                    top_k: need(&t, "num_experts_per_tok")?,
+                    intermediate: need(&t, "moe_intermediate_size")?,
+                    shared_intermediate: usize_of(&t, "shared_expert_intermediate_size").unwrap_or(0),
+                    norm_topk: t.get("norm_topk_prob").and_then(Value::as_bool).unwrap_or(true),
+                },
+                _ => MlpConfig::Dense { intermediate: need(&t, "intermediate_size")? },
+            }
         };
-        let rope = Self::rope(&t, attn.head_dim)?;
+        let rope = if inkling_loop.is_some() {
+            RopeConfig { theta: 0.0, rotary_dim: 0, mrope_section: Vec::new(), mrope_interleaved: false, scaling: RopeScaling::None }
+        } else {
+            Self::rope(&t, attn.head_dim)?
+        };
         let hc = usize_of(&t, "hc_count").filter(|&c| c > 1).map(|count| HcConfig {
             count,
             lowrank: usize_of(&t, "hc_lowrank").unwrap_or(16),
@@ -220,15 +308,20 @@ impl ModelConfig {
                 .or_else(|| t.get("tie_word_embeddings"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            max_positions: usize_of(&t, "max_position_embeddings").unwrap_or(32768),
+            max_positions: usize_of(&t, "max_position_embeddings")
+                .or_else(|| inkling_loop.as_ref().and_then(|_| usize_of(&t, "model_max_length")))
+                .unwrap_or(32768),
             attn,
             gdn,
             mlp,
             rope,
-            mtp_layers: usize_of(&t, "mtp_num_hidden_layers").unwrap_or(0),
+            mtp_layers: usize_of(&t, "mtp_num_hidden_layers")
+                .or_else(|| inkling_loop.as_ref().and_then(|_| usize_of(&root["mtp_config"], "num_hidden_layers")))
+                .unwrap_or(0),
             hc,
             ple,
             qsa,
+            inkling_loop,
             eos,
             raw: t,
         })
@@ -269,5 +362,28 @@ impl ModelConfig {
 
     pub fn full_layers(&self) -> usize {
         self.layers.iter().filter(|k| **k == LayerKind::Full).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inkling_loop_visits_keep_weight_ids_and_separate_cache_slots() {
+        let mut text = serde_json::json!({
+            "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64},
+            "sliding_window_size": 1024,
+            "local_layer_ids": (0..24).filter(|i| i % 6 != 5).collect::<Vec<_>>(),
+        });
+        let layout = InklingLoop::parse(&text, 24).unwrap();
+        assert_eq!(layout.visits.len(), 48);
+        assert_eq!(layout.global_visits(), 8);
+        for (i, pass) in [6, 18, 30].into_iter().zip(0..3) {
+            assert_eq!(layout.visits[i], LayerVisit { layer: 6, pass });
+        }
+        assert_eq!(layout.visits[42], LayerVisit { layer: 18, pass: 0 });
+        text["local_layer_ids"] = serde_json::json!([0, 0]);
+        assert!(InklingLoop::parse(&text, 24).is_err());
     }
 }

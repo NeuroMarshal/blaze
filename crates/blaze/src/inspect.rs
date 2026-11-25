@@ -22,9 +22,9 @@ pub fn linear_modules(ckpt: &Checkpoint) -> Vec<String> {
 }
 
 pub fn run(dir: &Path) -> Result<()> {
-    let cfg = ModelConfig::load(dir)?;
+    let root = ModelConfig::read_json(dir)?;
+    let cfg = ModelConfig::from_json(&root)?;
     let ckpt = Checkpoint::open(dir)?;
-    let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     let hf_quant = std::fs::read_to_string(dir.join("hf_quant_config.json")).ok().and_then(|s| serde_json::from_str(&s).ok());
     let quant = QuantConfig::from_model_config(&root, hf_quant.as_ref())?;
 
@@ -39,10 +39,20 @@ pub fn run(dir: &Path) -> Result<()> {
         cfg.vocab,
         cfg.max_positions
     );
-    println!(
-        "attention: {} q heads, {} kv heads, head dim {}, rotary dim {} (theta {}, {:?})",
-        cfg.attn.heads, cfg.attn.kv_heads, cfg.attn.head_dim, cfg.rope.rotary_dim, cfg.rope.theta, cfg.rope.scaling
-    );
+    if let Some(loop_cfg) = &cfg.inkling_loop {
+        println!("attention: {} q heads, {} kv heads, head dim {}, relative position bias",
+                 cfg.attn.heads, cfg.attn.kv_heads, cfg.attn.head_dim);
+        println!("loop: layers {:?}, {} passes, rank {}, {} visits ({} global), local window {}",
+                 loop_cfg.core, loop_cfg.passes, loop_cfg.gate_rank, loop_cfg.visits.len(), loop_cfg.global_visits(), loop_cfg.window);
+        for (packing, matrices) in crate::inkling::weights::packed_inventory(&ckpt, &cfg)? {
+            println!("  {packing:?}: {matrices} stacked expert matrices");
+        }
+    } else {
+        println!(
+            "attention: {} q heads, {} kv heads, head dim {}, rotary dim {} (theta {}, {:?})",
+            cfg.attn.heads, cfg.attn.kv_heads, cfg.attn.head_dim, cfg.rope.rotary_dim, cfg.rope.theta, cfg.rope.scaling
+        );
+    }
     if let Some(g) = &cfg.gdn {
         println!("gated deltanet: {} k heads x {}, {} v heads x {}, conv {}", g.k_heads, g.k_dim, g.v_heads, g.v_dim, g.conv_kernel);
     }

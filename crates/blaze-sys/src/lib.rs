@@ -590,3 +590,31 @@ unsafe extern "C" {
         mask_words: c_int, execution: u32, logprobs: bool, workspace: *mut std::ffi::c_void, bytes: usize,
         results: *mut f32, s: cudaStream_t) -> cudaError_t;
 }
+
+unsafe extern "C" {
+    pub fn blz_inkling_swiglu(gate_up: *const u16, out: *mut u16, n: c_int, gate_cap: f32, up_cap: f32,
+                             stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_expert_accumulate(input: *const u16, out: *mut f32, n: c_int, weight: f32,
+                                        stream: cudaStream_t) -> cudaError_t;
+}
+
+unsafe extern "C" {
+    pub fn blz_inkling_attention(q: *const u16, keys: *const c_void, values: *const c_void, relative: *const u16,
+                                 sinks: *const u16, gate: *const u16, out: *mut u16, scratch: *mut f32,
+                                 heads: c_int, kv_heads: c_int, capacity: c_int, position: c_int,
+                                 extent: c_int, tiles: c_int, q8: c_int, stream: cudaStream_t) -> cudaError_t;
+}
+
+unsafe extern "C" {
+    pub fn blz_inkling_vision_pos(x: *mut u16, table: *const u16, h: c_int, w: c_int, merge: c_int, side: c_int,
+                                  hidden: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_vision_qkv(x: *const u16, bias: *const u16, q: *mut u16, k: *mut u16, v: *mut u16,
+                                  w: c_int, merge: c_int, heads: c_int, rows: c_int, dim: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_vision_residual(state: *mut u16, x: *const u16, bias: *const u16, scale: *const u16,
+                                       rows: c_int, hidden: c_int, stream: cudaStream_t) -> cudaError_t;
+}
+
+unsafe extern "C" {
+    pub fn blz_inkling_expert_scatter(input: *const u16, output: *mut f32, ids: *const i32, weights: *const f32,
+                                     rows: c_int, hidden: c_int, stream: cudaStream_t) -> cudaError_t;
+}

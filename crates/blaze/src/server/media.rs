@@ -50,7 +50,14 @@ impl EmbedCache {
     }
 
     fn put(&mut self, key: u64, v: Arc<Vec<u16>>) {
-        self.bytes += v.len() * 2;
+        let bytes = v.len() * 2;
+        if bytes > CACHE_BYTES {
+            return;
+        }
+        if let Some(i) = self.entries.iter().position(|e| e.0 == key) {
+            self.bytes -= self.entries.remove(i).1.len() * 2;
+        }
+        self.bytes += bytes;
         self.entries.push((key, v));
         while self.bytes > CACHE_BYTES && self.entries.len() > 1 {
             self.bytes -= self.entries.remove(0).1.len() * 2;
@@ -102,7 +109,7 @@ pub fn parse_limit(s: &str) -> std::result::Result<usize, String> {
 }
 
 /// The image content parts of a body's messages, in prompt order: (url, detail). Other media are rejected here.
-fn image_parts(body: &Value) -> Checked<Vec<(String, Option<String>)>> {
+pub(super) fn image_parts(body: &Value) -> Checked<Vec<(String, Option<String>)>> {
     const OTHER: [&str; 6] = ["video_url", "video", "input_audio", "audio_url", "audio", "input_video"];
     let mut out = Vec::new();
     let parts = body.get("messages").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("content")?.as_array());
@@ -176,15 +183,22 @@ fn fetch_url(cfg: &MmConfig, url: &str, deadline: Instant) -> std::result::Resul
 }
 
 /// The bytes behind an image URL.
-fn load_url(cfg: &MmConfig, url: &str, deadline: Instant) -> std::result::Result<Vec<u8>, String> {
+pub(super) fn load_url(cfg: &MmConfig, url: &str, deadline: Instant) -> std::result::Result<Vec<u8>, String> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (meta, data) = rest.split_once(',').ok_or("malformed data URL: no comma")?;
         if !meta.split(';').any(|p| p.eq_ignore_ascii_case("base64")) {
             return Err("data URLs of images must be base64".into());
         }
-        let data: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        let too_large = || format!("the image is larger than the limit of {} bytes", cfg.fetch_max_bytes);
+        let max_encoded = cfg.fetch_max_bytes.div_ceil(3).saturating_mul(4);
+        let data: String = data.chars().filter(|c| !c.is_whitespace()).take(max_encoded.saturating_add(1)).collect();
+        if data.len() > max_encoded {
+            return Err(too_large());
+        }
         let e = &base64::engine::general_purpose::STANDARD;
-        return e.decode(&data).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&data)).map_err(|e| format!("invalid base64 image: {e}"));
+        let bytes = e.decode(&data).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(&data))
+            .map_err(|e| format!("invalid base64 image: {e}"))?;
+        return if bytes.len() <= cfg.fetch_max_bytes { Ok(bytes) } else { Err(too_large()) };
     }
     let lower = url.get(..8).unwrap_or(url).to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
@@ -387,6 +401,7 @@ mod tests {
         assert_eq!(load(&c, "data:image/png;base64,aGk").unwrap(), b"hi");
         assert!(load(&c, "data:image/png,hi").is_err());
         assert!(load(&c, "file:///etc/passwd").is_err());
+        assert!(load(&cfg(1000, 1, &[]), "data:image/png;base64,aGk=").unwrap_err().contains("larger"));
     }
 
     #[test]

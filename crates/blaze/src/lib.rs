@@ -14,6 +14,7 @@ pub mod engine;
 pub mod gpu;
 pub mod health;
 pub mod inspect;
+pub mod inkling;
 pub mod linear;
 pub mod mm;
 pub mod model;

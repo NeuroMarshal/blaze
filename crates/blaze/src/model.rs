@@ -1017,6 +1017,9 @@ impl Model {
     /// The token embedding of a checkpoint as a pinned host table (shared by every rank; the GPUs read the rows
     /// they need over PCIe instead of keeping 1-2.5 GB in VRAM).
     pub fn load_embedding(dir: &Path) -> Result<HostMapped> {
+        if crate::config::is_inkling_loop(&ModelConfig::read_json(dir)?) {
+            bail!("Inkling 2 Mini uses the looped execution path (blaze serve-inkling or blaze inkling-run)");
+        }
         let ckpt = Checkpoint::open(dir)?;
         let name = format!("{}embed_tokens.weight", ckpt.text_prefix());
         let et = ckpt.info(&name)?.clone();
