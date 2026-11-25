@@ -393,6 +393,9 @@ enum Command {
         device: i32,
         #[arg(long, default_value_t = 0)]
         expert_cache_mib: usize,
+        /// Keep cold experts in RAM and compute them on CPU. Zero selects every available CPU.
+        #[arg(long)]
+        expert_threads: Option<usize>,
         #[arg(long)]
         host_kv: bool,
         #[arg(long)]
@@ -426,6 +429,9 @@ enum Command {
         gpus: usize,
         #[arg(long, default_value_t = 0)]
         expert_cache_mib: usize,
+        /// Keep cold experts in RAM and compute them on CPU. Zero selects every available CPU.
+        #[arg(long)]
+        expert_threads: Option<usize>,
         #[arg(long)]
         host_kv: bool,
         #[arg(long)]
@@ -729,15 +735,15 @@ fn main() -> Result<()> {
         }
         Command::Inspect { model } => blaze::inspect::run(&model),
         Command::ServeInkling { model, host, port, served_model_name, context, max_tokens, device, gpus,
-                                expert_cache_mib, host_kv, q8_kv, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
+                                expert_cache_mib, expert_threads, host_kv, q8_kv, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
             let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             runtime.block_on(blaze::server::serve_inkling(blaze::server::InklingConfig {
                 path: model, host, port, name: served_model_name, max_tokens, queue: max_queued_requests,
-                options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, host_kv, q8_kv, prefill_chunk, max_image_tokens },
+                options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, expert_threads, host_kv, q8_kv, prefill_chunk, max_image_tokens },
                 allowed_media_domains: allowed_media_domain,
             }))
         }
-        Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, host_kv, q8_kv, prefill_chunk, temperature, seed } => {
+        Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, expert_threads, host_kv, q8_kv, prefill_chunk, temperature, seed } => {
             anyhow::ensure!(temperature.is_finite() && temperature >= 0.0, "--temperature must be finite and nonnegative");
             let text = blaze::text::Text::load(&model)?;
             let images = image.map(std::fs::read).transpose()?.into_iter().collect::<Vec<_>>();
@@ -750,15 +756,15 @@ fn main() -> Result<()> {
                 }))?
             };
             let mut engine = blaze::inkling::Model::load(&model, blaze::inkling::Options {
-                device, gpus, context, expert_cache_mib, host_kv, q8_kv, prefill_chunk, max_image_tokens: if images.is_empty() { 0 } else { 1024 },
+                device, gpus, context, expert_cache_mib, expert_threads, host_kv, q8_kv, prefill_chunk, max_image_tokens: if images.is_empty() { 0 } else { 1024 },
             })?;
             let ids = blaze::inkling::tokenize_prompt(&engine, &text, &rendered, &images)?;
             let params = blaze::sampler::SamplingParams { temperature, seed, ..Default::default() };
             let generated = blaze::inkling::generate(&mut engine, &text, &ids, max_tokens, &params, || false, |_| true)?;
             let visible: Vec<_> = generated.ids.iter().copied().filter(|id| !text.eos.contains(id)).collect();
             println!("{}", text.decode(&visible)?);
-            eprintln!("{} prompt tokens in {:.3}s, {} generated tokens in {:.3}s",
-                ids.len(), generated.prompt_elapsed.as_secs_f64(), generated.ids.len(), generated.decode_elapsed.as_secs_f64());
+            eprintln!("{} prompt tokens in {:.3}s, {} generated tokens in {:.3}s, {} CPU expert routes",
+                ids.len(), generated.prompt_elapsed.as_secs_f64(), generated.ids.len(), generated.decode_elapsed.as_secs_f64(), engine.cpu_expert_routes());
             Ok(())
         }
         Command::VisionCheck { model, reference, gpu, cpu, threads, image } => {

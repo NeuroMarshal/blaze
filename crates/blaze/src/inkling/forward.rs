@@ -409,6 +409,7 @@ pub struct Options {
     pub gpus: usize,
     pub context: usize,
     pub expert_cache_mib: usize,
+    pub expert_threads: Option<usize>,
     pub host_kv: bool,
     pub q8_kv: bool,
     pub max_image_tokens: usize,
@@ -452,6 +453,7 @@ impl Model {
             gpus,
             context,
             expert_cache_mib,
+            expert_threads,
             host_kv,
             q8_kv,
             max_image_tokens,
@@ -502,6 +504,21 @@ impl Model {
         } else {
             Some(Vision::load(&ckpt, &root, s.hidden, max_image_tokens)?)
         };
+        let cpu = expert_threads
+            .map(|n| -> Result<_> {
+                let n = if n == 0 {
+                    std::thread::available_parallelism().map_or(1, usize::from)
+                } else {
+                    n
+                };
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .thread_name(|i| format!("inkling-expert-{i}"))
+                    .build()?;
+                crate::eprintln!("Inkling CPU expert offload uses {n} workers");
+                Ok(std::sync::Arc::new(pool))
+            })
+            .transpose()?;
         let mut devices = Vec::with_capacity(gpus);
         for rank in 0..gpus {
             let id = device + rank as i32;
@@ -564,6 +581,7 @@ impl Model {
                 visits,
                 s.top_k,
                 prefill_chunk,
+                cpu.clone(),
             )?;
             devices.push(Device { id, compute, scratch });
         }
@@ -591,6 +609,10 @@ impl Model {
 
     pub fn context(&self) -> usize {
         self.context
+    }
+
+    pub fn cpu_expert_routes(&self) -> u64 {
+        self.devices.iter().map(|d| d.compute.cpu_routes()).sum()
     }
 
     pub fn prefill_chunk(&self) -> usize {

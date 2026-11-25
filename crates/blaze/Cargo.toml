@@ -15,6 +15,7 @@ blaze-sys = { path = "../blaze-sys" }
 anyhow.workspace = true
 clap.workspace = true
 half.workspace = true
+rayon = "1"
 memmap2.workspace = true
 regex.workspace = true
 serde.workspace = true

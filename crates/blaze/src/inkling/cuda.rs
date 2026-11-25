@@ -1,10 +1,13 @@
+use super::cpu::Routed;
 use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
 use crate::gpu::{DevBuf, Stream, check};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, ensure};
 use blaze_sys as sys;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::ptr::null_mut;
+use std::sync::Arc;
 
 pub(super) struct Dense {
     weight: DevBuf,
@@ -143,6 +146,7 @@ struct ExpertPool {
     stride: usize,
     next_slot: usize,
     entries: HashMap<(usize, usize), DeviceExpert>,
+    hits: HashMap<(usize, usize), usize>,
 }
 
 impl ExpertPool {
@@ -152,7 +156,51 @@ impl ExpertPool {
             stride,
             next_slot: 0,
             entries: HashMap::new(),
+            hits: HashMap::new(),
         })
+    }
+
+    fn use_gpu(
+        &mut self,
+        ckpt: &Checkpoint,
+        weights: &Experts,
+        layer: usize,
+        id: usize,
+        tick: usize,
+        observations: usize,
+        cpu_enabled: bool,
+    ) -> Result<bool> {
+        if cpu_enabled {
+            let key = (layer, id);
+            let count = self.hits.entry(key).or_default();
+            *count = count.saturating_add(observations);
+            let count = *count;
+            if !self.entries.contains_key(&key) {
+                if count < 2 {
+                    return Ok(false);
+                }
+                if self.next_slot >= self.buffer.bytes() / self.stride {
+                    // Changing a resident expert costs PCIe traffic. Only replace a less-used slot when
+                    // this expert has accumulated a clear lead, outside the active route group.
+                    let replace = self
+                        .entries
+                        .iter()
+                        .filter(|(_, e)| e.last_used != tick)
+                        .min_by_key(|(key, e)| (self.hits.get(key).copied().unwrap_or(0), e.last_used))
+                        .map(|(&key, _)| key);
+                    let Some(old) = replace else {
+                        return Ok(false);
+                    };
+                    if count < self.hits[&old].saturating_add(16) {
+                        return Ok(false);
+                    }
+                    let victim = self.entries.get_mut(&old).unwrap();
+                    victim.last_used = 0;
+                }
+            }
+        }
+        self.prepare(ckpt, weights, layer, id, tick)?;
+        Ok(true)
     }
 
     fn prepare(&mut self, ckpt: &Checkpoint, weights: &Experts, layer: usize, id: usize, tick: usize) -> Result<()> {
@@ -232,6 +280,8 @@ pub(super) struct Compute {
     scatter_ids: DevBuf,
     scatter_weights: DevBuf,
     cache: ExpertCache,
+    cpu: Option<Arc<rayon::ThreadPool>>,
+    cpu_routes: u64,
 }
 
 impl Compute {
@@ -245,6 +295,7 @@ impl Compute {
         layer_visits: [usize; 2],
         top_k: usize,
         prefill_chunk: usize,
+        cpu: Option<Arc<rayon::ThreadPool>>,
     ) -> Result<Self> {
         let stream = Stream::new()?;
         let batch = prefill_chunk.min(EXPERT_BATCH);
@@ -269,6 +320,8 @@ impl Compute {
             scatter_ids,
             scatter_weights,
             cache,
+            cpu,
+            cpu_routes: 0,
         })
     }
 
@@ -293,7 +346,11 @@ impl Compute {
         Ok(self.linear_bf16(matrix, &x, 1)?.into_iter().map(from_bf16).collect())
     }
 
-    pub fn moe(
+    pub fn cpu_routes(&self) -> u64 {
+        self.cpu_routes
+    }
+
+    fn moe(
         &mut self,
         ckpt: &Checkpoint,
         weights: &Experts,
@@ -303,7 +360,7 @@ impl Compute {
         gate_cap: f32,
         up_cap: f32,
     ) -> Result<Vec<f32>> {
-        let x: Vec<_> = x.iter().map(|&x| to_bf16(x)).collect();
+        let x_bf16: Vec<_> = x.iter().map(|&x| to_bf16(x)).collect();
         self.cache.generation += 1;
         let tick = self.cache.generation;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
@@ -313,12 +370,18 @@ impl Compute {
                 entry.last_used = tick;
             }
         }
-        for &(id, _) in routes {
-            pool.prepare(ckpt, weights, layer, id, tick)?;
-        }
-        self.input.upload(&x)?;
-        self.sum.zero(&self.stream)?;
+        let mut cold = Vec::new();
+        let mut resident = Vec::new();
         for &(id, weight) in routes {
+            if pool.use_gpu(ckpt, weights, layer, id, tick, 1, self.cpu.is_some())? {
+                resident.push((id, weight));
+            } else {
+                cold.push((Routed::read(ckpt, weights, id)?, x, 0, weight));
+            }
+        }
+        self.input.upload(&x_bf16)?;
+        self.sum.zero(&self.stream)?;
+        for (id, weight) in resident {
             let e = &pool.entries[&(layer, id)];
             e.gate_up
                 .run(&pool.buffer, self.input.ptr(), self.gate.ptr(), 1, &self.stream)?;
@@ -343,8 +406,11 @@ impl Compute {
                 "Inkling expert reduction",
             )?;
         }
+        let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, (gate_cap, up_cap), &mut self.cpu_routes);
         self.stream.sync()?;
-        self.sum.download(x.len())
+        let mut total = self.sum.download(x.len())?;
+        merge_cold(&mut total, x.len(), out_cpu);
+        Ok(total)
     }
 
     pub fn moe_batch(
@@ -368,7 +434,7 @@ impl Compute {
                 by_expert[id].push((row as i32, w));
             }
         }
-        let activations: Vec<Vec<u16>> = activations
+        let activations_bf16: Vec<Vec<u16>> = activations
             .iter()
             .map(|row| row.iter().copied().map(to_bf16).collect())
             .collect();
@@ -379,15 +445,26 @@ impl Compute {
         let mut input = Vec::with_capacity(hidden * EXPERT_BATCH);
         let mut ids = Vec::with_capacity(EXPERT_BATCH);
         let mut probs = Vec::with_capacity(EXPERT_BATCH);
+        let mut cold = Vec::new();
         for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            pool.prepare(ckpt, weights, layer, id, tick)?;
+            if !pool.use_gpu(ckpt, weights, layer, id, tick, rows.len(), self.cpu.is_some())? {
+                for &(row, weight) in rows {
+                    cold.push((
+                        Routed::read(ckpt, weights, id)?,
+                        activations[row as usize].as_slice(),
+                        row as usize,
+                        weight,
+                    ));
+                }
+                continue;
+            }
             let e = &pool.entries[&(layer, id)];
             for batch in rows.chunks(EXPERT_BATCH) {
                 input.clear();
                 ids.clear();
                 probs.clear();
                 for &(row, weight) in batch {
-                    input.extend_from_slice(&activations[row as usize]);
+                    input.extend_from_slice(&activations_bf16[row as usize]);
                     ids.push(row);
                     probs.push(weight);
                 }
@@ -428,7 +505,39 @@ impl Compute {
                 self.stream.sync()?;
             }
         }
-        self.sum.download(activations.len() * hidden)
+        let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, caps, &mut self.cpu_routes);
+        self.stream.sync()?;
+        let mut total = self.sum.download(activations.len() * hidden)?;
+        merge_cold(&mut total, hidden, out_cpu);
+        Ok(total)
+    }
+}
+
+type ColdRoute<'a> = (Routed<'a>, &'a [f32], usize, f32);
+
+fn run_cold(
+    cpu: Option<&rayon::ThreadPool>,
+    cold: Vec<ColdRoute<'_>>,
+    weights: &Experts,
+    caps: (f32, f32),
+    count: &mut u64,
+) -> Vec<(usize, f32, Vec<f32>)> {
+    if cold.is_empty() {
+        return Vec::new();
+    }
+    *count = count.saturating_add(cold.len() as u64);
+    cpu.unwrap().install(|| {
+        cold.into_par_iter()
+            .map(|(expert, x, row, weight)| (row, weight, expert.run(weights, x, caps)))
+            .collect()
+    })
+}
+
+fn merge_cold(output: &mut [f32], hidden: usize, cold: Vec<(usize, f32, Vec<f32>)>) {
+    for (row, weight, values) in cold {
+        for (dst, src) in output[row * hidden..][..hidden].iter_mut().zip(values) {
+            *dst += src * weight;
+        }
     }
 }
 

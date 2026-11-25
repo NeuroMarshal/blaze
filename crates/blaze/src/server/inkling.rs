@@ -298,6 +298,7 @@ fn run_job(model: &mut Model, text: &Text, path: &std::path::Path, media: &media
     let input = tokenize_prompt(model, text, &prompt, &images)?;
     let max_tokens = job.max_tokens.min(model.context().saturating_sub(input.len()));
     let mut decoder = Output::new(text)?;
+    let cpu_before = model.cpu_expert_routes();
     let result = generate(
         model,
         text,
@@ -323,11 +324,12 @@ fn run_job(model: &mut Model, text: &Text, path: &std::path::Path, media: &media
         let _ = job.tx.blocking_send(Reply::Delta { text, reasoning });
     }
     crate::eprintln!(
-        "Inkling {} prompt tokens in {:.3}s, {} generated tokens in {:.3}s",
+        "Inkling {} prompt tokens in {:.3}s, {} generated tokens in {:.3}s, {} CPU expert routes",
         input.len(),
         result.prompt_elapsed.as_secs_f64(),
         result.ids.len(),
-        result.decode_elapsed.as_secs_f64()
+        result.decode_elapsed.as_secs_f64(),
+        model.cpu_expert_routes() - cpu_before
     );
     Ok(Reply::Done {
         content: decoder.content,
