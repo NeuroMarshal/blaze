@@ -1,6 +1,7 @@
 use super::Model;
 use super::forward::{Prediction, Readout};
 use crate::sampler::{Rng, SamplingParams};
+use crate::suffix::{SuffixConfig, SuffixIndex};
 use crate::text::Text;
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
@@ -109,13 +110,28 @@ pub fn generate(
     }
     let prompt_elapsed = start.elapsed();
     let mut rng = sampling.seed.map_or_else(Rng::from_time, Rng::new);
+    let draft_limit = model.suffix_draft_tokens();
+    let mut suffix = if sampling.greedy() && draft_limit > 0 && prompt.iter().all(|i| matches!(i, Input::Token(_))) {
+        let context: Vec<_> = prompt.iter().filter_map(|input| match input {
+            Input::Token(id) => Some(*id as i32),
+            Input::Image(_) => None,
+        }).collect();
+        let mut index = SuffixIndex::default();
+        index.extend(context.iter().copied());
+        Some((index, context))
+    } else {
+        None
+    };
+    let suffix_config = SuffixConfig::default();
+    let (mut drafted, mut accepted) = (0, 0);
     let start = Instant::now();
     let mut ids = Vec::new();
     let mut stop = false;
-    for i in 0..max_tokens {
+    'decode: while ids.len() < max_tokens {
         let id = match prediction.as_ref().context("Inkling generated no prediction")? {
             Prediction::Token(id) => *id,
             Prediction::Scores(logits) => draw(logits, sampling, &mut rng),
+            Prediction::Tokens(_) => anyhow::bail!("unexpected batch of Inkling predictions"),
         };
         ids.push(id);
         if text.eos.contains(&id) {
@@ -125,9 +141,38 @@ pub fn generate(
         if !publish(id) {
             break;
         }
-        if i + 1 < max_tokens {
-            prediction = model.forward(&mut seq, id, readout)?;
+        if ids.len() == max_tokens {
+            break;
         }
+        if let Some((index, context)) = &mut suffix {
+            index.push(id as i32);
+            context.push(id as i32);
+            let (draft, _) = index.draft(context, draft_limit.min(max_tokens - ids.len()), &suffix_config);
+            if !draft.is_empty() {
+                let (keep, next) = model.verify_suffix(&mut seq, id, &draft)?;
+                drafted += draft.len();
+                accepted += keep;
+                for &id in &draft[..keep] {
+                    let token = id as u32;
+                    ids.push(token);
+                    if text.eos.contains(&token) {
+                        stop = true;
+                        break 'decode;
+                    }
+                    if !publish(token) {
+                        break 'decode;
+                    }
+                    index.push(id);
+                    context.push(id);
+                }
+                prediction = Some(Prediction::Token(next));
+                continue;
+            }
+        }
+        prediction = model.forward(&mut seq, id, readout)?;
+    }
+    if drafted > 0 {
+        crate::eprintln!("Inkling suffix accepted {accepted} / {drafted} drafts");
     }
     Ok(Generation {
         ids,
