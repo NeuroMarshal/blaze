@@ -131,7 +131,7 @@ pub fn generate(
         let id = match prediction.as_ref().context("Inkling generated no prediction")? {
             Prediction::Token(id) => *id,
             Prediction::Scores(logits) => draw(logits, sampling, &mut rng),
-            Prediction::Tokens(_) => anyhow::bail!("unexpected batch of Inkling predictions"),
+            Prediction::Verified { .. } => anyhow::bail!("unexpected suffix verdict outside verification"),
         };
         ids.push(id);
         if text.eos.contains(&id) {

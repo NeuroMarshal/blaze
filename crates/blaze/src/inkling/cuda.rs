@@ -504,6 +504,10 @@ impl Compute {
     }
 
     pub fn project_three(&mut self, matrices: [&Dense; 3], inputs: [&[&[f32]]; 3]) -> Result<[Vec<u16>; 3]> {
+        self.project_rows(matrices, inputs, false)
+    }
+
+    pub fn project_rows(&mut self, matrices: [&Dense; 3], inputs: [&[&[f32]]; 3], decode_rows: bool) -> Result<[Vec<u16>; 3]> {
         let m = inputs[0].len();
         let cols = matrices[0].cols;
         let rows = matrices.map(|w| w.rows * m);
@@ -537,7 +541,13 @@ impl Compute {
             gpu.copy_staged_input(end * 2)?;
             let mut out = 0;
             for i in 0..3 {
-                matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
+                if decode_rows && m > 1 {
+                    for row in 0..m {
+                        matrices[i].run(gpu, gpu.input.at(offsets[i] + row * cols), gpu.result.at(out + row * matrices[i].rows), 1)?;
+                    }
+                } else {
+                    matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
+                }
                 out += rows[i];
             }
             gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
@@ -650,7 +660,7 @@ impl Compute {
         self.cpu_routes
     }
 
-    fn moe(
+    pub(super) fn moe(
         &mut self,
         ckpt: &Checkpoint,
         weights: &Experts,

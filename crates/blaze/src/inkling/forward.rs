@@ -467,16 +467,16 @@ struct VisitState {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Readout {
+pub(super) enum Readout<'a> {
     None,
     Greedy,
-    Verify,
+    Verify(&'a [i32]),
     Scores,
 }
 
 pub(super) enum Prediction {
     Token(u32),
-    Tokens(Vec<u32>),
+    Verified { accepted: usize, next: u32 },
     Scores(Vec<f32>),
 }
 
@@ -798,12 +798,11 @@ impl Model {
             .chain(draft.iter().map(|&token| token as u32))
             .map(|token| self.embedding(token).map(ForwardRow::new))
             .collect::<Result<_>>()?;
-        let Some(Prediction::Tokens(predicted)) = self.forward_rows(seq, rows, Readout::Verify)? else {
+        let Some(Prediction::Verified { accepted, next }) = self.forward_rows(seq, rows, Readout::Verify(draft))? else {
             anyhow::bail!("Inkling verification produced no predictions");
         };
-        let accepted = draft.iter().zip(&predicted).take_while(|(draft, target)| **draft as u32 == **target).count();
         seq.position = start + 1 + accepted;
-        Ok((accepted, predicted[accepted]))
+        Ok((accepted, next))
     }
 
     pub(super) fn prefill(&mut self, seq: &mut Sequence, input: &[Input], readout: Readout) -> Result<Option<Prediction>> {
@@ -905,8 +904,10 @@ impl Model {
                 .zip(&q_refs)
                 .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
-            let [q_batch, k_batch, v_batch] =
-                compute.project_three([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs])?;
+            let verifying = matches!(readout, Readout::Verify(_));
+            let [q_batch, k_batch, v_batch] = compute.project_rows(
+                [&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs], verifying,
+            )?;
             for (offset, row) in rows.iter_mut().enumerate() {
                 let position = seq.position + offset;
                 let ForwardRow { x, blocks, messages, .. } = row;
@@ -979,7 +980,13 @@ impl Model {
                 activations.push(mlp_in);
                 residuals.push(residual);
             }
-            let mut moe = compute.moe_batch(
+            let mut moe = if verifying {
+                let mut output = Vec::with_capacity(rows.len() * s.hidden);
+                for (activation, route) in activations.iter().zip(&routes) {
+                    output.extend(compute.moe(&self.ckpt, &layer.experts, id, activation, route, s.gate_cap, s.up_cap)?);
+                }
+                output
+            } else { compute.moe_batch(
                 &self.ckpt,
                 &layer.experts,
                 id,
@@ -987,7 +994,7 @@ impl Model {
                 &routes,
                 (s.gate_cap, s.up_cap),
                 s.experts,
-            )?;
+            )? };
             for (offset, ((row, residual), moe)) in rows.iter_mut().zip(residuals).zip(moe.chunks_exact_mut(s.hidden)).enumerate()
             {
                 moe.iter_mut().for_each(|v| *v = round(*v));
@@ -1006,10 +1013,16 @@ impl Model {
             };
             let gpu = &mut self.devices[*self.placement.last().unwrap()].compute;
             // The model's tanh softcap is monotonic, so greedy decoding can select on the BF16 head output.
-            if matches!(readout, Readout::Verify) {
-                let tokens = rows.iter().map(|row| gpu.argmax(&self.head, &normalize(row), s.unpadded_vocab))
-                    .collect::<Result<_>>()?;
-                Some(Prediction::Tokens(tokens))
+            if let Readout::Verify(draft) = readout {
+                let mut verdict = None;
+                for (i, row) in rows.iter().enumerate() {
+                    let next = gpu.argmax(&self.head, &normalize(row), s.unpadded_vocab)?;
+                    if draft.get(i).copied() != Some(next as i32) {
+                        verdict = Some(Prediction::Verified { accepted: i, next });
+                        break;
+                    }
+                }
+                verdict
             } else if matches!(readout, Readout::Greedy) {
                 let x = normalize(rows.last().unwrap());
                 Some(Prediction::Token(gpu.argmax(&self.head, &x, s.unpadded_vocab)?))
