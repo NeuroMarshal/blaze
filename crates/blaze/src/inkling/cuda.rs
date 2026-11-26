@@ -335,7 +335,7 @@ const HEAT_EPOCH_VISITS: usize = 48 * 512;
 
 #[derive(Hash, Eq, PartialEq)]
 enum ProjectionKey {
-    Dense([usize; 3], [usize; 3]),
+    Dense([usize; 5], [usize; 5]),
     Controller([usize; 3], [usize; 3]),
     Router(usize),
     Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
@@ -505,13 +505,13 @@ impl Compute {
         Ok(self.read_result(rows))
     }
 
-    pub fn project_three(&mut self, matrices: [&Dense; 3], inputs: [&[&[f32]]; 3]) -> Result<[Vec<u16>; 3]> {
+    pub fn project_group<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N]) -> Result<[Vec<u16>; N]> {
         let m = inputs[0].len();
         let cols = matrices[0].cols;
         let rows = matrices.map(|w| w.rows * m);
         let output_values: usize = rows.iter().sum();
         ensure!(
-            m != 0
+            matches!(N, 3 | 5) && m != 0
                 && inputs.iter().all(|x| x.len() == m && x.iter().all(|r| r.len() == cols))
                 && matrices.iter().all(|w| w.cols == cols)
                 && m * cols * 6 <= self.input.bytes()
@@ -521,13 +521,16 @@ impl Compute {
 
         let host = self.transfer.host_ptr().cast_mut().cast::<u16>();
         let mut end = 0;
-        let mut offsets = [0; 3];
-        for i in 0..3 {
-            if i > 0 && inputs[i].iter().zip(inputs[0]).all(|(&a, &b)| std::ptr::eq(a, b)) {
+        let mut offsets = [0; 5];
+        for i in 0..N {
+            if let Some(j) = (0..i).find(|&j| std::ptr::eq(inputs[i], inputs[j]) ||
+                inputs[i].iter().zip(inputs[j]).all(|(&a, &b)| std::ptr::eq(a, b))) {
+                offsets[i] = offsets[j];
                 continue;
             }
             offsets[i] = end;
             let size = m * cols;
+            ensure!((end + size) * 2 <= self.input.bytes(), "Inkling grouped inputs exceed scratch");
             // The page-aligned staging area is idle and initialized before this write.
             let dst = unsafe { std::slice::from_raw_parts_mut(host.add(end), size) };
             for (out, v) in dst.iter_mut().zip(inputs[i].iter().flat_map(|r| r.iter())) {
@@ -538,14 +541,22 @@ impl Compute {
         let enqueue = |gpu: &Self| -> Result<()> {
             gpu.copy_staged_input(end * 2)?;
             let mut out = 0;
-            for i in 0..3 {
-                matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
+            for i in 0..N {
+                // Dynamic convolution taps use the decode GEMV for every prompt row.
+                if i >= 3 && m > 1 {
+                    for row in 0..m {
+                        matrices[i].run(gpu, gpu.input.at(offsets[i] + row * cols), gpu.result.at(out + row * matrices[i].rows), 1)?;
+                    }
+                } else {
+                    matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
+                }
                 out += rows[i];
             }
             gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
         };
         let work = if m == 1 {
-            let key = ProjectionKey::Dense(matrices.map(|matrix| matrix.weight.ptr::<u8>() as usize), offsets);
+            let weights = std::array::from_fn(|i| matrices.get(i).map_or(0, |w| w.weight.ptr::<u8>() as usize));
+            let key = ProjectionKey::Dense(weights, offsets);
             self.run_projection(key, enqueue)
         } else {
             enqueue(self)
@@ -1272,6 +1283,33 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA GPU"]
+    fn convolution_taps_share_key_value_inputs() {
+        crate::gpu::set_device(0).unwrap();
+        let mut gpu = Compute::new(32, 512, 32, 32, 0, [0; 2], [0; 2], 8, 3, None).unwrap();
+        gpu.projection_graphs = Some(HashMap::new());
+        let weights: Vec<_> = (0..32 * 32).map(|i| to_bf16((i % 37) as f32 * 0.031 - 0.5)).collect();
+        let projection = Dense::from_bf16(&weights, 32, 32).unwrap();
+        let taps = Dense::from_bf16(&weights[..8 * 32], 8, 32).unwrap();
+        let rows: Vec<Vec<_>> = (0..5).map(|r| (0..32).map(|i| ((i+1)*(r+1)) as f32 * 0.017).collect()).collect();
+        let refs: Vec<_> = rows.iter().map(Vec::as_slice).collect();
+        for (offset, m) in [(0, 3), (0, 1), (1, 1)] {
+            let q = &refs[offset..offset+m];
+            let k = &refs[offset+1..offset+m+1];
+            let v = &refs[offset+2..offset+m+2];
+            let expected_qkv = gpu.project_group([&projection; 3], [q, k, v]).unwrap();
+            let expected_taps = [k, v].map(|inputs| inputs.iter().flat_map(|x| {
+                gpu.linear(&taps, x).unwrap().into_iter().map(to_bf16)
+            }).collect::<Vec<_>>());
+            let [a, b, c, d, e] = gpu.project_group(
+                [&projection, &projection, &projection, &taps, &taps], [q, k, v, k, v],
+            ).unwrap();
+            assert_eq!([a, b, c], expected_qkv);
+            assert_eq!([d, e], expected_taps);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
     fn grouped_projection_graph_replays_with_new_input() {
         crate::gpu::set_device(0).unwrap();
         let mut gpu = Compute::new(32, 32, 32, 32, 0, [0; 2], [0; 2], 8, 1, None).unwrap();
@@ -1279,12 +1317,12 @@ mod tests {
         let matrix = Dense::from_bf16(&matrix, 32, 32).unwrap();
         let expected: Vec<_> = [1.0, 2.0].into_iter().map(|value| {
             let x = [value; 32];
-            gpu.project_three([&matrix; 3], [&[x.as_slice()]; 3]).unwrap()
+            gpu.project_group([&matrix; 3], [&[x.as_slice()]; 3]).unwrap()
         }).collect();
         gpu.projection_graphs = Some(HashMap::new());
         for (value, expected) in [1.0, 2.0].into_iter().zip(expected) {
             let x = [value; 32];
-            assert_eq!(gpu.project_three([&matrix; 3], [&[x.as_slice()]; 3]).unwrap(), expected);
+            assert_eq!(gpu.project_group([&matrix; 3], [&[x.as_slice()]; 3]).unwrap(), expected);
         }
         assert!(gpu.projection_graphs.as_ref().unwrap().values().any(Option::is_some));
     }

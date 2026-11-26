@@ -168,27 +168,25 @@ impl Conv {
 
     fn run(
         &self,
-        gpu: &mut Compute,
         state: &mut ConvState,
         x: &[f32],
-        input: &[f32],
+        dyn_weights: Option<&[u16]>,
         pos: usize,
         dim: usize,
-    ) -> Result<Vec<f32>> {
+    ) -> Vec<f32> {
         let k = self.taps.len();
-        let dyn_weights = self.dynamic.as_ref().map(|m| gpu.linear(m, input)).transpose()?;
         let mut out = x.to_vec();
         for lag in 0..k.min(pos + 1) {
             let src = if lag == 0 { x } else { &state.rows[(pos - lag) % (k - 1)] };
             let taps = &self.taps[lag];
-            if let Some(d) = &dyn_weights {
+            if let Some(d) = dyn_weights {
                 for (head, ((out, src), taps)) in out
                     .chunks_exact_mut(dim)
                     .zip(src.chunks_exact(dim))
                     .zip(taps.chunks_exact(dim))
                     .enumerate()
                 {
-                    let extra = d[head * k + lag];
+                    let extra = from_bf16(d[head * k + lag]);
                     for ((o, &v), &w) in out.iter_mut().zip(src).zip(taps) {
                         *o += v * (w + extra);
                     }
@@ -203,7 +201,7 @@ impl Conv {
             state.rows[pos % (k - 1)].copy_from_slice(x);
         }
         out.iter_mut().for_each(|v| *v = round(*v * self.scale));
-        Ok(out)
+        out
     }
 }
 
@@ -307,7 +305,7 @@ impl LoopInputs {
         }
         let inputs: [Vec<f32>; 3] = std::array::from_fn(|i| Controller::input(&qkv[i], &messages[i], eps));
         let inputs = inputs.each_ref().map(Vec::as_slice).map(|row| [row]);
-        let gates = gpu.project_three(
+        let gates = gpu.project_group(
             std::array::from_fn(|i| &self.controllers[i].down),
             inputs.each_ref().map(|row| row.as_slice()),
         )?;
@@ -667,7 +665,7 @@ impl Model {
             );
             let compute = Compute::new(
                 (s.hidden * 2).max(s.q_width()),
-                s.vocab.max(layers[0].query.rows),
+                s.vocab.max((layers[0].query.rows + 2 * (s.kv_width() + s.kv_heads * s.conv)) * prefill_chunk),
                 s.hidden,
                 s.intermediate,
                 expert_bytes,
@@ -879,8 +877,16 @@ impl Model {
                 .zip(&q_refs)
                 .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
-            let [q_batch, k_batch, v_batch] =
-                compute.project_three([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs])?;
+            let (qkv, conv) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
+                let [q, key, value, k_taps, v_taps] = compute.project_group(
+                    [&layer.query, &layer.key, &layer.value, k, v],
+                    [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs],
+                )?;
+                ([q, key, value], Some([k_taps, v_taps]))
+            } else {
+                (compute.project_group([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs])?, None)
+            };
+            let [q_batch, k_batch, v_batch] = qkv;
             for (offset, row) in rows.iter_mut().enumerate() {
                 let position = seq.position + offset;
                 let ForwardRow { x, blocks, messages, .. } = row;
@@ -898,12 +904,12 @@ impl Model {
                 let kv_range = offset * s.kv_width()..(offset + 1) * s.kv_width();
                 let key: Vec<_> = k_batch[kv_range.clone()].iter().copied().map(from_bf16).collect();
                 let value: Vec<_> = v_batch[kv_range].iter().copied().map(from_bf16).collect();
-                let key = layer
-                    .k_conv
-                    .run(compute, &mut state.key, &key, k_refs[offset], position, s.dim)?;
-                let value = layer
-                    .v_conv
-                    .run(compute, &mut state.value, &value, v_refs[offset], position, s.dim)?;
+                let taps = |i: usize| conv.as_ref().map(|w| {
+                    let width = s.kv_heads * s.conv;
+                    &w[i][offset * width..(offset + 1) * width]
+                });
+                let key = layer.k_conv.run(&mut state.key, &key, taps(0), position, s.dim);
+                let value = layer.v_conv.run(&mut state.value, &value, taps(1), position, s.dim);
                 let key: Vec<_> = key
                     .chunks_exact(s.dim)
                     .flat_map(|row| {
@@ -933,7 +939,7 @@ impl Model {
                 )?;
                 let mut residual = layer
                     .attn_conv
-                    .run(compute, &mut state.attention, &attn, &[], position, s.dim)?;
+                    .run(&mut state.attention, &attn, None, position, s.dim);
                 if id % s.block == 0 {
                     blocks.push(normalized(x, None, s.eps));
                 } else {
@@ -973,7 +979,7 @@ impl Model {
                 moe.iter_mut().for_each(|v| *v = round(*v));
                 let mlp = layer
                     .mlp_conv
-                    .run(compute, &mut state.mlp, moe, &[], seq.position + offset, s.dim)?;
+                    .run(&mut state.mlp, moe, None, seq.position + offset, s.dim);
                 row.x = residual.into_iter().zip(mlp).map(|(a, b)| round(a + b)).collect();
             }
         }
