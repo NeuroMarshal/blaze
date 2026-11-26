@@ -320,6 +320,11 @@ impl LoopInputs {
     }
 }
 
+enum Router {
+    Host(Vec<f32>),
+    Device(Dense),
+}
+
 struct Layer {
     local: bool,
     query: Dense,
@@ -340,7 +345,7 @@ struct Layer {
     v_conv: Conv,
     attn_conv: Conv,
     mlp_conv: Conv,
-    router: Vec<f32>,
+    router: Router,
     route_bias: Vec<f32>,
     experts: Experts,
 }
@@ -429,20 +434,24 @@ impl Layer {
             v_conv: Conv::load(ckpt, &t("attn.v_sconv"), kv, s, !local)?,
             attn_conv: Conv::load(ckpt, &t("attn_sconv"), s.hidden, s, false)?,
             mlp_conv: Conv::load(ckpt, &t("mlp_sconv"), s.hidden, s, false)?,
-            router: read("mlp.gate.weight", &[s.experts, s.hidden])?,
+            router: if s.hidden.is_multiple_of(32) && ckpt.info(&t("mlp.gate.weight"))?.dtype == Dtype::Bf16
+                && std::env::var_os("BLAZE_INKLING_GPU_ROUTER").is_some_and(|v| v == "1")
+            {
+                Router::Device(dense("mlp.gate.weight", s.experts, s.hidden)?)
+            } else {
+                Router::Host(read("mlp.gate.weight", &[s.experts, s.hidden])?)
+            },
             route_bias: read("mlp.gate.bias", &[s.experts])?,
             experts: Experts::load(ckpt, cfg, id)?,
         })
     }
 
-    fn routes(&self, x: &[f32], s: &Shape) -> Vec<(usize, f32)> {
-        let mut routes: Vec<_> = self
-            .router
-            .chunks_exact(s.hidden)
+    fn routes(&self, logits: impl Iterator<Item = f32>, s: &Shape) -> Vec<(usize, f32)> {
+        let mut routes: Vec<_> = logits
             .zip(&self.route_bias)
             .enumerate()
-            .map(|(id, (row, &bias))| {
-                let score = (1.0 + (-dot(row, x)).exp()).recip();
+            .map(|(id, (logit, &bias))| {
+                let score = (1.0 + (-logit).exp()).recip();
                 (id, score, score + bias)
             })
             .collect();
@@ -811,7 +820,6 @@ impl Model {
             let layer = &self.layers[id];
             let mut residuals = Vec::with_capacity(rows.len());
             let mut activations = Vec::with_capacity(rows.len());
-            let mut routes = Vec::with_capacity(rows.len());
             let mut q_inputs = Vec::with_capacity(rows.len());
             let mut k_inputs = Vec::with_capacity(rows.len());
             let mut v_inputs = Vec::with_capacity(rows.len());
@@ -941,10 +949,16 @@ impl Model {
                     .into_iter()
                     .map(round)
                     .collect::<Vec<_>>();
-                routes.push(layer.routes(&mlp_in, s));
                 activations.push(mlp_in);
                 residuals.push(residual);
             }
+            let routes: Vec<_> = match &layer.router {
+                Router::Device(w) => compute.router_logits(w, &activations)?.chunks_exact(s.experts)
+                    .map(|row| layer.routes(row.iter().copied(), s)).collect(),
+                Router::Host(w) => activations.iter().map(|x| {
+                    layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
+                }).collect(),
+            };
             let mut moe = compute.moe_batch(
                 &self.ckpt,
                 &layer.experts,

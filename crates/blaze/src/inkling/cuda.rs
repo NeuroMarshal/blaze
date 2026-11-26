@@ -337,6 +337,7 @@ const HEAT_EPOCH_VISITS: usize = 48 * 512;
 enum ProjectionKey {
     Dense([usize; 3], [usize; 3]),
     Controller([usize; 3], [usize; 3]),
+    Router(usize),
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
 
@@ -613,6 +614,37 @@ impl Compute {
         work?;
         synced?;
         Ok(self.read_result(N * rows))
+    }
+
+    pub fn router_logits(&mut self, weights: &Dense, activations: &[Vec<f32>]) -> Result<Vec<f32>> {
+        let tokens = activations.len();
+        let inputs = tokens * weights.cols;
+        let outputs = tokens * weights.rows;
+        ensure!(tokens > 0 && activations.iter().all(|x| x.len() == weights.cols)
+            && inputs * 2 <= self.input.bytes() && outputs * 4 <= self.result.bytes(),
+            "Inkling router exceeds scratch");
+        let host = self.transfer.host_ptr().cast_mut().cast::<u16>();
+        let dst = unsafe { std::slice::from_raw_parts_mut(host, inputs) };
+        for (dst, &value) in dst.iter_mut().zip(activations.iter().flatten()) {
+            *dst = to_bf16(value);
+        }
+        let enqueue = |gpu: &Self| {
+            gpu.copy_staged_input(inputs * 2)?;
+            check(unsafe {
+                sys::blz_inkling_router_logits(weights.weight.ptr(), gpu.input.ptr(), gpu.result.ptr(),
+                    weights.rows as i32, weights.cols as i32, tokens as i32, gpu.stream.0)
+            }, "Inkling MoE router")?;
+            gpu.queue_result::<f32>(gpu.result.ptr(), outputs)
+        };
+        let work = if tokens == 1 {
+            self.run_projection(ProjectionKey::Router(weights.weight.ptr::<u8>() as usize), enqueue)
+        } else {
+            enqueue(self)
+        };
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        Ok(self.read_result(outputs))
     }
 
     pub fn linear(&mut self, matrix: &Dense, x: &[f32]) -> Result<Vec<f32>> {
@@ -1168,6 +1200,28 @@ impl AttentionScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires a CUDA GPU and AVX2/FMA"]
+    fn router_logits_match_host_for_prefill_and_decode() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
+        crate::gpu::set_device(0).unwrap();
+        let mut gpu = Compute::new(96, 128, 96, 32, 0, [0; 2], [0; 2], 8, 3, None).unwrap();
+        gpu.projection_graphs = Some(HashMap::new());
+        let values = |i: usize| to_bf16(((i * 31 % 113) as f32 - 50.0) / (3 + i % 19) as f32);
+        let weights: Vec<_> = (0..11 * 96).map(values).collect();
+        let dense = Dense::from_bf16(&weights, 11, 96).unwrap();
+        let weights: Vec<_> = weights.into_iter().map(from_bf16).collect();
+        let inputs: Vec<Vec<_>> = (0..3).map(|row| {
+            (0..96).map(|i| from_bf16(values(i + 7 * row))).collect()
+        }).collect();
+        for batch in [&inputs[..], &inputs[1..2], &inputs[2..]] {
+            let actual = gpu.router_logits(&dense, batch).unwrap();
+            let expected = batch.iter().flat_map(|x| weights.chunks_exact(96).map(move |w| super::super::forward::dot(w, x)));
+            assert!(actual.into_iter().map(f32::to_bits).eq(expected.map(f32::to_bits)));
+        }
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]

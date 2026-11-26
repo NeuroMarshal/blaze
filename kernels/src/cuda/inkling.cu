@@ -51,7 +51,31 @@ __global__ void controller_up(const __nv_bfloat16* hidden, const __nv_bfloat16* 
     if (lane == 0) out[group * rows + row] = sum;
 }
 
+__global__ void router_logits(const __nv_bfloat16* w, const __nv_bfloat16* x, float* out, int cols) {
+    const int lane = threadIdx.x;
+    w += size_t(blockIdx.x) * cols;
+    x += size_t(blockIdx.y) * cols;
+    float acc = 0.0f;
+    for (int k = lane; k < cols; k += 32) {
+        acc = fmaf(__bfloat162float(w[k]), __bfloat162float(x[k]), acc);
+    }
+    acc += __shfl_down_sync(0xffffffff, acc, 8);
+    acc += __shfl_down_sync(0xffffffff, acc, 16);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) sum += __shfl_sync(0xffffffff, acc, i);
+    if (lane == 0) out[size_t(blockIdx.y) * gridDim.x + blockIdx.x] = sum;
+}
+
 } // namespace
+
+extern "C" cudaError_t blz_inkling_router_logits(const uint16_t* w, const uint16_t* x, float* out,
+        int rows, int cols, int tokens, cudaStream_t stream) {
+    if (rows <= 0 || cols <= 0 || cols % 32 || tokens <= 0 || tokens > 65535) return cudaErrorInvalidValue;
+    router_logits<<<dim3(rows, tokens), 32, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(w),
+        reinterpret_cast<const __nv_bfloat16*>(x), out, cols);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_inkling_controller_up(const uint16_t* hidden, const uint16_t* w0,
         const uint16_t* w1, const uint16_t* w2, float* out, int rows, int groups, cudaStream_t stream) {

@@ -596,6 +596,8 @@ unsafe extern "C" {
                              stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_reduce_experts(rows: *const u16, weights: *const f32, out: *mut f32,
                                       width: c_int, experts: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_router_logits(w: *const u16, x: *const u16, out: *mut f32, rows: c_int,
+                                     cols: c_int, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_up(hidden: *const u16, w0: *const u16, w1: *const u16, w2: *const u16,
                                      out: *mut f32, rows: c_int, groups: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_grouped_nvfp4(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,
