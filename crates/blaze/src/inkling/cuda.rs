@@ -321,6 +321,42 @@ const EXPERT_BATCH: usize = 64;
 // Count token visits, so a prefill chunk advances the heat clock by its length.
 const HEAT_EPOCH_VISITS: usize = 48 * 512;
 
+type ProjectionKey = ([usize; 3], [usize; 3]);
+const MAX_PROJECTION_GRAPHS: usize = 256;
+
+struct ProjectionGraph(sys::cudaGraphExec_t);
+
+impl ProjectionGraph {
+    fn capture(stream: &Stream, enqueue: impl FnOnce() -> Result<()>) -> Option<Self> {
+        if unsafe { sys::cudaStreamBeginCapture(stream.0, sys::CAPTURE_MODE_THREAD_LOCAL) } != 0 {
+            return None;
+        }
+        let recorded = enqueue();
+        let mut graph = null_mut();
+        let ended = unsafe { sys::cudaStreamEndCapture(stream.0, &mut graph) };
+        if graph.is_null() {
+            return None;
+        }
+        let mut exec = null_mut();
+        let instantiated = recorded.is_ok() && ended == 0
+            && unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) } == 0;
+        unsafe { sys::cudaGraphDestroy(graph) };
+        instantiated.then_some(Self(exec))
+    }
+
+    fn launch(&self, stream: &Stream) -> Result<()> {
+        check(unsafe { sys::cudaGraphLaunch(self.0, stream.0) }, "Inkling projection graph")
+    }
+}
+
+impl Drop for ProjectionGraph {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { sys::cudaGraphExecDestroy(self.0) };
+        }
+    }
+}
+
 pub(super) struct Compute {
     pub stream: Stream,
     gemm: *mut sys::blz_gemm,
@@ -336,6 +372,7 @@ pub(super) struct Compute {
     cache: ExpertCache,
     cpu: Option<Arc<rayon::ThreadPool>>,
     cpu_routes: u64,
+    projection_graphs: Option<HashMap<ProjectionKey, Option<ProjectionGraph>>>,
 }
 
 impl Compute {
@@ -380,6 +417,9 @@ impl Compute {
             cache,
             cpu,
             cpu_routes: 0,
+            projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
+                .filter(|value| value == "1")
+                .map(|_| HashMap::new()),
         })
     }
 
@@ -405,7 +445,7 @@ impl Compute {
         )
     }
 
-    fn queue_result<T: Copy>(&mut self, result: *const T, count: usize) -> Result<()> {
+    fn queue_result<T: Copy>(&self, result: *const T, count: usize) -> Result<()> {
         let bytes = count * std::mem::size_of::<T>();
         ensure!(bytes <= self.transfer.bytes(), "Inkling readback exceeds staging capacity");
         check(
@@ -474,18 +514,31 @@ impl Compute {
             }
             end += size;
         }
-        let work = (|| -> Result<()> {
-            check(
-                unsafe { sys::cudaMemcpyAsync(self.input.ptr(), host.cast(), end * 2, sys::MEMCPY_H2D, self.stream.0) },
-                "Inkling grouped projection inputs",
-            )?;
+        let enqueue = |gpu: &Self| -> Result<()> {
+            gpu.copy_staged_input(end * 2)?;
             let mut out = 0;
             for i in 0..3 {
-                matrices[i].run(self, self.input.at(offsets[i]), self.result.at(out), m)?;
+                matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
                 out += rows[i];
             }
-            self.queue_result::<u16>(self.result.ptr(), output_values)
-        })();
+            gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
+        };
+        let work = if m == 1 && self.projection_graphs.is_some() {
+            let key = (matrices.map(|matrix| matrix.weight.ptr::<u8>() as usize), offsets);
+            if let Some(cached) = self.projection_graphs.as_ref().unwrap().get(&key) {
+                cached.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream))
+            } else if self.projection_graphs.as_ref().unwrap().len() < MAX_PROJECTION_GRAPHS {
+                // The matrices and scratch buffers stay live for the lifetime of the compute device.
+                let captured = ProjectionGraph::capture(&self.stream, || enqueue(self));
+                let result = captured.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream));
+                self.projection_graphs.as_mut().unwrap().insert(key, captured);
+                result
+            } else {
+                enqueue(self)
+            }
+        } else {
+            enqueue(self)
+        };
         let synced = self.stream.sync();
         work?;
         synced?;
@@ -767,6 +820,7 @@ fn merge_cold(output: &mut [f32], hidden: usize, cold: Vec<(usize, f32, Vec<f32>
 
 impl Drop for Compute {
     fn drop(&mut self) {
+        self.projection_graphs.take();
         unsafe { sys::blz_gemm_destroy(self.gemm) };
     }
 }
@@ -997,6 +1051,25 @@ impl AttentionScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn grouped_projection_graph_replays_with_new_input() {
+        crate::gpu::set_device(0).unwrap();
+        let mut gpu = Compute::new(32, 32, 32, 32, 0, [0; 2], [0; 2], 8, 1, None).unwrap();
+        let matrix: Vec<_> = (0..32 * 32).map(|i| to_bf16(if i % 33 == 0 { 1.0 } else { 0.0 })).collect();
+        let matrix = Dense::from_bf16(&matrix, 32, 32).unwrap();
+        let expected: Vec<_> = [1.0, 2.0].into_iter().map(|value| {
+            let x = [value; 32];
+            gpu.project_three([&matrix; 3], [&[x.as_slice()]; 3]).unwrap()
+        }).collect();
+        gpu.projection_graphs = Some(HashMap::new());
+        for (value, expected) in [1.0, 2.0].into_iter().zip(expected) {
+            let x = [value; 32];
+            assert_eq!(gpu.project_three([&matrix; 3], [&[x.as_slice()]; 3]).unwrap(), expected);
+        }
+        assert!(gpu.projection_graphs.as_ref().unwrap().values().any(Option::is_some));
+    }
 
     #[test]
     #[ignore = "requires a CUDA GPU"]
