@@ -168,7 +168,10 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
                                 const __nv_bfloat16* relative, const __nv_bfloat16* sinks,
                                 const __nv_bfloat16* gate, __nv_bfloat16* output,
                                 float* scratch, int kv_heads, int capacity, int window, int position,
-                                int extent, int tile, float global_scale) {
+                                int extent, int tile, float global_scale, int query_stride) {
+    q += size_t(blockIdx.z) * query_stride;
+    output += size_t(blockIdx.z) * gridDim.x * HEAD_DIM;
+    scratch += size_t(blockIdx.z) * gridDim.x * gridDim.y * (HEAD_DIM + 2);
     const int head = blockIdx.x;
     const int kv_head = head / (gridDim.x / kv_heads);
     const int lane = threadIdx.x % 32;
@@ -270,6 +273,8 @@ __global__ void attention_merge(const float* scratch, const __nv_bfloat16* sinks
                                 const __nv_bfloat16* gate, __nv_bfloat16* out, int tiles) {
     const int head = blockIdx.x;
     const int col = threadIdx.x;
+    scratch += size_t(blockIdx.z) * gridDim.x * tiles * (HEAD_DIM + 2);
+    out += size_t(blockIdx.z) * gridDim.x * HEAD_DIM;
     const float* row = scratch + head * tiles * (HEAD_DIM + 2);
     const float sink = __bfloat162float(sinks[head]);
     float maximum = sink;
@@ -288,17 +293,19 @@ __global__ void attention_merge(const float* scratch, const __nv_bfloat16* sinks
 
 } // namespace
 
-extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const uint8_t* keys, const uint8_t* values,
+static cudaError_t launch_inkling_attention(const uint16_t* q, const uint8_t* keys, const uint8_t* values,
                                             const uint8_t* key_scales, const uint8_t* value_scales,
                                             const uint16_t* relative, const uint16_t* sinks, const uint16_t* gate,
                                             uint16_t* out, float* scratch, int heads, int kv_heads, int capacity,
-                                            int window, int position, int extent, int tiles, float global_scale, cudaStream_t stream) {
+                                            int window, int position, int extent, int tiles, float global_scale,
+                                            int queries, int query_stride, cudaStream_t stream) {
     if (kv_heads < 1 || heads < 1 || heads % kv_heads != 0 || window < 1 || window > capacity || position < 0 || tiles < 1)
         return cudaErrorInvalidValue;
     const int valid = min(window, position + 1);
     const int tile = (valid + tiles - 1) / tiles;
     const int blocks = (valid + tile - 1) / tile;
-    const dim3 grid(heads, blocks);
+    if (queries < 1 || (queries > 1 && query_stride < heads * HEAD_DIM)) return cudaErrorInvalidValue;
+    const dim3 grid(heads, blocks, queries);
     auto query = reinterpret_cast<const __nv_bfloat16*>(q);
     auto biases = reinterpret_cast<const __nv_bfloat16*>(relative);
     auto sink = reinterpret_cast<const __nv_bfloat16*>(sinks);
@@ -306,14 +313,67 @@ extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const uint8_t* k
     auto result = reinterpret_cast<__nv_bfloat16*>(out);
     if (key_scales) {
         attention_tiles<true><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, key_scales, value_scales,
-            biases, sink, gated, result, scratch, kv_heads, capacity, window, position, extent, tile, global_scale);
+            biases, sink, gated, result, scratch, kv_heads, capacity, window, position, extent, tile, global_scale, query_stride);
     } else {
         attention_tiles<false><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, nullptr, nullptr,
-            biases, sink, gated, result, scratch, kv_heads, capacity, window, position, extent, tile, global_scale);
+            biases, sink, gated, result, scratch, kv_heads, capacity, window, position, extent, tile, global_scale, query_stride);
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess || blocks == 1) return err;
-    attention_merge<<<heads, HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, blocks);
+    attention_merge<<<dim3(heads, 1, queries), HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, blocks);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const uint8_t* keys, const uint8_t* values,
+        const uint8_t* ks, const uint8_t* vs, const uint16_t* relative, const uint16_t* sinks, const uint16_t* gate,
+        uint16_t* out, float* scratch, int heads, int kv_heads, int capacity, int window, int position, int extent,
+        int tiles, float scale, cudaStream_t stream) {
+    return launch_inkling_attention(q, keys, values, ks, vs, relative, sinks, gate, out, scratch, heads, kv_heads,
+                                    capacity, window, position, extent, tiles, scale, 1, 0, stream);
+}
+
+extern "C" cudaError_t blz_dspark_attention(const uint16_t* q, int stride, int rows, const uint8_t* keys,
+        const uint8_t* values, const uint8_t* ks, const uint8_t* vs, const uint16_t* sinks, const uint16_t* gate,
+        uint16_t* out, float* scratch, int heads, int kv_heads, int capacity, int position, int tiles, float scale,
+        cudaStream_t stream) {
+    return launch_inkling_attention(q, keys, values, ks, vs, nullptr, sinks, gate, out, scratch, heads, kv_heads,
+                                    capacity, capacity, position, 0, tiles, scale, rows, stride, stream);
+}
+
+namespace {
+
+__global__ void dspark_norm_rope(__nv_bfloat16* x, int stride, const __nv_bfloat16* norm,
+                                  const float* freq, int start, int* slots, int capacity) {
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x;
+    x += row * stride + blockIdx.x * HEAD_DIM;
+    float v[4], sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        v[i] = __bfloat162float(x[lane + i * 32]);
+        sum = fmaf(v[i], v[i], sum);
+    }
+    const float inv = rsqrtf(warp_sum(sum) / HEAD_DIM + 1e-6f);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int j = lane + i * 32;
+        float s, c;
+        sincosf(float(start + row) * freq[j], &s, &c);
+        const float a = v[i] * inv * __bfloat162float(norm[j]);
+        const float b = v[i + 2] * inv * __bfloat162float(norm[j + 64]);
+        x[j] = __float2bfloat16(a * c - b * s);
+        x[j + 64] = __float2bfloat16(a * s + b * c);
+    }
+    if (slots && blockIdx.x == 0 && lane == 0) slots[row] = (start + row) % capacity;
+}
+
+} // namespace
+
+extern "C" cudaError_t blz_dspark_norm_rope(uint16_t* x, int stride, int rows, int heads, const uint16_t* norm,
+        const float* freq, int start, int* slots, int capacity, cudaStream_t stream) {
+    if (stride < heads * HEAD_DIM || heads <= 0 || rows <= 0 || capacity <= 0) return cudaErrorInvalidValue;
+    dspark_norm_rope<<<dim3(heads, rows), 32, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(x), stride,
+            reinterpret_cast<const __nv_bfloat16*>(norm), freq, start, slots, capacity);
     return cudaGetLastError();
 }
 

@@ -30,10 +30,10 @@ struct Layer {
     gate_up: Dense,
     down: Dense,
     ctx_norm: Vec<f32>,
-    ctx_k_norm: Vec<f32>,
+    ctx_k_norm: DevBuf,
     input_norm: Vec<f32>,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
+    q_norm: DevBuf,
+    k_norm: DevBuf,
     post_norm: Vec<f32>,
 }
 
@@ -47,15 +47,17 @@ pub(super) struct Draft {
     bias: Vec<f32>,
     correction: Dense,
     correction_bias: Vec<f32>,
-    inv_freq: [f32; D / 2],
+    inv_freq: DevBuf,
     input: DevBuf,
     output: DevBuf,
+    attention: DevBuf,
     partial: DevBuf,
     slots: DevBuf,
     no_sink: DevBuf,
     open_gate: DevBuf,
     scale: DevBuf,
     pub limit: usize,
+    pub head_vocab: usize,
 }
 
 pub(super) struct Cache {
@@ -82,7 +84,15 @@ impl Cache {
 
     pub fn new(capacity: usize, format: KvDtype) -> Result<Self> {
         let kv = (0..3)
-            .map(|i| Kv::new(Self::slots(capacity, i), Self::slots(capacity, i), KV_HEADS, false, format))
+            .map(|i| {
+                Kv::new(
+                    Self::slots(capacity, i),
+                    Self::slots(capacity, i),
+                    KV_HEADS,
+                    false,
+                    format,
+                )
+            })
             .collect::<Result<_>>()?;
         Ok(Self {
             kv,
@@ -94,7 +104,13 @@ impl Cache {
 }
 
 impl Draft {
-    pub fn load(c: &Checkpoint, cfg: &Value, limit: usize, vocab: usize) -> Result<Self> {
+    pub fn load(
+        c: &Checkpoint,
+        cfg: &Value,
+        limit: usize,
+        vocab: usize,
+        head_vocab: usize,
+    ) -> Result<Self> {
         for (key, expected) in [
             ("hidden_size", H),
             ("num_hidden_layers", 3),
@@ -131,6 +147,9 @@ impl Draft {
             .map(|i| {
                 let name = |t: &str| format!("layers.{i}.{t}.weight");
                 let vector = |t, len| read_float(c, &name(t), &[len]);
+                let head_norm = |t| {
+                    DevBuf::from_slice(&vector(t, D)?.into_iter().map(to_bf16).collect::<Vec<_>>())
+                };
                 Ok(Layer {
                     ctx: Dense::stack(
                         c,
@@ -157,10 +176,10 @@ impl Draft {
                     )?,
                     down: Dense::load(c, &name("mlp.down_proj"), H, FF)?,
                     ctx_norm: vector("dflare_norm", H)?,
-                    ctx_k_norm: vector("self_attn.k_norm_ctx", D)?,
+                    ctx_k_norm: head_norm("self_attn.k_norm_ctx")?,
                     input_norm: vector("input_layernorm", H)?,
-                    q_norm: vector("self_attn.q_norm", D)?,
-                    k_norm: vector("self_attn.k_norm", D)?,
+                    q_norm: head_norm("self_attn.q_norm")?,
+                    k_norm: head_norm("self_attn.k_norm")?,
                     post_norm: vector("post_attention_layernorm", H)?,
                 })
             })
@@ -174,6 +193,7 @@ impl Draft {
             layers,
             fuse,
             limit,
+            head_vocab,
             mask: read_float(c, "mask_embed", &[H])?,
             final_norm: read_float(c, "norm.weight", &[H])?,
             head_norm: read_float(c, "markov_head.dflare_norm.weight", &[H])?,
@@ -181,10 +201,13 @@ impl Draft {
             bias: read_float(c, "markov_head.rnn_proj.bias", &[3 * R])?,
             correction: Dense::load(c, "markov_head.hidden_out.weight", H, R)?,
             correction_bias: read_float(c, "markov_head.hidden_out.bias", &[H])?,
-            inv_freq: std::array::from_fn(|j| 1e6f32.powf(-2.0 * j as f32 / D as f32)),
+            inv_freq: DevBuf::from_slice(&std::array::from_fn::<_, { D / 2 }, _>(|j| {
+                1e6f32.powf(-2.0 * j as f32 / D as f32)
+            }))?,
             input: DevBuf::new(BLOCK * FF * 2)?,
             output: DevBuf::new(BLOCK * 2 * FF * 2)?,
-            partial: DevBuf::new(HEADS * 256 * (D + 2) * 4)?,
+            attention: DevBuf::new(BLOCK * Q * 2)?,
+            partial: DevBuf::new(BLOCK * HEADS * 256 * (D + 2) * 4)?,
             slots: DevBuf::new(BLOCK * 4)?,
             no_sink: DevBuf::from_slice(&[to_bf16(f32::NEG_INFINITY); HEADS])?,
             open_gate: DevBuf::from_slice(&vec![to_bf16(f32::INFINITY); Q])?,
@@ -219,16 +242,34 @@ impl Draft {
         normalized(&mix, Some(norm), EPS)
     }
 
-    fn rotate(&self, x: &mut [f32], weight: &[f32], position: usize) {
-        let angles: [_; D / 2] =
-            std::array::from_fn(|j| (position as f32 * self.inv_freq[j]).sin_cos());
-        for head in x.chunks_exact_mut(D) {
-            let y = normalized(head, Some(weight), EPS);
-            for (j, (sin, cos)) in angles.iter().copied().enumerate() {
-                head[j] = y[j] * cos - y[j + D / 2] * sin;
-                head[j + D / 2] = y[j] * sin + y[j + D / 2] * cos;
-            }
-        }
+    fn normalize_heads(
+        &self,
+        gpu: &Compute,
+        offset: usize,
+        stride: usize,
+        rows: usize,
+        heads: usize,
+        norm: &DevBuf,
+        start: usize,
+        cache_slots: Option<usize>,
+    ) -> Result<()> {
+        check(
+            unsafe {
+                sys::blz_dspark_norm_rope(
+                    self.output.at(offset),
+                    stride as i32,
+                    rows as i32,
+                    heads as i32,
+                    norm.ptr(),
+                    self.inv_freq.ptr(),
+                    start as i32,
+                    cache_slots.map_or(std::ptr::null_mut(), |_| self.slots.ptr()),
+                    cache_slots.unwrap_or(1) as i32,
+                    gpu.stream.0,
+                )
+            },
+            "DSpark head normalization and RoPE",
+        )
     }
 
     fn store(
@@ -236,25 +277,20 @@ impl Draft {
         gpu: &Compute,
         cache: &Cache,
         layer: usize,
-        start: usize,
-        kv: &[u16],
+        rows: usize,
+        offset: usize,
+        stride: usize,
     ) -> Result<()> {
-        let rows = kv.len() / (2 * K);
-        let slots: Vec<_> = (start..start + rows)
-            .map(|p| (p % Cache::slots(cache.capacity, layer)) as i32)
-            .collect();
-        self.slots.upload(&slots)?;
-        self.input.upload(kv)?;
         let [keys, values, ks, vs] = cache.kv[layer].pointers(0);
-        let key = self.input.ptr::<u16>().cast();
-        let value = self.input.at::<u16>(K).cast();
+        let key = self.output.at::<u16>(offset).cast();
+        let value = self.output.at::<u16>(offset + K).cast();
         let err = unsafe {
             if cache.format == KvDtype::Bf16 {
                 sys::blz_kv_store_dense(
                     key,
                     value,
-                    (2 * K) as i64,
-                    (2 * K) as i64,
+                    stride as i64,
+                    stride as i64,
                     self.slots.ptr(),
                     sys::BLZ_I32,
                     rows as i64,
@@ -271,8 +307,8 @@ impl Draft {
                 sys::blz_nvfp4_kv_store(
                     key,
                     value,
-                    (2 * K) as i64,
-                    (2 * K) as i64,
+                    stride as i64,
+                    stride as i64,
                     sys::BLZ_BF16,
                     self.slots.ptr(),
                     sys::BLZ_I32,
@@ -290,8 +326,7 @@ impl Draft {
                 )
             }
         };
-        check(err, "DSpark KV store")?;
-        gpu.stream.sync()
+        check(err, "DSpark KV store")
     }
 
     pub fn append(
@@ -307,18 +342,23 @@ impl Draft {
                 let inputs: Vec<_> = rows
                     .iter()
                     .flat_map(|r| self.mix(r, &self.fuse[i], &l.ctx_norm))
+                    .map(to_bf16)
                     .collect();
-                let mut kv = self.project(gpu, &l.ctx, &inputs, rows.len())?;
-                for (r, pair) in kv.chunks_exact_mut(2 * K).enumerate() {
-                    self.rotate(&mut pair[..K], &l.ctx_k_norm, pos + r);
-                }
-                self.store(
+                self.input.upload(&inputs)?;
+                l.ctx
+                    .run(gpu, self.input.ptr(), self.output.ptr(), rows.len())?;
+                self.normalize_heads(
                     gpu,
-                    cache,
-                    i,
+                    0,
+                    2 * K,
+                    rows.len(),
+                    KV_HEADS,
+                    &l.ctx_k_norm,
                     pos,
-                    &kv.into_iter().map(to_bf16).collect::<Vec<_>>(),
+                    Some(Cache::slots(cache.capacity, i)),
                 )?;
+                self.store(gpu, cache, i, rows.len(), 0, 2 * K)?;
+                gpu.stream.sync()?;
             }
         }
         cache.conditioning = self.mix(features.last().unwrap(), &self.fuse[3], &self.head_norm);
@@ -345,76 +385,89 @@ impl Draft {
             let input: Vec<_> = x
                 .chunks_exact(H)
                 .flat_map(|r| normalized(r, Some(&l.input_norm), EPS))
+                .map(to_bf16)
                 .collect();
-            let mut qkv = self.project(gpu, &l.qkv, &input, BLOCK)?;
-            let mut queries = Vec::with_capacity(Q * BLOCK);
-            let mut kv = Vec::with_capacity(2 * K * BLOCK);
-            for (r, row) in qkv.chunks_exact_mut(Q + 2 * K).enumerate() {
-                let (q, pair) = row.split_at_mut(Q);
-                self.rotate(q, &l.q_norm, pos + r);
-                self.rotate(&mut pair[..K], &l.k_norm, pos + r);
-                queries.extend(q.iter().copied().map(to_bf16));
-                kv.extend(pair.iter().copied().map(to_bf16));
-            }
-            self.store(gpu, cache, i, pos, &kv)?;
-            self.input.upload(&queries)?;
             let [k, v, ks, vs] = cache.kv[i].pointers(0);
             let slots = Cache::slots(cache.capacity, i);
-            for r in 0..BLOCK {
-                check(
-                    unsafe {
-                        sys::blz_inkling_attention(
-                            self.input.at(r * Q),
-                            k,
-                            v,
-                            ks,
-                            vs,
-                            std::ptr::null(),
-                            self.no_sink.ptr(),
-                            self.open_gate.ptr(),
-                            self.output.at(r * Q),
-                            self.partial.ptr(),
-                            HEADS as i32,
-                            KV_HEADS as i32,
-                            slots as i32,
-                            slots as i32,
-                            (pos + BLOCK - 1) as i32,
-                            0,
-                            (pos + BLOCK).min(slots).div_ceil(64).clamp(1, 256) as i32,
-                            SCALE,
-                            gpu.stream.0,
-                        )
-                    },
-                    "DSpark block attention",
-                )?;
-            }
+            let stride = Q + 2 * K;
+            self.input.upload(&input)?;
+            l.qkv.run(gpu, self.input.ptr(), self.output.ptr(), BLOCK)?;
+            self.normalize_heads(gpu, 0, stride, BLOCK, HEADS, &l.q_norm, pos, None)?;
+            self.normalize_heads(gpu, Q, stride, BLOCK, KV_HEADS, &l.k_norm, pos, Some(slots))?;
+            self.store(gpu, cache, i, BLOCK, Q, stride)?;
+            check(
+                unsafe {
+                    sys::blz_dspark_attention(
+                        self.output.ptr(),
+                        stride as i32,
+                        BLOCK as i32,
+                        k,
+                        v,
+                        ks,
+                        vs,
+                        self.no_sink.ptr(),
+                        self.open_gate.ptr(),
+                        self.attention.ptr(),
+                        self.partial.ptr(),
+                        HEADS as i32,
+                        KV_HEADS as i32,
+                        slots as i32,
+                        (pos + BLOCK - 1) as i32,
+                        (pos + BLOCK).min(slots).div_ceil(64).clamp(1, 256) as i32,
+                        SCALE,
+                        gpu.stream.0,
+                    )
+                },
+                "DSpark block attention",
+            )?;
+            l.out
+                .run(gpu, self.attention.ptr(), self.input.ptr(), BLOCK)?;
             gpu.stream.sync()?;
-            let attn: Vec<_> = self
-                .output
-                .download::<u16>(BLOCK * Q)?
+            let out = self
+                .input
+                .download::<u16>(BLOCK * H)?
                 .into_iter()
-                .map(from_bf16)
-                .collect();
-            let out = self.project(gpu, &l.out, &attn, BLOCK)?;
+                .map(from_bf16);
             x.iter_mut().zip(out).for_each(|(dst, v)| *dst += v);
             let input: Vec<_> = x
                 .chunks_exact(H)
                 .flat_map(|r| normalized(r, Some(&l.post_norm), EPS))
                 .collect();
-            let gate = self.project(gpu, &l.gate_up, &input, BLOCK)?;
-            let mut glu = Vec::with_capacity(BLOCK * FF);
-            for row in gate.chunks_exact(2 * FF) {
-                glu.extend(
-                    row[..FF]
-                        .iter()
-                        .zip(&row[FF..])
-                        .map(|(&g, &u)| g * u / (1.0 + (-g).exp())),
-                );
-            }
-            let out = self.project(gpu, &l.down, &glu, BLOCK)?;
+            self.input
+                .upload(&input.into_iter().map(to_bf16).collect::<Vec<_>>())?;
+            l.gate_up
+                .run(gpu, self.input.ptr(), self.output.ptr(), BLOCK)?;
+            check(
+                unsafe {
+                    sys::blz_silu_mul(
+                        self.output.ptr(),
+                        (2 * FF) as i64,
+                        self.output.at(FF),
+                        (2 * FF) as i64,
+                        BLOCK as i32,
+                        FF as i32,
+                        self.input.ptr(),
+                        gpu.stream.0,
+                    )
+                },
+                "DSpark SwiGLU",
+            )?;
+            l.down
+                .run(gpu, self.input.ptr(), self.output.ptr(), BLOCK)?;
+            gpu.stream.sync()?;
+            let out = self
+                .output
+                .download::<u16>(BLOCK * H)?
+                .into_iter()
+                .map(from_bf16);
             x.iter_mut().zip(out).for_each(|(dst, v)| *dst += v);
         }
         let table = ckpt.bytes("markov_head.markov_w1.weight")?;
+        let candidate_count = if self.head_vocab == 0 {
+            vocab
+        } else {
+            vocab.min(self.head_vocab)
+        };
         let mut previous = anchor;
         let mut state = [0.0; R];
         let mut draft = Vec::with_capacity(limit);
@@ -444,7 +497,7 @@ impl Draft {
                 .zip(&self.correction_bias)
                 .map(|((a, b), c)| a + b + c)
                 .collect();
-            previous = gpu.argmax(head, &merged, vocab)?;
+            previous = gpu.argmax(head, &merged, candidate_count)?;
             draft.push(previous);
         }
         Ok(draft)

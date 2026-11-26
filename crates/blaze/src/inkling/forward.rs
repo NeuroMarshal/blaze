@@ -516,6 +516,7 @@ impl Sequence {
 
 pub struct Options {
     pub dspark_tokens: usize,
+    pub dspark_head_vocab: usize,
     pub device: i32,
     pub gpus: usize,
     pub context: usize,
@@ -563,6 +564,7 @@ impl Model {
     pub fn load(path: &Path, opts: Options) -> Result<Self> {
         let Options {
             dspark_tokens,
+            dspark_head_vocab,
             device,
             gpus,
             context,
@@ -617,7 +619,7 @@ impl Model {
         let head = Dense::load(&ckpt, "model.llm.unembed.weight", s.vocab, s.hidden)?;
         let draft = (dspark_tokens > 0).then(|| {
             ensure!(s.hidden == 2304 && loops.visits.len() == 48 && context < i32::MAX as usize - 8, "unsupported DSpark target");
-            Draft::load(&ckpt, &root["mtp_config"], dspark_tokens, s.vocab)
+            Draft::load(&ckpt, &root["mtp_config"], dspark_tokens, s.vocab, dspark_head_vocab)
         }).transpose()?;
         let vision = if max_image_tokens == 0 {
             None
@@ -817,20 +819,27 @@ impl Model {
                          mut sample: impl FnMut(&[f32]) -> u32) -> Result<(usize,u32)> {
         if self.serial_verify || matches!(readout, Readout::Scores) {
             let mut token = anchor;
+            let start = seq.position;
+            let mut features = Vec::with_capacity(draft.len() + 1);
             for i in 0..=draft.len() {
-                let next = match self.forward(seq, token, readout)? {
+                let row = ForwardRow::new(self.embedding(token)?);
+                let next = match self.forward_rows(seq, vec![row], readout, Some(&mut features))? {
                     Some(Prediction::Token(id)) => id,
                     Some(Prediction::Scores(scores)) => sample(&scores),
                     _ => anyhow::bail!("missing DSpark target prediction"),
                 };
-                if draft.get(i) != Some(&next) { return Ok((i, next)); }
+                if draft.get(i) != Some(&next) {
+                    let compute = &self.devices[*self.placement.last().unwrap()].compute;
+                    self.draft.as_ref().unwrap().append(compute, seq.draft.as_mut().unwrap(), start, &features)?;
+                    return Ok((i, next));
+                }
                 token = next;
             }
             unreachable!("the bonus prediction has no matching draft");
         }
         let rows = std::iter::once(anchor).chain(draft.iter().copied())
             .map(|t| self.embedding(t).map(ForwardRow::new)).collect::<Result<_>>()?;
-        let Some(Prediction::Verified(kept, next)) = self.forward_rows(seq, rows, Readout::Verify(draft))? else {
+        let Some(Prediction::Verified(kept, next)) = self.forward_rows(seq, rows, Readout::Verify(draft), None)? else {
             anyhow::bail!("missing DSpark target verdict");
         };
         Ok((kept,next))
@@ -845,7 +854,7 @@ impl Model {
 
     pub(super) fn forward(&mut self, seq: &mut Sequence, token: u32, readout: Readout) -> Result<Option<Prediction>> {
         let x = self.embedding(token)?;
-        self.forward_rows(seq, vec![ForwardRow::new(x)], readout)
+        self.forward_rows(seq, vec![ForwardRow::new(x)], readout, None)
     }
 
     pub(super) fn prefill(&mut self, seq: &mut Sequence, input: &[Input], readout: Readout) -> Result<Option<Prediction>> {
@@ -862,10 +871,11 @@ impl Model {
                 Ok(ForwardRow::new(x))
             })
             .collect::<Result<_>>()?;
-        self.forward_rows(seq, rows, readout)
+        self.forward_rows(seq, rows, readout, None)
     }
 
-    fn forward_rows(&mut self, seq: &mut Sequence, mut rows: Vec<ForwardRow>, readout: Readout) -> Result<Option<Prediction>> {
+    fn forward_rows(&mut self, seq: &mut Sequence, mut rows: Vec<ForwardRow>, readout: Readout,
+                    deferred_features: Option<&mut Vec<Features>>) -> Result<Option<Prediction>> {
         ensure!(
             !rows.is_empty() && rows.len() <= seq.capacity.saturating_sub(seq.position),
             "Inkling chunk exceeds the sequence context limit of {}",
@@ -1126,7 +1136,11 @@ impl Model {
             }
         };
         if let (Some(draft), Some(cache), Some(f)) = (&self.draft, &mut seq.draft, features) {
-            draft.append(compute, cache, seq.position, &f[..consumed])?;
+            if let Some(pending) = deferred_features {
+                pending.extend(f.into_iter().take(consumed));
+            } else {
+                draft.append(compute, cache, seq.position, &f[..consumed])?;
+            }
         }
         seq.position += consumed;
         Ok(result)

@@ -622,6 +622,13 @@ unsafe extern "C" {
                                  gate: *const u16, out: *mut u16, scratch: *mut f32, heads: c_int,
                                  kv_heads: c_int, capacity: c_int, window: c_int, position: c_int, extent: c_int,
                                  tiles: c_int, global_scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_dspark_attention(q: *const u16, stride: c_int, rows: c_int, keys: *const u8, values: *const u8,
+                                ks: *const u8, vs: *const u8, sinks: *const u16, gate: *const u16,
+                                out: *mut u16, scratch: *mut f32, heads: c_int, kv_heads: c_int, capacity: c_int,
+                                position: c_int, tiles: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_dspark_norm_rope(x: *mut u16, stride: c_int, rows: c_int, heads: c_int, norm: *const u16,
+                                freq: *const f32, start: c_int, slots: *mut c_int, capacity: c_int,
+                                stream: cudaStream_t) -> cudaError_t;
 }
 
 unsafe extern "C" {

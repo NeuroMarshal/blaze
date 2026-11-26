@@ -114,6 +114,8 @@ pub fn generate(
     let mut stop = false;
     let mut drafted = 0;
     let mut accepted = 0;
+    let mut draft_time = std::time::Duration::ZERO;
+    let mut verify_time = std::time::Duration::ZERO;
     'decode: while ids.len() < max_tokens {
         let id = match prediction.as_ref().context("Inkling generated no prediction")? {
             Prediction::Token(id) => *id,
@@ -132,8 +134,12 @@ pub fn generate(
         if remaining == 0 { break; }
         let limit = model.draft_limit().min(remaining);
         if limit > 0 {
+            let t = Instant::now();
             let draft = model.draft_tokens(&seq, id, limit)?;
+            draft_time += t.elapsed();
+            let t = Instant::now();
             let (kept, next) = model.verify(&mut seq, id, &draft, readout, |logits| draw(logits, sampling, &mut rng))?;
+            verify_time += t.elapsed();
             accepted += kept;
             drafted += draft.len();
             for &token in &draft[..kept] {
@@ -146,7 +152,10 @@ pub fn generate(
             prediction = model.forward(&mut seq, id, readout)?;
         }
     }
-    if drafted > 0 { crate::eprintln!("DSpark accepted {accepted} / {drafted} draft tokens"); }
+    if drafted > 0 {
+        crate::eprintln!("DSpark proposed in {:.3}s, verified in {:.3}s; DSpark accepted {accepted} / {drafted} draft tokens",
+            draft_time.as_secs_f64(), verify_time.as_secs_f64());
+    }
     Ok(Generation {
         ids,
         stop,

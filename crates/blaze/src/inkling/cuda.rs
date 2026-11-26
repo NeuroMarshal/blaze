@@ -60,16 +60,20 @@ impl Dense {
     }
 
     pub(super) fn run(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize) -> Result<()> {
-        let (n, k) = (self.rows as i32, self.cols as i32);
+        self.run_prefix(gpu, x, out, m, self.rows)
+    }
+
+    fn run_prefix(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize, rows: usize) -> Result<()> {
+        let (n, k) = (rows as i32, self.cols as i32);
         let weight = self.weight.ptr::<u16>();
         if m == 1 && (x as usize).is_multiple_of(16) {
-            if self.rows > 4096 && crate::tune::wide_fits(m, self.cols, self.cols) {
+            if rows > 4096 && crate::tune::wide_fits(m, self.cols, self.cols) {
                 return check(
                     unsafe { sys::blz_gemv_wide(x.cast(), k.into(), weight.cast(), out.cast(), n.into(), 1, n, k, gpu.stream.0) },
                     "Inkling wide GEMV",
                 );
             }
-            if self.rows <= 4096 && crate::tune::skinny_fits(m, self.cols, self.cols) {
+            if rows <= 4096 && crate::tune::skinny_fits(m, self.cols, self.cols) {
                 return check(
                     unsafe {
                         sys::blz_skinny_gemm_ex(
@@ -97,9 +101,9 @@ impl Dense {
                     self.cols as i64,
                     weight,
                     out,
-                    self.rows as i64,
+                    n as i64,
                     m as i32,
-                    self.rows as i32,
+                    n,
                     self.cols as i32,
                     gpu.stream.0,
                 )
@@ -732,17 +736,18 @@ impl Compute {
     }
 
     pub fn argmax(&mut self, matrix: &Dense, x: &[f32], vocab: usize) -> Result<u32> {
+        ensure!(vocab > 0 && vocab <= matrix.rows, "invalid Inkling readout vocabulary");
         let x: Vec<_> = x.iter().copied().map(to_bf16).collect();
         let work = (|| -> Result<()> {
             self.stage_input(&x)?;
-            matrix.run(self, self.input.ptr(), self.result.ptr(), 1)?;
+            matrix.run_prefix(self, self.input.ptr(), self.result.ptr(), 1, vocab)?;
             check(
                 unsafe {
                     sys::blz_argmax_bf16(
                         self.result.ptr(),
                         1,
                         vocab as i32,
-                        matrix.rows as i64,
+                        vocab as i64,
                         self.next_id.ptr(),
                         self.stream.0,
                     )
@@ -1305,7 +1310,7 @@ mod tests {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
         crate::gpu::set_device(0).unwrap();
         let width = 2304;
-        let mut gpu = Compute::new(2 * width, 4 * width, width, 64, 0, [0; 2], [0; 2], 8, 1, None).unwrap();
+        let mut gpu = Compute::new(2 * width, 4 * width, width, 64, 0, [0; 2], [0; 2], 8, 8, None).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let values = |len, scale: f32| (0..len).map(|i: usize| {
             (((i * 47 % 179) as f32 - 89.0) / (9 + i % 31) as f32) * scale
@@ -1318,6 +1323,8 @@ mod tests {
         let router = dense(128, width, 0.07);
         let weights = values(width, 0.43);
         let norm = DevBuf::from_slice(&weights).unwrap();
+        let (mut inputs, mut xs, mut messages, mut activations, mut routes) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for factor in [0.007, 0.75, 9.0] {
             let x = values(width, factor);
             let mut msg = values(width, -0.4);
@@ -1334,7 +1341,14 @@ mod tests {
             let (actual, logits) = gpu.gated_router(&down, &up, &norm, &router, &input, &x, &msg, eps).unwrap();
             assert_eq!(actual, expected);
             assert_eq!(logits, scores);
+            inputs.extend(input);
+            xs.extend(x);
+            messages.extend(msg);
+            activations.extend(expected);
+            routes.extend(scores);
         }
+        let batch = gpu.gated_router(&down, &up, &norm, &router, &inputs, &xs, &messages, 1e-6).unwrap();
+        assert_eq!(batch, (activations, routes));
     }
 
     #[test]
