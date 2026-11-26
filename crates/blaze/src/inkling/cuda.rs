@@ -338,6 +338,7 @@ enum ProjectionKey {
     Dense([usize; 3], [usize; 3]),
     Controller([usize; 3], [usize; 3]),
     Router(usize),
+    Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
 
@@ -752,73 +753,88 @@ impl Compute {
                     }
                 }
             }
-            self.copy_staged_input(end)?;
-            if grouped {
-                let run: GroupedExpertGemv = match weights.gate_up.packing {
-                    Packing::Nvfp4 => sys::blz_inkling_grouped_nvfp4,
-                    Packing::Mxfp8 => sys::blz_inkling_grouped_mxfp8,
-                };
-                let group_count = resident.len() as i32;
-                let launch = |matrix: &PackedMatrix, meta, x, x_step, y| {
-                    check(
-                        unsafe {
-                            run(
-                                x, x_step, pool.buffer.ptr(), self.input.at::<u8>(meta).cast(), y,
-                                group_count, matrix.rows as i32, matrix.cols as i32, self.stream.0,
-                            )
-                        },
-                        "Inkling grouped expert GEMV",
-                    )
-                };
-                launch(&weights.gate_up, gate_meta, self.input.ptr(), 0, self.gate.ptr())?;
-                check(
-                    unsafe {
-                        sys::blz_inkling_swiglu(
-                            self.gate.ptr(),
-                            self.glu.ptr(),
-                            group_count * weights.down.cols as i32,
-                            gate_cap,
-                            up_cap,
-                            self.stream.0,
+            let enqueue = |gpu: &Self| -> Result<()> {
+                let pool = gpu.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
+                gpu.copy_staged_input(end)?;
+                if grouped {
+                    let run: GroupedExpertGemv = match weights.gate_up.packing {
+                        Packing::Nvfp4 => sys::blz_inkling_grouped_nvfp4,
+                        Packing::Mxfp8 => sys::blz_inkling_grouped_mxfp8,
+                    };
+                    let group_count = resident.len() as i32;
+                    let launch = |matrix: &PackedMatrix, meta, x, x_step, y| {
+                        check(
+                            unsafe {
+                                run(
+                                    x, x_step, pool.buffer.ptr(), gpu.input.at::<u8>(meta).cast(), y,
+                                    group_count, matrix.rows as i32, matrix.cols as i32, gpu.stream.0,
+                                )
+                            },
+                            "Inkling grouped expert GEMV",
                         )
-                    },
-                    "Inkling expert activation",
-                )?;
-                launch(&weights.down, down_meta, self.glu.ptr(), weights.down.cols as i64, self.result.ptr())?;
-            } else {
-                for (row, &(id, _)) in resident.iter().enumerate() {
-                    let expert = &pool.entries[&(layer, id)];
-                    expert.gate_up.run(&pool.buffer, self.input.ptr(), self.gate.ptr(), 1, &self.stream)?;
+                    };
+                    launch(&weights.gate_up, gate_meta, gpu.input.ptr(), 0, gpu.gate.ptr())?;
                     check(
                         unsafe {
                             sys::blz_inkling_swiglu(
-                                self.gate.ptr(),
-                                self.glu.ptr(),
-                                weights.down.cols as i32,
+                                gpu.gate.ptr(),
+                                gpu.glu.ptr(),
+                                group_count * weights.down.cols as i32,
                                 gate_cap,
                                 up_cap,
-                                self.stream.0,
+                                gpu.stream.0,
                             )
                         },
                         "Inkling expert activation",
                     )?;
-                    expert.down.run(&pool.buffer, self.glu.ptr(), self.result.at(row * x.len()), 1, &self.stream)?;
+                    launch(&weights.down, down_meta, gpu.glu.ptr(), weights.down.cols as i64, gpu.result.ptr())?;
+                } else {
+                    for (row, &(id, _)) in resident.iter().enumerate() {
+                        let expert = &pool.entries[&(layer, id)];
+                        expert.gate_up.run(&pool.buffer, gpu.input.ptr(), gpu.gate.ptr(), 1, &gpu.stream)?;
+                        check(
+                            unsafe {
+                                sys::blz_inkling_swiglu(
+                                    gpu.gate.ptr(),
+                                    gpu.glu.ptr(),
+                                    weights.down.cols as i32,
+                                    gate_cap,
+                                    up_cap,
+                                    gpu.stream.0,
+                                )
+                            },
+                            "Inkling expert activation",
+                        )?;
+                        expert.down.run(&pool.buffer, gpu.glu.ptr(), gpu.result.at(row * x.len()), 1, &gpu.stream)?;
+                    }
                 }
+                check(
+                    unsafe {
+                        sys::blz_inkling_reduce_experts(
+                            gpu.result.ptr(),
+                            gpu.input.at(offset / std::mem::size_of::<f32>()),
+                            gpu.sum.ptr(),
+                            x.len() as i32,
+                            resident.len() as i32,
+                            gpu.stream.0,
+                        )
+                    },
+                    "Inkling expert reduction",
+                )?;
+                gpu.queue_result::<f32>(gpu.sum.ptr(), x.len())
+            };
+            if grouped {
+                let key = ProjectionKey::Experts {
+                    pool: pool.buffer.ptr::<u8>() as usize,
+                    hidden: x.len(),
+                    intermediate: weights.down.cols,
+                    count: resident.len(),
+                    caps: [gate_cap.to_bits(), up_cap.to_bits()],
+                };
+                self.run_projection(key, enqueue)
+            } else {
+                enqueue(self)
             }
-            check(
-                unsafe {
-                    sys::blz_inkling_reduce_experts(
-                        self.result.ptr(),
-                        self.input.at(offset / std::mem::size_of::<f32>()),
-                        self.sum.ptr(),
-                        x.len() as i32,
-                        resident.len() as i32,
-                        self.stream.0,
-                    )
-                },
-                "Inkling expert reduction",
-            )?;
-            self.queue_result::<f32>(self.sum.ptr(), x.len())
         })();
         let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, (gate_cap, up_cap), &mut self.cpu_routes);
         let synced = self.stream.sync();
