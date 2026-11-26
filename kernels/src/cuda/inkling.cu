@@ -17,9 +17,14 @@ __global__ void softcapped_swiglu(const __nv_bfloat162* gate_up, __nv_bfloat16* 
     out[i] = __float2bfloat16(gate * up / (1.0f + expf(-x.x)));
 }
 
-__global__ void add_expert(const __nv_bfloat16* in, float* out, int n, float weight) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = fmaf(__bfloat162float(in[i]), weight, out[i]);
+__global__ void reduce_experts(const __nv_bfloat16* rows, const float* weights, float* out, int width, int experts) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= width) return;
+    float sum = 0.0f;
+    for (int expert = 0; expert < experts; ++expert) {
+        sum = fmaf(__bfloat162float(rows[size_t(expert) * width + col]), weights[expert], sum);
+    }
+    out[col] = sum;
 }
 
 } // namespace
@@ -31,9 +36,10 @@ extern "C" cudaError_t blz_inkling_swiglu(const uint16_t* gate_up, uint16_t* out
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_inkling_expert_accumulate(const uint16_t* in, float* out, int n,
-                                                     float weight, cudaStream_t stream) {
-    add_expert<<<(n + 127) / 128, 128, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(in), out, n, weight);
+extern "C" cudaError_t blz_inkling_reduce_experts(const uint16_t* rows, const float* weights, float* out,
+                                                int width, int experts, cudaStream_t stream) {
+    reduce_experts<<<(width + 127) / 128, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(rows), weights, out, width, experts);
     return cudaGetLastError();
 }
 

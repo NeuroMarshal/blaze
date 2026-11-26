@@ -354,7 +354,7 @@ impl Compute {
         let stream = Stream::new()?;
         let batch = prefill_chunk.min(EXPERT_BATCH);
         let input = DevBuf::new((max_in * 3).max(hidden * prefill_chunk * 3) * 2)?;
-        let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk) * 2)?;
+        let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk).max(hidden * top_k) * 2)?;
         let gate = DevBuf::new((intermediate * 2 * batch).max(max_in) * 2)?;
         let glu = DevBuf::new(intermediate * batch * 2)?;
         let sum = DevBuf::new(prefill_chunk * hidden * 4)?;
@@ -387,12 +387,16 @@ impl Compute {
         // SAFETY: all source u16 values are initialized and the staging buffer remains live until stream sync.
         let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) };
         self.transfer.host_slice_mut()[..bytes.len()].copy_from_slice(bytes);
+        self.copy_staged_input(bytes.len())
+    }
+
+    fn copy_staged_input(&self, bytes: usize) -> Result<()> {
         check(
             unsafe {
                 sys::cudaMemcpyAsync(
                     self.input.ptr(),
                     self.transfer.host_ptr(),
-                    bytes.len(),
+                    bytes,
                     sys::MEMCPY_H2D,
                     self.stream.0,
                 )
@@ -560,36 +564,65 @@ impl Compute {
                 cold.push((Routed::read(ckpt, weights, id)?, x, 0, weight));
             }
         }
-        self.input.upload(&x_bf16)?;
-        self.sum.zero(&self.stream)?;
-        for (id, weight) in resident {
-            let e = &pool.entries[&(layer, id)];
-            e.gate_up
-                .run(&pool.buffer, self.input.ptr(), self.gate.ptr(), 1, &self.stream)?;
+        if resident.is_empty() {
+            let mut total = vec![0.0; x.len()];
+            let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, (gate_cap, up_cap), &mut self.cpu_routes);
+            merge_cold(&mut total, x.len(), out_cpu);
+            return Ok(total);
+        }
+
+        let work = (|| -> Result<()> {
+            let activation_bytes = std::mem::size_of_val(x_bf16.as_slice());
+            let offset = activation_bytes.next_multiple_of(std::mem::align_of::<f32>());
+            let end = offset + resident.len() * std::mem::size_of::<f32>();
+            ensure!(end <= self.input.bytes() && end <= self.transfer.bytes(), "Inkling MoE input exceeds staging");
+            let staging = self.transfer.host_slice_mut();
+            // SAFETY: these initialized activation values are copied as native-endian bytes.
+            let activations = unsafe { std::slice::from_raw_parts(x_bf16.as_ptr().cast::<u8>(), activation_bytes) };
+            staging[..activation_bytes].copy_from_slice(activations);
+            for (dst, (_, weight)) in staging[offset..end].chunks_exact_mut(4).zip(&resident) {
+                dst.copy_from_slice(&weight.to_ne_bytes());
+            }
+            self.copy_staged_input(end)?;
+            let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
+            for (row, &(id, _)) in resident.iter().enumerate() {
+                let expert = &pool.entries[&(layer, id)];
+                expert.gate_up.run(&pool.buffer, self.input.ptr(), self.gate.ptr(), 1, &self.stream)?;
+                check(
+                    unsafe {
+                        sys::blz_inkling_swiglu(
+                            self.gate.ptr(),
+                            self.glu.ptr(),
+                            weights.down.cols as i32,
+                            gate_cap,
+                            up_cap,
+                            self.stream.0,
+                        )
+                    },
+                    "Inkling expert activation",
+                )?;
+                expert.down.run(&pool.buffer, self.glu.ptr(), self.result.at(row * x.len()), 1, &self.stream)?;
+            }
             check(
                 unsafe {
-                    sys::blz_inkling_swiglu(
-                        self.gate.ptr(),
-                        self.glu.ptr(),
-                        weights.down.cols as i32,
-                        gate_cap,
-                        up_cap,
+                    sys::blz_inkling_reduce_experts(
+                        self.result.ptr(),
+                        self.input.at(offset / std::mem::size_of::<f32>()),
+                        self.sum.ptr(),
+                        x.len() as i32,
+                        resident.len() as i32,
                         self.stream.0,
                     )
                 },
-                "Inkling expert activation",
-            )?;
-            e.down.run(&pool.buffer, self.glu.ptr(), self.result.ptr(), 1, &self.stream)?;
-            check(
-                unsafe {
-                    sys::blz_inkling_expert_accumulate(self.result.ptr(), self.sum.ptr(), x.len() as i32, weight, self.stream.0)
-                },
                 "Inkling expert reduction",
             )?;
-        }
+            self.queue_result::<f32>(self.sum.ptr(), x.len())
+        })();
         let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, (gate_cap, up_cap), &mut self.cpu_routes);
-        self.stream.sync()?;
-        let mut total = self.sum.download(x.len())?;
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        let mut total = self.read_result(x.len());
         merge_cold(&mut total, x.len(), out_cpu);
         Ok(total)
     }
@@ -964,6 +997,37 @@ impl AttentionScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn expert_reduction_preserves_accumulation_order() {
+        crate::gpu::set_device(0).unwrap();
+        let stream = Stream::new().unwrap();
+        let width = 131;
+        let weights = [0.73, -0.14, 0.067, 0.88, -0.861, 0.11, 0.37, 0.15];
+        let rows: Vec<_> = (0..width * weights.len())
+            .map(|i| to_bf16(((i * 19 % 251) as f32 - 117.0) * 0.013))
+            .collect();
+        let expected: Vec<_> = (0..width)
+            .map(|col| weights.iter().enumerate().fold(0.0, |sum, (i, &weight)| {
+                from_bf16(rows[i * width + col]).mul_add(weight, sum)
+            }))
+            .collect();
+        let input = DevBuf::from_slice(&rows).unwrap();
+        let weights_dev = DevBuf::from_slice(&weights).unwrap();
+        let output = DevBuf::new(width * 4).unwrap();
+        check(
+            unsafe {
+                sys::blz_inkling_reduce_experts(
+                    input.ptr(), weights_dev.ptr(), output.ptr(), width as i32, weights.len() as i32, stream.0,
+                )
+            },
+            "test Inkling expert reduction",
+        )
+        .unwrap();
+        stream.sync().unwrap();
+        assert_eq!(output.download::<f32>(width).unwrap(), expected);
+    }
 
     #[test]
     #[ignore = "requires a CUDA GPU"]

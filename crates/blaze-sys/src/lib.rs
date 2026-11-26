@@ -594,8 +594,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn blz_inkling_swiglu(gate_up: *const u16, out: *mut u16, n: c_int, gate_cap: f32, up_cap: f32,
                              stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_inkling_expert_accumulate(input: *const u16, out: *mut f32, n: c_int, weight: f32,
-                                        stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_reduce_experts(rows: *const u16, weights: *const f32, out: *mut f32,
+                                      width: c_int, experts: c_int, stream: cudaStream_t) -> cudaError_t;
 }
 
 unsafe extern "C" {
