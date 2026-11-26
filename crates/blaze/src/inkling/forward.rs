@@ -1,4 +1,5 @@
 use super::{KvDtype, cpu};
+use super::dspark::{Cache as DraftCache, Draft, Features};
 use super::cuda::{AttentionScratch, Compute, Dense, Kv, expert_size, from_bf16, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
@@ -177,7 +178,7 @@ impl Conv {
         let k = self.taps.len();
         let mut out = x.to_vec();
         for lag in 0..k.min(pos + 1) {
-            let src = if lag == 0 { x } else { &state.rows[(pos - lag) % (k - 1)] };
+            let src = if lag == 0 { x } else { &state.rows[(pos - lag) % state.rows.len()] };
             let taps = &self.taps[lag];
             if let Some(d) = dyn_weights {
                 for (head, ((out, src), taps)) in out
@@ -198,7 +199,8 @@ impl Conv {
             }
         }
         if k > 1 {
-            state.rows[pos % (k - 1)].copy_from_slice(x);
+            let slot = pos % state.rows.len();
+            state.rows[slot].copy_from_slice(x);
         }
         out.iter_mut().for_each(|v| *v = round(*v * self.scale));
         out
@@ -210,9 +212,9 @@ struct ConvState {
 }
 
 impl ConvState {
-    fn new(taps: usize, width: usize) -> Self {
+    fn new(taps: usize, width: usize, slack: usize) -> Self {
         Self {
-            rows: vec![vec![0.0; width]; taps - 1],
+            rows: vec![vec![0.0; width]; if taps > 1 { taps - 1 + slack } else { 0 }],
         }
     }
 }
@@ -486,18 +488,21 @@ struct VisitState {
 }
 
 #[derive(Clone, Copy)]
-pub(super) enum Readout {
+pub(super) enum Readout<'a> {
     None,
     Greedy,
+    Verify(&'a [u32]),
     Scores,
 }
 
 pub(super) enum Prediction {
     Token(u32),
+    Verified(usize, u32),
     Scores(Vec<f32>),
 }
 
 pub struct Sequence {
+    draft: Option<DraftCache>,
     position: usize,
     capacity: usize,
     visits: Vec<VisitState>,
@@ -510,6 +515,7 @@ impl Sequence {
 }
 
 pub struct Options {
+    pub dspark_tokens: usize,
     pub device: i32,
     pub gpus: usize,
     pub context: usize,
@@ -534,6 +540,8 @@ impl Drop for Device {
 }
 
 pub struct Model {
+    draft: Option<Draft>,
+    serial_verify: bool,
     ckpt: Checkpoint,
     cfg: Shape,
     loops: InklingLoop,
@@ -554,6 +562,7 @@ pub struct Model {
 impl Model {
     pub fn load(path: &Path, opts: Options) -> Result<Self> {
         let Options {
+            dspark_tokens,
             device,
             gpus,
             context,
@@ -573,6 +582,8 @@ impl Model {
             "Inkling prefill chunk must be in 1..=1024"
         );
         let root = ModelConfig::read_json(path)?;
+        ensure!(dspark_tokens <= 7 && (dspark_tokens == 0 || dspark_tokens < prefill_chunk),
+            "DSpark supports up to seven drafts and needs a prefill chunk larger than the draft count");
         let cfg = ModelConfig::from_json(&root)?;
         let loops = cfg.inkling_loop.as_ref().context("expected an Inkling 2 loop checkpoint")?;
         ensure!(
@@ -604,6 +615,10 @@ impl Model {
         let last_device = *placement.last().unwrap();
         gpu::set_device(device + last_device as i32)?;
         let head = Dense::load(&ckpt, "model.llm.unembed.weight", s.vocab, s.hidden)?;
+        let draft = (dspark_tokens > 0).then(|| {
+            ensure!(s.hidden == 2304 && loops.visits.len() == 48 && context < i32::MAX as usize - 8, "unsupported DSpark target");
+            Draft::load(&ckpt, &root["mtp_config"], dspark_tokens, s.vocab)
+        }).transpose()?;
         let vision = if max_image_tokens == 0 {
             None
         } else {
@@ -645,7 +660,7 @@ impl Model {
                 let layer = &layers[visit.layer];
                 let packing = layer.experts.gate_up.packing as usize;
                 let slots = if layer.local {
-                    loops.window.min(context)
+                    (loops.window + dspark_tokens).min(context)
                 } else if host_kv {
                     context.min(SHORT_KV_TOKENS)
                 } else {
@@ -661,7 +676,8 @@ impl Model {
                 0
             };
             let (free, _) = gpu::mem_info()?;
-            let reserve = (512 << 20) + vision_reserve;
+            let draft_reserve = if draft.is_some() && rank == last_device { DraftCache::bytes(context, kv_dtype) } else { 0 };
+            let reserve = (512 << 20) + vision_reserve + draft_reserve;
             let max_experts = free.saturating_sub(kv_bytes).saturating_sub(reserve).min(all_experts);
             let expert_bytes = if expert_cache_mib == 0 {
                 max_experts
@@ -694,6 +710,8 @@ impl Model {
         let norm_final = read_float(&ckpt, "model.llm.norm.weight", &[s.hidden])?;
         let query_final = read_float(&ckpt, "model.llm.attn_res.output_query", &[s.hidden])?;
         Ok(Self {
+            draft,
+            serial_verify: expert_threads.is_some(),
             ckpt,
             cfg: s,
             loops: loops.clone(),
@@ -731,6 +749,7 @@ impl Model {
             self.context
         );
         let s = &self.cfg;
+        let slack = self.draft.as_ref().map_or(0, |draft| draft.limit);
         let visits = self
             .loops
             .visits
@@ -740,19 +759,21 @@ impl Model {
                 let local = self.loops.is_local(visit.layer);
                 Ok(VisitState {
                     kv: Kv::new(
+                        if local { capacity.min(self.loops.window + slack) } else { capacity },
                         if local { capacity.min(self.loops.window) } else { capacity },
                         s.kv_heads,
                         !local && self.global_kv_host && capacity > SHORT_KV_TOKENS,
                         self.kv_dtype,
                     )?,
-                    key: ConvState::new(s.conv, s.kv_width()),
-                    value: ConvState::new(s.conv, s.kv_width()),
-                    attention: ConvState::new(s.conv, s.hidden),
-                    mlp: ConvState::new(s.conv, s.hidden),
+                    key: ConvState::new(s.conv, s.kv_width(), slack),
+                    value: ConvState::new(s.conv, s.kv_width(), slack),
+                    attention: ConvState::new(s.conv, s.hidden, slack),
+                    mlp: ConvState::new(s.conv, s.hidden, slack),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Sequence {
+            draft: self.draft.as_ref().map(|_| DraftCache::new(capacity, self.kv_dtype)).transpose()?,
             position: 0,
             capacity,
             visits,
@@ -778,6 +799,41 @@ impl Model {
             .map(|p| from_bf16(u16::from_le_bytes([p[0], p[1]])))
             .collect();
         Ok(normalized(&x, Some(&self.norm_embed), s.eps).into_iter().map(round).collect())
+    }
+
+    pub(super) fn draft_limit(&self) -> usize {
+        self.draft.as_ref().map_or(0, |draft| draft.limit)
+    }
+
+    pub(super) fn draft_tokens(&mut self, seq: &Sequence, anchor: u32, limit: usize) -> Result<Vec<u32>> {
+        let x = self.embedding(anchor)?;
+        let device = &mut self.devices[*self.placement.last().unwrap()];
+        gpu::set_device(device.id)?;
+        self.draft.as_ref().unwrap().propose(&mut device.compute, seq.draft.as_ref().unwrap(), &self.ckpt,
+            &self.head, anchor, x, seq.position, self.cfg.unpadded_vocab, limit)
+    }
+
+    pub(super) fn verify(&mut self, seq: &mut Sequence, anchor: u32, draft: &[u32], readout: Readout,
+                         mut sample: impl FnMut(&[f32]) -> u32) -> Result<(usize,u32)> {
+        if self.serial_verify || matches!(readout, Readout::Scores) {
+            let mut token = anchor;
+            for i in 0..=draft.len() {
+                let next = match self.forward(seq, token, readout)? {
+                    Some(Prediction::Token(id)) => id,
+                    Some(Prediction::Scores(scores)) => sample(&scores),
+                    _ => anyhow::bail!("missing DSpark target prediction"),
+                };
+                if draft.get(i) != Some(&next) { return Ok((i, next)); }
+                token = next;
+            }
+            unreachable!("the bonus prediction has no matching draft");
+        }
+        let rows = std::iter::once(anchor).chain(draft.iter().copied())
+            .map(|t| self.embedding(t).map(ForwardRow::new)).collect::<Result<_>>()?;
+        let Some(Prediction::Verified(kept, next)) = self.forward_rows(seq, rows, Readout::Verify(draft))? else {
+            anyhow::bail!("missing DSpark target verdict");
+        };
+        Ok((kept,next))
     }
 
     pub fn encode_image(&self, bytes: &[u8]) -> Result<Vec<Vec<u16>>> {
@@ -817,9 +873,13 @@ impl Model {
         );
         let s = &self.cfg;
         let mut active = None;
+        let mut features = seq.draft.as_ref().map(|_| vec![Features::default(); rows.len()]);
         // Visit each physical weight bank once per chunk. Per-visit attention and convolution still consume
         // tokens in order, so batching the traversal has the same state transitions as token-wise decoding.
-        for (visit, state) in self.loops.visits.iter().zip(&mut seq.visits) {
+        for (index, (visit, state)) in self.loops.visits.iter().zip(&mut seq.visits).enumerate() {
+            if let Some(f) = &mut features && let Some(tap) = [5, 23, 41].iter().position(|&v| v == index) {
+                for (dst,row) in f.iter_mut().zip(&rows) { dst[tap].clone_from(&row.x); }
+            }
             let id = visit.layer;
             let rank = self.placement[id];
             let device = &mut self.devices[rank];
@@ -891,13 +951,13 @@ impl Model {
                 .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
             let (qkv, conv) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
-                let [q, key, value, k_taps, v_taps] = compute.project_group(
+                let [q, key, value, k_taps, v_taps] = compute.project_rows(
                     [&layer.query, &layer.key, &layer.value, k, v],
-                    [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs],
+                    [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)),
                 )?;
                 ([q, key, value], Some([k_taps, v_taps]))
             } else {
-                (compute.project_group([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs])?, None)
+                (compute.project_rows([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)))?, None)
             };
             let [q_batch, k_batch, v_batch] = qkv;
             let single_row = rows.len() == 1;
@@ -993,7 +1053,13 @@ impl Model {
                     layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
                 }).collect(),
             };
-            let mut moe = compute.moe_batch(
+            let mut moe = if matches!(readout, Readout::Verify(_)) {
+                let mut output = Vec::with_capacity(rows.len()*s.hidden);
+                for (x, route) in activations.iter().zip(&routes) {
+                    output.extend(compute.moe(&self.ckpt,&layer.experts,id,x,route,s.gate_cap,s.up_cap)?);
+                }
+                output
+            } else { compute.moe_batch(
                 &self.ckpt,
                 &layer.experts,
                 id,
@@ -1001,7 +1067,7 @@ impl Model {
                 &routes,
                 (s.gate_cap, s.up_cap),
                 s.experts,
-            )?;
+            )? };
             for (offset, ((row, residual), moe)) in rows.iter_mut().zip(residuals).zip(moe.chunks_exact_mut(s.hidden)).enumerate()
             {
                 moe.iter_mut().for_each(|v| *v = round(*v));
@@ -1011,24 +1077,45 @@ impl Model {
                 row.x = residual.into_iter().zip(mlp).map(|(a, b)| round(a + b)).collect();
             }
         }
-        let result = if matches!(readout, Readout::None) {
+        let normalize = |row: &ForwardRow| {
+            let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);
+            normalized(&x, Some(&self.norm_final), s.eps)
+        };
+        if let Some(f) = &mut features {
+            for (dst,row) in f.iter_mut().zip(&rows) { dst[3] = normalize(row); }
+        }
+        let compute = &mut self.devices[*self.placement.last().unwrap()].compute;
+        let mut consumed = rows.len();
+        let result = if let Readout::Verify(draft) = readout {
+            let mut verdict = None;
+            for (i, f) in features.as_ref().unwrap().iter().enumerate() {
+                let next = compute.argmax(&self.head,&f[3],s.unpadded_vocab)?;
+                if draft.get(i) != Some(&next) {
+                    consumed = i + 1;
+                    verdict = Some(Prediction::Verified(i, next));
+                    break;
+                }
+            }
+            verdict
+        } else if matches!(readout, Readout::None) {
             None
         } else {
             let row = rows.last().unwrap();
-            let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);
-            let x = normalized(&x, Some(&self.norm_final), s.eps);
-            let gpu = &mut self.devices[*self.placement.last().unwrap()].compute;
+            let x = features.as_ref().map_or_else(|| normalize(row), |f| f.last().unwrap()[3].clone());
             // The model's tanh softcap is monotonic, so greedy decoding can select on the BF16 head output.
             if matches!(readout, Readout::Greedy) {
-                Some(Prediction::Token(gpu.argmax(&self.head, &x, s.unpadded_vocab)?))
+                Some(Prediction::Token(compute.argmax(&self.head, &x, s.unpadded_vocab)?))
             } else {
-                let mut logits = gpu.linear(&self.head, &x)?;
+                let mut logits = compute.linear(&self.head, &x)?;
                 logits.truncate(s.unpadded_vocab);
                 cpu::softcap(&mut logits, s.logit_cap);
                 Some(Prediction::Scores(logits))
             }
         };
-        seq.position += rows.len();
+        if let (Some(draft), Some(cache), Some(f)) = (&self.draft, &mut seq.draft, features) {
+            draft.append(compute, cache, seq.position, &f[..consumed])?;
+        }
+        seq.position += consumed;
         Ok(result)
     }
 }
@@ -1059,7 +1146,7 @@ fn inv_rms(x: &[f32], eps: f32) -> f32 {
     (dot(x, x) / x.len() as f32 + eps).sqrt().recip()
 }
 
-fn normalized(x: &[f32], scale: Option<&[f32]>, eps: f32) -> Vec<f32> {
+pub(super) fn normalized(x: &[f32], scale: Option<&[f32]>, eps: f32) -> Vec<f32> {
     let rms = inv_rms(x, eps);
     match scale {
         Some(s) => x.iter().zip(s).map(|(&x, &s)| x * rms * s).collect(),

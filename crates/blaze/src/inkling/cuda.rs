@@ -13,7 +13,7 @@ use std::sync::Arc;
 pub(super) struct Dense {
     weight: DevBuf,
     pub rows: usize,
-    cols: usize,
+    pub(super) cols: usize,
 }
 
 impl Dense {
@@ -507,6 +507,10 @@ impl Compute {
     }
 
     pub fn project_group<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N]) -> Result<[Vec<u16>; N]> {
+        self.project_rows(matrices, inputs, false)
+    }
+
+    pub fn project_rows<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N], verifying: bool) -> Result<[Vec<u16>; N]> {
         let m = inputs[0].len();
         let cols = matrices[0].cols;
         let rows = matrices.map(|w| w.rows * m);
@@ -544,7 +548,7 @@ impl Compute {
             let mut out = 0;
             for i in 0..N {
                 // Dynamic convolution taps use the decode GEMV for every prompt row.
-                if i >= 3 && m > 1 {
+                if (verifying || i >= 3) && m > 1 {
                     for row in 0..m {
                         matrices[i].run(gpu, gpu.input.at(offsets[i] + row * cols), gpu.result.at(out + row * matrices[i].rows), 1)?;
                     }
@@ -748,7 +752,7 @@ impl Compute {
         self.cpu_routes
     }
 
-    fn moe(
+    pub(super) fn moe(
         &mut self,
         ckpt: &Checkpoint,
         weights: &Experts,
@@ -1075,6 +1079,7 @@ const KV_SCALE_BYTES: usize = HEAD_DIM / 16;
 pub(super) struct Kv {
     storage: DevBuf,
     capacity: usize,
+    window: usize,
     heads: usize,
     dtype: KvDtype,
 }
@@ -1087,7 +1092,7 @@ impl Kv {
         }
     }
 
-    pub fn new(capacity: usize, heads: usize, host: bool, dtype: KvDtype) -> Result<Self> {
+    pub fn new(capacity: usize, window: usize, heads: usize, host: bool, dtype: KvDtype) -> Result<Self> {
         let bytes = capacity
             .checked_mul(Self::row_bytes(heads, dtype) * 2)
             .ok_or_else(|| anyhow::anyhow!("Inkling KV size overflows"))?;
@@ -1095,12 +1100,13 @@ impl Kv {
         Ok(Self {
             storage: alloc(bytes)?,
             capacity,
+            window,
             heads,
             dtype,
         })
     }
 
-    fn pointers(&self, slot: usize) -> [*mut u8; 4] {
+    pub(super) fn pointers(&self, slot: usize) -> [*mut u8; 4] {
         if self.dtype == KvDtype::Bf16 {
             let row_bytes = Self::row_bytes(self.heads, self.dtype);
             return [
@@ -1241,7 +1247,7 @@ impl AttentionScratch {
             )?;
             kv.store(position, key, value, &self.zero, &self.kv_scale, &gpu.stream)?;
             bias.run(gpu, relative, self.relative.ptr(), self.heads)?;
-            let tiles = kv.capacity.min(position + 1).div_ceil(64).clamp(1, MAX_TILES);
+            let tiles = kv.window.min(position + 1).div_ceil(64).clamp(1, MAX_TILES);
             let [keys, values, key_scales, value_scales] = kv.pointers(0);
             check(
                 unsafe {
@@ -1259,6 +1265,7 @@ impl AttentionScratch {
                         self.heads as i32,
                         self.kv_heads as i32,
                         kv.capacity as i32,
+                        kv.window as i32,
                         position as i32,
                         bias.rows as i32,
                         tiles as i32,
@@ -1476,7 +1483,8 @@ mod tests {
             .into_iter()
             .flat_map(|dtype| [(dtype, false), (dtype, true)])
         {
-            let kv = Kv::new(2, 1, host, dtype).unwrap();
+            let capacity = if host { 2 } else { 5 };
+            let kv = Kv::new(capacity, 2, 1, host, dtype).unwrap();
             for (position, k, v) in [(3, 0.5, -10.0), (4, -0.125, 2.0), (5, 0.25, 5.0)] {
                 let ks: [u16; HEAD_DIM] = std::array::from_fn(|i| to_bf16(key(i, k)));
                 let vs: [u16; HEAD_DIM] = std::array::from_fn(|i| to_bf16(value(i, v)));
@@ -1502,6 +1510,7 @@ mod tests {
                             scratch.ptr(),
                             1,
                             1,
+                            capacity as i32,
                             2,
                             5,
                             2,

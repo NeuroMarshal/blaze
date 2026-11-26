@@ -1,4 +1,5 @@
 mod cpu;
+mod dspark;
 mod cuda;
 mod forward;
 pub(crate) mod weights;

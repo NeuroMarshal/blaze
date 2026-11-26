@@ -112,10 +112,13 @@ pub fn generate(
     let start = Instant::now();
     let mut ids = Vec::new();
     let mut stop = false;
-    for i in 0..max_tokens {
+    let mut drafted = 0;
+    let mut accepted = 0;
+    'decode: while ids.len() < max_tokens {
         let id = match prediction.as_ref().context("Inkling generated no prediction")? {
             Prediction::Token(id) => *id,
             Prediction::Scores(logits) => draw(logits, sampling, &mut rng),
+            Prediction::Verified(_, _) => anyhow::bail!("unexpected DSpark verdict"),
         };
         ids.push(id);
         if text.eos.contains(&id) {
@@ -125,10 +128,25 @@ pub fn generate(
         if !publish(id) {
             break;
         }
-        if i + 1 < max_tokens {
+        let remaining = max_tokens - ids.len();
+        if remaining == 0 { break; }
+        let limit = model.draft_limit().min(remaining);
+        if limit > 0 {
+            let draft = model.draft_tokens(&seq, id, limit)?;
+            let (kept, next) = model.verify(&mut seq, id, &draft, readout, |logits| draw(logits, sampling, &mut rng))?;
+            accepted += kept;
+            drafted += draft.len();
+            for &token in &draft[..kept] {
+                ids.push(token);
+                if text.eos.contains(&token) { stop = true; break 'decode; }
+                if !publish(token) { break 'decode; }
+            }
+            prediction = Some(Prediction::Token(next));
+        } else {
             prediction = model.forward(&mut seq, id, readout)?;
         }
     }
+    if drafted > 0 { crate::eprintln!("DSpark accepted {accepted} / {drafted} draft tokens"); }
     Ok(Generation {
         ids,
         stop,
