@@ -1,6 +1,6 @@
 use super::{KvDtype, cpu};
 use super::dspark::{Cache as DraftCache, Draft, Features};
-use super::cuda::{AttentionScratch, Compute, Dense, Kv, expert_size, from_bf16, to_bf16};
+use super::cuda::{AttentionConv, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
 use super::weights::{Experts, read_float};
@@ -217,6 +217,23 @@ impl ConvState {
             rows: vec![vec![0.0; width]; if taps > 1 { taps - 1 + slack } else { 0 }],
         }
     }
+
+    fn bf16_history(&self, pos: usize, taps: usize) -> Vec<u16> {
+        (pos.saturating_sub(taps - 1)..pos)
+            .flat_map(|p| self.rows[p % self.rows.len()].iter().copied().map(to_bf16))
+            .collect()
+    }
+
+    fn remember_bf16(&mut self, start: usize, width: usize, rows: &[u16]) {
+        let slots = self.rows.len();
+        let count = rows.len() / width;
+        for r in count.saturating_sub(slots)..count {
+            let slot = (start + r) % slots;
+            for (dst, &value) in self.rows[slot].iter_mut().zip(&rows[r * width..(r + 1) * width]) {
+                *dst = from_bf16(value);
+            }
+        }
+    }
 }
 
 struct Controller {
@@ -285,6 +302,37 @@ struct LoopInputs {
 }
 
 impl LoopInputs {
+    fn mix_attention_rows(&self, gpu: &mut Compute, qkv: &mut [Vec<Vec<f32>>],
+                          rows: &[ForwardRow], eps: f32) -> Result<()> {
+        let controllers = self.controllers.first_chunk::<3>().unwrap();
+        let width = qkv[0][0].len();
+        if qkv.len() > 1
+            && let [GateWeights::Device(q), GateWeights::Device(k), GateWeights::Device(v)] =
+                controllers.each_ref().map(|c| &c.up)
+        {
+            let limit = gpu.controller_batch_limit::<3>(width).max(1);
+            for (queries, rows) in qkv.chunks_mut(limit).zip(rows.chunks(limit)) {
+                let messages: Vec<[Vec<f32>; 3]> = rows.iter().map(|row| {
+                    std::array::from_fn(|i| mix_normalized(&row.messages, &self.queries[i]))
+                }).collect();
+                let inputs: Vec<[Vec<f32>; 3]> = queries.iter().zip(&messages).map(|(qkv, msg)| {
+                    std::array::from_fn(|i| Controller::input(&qkv[i], &msg[i], eps))
+                }).collect();
+                let input_refs: Vec<_> = inputs.iter().map(|r| r.each_ref().map(Vec::as_slice)).collect();
+                let gates = gpu.controller_gates_batch(controllers.each_ref().map(|c| &c.down), [q, k, v], &input_refs)?;
+                for ((x, msg), gates) in queries.iter_mut().flatten().zip(messages.iter().flatten()).zip(gates.chunks_exact(2 * width)) {
+                    let (forget, gain) = gates.split_at(width);
+                    cpu::controller_mix(x, msg, forget, gain);
+                }
+            }
+        } else {
+            for (qkv, row) in qkv.iter_mut().zip(rows) {
+                self.mix_attention(gpu, qkv, &row.messages, eps)?;
+            }
+        }
+        Ok(())
+    }
+
     fn mix_attention(&self, gpu: &mut Compute, qkv: &mut [Vec<f32>], memory: &[Vec<f32>], eps: f32) -> Result<()> {
         let messages: [Vec<f32>; 3] = std::array::from_fn(|i| mix_normalized(memory, &self.queries[i]));
         let controllers = self.controllers.first_chunk::<3>().unwrap();
@@ -344,6 +392,7 @@ struct Layer {
     loop_inputs: Option<LoopInputs>,
     k_conv: Conv,
     v_conv: Conv,
+    kv_taps: Option<gpu::DevBuf>,
     attn_conv: Conv,
     mlp_conv: Conv,
     router: Router,
@@ -408,6 +457,12 @@ impl Layer {
                 rel_transposed[j * s.relative + i] = to_bf16(v);
             }
         }
+        let k_conv = Conv::load(ckpt, &t("attn.k_sconv"), kv, s, !local)?;
+        let v_conv = Conv::load(ckpt, &t("attn.v_sconv"), kv, s, !local)?;
+        let kv_taps = avx_controller.then(|| {
+            let weights: Vec<_> = k_conv.taps.iter().chain(&v_conv.taps).flatten().copied().collect();
+            gpu::DevBuf::from_slice(&weights)
+        }).transpose()?;
 
         Ok(Self {
             local,
@@ -443,8 +498,9 @@ impl Layer {
             res_query,
             res_mlp: read_float(ckpt, &format!("{attn_res}.mlp_queries.{id}"), &[s.hidden])?,
             loop_inputs,
-            k_conv: Conv::load(ckpt, &t("attn.k_sconv"), kv, s, !local)?,
-            v_conv: Conv::load(ckpt, &t("attn.v_sconv"), kv, s, !local)?,
+            k_conv,
+            v_conv,
+            kv_taps,
             attn_conv: Conv::load(ckpt, &t("attn_sconv"), s.hidden, s, false)?,
             mlp_conv: Conv::load(ckpt, &t("mlp_sconv"), s.hidden, s, false)?,
             router: if s.hidden.is_multiple_of(32) && ckpt.info(&t("mlp.gate.weight"))?.dtype == Dtype::Bf16
@@ -645,7 +701,7 @@ impl Model {
         for rank in 0..gpus {
             let id = device + rank as i32;
             gpu::set_device(id)?;
-            let scratch = AttentionScratch::new(s.heads, s.kv_heads, s.extent, s.relative)?;
+            let scratch = AttentionScratch::new(s.heads, s.kv_heads, s.extent, s.relative, prefill_chunk, s.conv)?;
             let mut sizes = [0; 2];
             let mut visits = [0; 2];
             let mut kv_bytes = 0usize;
@@ -662,7 +718,7 @@ impl Model {
                 let layer = &layers[visit.layer];
                 let packing = layer.experts.gate_up.packing as usize;
                 let slots = if layer.local {
-                    (loops.window + dspark_tokens).min(context)
+                    (loops.window + prefill_chunk.min(PREFILL_ATTENTION_ROWS).saturating_sub(1).max(dspark_tokens)).min(context)
                 } else if host_kv {
                     context.min(SHORT_KV_TOKENS)
                 } else {
@@ -752,6 +808,7 @@ impl Model {
         );
         let s = &self.cfg;
         let slack = self.draft.as_ref().map_or(0, |draft| draft.limit);
+        let kv_slack = (self.prefill_chunk.min(PREFILL_ATTENTION_ROWS) - 1).max(slack);
         let visits = self
             .loops
             .visits
@@ -761,7 +818,7 @@ impl Model {
                 let local = self.loops.is_local(visit.layer);
                 Ok(VisitState {
                     kv: Kv::new(
-                        if local { capacity.min(self.loops.window + slack) } else { capacity },
+                        if local { capacity.min(self.loops.window + kv_slack) } else { capacity },
                         if local { capacity.min(self.loops.window) } else { capacity },
                         s.kv_heads,
                         !local && self.global_kv_host && capacity > SHORT_KV_TOKENS,
@@ -904,6 +961,8 @@ impl Model {
             let mut q_inputs = Vec::with_capacity(rows.len());
             let mut k_inputs = Vec::with_capacity(rows.len());
             let mut v_inputs = Vec::with_capacity(rows.len());
+            let controller = (visit.pass > 0).then(|| layer.loop_inputs.as_ref().unwrap());
+            let mut qkv_rows = Vec::with_capacity(rows.len());
             for row in &mut rows {
                 let ForwardRow {
                     x,
@@ -925,7 +984,6 @@ impl Model {
                 if id == self.loops.core.end {
                     messages.clear();
                 }
-                let controller = (visit.pass > 0).then(|| layer.loop_inputs.as_ref().unwrap());
                 let mut qkv = if id == 0 {
                     vec![x.clone()]
                 } else {
@@ -934,9 +992,12 @@ impl Model {
                 if qkv.len() == 1 && controller.is_some() {
                     qkv.resize(3, qkv[0].clone());
                 }
-                if let Some(c) = controller {
-                    c.mix_attention(compute, &mut qkv, messages, s.eps)?;
-                }
+                qkv_rows.push(qkv);
+            }
+            if let Some(c) = controller {
+                c.mix_attention_rows(compute, &mut qkv_rows, &rows, s.eps)?;
+            }
+            for qkv in qkv_rows {
                 let norm = |x: &[f32], weight: &[f32]| normalized(x, Some(weight), s.eps);
                 let q_in = norm(&qkv[0], &layer.norm_q);
                 let k_in = qkv
@@ -976,9 +1037,14 @@ impl Model {
             let mut messages_batch = Vec::new();
             let limit = compute.gate_batch_limit(s.hidden);
             let mut gated_logits = None;
-            for (offset, row) in rows.iter_mut().enumerate() {
+            let kv_weights = layer.kv_taps.as_ref().filter(|_| count > 1);
+            let kv_history = kv_weights.map(|_| [
+                state.key.bf16_history(seq.position, s.conv),
+                state.value.bf16_history(seq.position, s.conv),
+            ]);
+            let mut queries = Vec::with_capacity(count);
+            for offset in 0..count {
                 let position = seq.position + offset;
-                let ForwardRow { x, blocks, messages, .. } = row;
                 let q_raw = &q_batch[offset * layer.query.rows..(offset + 1) * layer.query.rows];
                 let (q_raw, rest) = q_raw.split_at(s.q_width());
                 let (gate, rest) = rest.split_at(s.q_width());
@@ -991,6 +1057,11 @@ impl Model {
                 let q = clipped(q_raw, &layer.q_clip, s.dim, s.qk_clip, log_scale);
                 let rel = clipped(rel_raw, &layer.rel_clip, s.relative, s.rel_clip, log_scale);
                 let kv_range = offset * s.kv_width()..(offset + 1) * s.kv_width();
+                if kv_weights.is_some() {
+                    queries.push(AttentionRow { q, gate, sink, relative: rel,
+                        key: (&k_batch[kv_range.clone()]).into(), value: (&v_batch[kv_range]).into() });
+                    continue;
+                }
                 let key: Vec<_> = k_batch[kv_range.clone()].iter().copied().map(from_bf16).collect();
                 let value: Vec<_> = v_batch[kv_range].iter().copied().map(from_bf16).collect();
                 let taps = |i: usize| conv.as_ref().map(|w| {
@@ -1013,22 +1084,30 @@ impl Model {
                         row.iter().map(move |&v| to_bf16(v * scale))
                     })
                     .collect();
-                let attn = device.scratch.run(
-                    compute,
-                    &state.kv,
-                    &q,
-                    gate,
-                    sink,
-                    &rel,
-                    &key,
-                    &value,
-                    &layer.bias,
-                    &layer.output,
-                    position,
-                )?;
+                queries.push(AttentionRow { q, gate, sink, relative: rel, key: key.into(), value: value.into() });
+            }
+            let kv_conv = kv_weights.zip(kv_history.as_ref()).map(|(weights, history)| AttentionConv {
+                weights,
+                history: history.each_ref().map(Vec::as_slice),
+                dynamic: conv.as_ref().map(|c| c.each_ref().map(Vec::as_slice)),
+                taps: s.conv,
+                scale: layer.k_conv.scale,
+                clip: s.qk_clip,
+                eps: s.eps,
+            });
+            let attention = device.scratch.run_rows(
+                compute, &state.kv, &queries, &layer.bias, &layer.output, seq.position, kv_conv,
+            )?;
+            if kv_weights.is_some() {
+                state.key.remember_bf16(seq.position, s.kv_width(), &k_batch);
+                state.value.remember_bf16(seq.position, s.kv_width(), &v_batch);
+            }
+            for (offset, (row, attn)) in rows.iter_mut().zip(attention.chunks_exact(s.hidden)).enumerate() {
+                let position = seq.position + offset;
+                let ForwardRow { x, blocks, messages, .. } = row;
                 let mut residual = layer
                     .attn_conv
-                    .run(&mut state.attention, &attn, None, position, s.dim);
+                    .run(&mut state.attention, attn, None, position, s.dim);
                 if id % s.block == 0 {
                     blocks.push(normalized(x, None, s.eps));
                 } else {
@@ -1250,4 +1329,66 @@ unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
     let sum = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
     unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), sum) };
     lanes.into_iter().sum::<f32>() + a[n..].iter().zip(&b[n..]).map(|(&a, &b)| a * b).sum::<f32>()
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use crate::gpu::{DevBuf, Stream, check};
+
+    #[test]
+    #[ignore = "requires CUDA and AVX2/FMA"]
+    fn prefill_kv_convolution_matches_cpu_with_history_and_dynamic_taps() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        gpu::set_device(0).unwrap();
+        let stream = Stream::new().unwrap();
+        let (heads, dim, taps, count) = (2, 128, 4, 16);
+        let width = heads * dim;
+        let scale = ((2 * taps + 1) as f32).sqrt().recip();
+        let clip = 5.0;
+        let eps = 1e-6;
+        let signal = |i: usize| ((i * 103 % 199) as f32 - 99.0) / 79.0;
+        let static_taps: Vec<_> = (0..taps * width).map(|i| signal(i + 17) / 2.0).collect();
+        let weights = DevBuf::from_slice(&static_taps.repeat(2)).unwrap();
+        let conv = Conv {
+            taps: static_taps.chunks_exact(width).map(<[f32]>::to_vec).collect(),
+            dynamic: None,
+            scale,
+        };
+        let raw: Vec<_> = (0..(count + taps - 1) * width).map(|i| to_bf16(signal(i))).collect();
+        let dynamic: Vec<_> = (0..(count + taps - 1) * heads * taps)
+            .map(|i| to_bf16(signal(i + 13) / 5.0)).collect();
+        let k = DevBuf::new(count * width * 2).unwrap();
+        let v = DevBuf::new(count * width * 2).unwrap();
+        for (history, use_dynamic) in [(0, false), (1, true), (3, true), (3, false)] {
+            let raw_gpu = DevBuf::from_slice(&raw).unwrap();
+            let dynamic_gpu = DevBuf::from_slice(&dynamic[history * heads * taps..]).unwrap();
+            let dyn_ptr = if use_dynamic { dynamic_gpu.ptr() } else { std::ptr::null() };
+            check(unsafe {
+                blaze_sys::blz_inkling_prefill_conv(raw_gpu.ptr(), raw_gpu.ptr(), dyn_ptr, dyn_ptr, weights.ptr(),
+                    k.ptr(), v.ptr(), heads as i32, taps as i32, history as i32, count as i32, scale, clip, eps, stream.0)
+            }, "prefill convolution parity").unwrap();
+            stream.sync().unwrap();
+            let mut state = ConvState::new(taps, width, 0);
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for (pos, row) in raw.chunks_exact(width).take(history + count).enumerate() {
+                let x: Vec<_> = row.iter().copied().map(from_bf16).collect();
+                let d = use_dynamic.then(|| &dynamic[pos * heads * taps..(pos + 1) * heads * taps]);
+                let y = conv.run(&mut state, &x, d, pos, dim);
+                if pos >= history {
+                    for head in y.chunks_exact(dim) {
+                        let ks = clip_scale(head, clip);
+                        let vs = inv_rms(head, eps);
+                        keys.extend(head.iter().map(|x| to_bf16(x * ks)));
+                        values.extend(head.iter().map(|x| to_bf16(x * vs)));
+                    }
+                }
+            }
+            assert_eq!(k.download::<u16>(count * width).unwrap(), keys);
+            assert_eq!(v.download::<u16>(count * width).unwrap(), values);
+        }
+    }
 }

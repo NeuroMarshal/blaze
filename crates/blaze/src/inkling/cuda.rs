@@ -6,6 +6,7 @@ use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, ensure};
 use blaze_sys as sys;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::null_mut;
 use std::sync::Arc;
@@ -357,7 +358,7 @@ const HEAT_EPOCH_VISITS: usize = 48 * 512;
 #[derive(Hash, Eq, PartialEq)]
 enum ProjectionKey {
     Dense([usize; 5], [usize; 5]),
-    Controller([usize; 3], [usize; 3]),
+    Controller([usize; 3], [usize; 3], usize),
     Router(usize),
     GatedRouter { weights: [usize; 4], eps: u32, tokens: usize },
     Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
@@ -614,42 +615,71 @@ impl Compute {
     pub fn controller_gates<const N: usize>(
         &mut self, down: [&Dense; N], up: [&Dense; N], inputs: [&[f32]; N],
     ) -> Result<Vec<f32>> {
+        self.controller_gates_batch(down, up, &[inputs])
+    }
+
+    pub fn controller_batch_limit<const N: usize>(&self, width: usize) -> usize {
+        (self.input.bytes() / (N * width * 4))
+            .min(self.result.bytes() / (N * width * 8))
+            .min(self.gate.bytes() / (N * 64 * 2))
+            .min(PREFILL_ATTENTION_ROWS)
+    }
+
+    pub fn controller_gates_batch<const N: usize>(
+        &mut self, down: [&Dense; N], up: [&Dense; N], inputs: &[[&[f32]; N]],
+    ) -> Result<Vec<f32>> {
         let cols = down[0].cols;
         let rows = up[0].rows;
+        let count = inputs.len();
+        let num_inputs = count * N * cols;
+        let num_outputs = count * N * rows;
         ensure!(
-            matches!(N, 1 | 3) && inputs.iter().all(|x| x.len() == cols)
+            matches!(N, 1 | 3) && count > 0 && inputs.iter().flatten().all(|x| x.len() == cols)
                 && down.iter().all(|w| w.cols == cols && w.rows == 64)
                 && up.iter().all(|w| w.rows == rows && w.cols == 64)
-                && N * cols * 2 <= self.input.bytes() && N * 64 * 2 <= self.gate.bytes()
-                && N * rows * 4 <= self.result.bytes(), "Inkling controller exceeds scratch"
+                && num_inputs * 2 <= self.input.bytes() && count * N * 64 * 2 <= self.gate.bytes()
+                && num_outputs * 4 <= self.result.bytes(), "Inkling controller exceeds scratch"
         );
         let host = self.transfer.host_ptr().cast_mut().cast::<u16>();
-        let dst = unsafe { std::slice::from_raw_parts_mut(host, N * cols) };
-        for (dst, input) in dst.chunks_exact_mut(cols).zip(inputs) {
-            for (dst, &value) in dst.iter_mut().zip(input) { *dst = to_bf16(value); }
+        let dst = unsafe { std::slice::from_raw_parts_mut(host, num_inputs) };
+        for (dst, &input) in dst.chunks_exact_mut(cols).zip(inputs.iter().flatten()) {
+            for (dst, &value) in dst.iter_mut().zip(input) {
+                *dst = to_bf16(value);
+            }
         }
         let pointers = |matrices: [&Dense; N]| std::array::from_fn(|i| {
             matrices.get(i).map_or(0, |w| w.weight.ptr::<u16>() as usize)
         });
-        let key = ProjectionKey::Controller(pointers(down), pointers(up));
+        let key = ProjectionKey::Controller(pointers(down), pointers(up), count);
         let work = self.run_projection(key, |gpu| {
-            gpu.copy_staged_input(N * cols * 2)?;
+            gpu.copy_staged_input(num_inputs * 2)?;
             for (i, w) in down.iter().enumerate() {
-                w.run(gpu, gpu.input.at(i * cols), gpu.gate.at(i * 64), 1)?;
+                if count > 1 && crate::tune::skinny_fits(count, cols, N * cols) {
+                    check(unsafe {
+                        sys::blz_skinny_gemm_ex(gpu.input.at::<u16>(i * cols).cast(), (N * cols) as i64,
+                            w.weight.ptr(), gpu.gate.at::<u16>(i * 64).cast(), (N * 64) as i64, count as i32,
+                            64, cols as i32, sys::BLZ_BF16, gpu.stream.0)
+                    }, "Inkling batched loop projection")?;
+                } else {
+                    for r in 0..count {
+                        let index = r * N + i;
+                        w.run(gpu, gpu.input.at(index * cols), gpu.gate.at(index * 64), 1)?;
+                    }
+                }
             }
             let weights = |i: usize| up.get(i).map_or(std::ptr::null(), |w| w.weight.ptr::<u16>());
             check(unsafe {
                 sys::blz_inkling_controller_up(
                     gpu.gate.ptr(), weights(0), weights(1), weights(2), gpu.result.ptr(),
-                    rows as i32, N as i32, 1, gpu.stream.0,
+                    rows as i32, N as i32, count as i32, gpu.stream.0,
                 )
             }, "Inkling controller gates")?;
-            gpu.queue_result::<f32>(gpu.result.ptr(), N * rows)
+            gpu.queue_result::<f32>(gpu.result.ptr(), num_outputs)
         });
         let synced = self.stream.sync();
         work?;
         synced?;
-        Ok(self.read_result(N * rows))
+        Ok(self.read_result(num_outputs))
     }
 
     pub fn router_logits(&mut self, weights: &Dense, activations: &[Vec<f32>]) -> Result<Vec<f32>> {
@@ -1169,14 +1199,19 @@ impl Kv {
         scale: &DevBuf,
         stream: &Stream,
     ) -> Result<()> {
-        let [keys, values, key_scales, value_scales] = self.pointers(position % self.capacity);
+        self.store_rows(position % self.capacity, key, value, zero.ptr(), 1, scale, stream)
+    }
+
+    fn store_rows(&self, base: usize, key: *const u16, value: *const u16, slots: *const i32,
+                  count: usize, scale: &DevBuf, stream: &Stream) -> Result<()> {
+        let [keys, values, key_scales, value_scales] = self.pointers(base);
         let stride = (self.heads * HEAD_DIM) as i64;
         if self.dtype == KvDtype::Bf16 {
             return check(
                 unsafe {
                     sys::blz_kv_store_dense(
-                        key.cast(), value.cast(), stride, stride, zero.ptr(), sys::BLZ_I32,
-                        1, self.heads as i32, HEAD_DIM as i32, sys::BLZ_KV_BF16,
+                        key.cast(), value.cast(), stride, stride, slots.cast(), sys::BLZ_I32,
+                        count as i64, self.heads as i32, HEAD_DIM as i32, sys::BLZ_KV_BF16,
                         keys, values, scale.ptr(), scale.ptr(), stream.0,
                     )
                 },
@@ -1191,9 +1226,9 @@ impl Kv {
                     stride,
                     stride,
                     sys::BLZ_BF16,
-                    zero.ptr(),
+                    slots.cast(),
                     sys::BLZ_I32,
-                    1,
+                    count as i64,
                     self.heads as i32,
                     HEAD_DIM as i32,
                     keys,
@@ -1211,6 +1246,33 @@ impl Kv {
     }
 }
 
+pub(super) const PREFILL_ATTENTION_ROWS: usize = 16;
+
+pub(super) struct AttentionRow<'a> {
+    pub q: Vec<u16>,
+    pub gate: &'a [u16],
+    pub sink: &'a [u16],
+    pub relative: Vec<u16>,
+    pub key: Cow<'a, [u16]>,
+    pub value: Cow<'a, [u16]>,
+}
+
+pub(super) struct AttentionConv<'a> {
+    pub weights: &'a DevBuf,
+    pub history: [&'a [u16]; 2],
+    pub dynamic: Option<[&'a [u16]; 2]>,
+    pub taps: usize,
+    pub scale: f32,
+    pub clip: f32,
+    pub eps: f32,
+}
+
+impl AttentionRow<'_> {
+    fn fields(&self) -> [&[u16]; 6] {
+        [&self.q, self.gate, self.sink, &self.relative, &self.key, &self.value]
+    }
+}
+
 pub(super) struct AttentionScratch {
     input: DevBuf,
     staging: HostMapped,
@@ -1218,23 +1280,124 @@ pub(super) struct AttentionScratch {
     zero: DevBuf,
     kv_scale: DevBuf,
     tiles: DevBuf,
+    attended: DevBuf,
+    filtered: DevBuf,
+    batch: usize,
     heads: usize,
     kv_heads: usize,
 }
 
 impl AttentionScratch {
-    pub fn new(heads: usize, kv_heads: usize, extent: usize, relative: usize) -> Result<Self> {
+    pub fn new(heads: usize, kv_heads: usize, extent: usize, relative: usize, chunk: usize, taps: usize) -> Result<Self> {
         let values = heads * (HEAD_DIM * 2 + relative + 1) + kv_heads * HEAD_DIM * 2;
+        let batch = chunk.min(PREFILL_ATTENTION_ROWS);
+        let bytes = (values * batch + 2 * taps * kv_heads * (HEAD_DIM + batch)) * 2 + 9 * 16 + batch * 4;
         Ok(Self {
-            input: DevBuf::new(values * 2 + 6 * 16)?,
-            staging: HostMapped::new(values * 2 + 6 * 16)?,
-            relative: DevBuf::new(heads * extent * 2)?,
+            input: DevBuf::new(bytes)?,
+            staging: HostMapped::new(bytes)?,
+            relative: DevBuf::new(batch * heads * extent * 2)?,
             zero: DevBuf::from_slice(&[0i32])?,
             kv_scale: DevBuf::from_slice(&[KV_GLOBAL_SCALE])?,
-            tiles: DevBuf::new(heads * MAX_TILES * (HEAD_DIM + 2) * 4)?,
+            tiles: DevBuf::new(batch * heads * MAX_TILES * (HEAD_DIM + 2) * 4)?,
+            attended: DevBuf::new(batch * heads * HEAD_DIM * 2)?,
+            filtered: DevBuf::new(batch * 2 * kv_heads * HEAD_DIM * 2)?,
+            batch,
             heads,
             kv_heads,
         })
+    }
+
+    pub fn run_rows(&mut self, gpu: &mut Compute, kv: &Kv, rows: &[AttentionRow<'_>], bias: &Dense,
+                    output: &Dense, start: usize, conv: Option<AttentionConv<'_>>) -> Result<Vec<f32>> {
+        if let [row] = rows {
+            let [q, gate, sink, relative, key, value] = row.fields();
+            return self.run(gpu, kv, q, gate, sink, relative, key, value, bias, output, start);
+        }
+
+        let mut result = Vec::with_capacity(rows.len() * output.rows);
+        for (block, chunk) in rows.chunks(self.batch).enumerate() {
+            let first = block * self.batch;
+            let pos = start + first;
+            let count = chunk.len();
+            let oldest = (pos + 1).saturating_sub(kv.window);
+            ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
+            let staging = self.staging.host_slice_mut();
+            let mut offset: usize = 0;
+            let history = conv.as_ref().map_or(0, |c| (c.taps - 1).min(pos));
+            let width = self.kv_heads * HEAD_DIM;
+            let mut stage = |src: &[u16], offset: &mut usize| {
+                // The staged copy reads initialized BF16 rows as bytes.
+                let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src)) };
+                staging[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+                *offset += bytes.len();
+            };
+            let [q, gate, sink, relative, key, value] = std::array::from_fn(|field| {
+                offset = offset.next_multiple_of(16);
+                let ptr = self.input.at::<u16>(offset / 2);
+                if let Some(c) = &conv && field >= 4 {
+                    let from_state = history.saturating_sub(first) * width;
+                    let initial = c.history[field - 4];
+                    stage(&initial[initial.len() - from_state..], &mut offset);
+                    for row in &rows[first.saturating_sub(history)..first] {
+                        stage(row.fields()[field], &mut offset);
+                    }
+                }
+                for row in chunk {
+                    stage(row.fields()[field], &mut offset);
+                }
+                ptr
+            });
+            let dynamic = if let Some(c) = &conv && let Some(dynamic) = c.dynamic {
+                let width = self.kv_heads * c.taps;
+                dynamic.map(|src| {
+                    offset = offset.next_multiple_of(16);
+                    let ptr = self.input.at::<u16>(offset / 2);
+                    stage(&src[first * width..(first + count) * width], &mut offset);
+                    ptr as *const u16
+                })
+            } else {
+                [std::ptr::null(); 2]
+            };
+            let slots_at = offset.next_multiple_of(16);
+            let mut offset = slots_at;
+            for p in pos..pos + count {
+                staging[offset..offset + 4].copy_from_slice(&((p % kv.capacity) as i32).to_ne_bytes());
+                offset += 4;
+            }
+            let work = (|| -> Result<()> {
+                check(unsafe {
+                    sys::cudaMemcpyAsync(self.input.ptr(), self.staging.host_ptr(), offset, sys::MEMCPY_H2D, gpu.stream.0)
+                }, "Inkling attention batch inputs")?;
+                let (key, value) = if let Some(c) = &conv {
+                    let keys = self.filtered.ptr();
+                    let values = self.filtered.at(self.batch * width);
+                    check(unsafe {
+                        sys::blz_inkling_prefill_conv(key, value, dynamic[0], dynamic[1], c.weights.ptr(), keys, values,
+                            self.kv_heads as i32, c.taps as i32, history as i32, count as i32,
+                            c.scale, c.clip, c.eps, gpu.stream.0)
+                    }, "Inkling prefill KV convolution")?;
+                    (keys, values)
+                } else {
+                    (key, value)
+                };
+                kv.store_rows(0, key, value, self.input.at(slots_at / 4), count, &self.kv_scale, &gpu.stream)?;
+                bias.run(gpu, relative, self.relative.ptr(), count * self.heads)?;
+                let [keys, values, ks, vs] = kv.pointers(0);
+                check(unsafe {
+                    sys::blz_inkling_prefill_attention(q, keys, values, ks, vs, self.relative.ptr(), sink, gate,
+                        self.attended.ptr(), self.tiles.ptr(), self.heads as i32, self.kv_heads as i32,
+                        kv.capacity as i32, kv.window as i32, pos as i32, bias.rows as i32, count as i32,
+                        KV_GLOBAL_SCALE, gpu.stream.0)
+                }, "Inkling causal prefill attention")?;
+                output.run_decode_rows(gpu, self.attended.ptr(), gpu.result.ptr(), count)?;
+                gpu.queue_result::<u16>(gpu.result.ptr(), count * output.rows)
+            })();
+            let synced = gpu.stream.sync();
+            work?;
+            synced?;
+            result.extend(gpu.read_result::<u16>(count * output.rows).into_iter().map(from_bf16));
+        }
+        Ok(result)
     }
 
     pub fn run(
@@ -1318,6 +1481,43 @@ impl AttentionScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn causal_prefill_matches_decode_across_tiles_and_ring_wrap() {
+        crate::gpu::set_device(0).unwrap();
+        let window = 80;
+        let capacity = window + PREFILL_ATTENTION_ROWS - 1;
+        let end = 113;
+        let mut scratch = AttentionScratch::new(1, 1, window, 8, PREFILL_ATTENTION_ROWS, 4).unwrap();
+        let mut gpu = Compute::new(128, 2048, 128, 64, 0, [0; 2], [0; 2], 8, 16, None).unwrap();
+        let bias: Vec<_> = (0..window * 8).map(|i| to_bf16((i % 11) as f32 / 32.0)).collect();
+        let bias = Dense::from_bf16(&bias, window, 8).unwrap();
+        let weights: Vec<_> = (0..128 * 128).map(|i| to_bf16((i % 13) as f32 / 256.0)).collect();
+        let output = Dense::from_bf16(&weights, 128, 128).unwrap();
+        let row = |size, pos, salt| (0..size)
+            .map(|i| to_bf16((((i * 37 + pos * salt) % 97) as f32 - 48.0) / 64.0))
+            .collect::<Vec<_>>();
+        let gates: Vec<_> = (0..end).map(|p| row(128, p, 3)).collect();
+        let sinks: Vec<_> = (0..end).map(|p| row(1, p, 7)).collect();
+        let rows: Vec<_> = (0..end).map(|p| AttentionRow {
+            q: row(128, p, 11),
+            gate: &gates[p],
+            sink: &sinks[p],
+            relative: row(8, p, 13),
+            key: row(128, p, 17).into(),
+            value: row(128, p, 19).into(),
+        }).collect();
+        for dtype in [KvDtype::Bf16, KvDtype::Nvfp4, KvDtype::Nvfp4FourOverSix] {
+            let serial = Kv::new(capacity, window, 1, false, dtype).unwrap();
+            let batch = Kv::new(capacity, window, 1, false, dtype).unwrap();
+            let expected: Vec<_> = rows.iter().enumerate().flat_map(|(pos, row)| {
+                scratch.run_rows(&mut gpu, &serial, std::slice::from_ref(row), &bias, &output, pos, None).unwrap()
+            }).collect();
+            let actual = scratch.run_rows(&mut gpu, &batch, &rows, &bias, &output, 0, None).unwrap();
+            assert_eq!(actual, expected, "{dtype:?}");
+        }
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]

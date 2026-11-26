@@ -162,7 +162,7 @@ __device__ inline float warp_sum(float x) {
     return x;
 }
 
-template <bool Packed>
+template <bool Packed, bool Causal = false>
 __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, const uint8_t* values,
                                 const uint8_t* key_scales, const uint8_t* value_scales,
                                 const __nv_bfloat16* relative, const __nv_bfloat16* sinks,
@@ -172,6 +172,18 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
     q += size_t(blockIdx.z) * query_stride;
     output += size_t(blockIdx.z) * gridDim.x * HEAD_DIM;
     scratch += size_t(blockIdx.z) * gridDim.x * gridDim.y * (HEAD_DIM + 2);
+    int blocks = gridDim.y;
+    if constexpr (Causal) {
+        position += blockIdx.z;
+        relative += size_t(blockIdx.z) * gridDim.x * extent;
+        sinks += size_t(blockIdx.z) * gridDim.x;
+        gate += size_t(blockIdx.z) * query_stride;
+        const int valid = min(window, position + 1);
+        const int tiles = min(256, (valid + 63) / 64);
+        tile = (valid + tiles - 1) / tiles;
+        blocks = (valid + tile - 1) / tile;
+        if (blockIdx.y >= blocks) return;
+    }
     const int head = blockIdx.x;
     const int kv_head = head / (gridDim.x / kv_heads);
     const int lane = threadIdx.x % 32;
@@ -252,7 +264,7 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
         out = fmaf(factor, partials[w][threadIdx.x], out);
         denom = fmaf(factor, sums[w], denom);
     }
-    if (gridDim.y == 1) {
+    if (blocks == 1) {
         const float sink = __bfloat162float(sinks[head]);
         const float m = fmaxf(maximum, sink);
         const float factor = __expf(maximum - m);
@@ -269,13 +281,25 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
     }
 }
 
+template <bool Causal = false>
 __global__ void attention_merge(const float* scratch, const __nv_bfloat16* sinks,
-                                const __nv_bfloat16* gate, __nv_bfloat16* out, int tiles) {
+                                const __nv_bfloat16* gate, __nv_bfloat16* out, int stride,
+                                int position = 0, int window = 0) {
     const int head = blockIdx.x;
     const int col = threadIdx.x;
-    scratch += size_t(blockIdx.z) * gridDim.x * tiles * (HEAD_DIM + 2);
+    scratch += size_t(blockIdx.z) * gridDim.x * stride * (HEAD_DIM + 2);
     out += size_t(blockIdx.z) * gridDim.x * HEAD_DIM;
-    const float* row = scratch + head * tiles * (HEAD_DIM + 2);
+    int tiles = stride;
+    if constexpr (Causal) {
+        const int valid = min(window, position + int(blockIdx.z) + 1);
+        const int n = min(256, (valid + 63) / 64);
+        const int tile = (valid + n - 1) / n;
+        tiles = (valid + tile - 1) / tile;
+        if (tiles == 1) return;
+        sinks += size_t(blockIdx.z) * gridDim.x;
+        gate += size_t(blockIdx.z) * gridDim.x * HEAD_DIM;
+    }
+    const float* row = scratch + head * stride * (HEAD_DIM + 2);
     const float sink = __bfloat162float(sinks[head]);
     float maximum = sink;
     for (int t = 0; t < tiles; ++t) maximum = fmaxf(maximum, row[t * (HEAD_DIM + 2) + HEAD_DIM]);
@@ -320,7 +344,7 @@ static cudaError_t launch_inkling_attention(const uint16_t* q, const uint8_t* ke
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess || blocks == 1) return err;
-    attention_merge<<<dim3(heads, 1, queries), HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, blocks);
+    attention_merge<><<<dim3(heads, 1, queries), HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, blocks);
     return cudaGetLastError();
 }
 
@@ -338,6 +362,89 @@ extern "C" cudaError_t blz_dspark_attention(const uint16_t* q, int stride, int r
         cudaStream_t stream) {
     return launch_inkling_attention(q, keys, values, ks, vs, nullptr, sinks, gate, out, scratch, heads, kv_heads,
                                     capacity, capacity, position, 0, tiles, scale, rows, stride, stream);
+}
+
+extern "C" cudaError_t blz_inkling_prefill_attention(
+        const uint16_t* q, const uint8_t* keys, const uint8_t* values, const uint8_t* ks, const uint8_t* vs,
+        const uint16_t* relative, const uint16_t* sinks, const uint16_t* gate, uint16_t* out, float* scratch,
+        int heads, int kv_heads, int capacity, int window, int start, int extent, int rows, float scale,
+        cudaStream_t stream) {
+    if (heads < 1 || kv_heads < 1 || heads % kv_heads || window < 1 || window > capacity || start < 0 || rows < 1)
+        return cudaErrorInvalidValue;
+    const int tiles = min(256, (min(window, start + rows) + 63) / 64);
+    const dim3 grid(heads, tiles, rows);
+    const auto* query = reinterpret_cast<const __nv_bfloat16*>(q);
+    const auto* biases = reinterpret_cast<const __nv_bfloat16*>(relative);
+    const auto* sink = reinterpret_cast<const __nv_bfloat16*>(sinks);
+    const auto* gated = reinterpret_cast<const __nv_bfloat16*>(gate);
+    auto* result = reinterpret_cast<__nv_bfloat16*>(out);
+    if (ks) {
+        attention_tiles<true, true><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, ks, vs, biases, sink,
+            gated, result, scratch, kv_heads, capacity, window, start, extent, 0, scale, heads * HEAD_DIM);
+    } else {
+        attention_tiles<false, true><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, nullptr, nullptr, biases,
+            sink, gated, result, scratch, kv_heads, capacity, window, start, extent, 0, scale, heads * HEAD_DIM);
+    }
+    const auto err = cudaGetLastError();
+    if (err != cudaSuccess || tiles == 1) return err;
+    attention_merge<true><<<dim3(heads, 1, rows), HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, tiles, start, window);
+    return cudaGetLastError();
+}
+
+namespace {
+
+template<bool Key>
+__global__ void inkling_prefill_conv(const __nv_bfloat16* raw, const __nv_bfloat16* dynamic,
+        const float* weights, __nv_bfloat16* out, int heads, int taps, int history,
+        float scale, float clip, float eps) {
+    const int lane = threadIdx.x;
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int width = heads * HEAD_DIM;
+    const int offset = head * HEAD_DIM;
+    const auto* current = raw + (history + row) * width + offset;
+    float values[HEAD_DIM / 8];
+    float partial[4] = {};
+    for (int i = 0; i < HEAD_DIM / 8; ++i) {
+        const int col = i * 8 + lane;
+        float v = __bfloat162float(current[col]);
+        const int last = min(taps, history + row + 1);
+        for (int lag = 0; lag < last; ++lag) {
+            float w = weights[lag * width + offset + col];
+            if (dynamic) w += __bfloat162float(dynamic[(row * heads + head) * taps + lag]);
+            v = __fadd_rn(v, __fmul_rn(__bfloat162float(current[col - lag * width]), w));
+        }
+        v = __bfloat162float(__float2bfloat16(v * scale));
+        values[i] = v;
+        partial[i % 4] = fmaf(v, v, partial[i % 4]);
+    }
+    // Match the eight-lane FP32 CPU reduction before rounding the KV inputs.
+    const unsigned mask = __activemask();
+    const float accum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+    float sum = 0.0f;
+    for (int i = 0; i < 8; ++i) sum += __shfl_sync(mask, accum, i, 8);
+    const float norm = Key ? fminf(1.0f, __fdiv_rn(clip, __fsqrt_rn(sum) + 1e-6f))
+                           : __fdiv_rn(1.0f, __fsqrt_rn(sum / HEAD_DIM + eps));
+    auto* dest = out + row * width + offset;
+    for (int i = 0; i < HEAD_DIM / 8; ++i) dest[i * 8 + lane] = __float2bfloat16(values[i] * norm);
+}
+
+} // namespace
+
+extern "C" cudaError_t blz_inkling_prefill_conv(const uint16_t* key, const uint16_t* value, const uint16_t* key_dynamic,
+        const uint16_t* value_dynamic, const float* weights, uint16_t* keys, uint16_t* values, int heads, int taps,
+        int history, int rows, float scale, float clip, float eps, cudaStream_t stream) {
+    if (heads < 1 || taps < 1 || rows < 1 || history < 0 || history >= taps) return cudaErrorInvalidValue;
+    const dim3 grid(heads, rows);
+    inkling_prefill_conv<true><<<grid, 8, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(key),
+        reinterpret_cast<const __nv_bfloat16*>(key_dynamic), weights, reinterpret_cast<__nv_bfloat16*>(keys),
+        heads, taps, history, scale, clip, eps);
+    const auto err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    inkling_prefill_conv<false><<<grid, 8, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(value),
+        reinterpret_cast<const __nv_bfloat16*>(value_dynamic), weights + size_t(heads) * HEAD_DIM * taps,
+        reinterpret_cast<__nv_bfloat16*>(values), heads, taps, history, scale, clip, eps);
+    return cudaGetLastError();
 }
 
 namespace {
