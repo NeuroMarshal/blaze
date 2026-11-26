@@ -338,6 +338,7 @@ enum ProjectionKey {
     Dense([usize; 5], [usize; 5]),
     Controller([usize; 3], [usize; 3]),
     Router(usize),
+    GatedRouter { weights: [usize; 4], eps: u32 },
     Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
@@ -657,6 +658,59 @@ impl Compute {
         work?;
         synced?;
         Ok(self.read_result(outputs))
+    }
+
+    pub fn gated_router(
+        &mut self, down: &Dense, up: &Dense, norm: &DevBuf, router: &Dense,
+        input: &[f32], x: &[f32], message: &[f32], eps: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let width = x.len();
+        let scores = router.rows;
+        let bytes = width * 12;
+        let output_bytes = width * 2 + scores * 4;
+        ensure!((32..=4096).contains(&width) && width.is_multiple_of(32)
+            && message.len() == width && input.len() == width * 2 && router.cols == width
+            && down.cols == width * 2 && down.rows == 64 && up.rows == width * 2 && up.cols == 64
+            && norm.bytes() == width * 4 && bytes.max(output_bytes) <= self.input.bytes()
+            && width * 8 <= self.result.bytes() && self.gate.bytes() >= 128, "Inkling gated router exceeds scratch");
+        let staging = self.transfer.host_slice_mut();
+        let (normalized, rest) = staging[..bytes].split_at_mut(width * 4);
+        for (dst, value) in normalized.chunks_exact_mut(2).zip(input) {
+            dst.copy_from_slice(&to_bf16(*value).to_ne_bytes());
+        }
+        for (dst, src) in rest.chunks_exact_mut(width * 4).zip([x, message]) {
+            let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), dst.len()) };
+            dst.copy_from_slice(src);
+        }
+        let key = ProjectionKey::GatedRouter {
+            weights: [down.weight.ptr::<u8>() as usize, up.weight.ptr::<u8>() as usize,
+                      norm.ptr::<u8>() as usize, router.weight.ptr::<u8>() as usize],
+            eps: eps.to_bits(),
+        };
+        let work = self.run_projection(key, |gpu| {
+            gpu.copy_staged_input(bytes)?;
+            down.run(gpu, gpu.input.ptr(), gpu.gate.ptr(), 1)?;
+            check(unsafe {
+                sys::blz_inkling_controller_up(gpu.gate.ptr(), up.weight.ptr(), std::ptr::null(), std::ptr::null(),
+                    gpu.result.ptr(), up.rows as i32, 1, gpu.stream.0)
+            }, "Inkling MLP controller projection")?;
+            check(unsafe {
+                sys::blz_inkling_controller_norm(gpu.result.ptr(), gpu.input.at(width), gpu.input.at(width * 2),
+                    norm.ptr(), gpu.input.ptr(), width as i32, eps, gpu.stream.0)
+            }, "Inkling gated MLP normalization")?;
+            check(unsafe {
+                sys::blz_inkling_router_logits(router.weight.ptr(), gpu.input.ptr(), gpu.input.at(width / 2),
+                    scores as i32, width as i32, 1, gpu.stream.0)
+            }, "Inkling gated MoE router")?;
+            gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
+        });
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        let activation = self.read_result::<u16>(width).into_iter().map(from_bf16).collect();
+        let host = self.transfer.host_ptr().cast::<u16>();
+        let logits = unsafe { std::slice::from_raw_parts(host.add(width).cast::<f32>(), scores) }.to_vec();
+        Ok((activation, logits))
     }
 
     pub fn linear(&mut self, matrix: &Dense, x: &[f32]) -> Result<Vec<f32>> {
@@ -1227,6 +1281,45 @@ impl AttentionScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires a CUDA GPU and AVX2/FMA"]
+    fn gated_router_replays_the_cpu_mix_and_norm() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
+        crate::gpu::set_device(0).unwrap();
+        let width = 2304;
+        let mut gpu = Compute::new(2 * width, 4 * width, width, 64, 0, [0; 2], [0; 2], 8, 1, None).unwrap();
+        gpu.projection_graphs = Some(HashMap::new());
+        let values = |len, scale: f32| (0..len).map(|i: usize| {
+            (((i * 47 % 179) as f32 - 89.0) / (9 + i % 31) as f32) * scale
+        }).collect::<Vec<_>>();
+        let dense = |rows, cols, scale| Dense::from_bf16(
+            &values(rows * cols, scale).into_iter().map(to_bf16).collect::<Vec<_>>(), rows, cols,
+        ).unwrap();
+        let down = dense(64, 2 * width, 0.005);
+        let up = dense(2 * width, 64, 0.15);
+        let router = dense(128, width, 0.07);
+        let weights = values(width, 0.43);
+        let norm = DevBuf::from_slice(&weights).unwrap();
+        for factor in [0.007, 0.75, 9.0] {
+            let x = values(width, factor);
+            let mut msg = values(width, -0.4);
+            msg.rotate_left(11);
+            let input = values(2 * width, factor);
+            let gates = gpu.controller_gates([&down], [&up], [&input]).unwrap();
+            let (mut expected, eps) = (x.clone(), 1e-6);
+            super::super::cpu::controller_mix(&mut expected, &msg, &gates[..width], &gates[width..]);
+            let rms = (super::super::forward::dot(&expected, &expected) / width as f32 + eps).sqrt().recip();
+            for (v, weight) in expected.iter_mut().zip(&weights) {
+                *v = from_bf16(to_bf16(*v * rms * weight));
+            }
+            let scores = gpu.router_logits(&router, std::slice::from_ref(&expected)).unwrap();
+            let (actual, logits) = gpu.gated_router(&down, &up, &norm, &router, &input, &x, &msg, eps).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(logits, scores);
+        }
+    }
 
     #[test]
     #[cfg(target_arch = "x86_64")]

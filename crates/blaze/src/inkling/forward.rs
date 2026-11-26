@@ -334,6 +334,7 @@ struct Layer {
     norm_k: Vec<f32>,
     norm_v: Vec<f32>,
     norm_mlp: Vec<f32>,
+    gated_norm: Option<gpu::DevBuf>,
     q_clip: Vec<f32>,
     rel_clip: Vec<f32>,
     res_query: Vec<f32>,
@@ -388,6 +389,17 @@ impl Layer {
             None
         };
         let rel = read("attn.rel_logits_proj.proj", &[s.relative, s.extent])?;
+        let norm_mlp = read("mlp_norm.weight", &[s.hidden])?;
+        #[cfg(target_arch = "x86_64")]
+        let avx_controller = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx_controller = false;
+        let gated_norm = if avx_controller && s.hidden.is_multiple_of(32) && s.hidden <= 4096
+            && loop_inputs.as_ref().is_some_and(|c| matches!(c.controllers[3].up, GateWeights::Device(_)))
+            && std::env::var_os("BLAZE_INKLING_GPU_ROUTER").is_some_and(|v| v == "1")
+        {
+            Some(gpu::DevBuf::from_slice(&norm_mlp)?)
+        } else { None };
         let mut rel_transposed = vec![0u16; rel.len()];
         for (i, row) in rel.chunks_exact(s.extent).enumerate() {
             for (j, &v) in row.iter().enumerate() {
@@ -422,7 +434,8 @@ impl Layer {
             } else {
                 read("v_input_norm.weight", &[s.hidden])?
             },
-            norm_mlp: read("mlp_norm.weight", &[s.hidden])?,
+            norm_mlp,
+            gated_norm,
             q_clip: read("attn.q_l2_clip.scale", &[s.heads, s.dim])?,
             rel_clip: read("attn.rel_l2_clip.scale", &[s.heads, s.relative])?,
             res_query,
@@ -887,6 +900,8 @@ impl Model {
                 (compute.project_group([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs])?, None)
             };
             let [q_batch, k_batch, v_batch] = qkv;
+            let single_row = rows.len() == 1;
+            let mut gated_logits = None;
             for (offset, row) in rows.iter_mut().enumerate() {
                 let position = seq.position + offset;
                 let ForwardRow { x, blocks, messages, .. } = row;
@@ -949,7 +964,19 @@ impl Model {
                 if visit.pass > 0 {
                     let c = layer.loop_inputs.as_ref().unwrap();
                     let msg = mix_normalized(messages, &c.queries[3]);
-                    c.controllers[3].merge(compute, &mut mlp_in, &msg, s.eps)?;
+                    let gate = &c.controllers[3];
+                    if single_row && let (Some(norm), GateWeights::Device(up), Router::Device(router)) =
+                        (&layer.gated_norm, &gate.up, &layer.router)
+                    {
+                        let (activation, logits) = compute.gated_router(
+                            &gate.down, up, norm, router, &Controller::input(&mlp_in, &msg, s.eps), &mlp_in, &msg, s.eps,
+                        )?;
+                        activations.push(activation);
+                        residuals.push(residual);
+                        gated_logits = Some(logits);
+                        continue;
+                    }
+                    gate.merge(compute, &mut mlp_in, &msg, s.eps)?;
                 }
                 let mlp_in = normalized(&mlp_in, Some(&layer.norm_mlp), s.eps)
                     .into_iter()
@@ -958,10 +985,11 @@ impl Model {
                 activations.push(mlp_in);
                 residuals.push(residual);
             }
-            let routes: Vec<_> = match &layer.router {
-                Router::Device(w) => compute.router_logits(w, &activations)?.chunks_exact(s.experts)
+            let routes: Vec<_> = match (&layer.router, gated_logits) {
+                (_, Some(logits)) => vec![layer.routes(logits.into_iter(), s)],
+                (Router::Device(w), None) => compute.router_logits(w, &activations)?.chunks_exact(s.experts)
                     .map(|row| layer.routes(row.iter().copied(), s)).collect(),
-                Router::Host(w) => activations.iter().map(|x| {
+                (Router::Host(w), None) => activations.iter().map(|x| {
                     layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
                 }).collect(),
             };

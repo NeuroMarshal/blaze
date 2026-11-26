@@ -67,7 +67,53 @@ __global__ void router_logits(const __nv_bfloat16* w, const __nv_bfloat16* x, fl
     if (lane == 0) out[size_t(blockIdx.y) * gridDim.x + blockIdx.x] = sum;
 }
 
+__device__ float controller_tanh(float value) {
+    const float x = fmaxf(-80.0f, -2.0f * fabsf(value));
+    const int n = __float2int_rn(x * 1.4426950408889634f);
+    const float r = fmaf(-float(n), 0.6931471805599453f, x);
+    float p = fmaf(1.0f / 720.0f, r, 1.0f / 120.0f);
+    p = fmaf(p, r, 1.0f / 24.0f);
+    p = fmaf(p, r, 1.0f / 6.0f);
+    p = fmaf(p, r, 0.5f);
+    p = fmaf(p, r, 1.0f);
+    p = fmaf(p, r, 1.0f);
+    const float e = p * __int_as_float((n + 127) << 23);
+    return copysignf(__fdiv_rn(1.0f - e, 1.0f + e), value);
+}
+
+__global__ void controller_norm(const float* gates, const float* x, const float* msg,
+                                const float* norm, __nv_bfloat16* output, int width, float eps) {
+    extern __shared__ float mixed[];
+    __shared__ float scale;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        const float keep = __fmul_rn(x[i], 1.0f - controller_tanh(gates[i]));
+        const float add = __fmul_rn(msg[i], controller_tanh(gates[width+i]));
+        mixed[i] = keep + add;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float acc = 0.0f;
+        for (int i = threadIdx.x; i < width; i += 32) acc = fmaf(mixed[i], mixed[i], acc);
+        acc += __shfl_down_sync(0xffffffff, acc, 8);
+        acc += __shfl_down_sync(0xffffffff, acc, 16);
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) sum += __shfl_sync(0xffffffff, acc, i);
+        if (threadIdx.x == 0) scale = __fdiv_rn(1.0f, __fsqrt_rn(__fdiv_rn(sum, float(width)) + eps));
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < width; i += blockDim.x) output[i] = __float2bfloat16(mixed[i] * scale * norm[i]);
+}
+
 } // namespace
+
+extern "C" cudaError_t blz_inkling_controller_norm(const float* gates, const float* x, const float* msg,
+        const float* norm, uint16_t* out, int width, float eps, cudaStream_t stream) {
+    if (width <= 0 || width > 4096 || width % 32) return cudaErrorInvalidValue;
+    controller_norm<<<1, 256, width * sizeof(float), stream>>>(gates, x, msg, norm,
+        reinterpret_cast<__nv_bfloat16*>(out), width, eps);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_inkling_router_logits(const uint16_t* w, const uint16_t* x, float* out,
         int rows, int cols, int tokens, cudaStream_t stream) {
