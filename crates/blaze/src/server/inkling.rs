@@ -74,7 +74,7 @@ pub async fn serve(config: Config) -> Result<()> {
         vision: config.options.max_image_tokens > 0,
     });
     let (ready, status) = oneshot::channel();
-    std::thread::Builder::new().name("blaze-inkling".into()).spawn(move || {
+    let worker = std::thread::Builder::new().name("blaze-inkling".into()).spawn(move || {
         let stage = crate::logging::stage("Inkling tokenizer, model weights and CUDA buffers");
         let loaded = (|| Ok::<_, anyhow::Error>((Text::load(&config.path)?, Model::load(&config.path, config.options)?)))();
         let (text, mut model) = match loaded {
@@ -113,7 +113,11 @@ pub async fn serve(config: Config) -> Result<()> {
             }
         }
     })?;
-    status.await.context("Inkling worker exited during startup")??;
+    let startup = status.await.context("Inkling worker exited during startup").and_then(|result| result);
+    if let Err(err) = startup {
+        let _ = worker.join();
+        return Err(err);
+    }
     crate::eprintln!("{} ready at {}", state.name, early.listen);
     let app = Router::new()
         .route("/health", get(|| async { StatusCode::OK }))
@@ -127,7 +131,10 @@ pub async fn serve(config: Config) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("Inkling HTTP app already initialized"))?;
     let _ = early.signal.wait_for(|shutdown| *shutdown).await;
     let _ = early.stop.send(());
-    early.serving.await??;
+    let serving = early.serving.await;
+    drop(early.app);
+    worker.join().map_err(|_| anyhow::anyhow!("Inkling worker panicked during shutdown"))?;
+    serving??;
     Ok(())
 }
 
