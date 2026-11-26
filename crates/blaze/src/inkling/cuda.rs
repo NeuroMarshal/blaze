@@ -60,16 +60,31 @@ impl Dense {
     }
 
     pub(super) fn run(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize) -> Result<()> {
-        self.run_prefix(gpu, x, out, m, self.rows)
+        self.run_prefix(gpu, x, out, m, self.rows, m == 1)
     }
 
-    fn run_prefix(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize, rows: usize) -> Result<()> {
+    fn run_decode_rows(&self, gpu: &Compute, x: *const u16, out: *mut u16, count: usize) -> Result<()> {
+        let max_rows = if self.rows > 4096 && crate::tune::wide_fits(1, self.cols, self.cols) {
+            sys::BLZ_GEMV_WIDE_MAX_ROWS.min(sys::BLZ_GEMV_WIDE_MAX_SMEM / (self.cols * 2))
+        } else if self.rows <= 4096 && crate::tune::skinny_fits(1, self.cols, self.cols) {
+            sys::BLZ_SKINNY_EX_MAX_ROWS
+        } else { 1 };
+        let max_rows = if (x as usize).is_multiple_of(16) { max_rows } else { 1 };
+        for first in (0..count).step_by(max_rows) {
+            let batch = (count - first).min(max_rows);
+            let input = x.wrapping_add(first * self.cols);
+            self.run_prefix(gpu, input, out.wrapping_add(first * self.rows), batch, self.rows, true)?;
+        }
+        Ok(())
+    }
+
+    fn run_prefix(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize, rows: usize, decode: bool) -> Result<()> {
         let (n, k) = (rows as i32, self.cols as i32);
         let weight = self.weight.ptr::<u16>();
-        if m == 1 && (x as usize).is_multiple_of(16) {
+        if decode && (x as usize).is_multiple_of(16) {
             if rows > 4096 && crate::tune::wide_fits(m, self.cols, self.cols) {
                 return check(
-                    unsafe { sys::blz_gemv_wide(x.cast(), k.into(), weight.cast(), out.cast(), n.into(), 1, n, k, gpu.stream.0) },
+                    unsafe { sys::blz_gemv_wide(x.cast(), k.into(), weight.cast(), out.cast(), n.into(), m as i32, n, k, gpu.stream.0) },
                     "Inkling wide GEMV",
                 );
             }
@@ -82,7 +97,7 @@ impl Dense {
                             weight.cast(),
                             out.cast(),
                             n.into(),
-                            1,
+                            m as i32,
                             n,
                             k,
                             sys::BLZ_BF16,
@@ -234,6 +249,7 @@ impl ExpertPool {
         epoch: usize,
         observations: Option<usize>,
         preserve_group: bool,
+        pending: Option<&Stream>,
     ) -> Result<bool> {
         let mut heat = Heat::default();
         if let Some(observations) = observations {
@@ -265,6 +281,7 @@ impl ExpertPool {
                 if observations.is_some() && heat.count < old_count.saturating_add(16.max(old_count / 4)) {
                     return Ok(false);
                 }
+                if let Some(stream) = pending { stream.sync()?; }
                 self.entries.remove(&old).unwrap().slot
             }
         };
@@ -420,8 +437,8 @@ impl Compute {
         let gate = DevBuf::new((intermediate * 2 * expert_rows).max(max_in) * 2)?;
         let glu = DevBuf::new(intermediate * expert_rows * 2)?;
         let sum = DevBuf::new(prefill_chunk * hidden * 4)?;
-        let scatter_ids = DevBuf::new(batch * 4)?;
-        let scatter_weights = DevBuf::new(batch * 4)?;
+        let scatter_ids = DevBuf::new(prefill_chunk * top_k * 4)?;
+        let scatter_weights = DevBuf::new(prefill_chunk * top_k * 4)?;
         let transfer = HostMapped::new(input.bytes().max(result.bytes()))?;
         let next_id = DevBuf::new(4)?;
         let cache = ExpertCache::new(expert_bytes, expert_sizes, layer_visits, top_k)?;
@@ -553,9 +570,7 @@ impl Compute {
             for i in 0..N {
                 // Dynamic convolution taps use the decode GEMV for every prompt row.
                 if (verifying || i >= 3) && m > 1 {
-                    for row in 0..m {
-                        matrices[i].run(gpu, gpu.input.at(offsets[i] + row * cols), gpu.result.at(out + row * matrices[i].rows), 1)?;
-                    }
+                    matrices[i].run_decode_rows(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
                 } else {
                     matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
                 }
@@ -704,9 +719,7 @@ impl Compute {
         };
         let work = self.run_projection(key, |gpu| {
             gpu.copy_staged_input(bytes)?;
-            for r in 0..tokens {
-                down.run(gpu, gpu.input.at(r*2*width), gpu.gate.at(r*64), 1)?;
-            }
+            down.run_decode_rows(gpu, gpu.input.ptr(), gpu.gate.ptr(), tokens)?;
             check(unsafe {
                 sys::blz_inkling_controller_up(gpu.gate.ptr(), up.weight.ptr(), std::ptr::null(), std::ptr::null(),
                     gpu.result.ptr(), up.rows as i32, 1, tokens as i32, gpu.stream.0)
@@ -740,7 +753,7 @@ impl Compute {
         let x: Vec<_> = x.iter().copied().map(to_bf16).collect();
         let work = (|| -> Result<()> {
             self.stage_input(&x)?;
-            matrix.run_prefix(self, self.input.ptr(), self.result.ptr(), 1, vocab)?;
+            matrix.run_prefix(self, self.input.ptr(), self.result.ptr(), 1, vocab, true)?;
             check(
                 unsafe {
                     sys::blz_argmax_bf16(
@@ -791,7 +804,7 @@ impl Compute {
         let mut cold = Vec::new();
         let mut resident = Vec::new();
         for &(id, weight) in routes {
-            if pool.use_gpu(ckpt, weights, (layer, id), tick, epoch, self.cpu.is_some().then_some(1), true)? {
+            if pool.use_gpu(ckpt, weights, (layer, id), tick, epoch, self.cpu.is_some().then_some(1), true, None)? {
                 resident.push((id, weight));
             } else {
                 cold.push((Routed::read(ckpt, weights, id)?, x, 0, weight));
@@ -949,89 +962,92 @@ impl Compute {
                 by_expert[id].push((row as i32, w));
             }
         }
-        let activations_bf16: Vec<Vec<u16>> = activations
-            .iter()
-            .map(|row| row.iter().copied().map(to_bf16).collect())
-            .collect();
-        self.sum.zero(&self.stream)?;
+        let activations_bf16: Vec<_> = activations.iter().flatten().copied().map(to_bf16).collect();
+        let (ids, probs): (Vec<_>, Vec<_>) = by_expert.iter().flatten().copied().unzip();
+        let gather_offset = activations_bf16.len();
+        ensure!((gather_offset + activations.len().min(EXPERT_BATCH) * hidden) * 2 <= self.input.bytes(),
+            "Inkling expert gather exceeds scratch");
         self.cache.generation += 1;
         let tick = self.cache.generation;
         self.cache.visits += activations.len();
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
-        let mut input = Vec::with_capacity(hidden * EXPERT_BATCH);
-        let mut ids = Vec::with_capacity(EXPERT_BATCH);
-        let mut probs = Vec::with_capacity(EXPERT_BATCH);
-        let mut cold = Vec::new();
-        for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            if !pool.use_gpu(
-                ckpt,
-                weights,
-                (layer, id),
-                tick,
-                epoch,
-                self.cpu.is_some().then_some(rows.len()),
-                false,
-            )? {
-                for &(row, weight) in rows {
-                    cold.push((
-                        Routed::read(ckpt, weights, id)?,
-                        activations[row as usize].as_slice(),
-                        row as usize,
-                        weight,
-                    ));
+        let work = (|| -> Result<_> {
+            self.input.upload_async(&activations_bf16, &self.stream)?;
+            self.scatter_ids.upload_async(&ids, &self.stream)?;
+            self.scatter_weights.upload_async(&probs, &self.stream)?;
+            self.sum.zero(&self.stream)?;
+            let mut offset = 0;
+            let mut cold = Vec::new();
+            for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                let start = offset;
+                offset += rows.len();
+                if !pool.use_gpu(
+                    ckpt,
+                    weights,
+                    (layer, id),
+                    tick,
+                    epoch,
+                    self.cpu.is_some().then_some(rows.len()),
+                    false,
+                    Some(&self.stream),
+                )? {
+                    for &(row, weight) in rows {
+                        cold.push((
+                            Routed::read(ckpt, weights, id)?,
+                            activations[row as usize].as_slice(),
+                            row as usize,
+                            weight,
+                        ));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let e = &pool.entries[&(layer, id)];
-            for batch in rows.chunks(EXPERT_BATCH) {
-                input.clear();
-                ids.clear();
-                probs.clear();
-                for &(row, weight) in batch {
-                    input.extend_from_slice(&activations_bf16[row as usize]);
-                    ids.push(row);
-                    probs.push(weight);
+                let e = &pool.entries[&(layer, id)];
+                for (index, batch) in rows.chunks(EXPERT_BATCH).enumerate() {
+                    let at = start + index * EXPERT_BATCH;
+                    let n = batch.len();
+                    let input = self.input.at(gather_offset);
+                    check(unsafe {
+                        sys::blz_gather_rows(self.input.ptr(), hidden as i64, self.scatter_ids.at(at),
+                            n as i32, hidden as i32, input, self.stream.0)
+                    }, "Inkling gather expert activations")?;
+                    e.gate_up
+                        .run(&pool.buffer, input, self.gate.ptr(), n, &self.stream)?;
+                    check(
+                        unsafe {
+                            sys::blz_inkling_swiglu(
+                                self.gate.ptr(),
+                                self.glu.ptr(),
+                                (intermediate * n) as i32,
+                                caps.0,
+                                caps.1,
+                                self.stream.0,
+                            )
+                        },
+                        "Inkling batched activation",
+                    )?;
+                    e.down.run(&pool.buffer, self.glu.ptr(), self.result.ptr(), n, &self.stream)?;
+                    check(
+                        unsafe {
+                            sys::blz_inkling_expert_scatter(
+                                self.result.ptr(),
+                                self.sum.ptr(),
+                                self.scatter_ids.at(at),
+                                self.scatter_weights.at(at),
+                                n as i32,
+                                hidden as i32,
+                                self.stream.0,
+                            )
+                        },
+                        "Inkling batched expert reduction",
+                    )?;
                 }
-                self.input.upload(&input)?;
-                self.scatter_ids.upload(&ids)?;
-                self.scatter_weights.upload(&probs)?;
-                let n = batch.len();
-                e.gate_up
-                    .run(&pool.buffer, self.input.ptr(), self.gate.ptr(), n, &self.stream)?;
-                check(
-                    unsafe {
-                        sys::blz_inkling_swiglu(
-                            self.gate.ptr(),
-                            self.glu.ptr(),
-                            (intermediate * n) as i32,
-                            caps.0,
-                            caps.1,
-                            self.stream.0,
-                        )
-                    },
-                    "Inkling batched activation",
-                )?;
-                e.down.run(&pool.buffer, self.glu.ptr(), self.result.ptr(), n, &self.stream)?;
-                check(
-                    unsafe {
-                        sys::blz_inkling_expert_scatter(
-                            self.result.ptr(),
-                            self.sum.ptr(),
-                            self.scatter_ids.ptr(),
-                            self.scatter_weights.ptr(),
-                            n as i32,
-                            hidden as i32,
-                            self.stream.0,
-                        )
-                    },
-                    "Inkling batched expert reduction",
-                )?;
-                self.stream.sync()?;
             }
-        }
-        let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, caps, &mut self.cpu_routes);
-        self.stream.sync()?;
+            Ok(run_cold(self.cpu.as_deref(), cold, weights, caps, &mut self.cpu_routes))
+        })();
+        let synced = self.stream.sync();
+        let out_cpu = work?;
+        synced?;
         let mut total = self.sum.download(activations.len() * hidden)?;
         merge_cold(&mut total, hidden, out_cpu);
         Ok(total)
