@@ -27,7 +27,40 @@ __global__ void reduce_experts(const __nv_bfloat16* rows, const float* weights, 
     out[col] = sum;
 }
 
+__global__ void controller_up(const __nv_bfloat16* hidden, const __nv_bfloat16* w0,
+                              const __nv_bfloat16* w1, const __nv_bfloat16* w2, float* out, int rows) {
+    const int group = blockIdx.y;
+    const int row = blockIdx.x * (blockDim.x / 8) + threadIdx.x / 8;
+    const int lane = threadIdx.x % 8;
+    if (row >= rows) return;
+    const auto* w = (group == 0 ? w0 : group == 1 ? w1 : w2) + row * 64 + lane;
+    const auto* x = hidden + group * 64 + lane;
+    float acc[4];
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int k = i * 8;
+        acc[i] = fmaf(__bfloat162float(w[k]), __bfloat162float(x[k]), 0.0f);
+        acc[i] = fmaf(__bfloat162float(w[k+32]), __bfloat162float(x[k+32]), acc[i]);
+    }
+    // Match the four AVX accumulators and their ordered horizontal sum.
+    const float partial = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+    const unsigned mask = __activemask();
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) sum += __shfl_sync(mask, partial, i, 8);
+    if (lane == 0) out[group * rows + row] = sum;
+}
+
 } // namespace
+
+extern "C" cudaError_t blz_inkling_controller_up(const uint16_t* hidden, const uint16_t* w0,
+        const uint16_t* w1, const uint16_t* w2, float* out, int rows, int groups, cudaStream_t stream) {
+    if (rows <= 0 || (groups != 1 && groups != 3)) return cudaErrorInvalidValue;
+    controller_up<<<dim3((rows + 15) / 16, groups), 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(hidden), reinterpret_cast<const __nv_bfloat16*>(w0),
+        reinterpret_cast<const __nv_bfloat16*>(w1), reinterpret_cast<const __nv_bfloat16*>(w2), out, rows);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_inkling_swiglu(const uint16_t* gate_up, uint16_t* out, int n,
                                           float gate_cap, float up_cap, cudaStream_t stream) {

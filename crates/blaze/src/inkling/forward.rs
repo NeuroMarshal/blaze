@@ -221,16 +221,31 @@ impl ConvState {
 
 struct Controller {
     down: Dense,
-    forget: Vec<f32>,
-    gain: Vec<f32>,
+    up: GateWeights,
+}
+
+enum GateWeights {
+    Host { forget: Vec<f32>, gain: Vec<f32> },
+    Device(Dense),
 }
 
 impl Controller {
     fn load(ckpt: &Checkpoint, name: &str, hidden: usize, rank: usize) -> Result<Self> {
+        let forget = format!("{name}.forget_weight");
+        let gain = format!("{name}.gain_weight");
+        let up = if rank == 64 && std::env::var_os("BLAZE_INKLING_GPU_CONTROLLER").is_some_and(|v| v == "1")
+            && ckpt.info(&forget)?.dtype == Dtype::Bf16 && ckpt.info(&gain)?.dtype == Dtype::Bf16
+        {
+            GateWeights::Device(Dense::stack(ckpt, &[(&forget, hidden), (&gain, hidden)], rank)?)
+        } else {
+            GateWeights::Host {
+                forget: read_float(ckpt, &forget, &[hidden, rank])?,
+                gain: read_float(ckpt, &gain, &[hidden, rank])?,
+            }
+        };
         Ok(Self {
             down: Dense::load(ckpt, &format!("{name}.down_weight"), rank, hidden * 2)?,
-            forget: read_float(ckpt, &format!("{name}.forget_weight"), &[hidden, rank])?,
-            gain: read_float(ckpt, &format!("{name}.gain_weight"), &[hidden, rank])?,
+            up,
         })
     }
 
@@ -241,15 +256,25 @@ impl Controller {
             .collect()
     }
 
-    fn apply(&self, x: &mut [f32], message: &[f32], h: &[f32]) {
-        let forget: Vec<_> = self.forget.chunks_exact(h.len()).map(|row| dot(row, h)).collect();
-        let gain: Vec<_> = self.gain.chunks_exact(h.len()).map(|row| dot(row, h)).collect();
+    fn apply_host(x: &mut [f32], message: &[f32], h: &[f32], forget: &[f32], gain: &[f32]) {
+        let forget: Vec<_> = forget.chunks_exact(h.len()).map(|row| dot(row, h)).collect();
+        let gain: Vec<_> = gain.chunks_exact(h.len()).map(|row| dot(row, h)).collect();
         cpu::controller_mix(x, message, &forget, &gain);
     }
 
     fn merge(&self, gpu: &mut Compute, x: &mut [f32], message: &[f32], eps: f32) -> Result<()> {
-        let h = gpu.linear(&self.down, &Self::input(x, message, eps))?;
-        self.apply(x, message, &h);
+        let input = Self::input(x, message, eps);
+        match &self.up {
+            GateWeights::Device(up) => {
+                let gates = gpu.controller_gates([&self.down], [up], [&input])?;
+                let (forget, gain) = gates.split_at(x.len());
+                cpu::controller_mix(x, message, forget, gain);
+            }
+            GateWeights::Host { forget, gain } => {
+                let h = gpu.linear(&self.down, &input)?;
+                Self::apply_host(x, message, &h, forget, gain);
+            }
+        }
         Ok(())
     }
 }
@@ -262,6 +287,24 @@ struct LoopInputs {
 impl LoopInputs {
     fn mix_attention(&self, gpu: &mut Compute, qkv: &mut [Vec<f32>], memory: &[Vec<f32>], eps: f32) -> Result<()> {
         let messages: [Vec<f32>; 3] = std::array::from_fn(|i| mix_normalized(memory, &self.queries[i]));
+        let controllers = self.controllers.first_chunk::<3>().unwrap();
+        let weights = controllers.each_ref().map(|c| &c.up);
+        if let [GateWeights::Device(q), GateWeights::Device(k), GateWeights::Device(v)] = weights {
+            let inputs: [Vec<f32>; 3] = std::array::from_fn(|i| Controller::input(&qkv[i], &messages[i], eps));
+            let gates = gpu.controller_gates(controllers.each_ref().map(|c| &c.down), [q, k, v], inputs.each_ref().map(Vec::as_slice))?;
+            let width = qkv[0].len();
+            for ((x, message), gates) in qkv.iter_mut().zip(messages).zip(gates.chunks_exact(2 * width)) {
+                let (forget, gain) = gates.split_at(width);
+                cpu::controller_mix(x, &message, forget, gain);
+            }
+            return Ok(());
+        }
+        if weights.iter().any(|w| matches!(w, GateWeights::Device(_))) {
+            for ((controller, x), message) in controllers.iter().zip(qkv).zip(messages) {
+                controller.merge(gpu, x, &message, eps)?;
+            }
+            return Ok(());
+        }
         let inputs: [Vec<f32>; 3] = std::array::from_fn(|i| Controller::input(&qkv[i], &messages[i], eps));
         let inputs = inputs.each_ref().map(Vec::as_slice).map(|row| [row]);
         let gates = gpu.project_three(
@@ -270,7 +313,8 @@ impl LoopInputs {
         )?;
         for (i, gate) in gates.into_iter().enumerate() {
             let h: Vec<_> = gate.into_iter().map(from_bf16).collect();
-            self.controllers[i].apply(&mut qkv[i], &messages[i], &h);
+            let GateWeights::Host { forget, gain } = weights[i] else { unreachable!() };
+            Controller::apply_host(&mut qkv[i], &messages[i], &h, forget, gain);
         }
         Ok(())
     }
@@ -1018,7 +1062,7 @@ fn clipped(x: &[u16], learned: &[f32], dim: usize, max: f32, log_scale: f32) -> 
         .collect()
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {

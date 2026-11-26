@@ -333,7 +333,11 @@ const EXPERT_BATCH: usize = 64;
 // Count token visits, so a prefill chunk advances the heat clock by its length.
 const HEAT_EPOCH_VISITS: usize = 48 * 512;
 
-type ProjectionKey = ([usize; 3], [usize; 3]);
+#[derive(Hash, Eq, PartialEq)]
+enum ProjectionKey {
+    Dense([usize; 3], [usize; 3]),
+    Controller([usize; 3], [usize; 3]),
+}
 const MAX_PROJECTION_GRAPHS: usize = 256;
 
 struct ProjectionGraph(sys::cudaGraphExec_t);
@@ -538,19 +542,9 @@ impl Compute {
             }
             gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
         };
-        let work = if m == 1 && self.projection_graphs.is_some() {
-            let key = (matrices.map(|matrix| matrix.weight.ptr::<u8>() as usize), offsets);
-            if let Some(cached) = self.projection_graphs.as_ref().unwrap().get(&key) {
-                cached.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream))
-            } else if self.projection_graphs.as_ref().unwrap().len() < MAX_PROJECTION_GRAPHS {
-                // The matrices and scratch buffers stay live for the lifetime of the compute device.
-                let captured = ProjectionGraph::capture(&self.stream, || enqueue(self));
-                let result = captured.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream));
-                self.projection_graphs.as_mut().unwrap().insert(key, captured);
-                result
-            } else {
-                enqueue(self)
-            }
+        let work = if m == 1 {
+            let key = ProjectionKey::Dense(matrices.map(|matrix| matrix.weight.ptr::<u8>() as usize), offsets);
+            self.run_projection(key, enqueue)
         } else {
             enqueue(self)
         };
@@ -564,6 +558,61 @@ impl Compute {
             offset += len;
             dst
         }))
+    }
+
+    fn run_projection(&mut self, key: ProjectionKey, enqueue: impl Fn(&Self) -> Result<()>) -> Result<()> {
+        let Some(graphs) = &self.projection_graphs else { return enqueue(self) };
+        if let Some(cached) = graphs.get(&key) {
+            return cached.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream));
+        }
+        if graphs.len() >= MAX_PROJECTION_GRAPHS {
+            return enqueue(self);
+        }
+        let captured = ProjectionGraph::capture(&self.stream, || enqueue(self));
+        let result = captured.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream));
+        self.projection_graphs.as_mut().unwrap().insert(key, captured);
+        result
+    }
+
+    pub fn controller_gates<const N: usize>(
+        &mut self, down: [&Dense; N], up: [&Dense; N], inputs: [&[f32]; N],
+    ) -> Result<Vec<f32>> {
+        let cols = down[0].cols;
+        let rows = up[0].rows;
+        ensure!(
+            matches!(N, 1 | 3) && inputs.iter().all(|x| x.len() == cols)
+                && down.iter().all(|w| w.cols == cols && w.rows == 64)
+                && up.iter().all(|w| w.rows == rows && w.cols == 64)
+                && N * cols * 2 <= self.input.bytes() && N * 64 * 2 <= self.gate.bytes()
+                && N * rows * 4 <= self.result.bytes(), "Inkling controller exceeds scratch"
+        );
+        let host = self.transfer.host_ptr().cast_mut().cast::<u16>();
+        let dst = unsafe { std::slice::from_raw_parts_mut(host, N * cols) };
+        for (dst, input) in dst.chunks_exact_mut(cols).zip(inputs) {
+            for (dst, &value) in dst.iter_mut().zip(input) { *dst = to_bf16(value); }
+        }
+        let pointers = |matrices: [&Dense; N]| std::array::from_fn(|i| {
+            matrices.get(i).map_or(0, |w| w.weight.ptr::<u16>() as usize)
+        });
+        let key = ProjectionKey::Controller(pointers(down), pointers(up));
+        let work = self.run_projection(key, |gpu| {
+            gpu.copy_staged_input(N * cols * 2)?;
+            for (i, w) in down.iter().enumerate() {
+                w.run(gpu, gpu.input.at(i * cols), gpu.gate.at(i * 64), 1)?;
+            }
+            let weights = |i: usize| up.get(i).map_or(std::ptr::null(), |w| w.weight.ptr::<u16>());
+            check(unsafe {
+                sys::blz_inkling_controller_up(
+                    gpu.gate.ptr(), weights(0), weights(1), weights(2), gpu.result.ptr(),
+                    rows as i32, N as i32, gpu.stream.0,
+                )
+            }, "Inkling controller gates")?;
+            gpu.queue_result::<f32>(gpu.result.ptr(), N * rows)
+        });
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        Ok(self.read_result(N * rows))
     }
 
     pub fn linear(&mut self, matrix: &Dense, x: &[f32]) -> Result<Vec<f32>> {
@@ -1119,6 +1168,37 @@ impl AttentionScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires a CUDA GPU and AVX2/FMA"]
+    fn controller_up_matches_host_dots() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
+        crate::gpu::set_device(0).unwrap();
+        let stream = Stream::new().unwrap();
+        let rows = 67;
+        let values = |size, salt| (0..size).map(|i: usize| {
+            to_bf16((((i * 31 + salt) % 101) as f32 - 50.0) / (3 + i % 19) as f32)
+        }).collect::<Vec<_>>();
+        let x = values(3 * 64, 17);
+        let weights: [_; 3] = std::array::from_fn(|i| values(rows * 64, 23 * i));
+        let matrices = weights.each_ref().map(|w| DevBuf::from_slice(w).unwrap());
+        let input = DevBuf::from_slice(&x).unwrap();
+        let output = DevBuf::new(3 * rows * 4).unwrap();
+        check(unsafe {
+            sys::blz_inkling_controller_up(input.ptr(), matrices[0].ptr(), matrices[1].ptr(), matrices[2].ptr(),
+                output.ptr(), rows as i32, 3, stream.0)
+        }, "controller parity").unwrap();
+        stream.sync().unwrap();
+        let actual = output.download::<f32>(3 * rows).unwrap();
+        for (i, row) in actual.chunks_exact(rows).enumerate() {
+            let h: Vec<_> = x[i * 64..(i + 1) * 64].iter().copied().map(from_bf16).collect();
+            for (w, value) in weights[i].chunks_exact(64).zip(row) {
+                let w: Vec<_> = w.iter().copied().map(from_bf16).collect();
+                assert_eq!(super::super::forward::dot(&w, &h).to_bits(), value.to_bits());
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires a CUDA GPU"]
