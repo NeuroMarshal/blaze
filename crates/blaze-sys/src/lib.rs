@@ -597,11 +597,11 @@ unsafe extern "C" {
     pub fn blz_inkling_reduce_experts(rows: *const u16, weights: *const f32, out: *mut f32,
                                       width: c_int, experts: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_norm(gates: *const f32, x: *const f32, msg: *const f32, norm: *const f32,
-                                     out: *mut u16, width: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
+                                     out: *mut u16, width: c_int, eps: f32, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_router_logits(w: *const u16, x: *const u16, out: *mut f32, rows: c_int,
                                      cols: c_int, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_up(hidden: *const u16, w0: *const u16, w1: *const u16, w2: *const u16,
-                                     out: *mut f32, rows: c_int, groups: c_int, stream: cudaStream_t) -> cudaError_t;
+                                     out: *mut f32, rows: c_int, groups: c_int, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_grouped_nvfp4(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,
                                      y: *mut u16, experts: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_grouped_mxfp8(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,

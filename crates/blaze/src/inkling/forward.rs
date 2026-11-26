@@ -960,7 +960,11 @@ impl Model {
                 (compute.project_rows([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)))?, None)
             };
             let [q_batch, k_batch, v_batch] = qkv;
-            let single_row = rows.len() == 1;
+            let count = rows.len();
+            let mut inputs = Vec::new();
+            let mut mixed = Vec::new();
+            let mut messages_batch = Vec::new();
+            let limit = compute.gate_batch_limit(s.hidden);
             let mut gated_logits = None;
             for (offset, row) in rows.iter_mut().enumerate() {
                 let position = seq.position + offset;
@@ -1025,15 +1029,24 @@ impl Model {
                     let c = layer.loop_inputs.as_ref().unwrap();
                     let msg = mix_normalized(messages, &c.queries[3]);
                     let gate = &c.controllers[3];
-                    if single_row && let (Some(norm), GateWeights::Device(up), Router::Device(router)) =
+                    if let (Some(norm), GateWeights::Device(up), Router::Device(router)) =
                         (&layer.gated_norm, &gate.up, &layer.router)
                     {
-                        let (activation, logits) = compute.gated_router(
-                            &gate.down, up, norm, router, &Controller::input(&mlp_in, &msg, s.eps), &mlp_in, &msg, s.eps,
-                        )?;
-                        activations.push(activation);
+                        inputs.extend(Controller::input(&mlp_in, &msg, s.eps));
+                        mixed.extend(mlp_in);
+                        messages_batch.extend(msg);
                         residuals.push(residual);
-                        gated_logits = Some(logits);
+                        if offset+1 == count || mixed.len() >= limit*s.hidden {
+                            let (activation, logits) = compute.gated_router(
+                                &gate.down, up, norm, router, &inputs, &mixed, &messages_batch, s.eps,
+                            )?;
+                            if count == 1 { activations.push(activation); }
+                            else { activations.extend(activation.chunks_exact(s.hidden).map(<[f32]>::to_vec)); }
+                            gated_logits.get_or_insert_with(Vec::new).extend(logits);
+                            inputs.clear();
+                            mixed.clear();
+                            messages_batch.clear();
+                        }
                         continue;
                     }
                     gate.merge(compute, &mut mlp_in, &msg, s.eps)?;
@@ -1046,7 +1059,7 @@ impl Model {
                 residuals.push(residual);
             }
             let routes: Vec<_> = match (&layer.router, gated_logits) {
-                (_, Some(logits)) => vec![layer.routes(logits.into_iter(), s)],
+                (_, Some(logits)) => logits.chunks_exact(s.experts).map(|row| layer.routes(row.iter().copied(), s)).collect(),
                 (Router::Device(w), None) => compute.router_logits(w, &activations)?.chunks_exact(s.experts)
                     .map(|row| layer.routes(row.iter().copied(), s)).collect(),
                 (Router::Host(w), None) => activations.iter().map(|x| {

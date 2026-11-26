@@ -338,7 +338,7 @@ enum ProjectionKey {
     Dense([usize; 5], [usize; 5]),
     Controller([usize; 3], [usize; 3]),
     Router(usize),
-    GatedRouter { weights: [usize; 4], eps: u32 },
+    GatedRouter { weights: [usize; 4], eps: u32, tokens: usize },
     Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
@@ -622,7 +622,7 @@ impl Compute {
             check(unsafe {
                 sys::blz_inkling_controller_up(
                     gpu.gate.ptr(), weights(0), weights(1), weights(2), gpu.result.ptr(),
-                    rows as i32, N as i32, gpu.stream.0,
+                    rows as i32, N as i32, 1, gpu.stream.0,
                 )
             }, "Inkling controller gates")?;
             gpu.queue_result::<f32>(gpu.result.ptr(), N * rows)
@@ -664,56 +664,65 @@ impl Compute {
         Ok(self.read_result(outputs))
     }
 
+    pub fn gate_batch_limit(&self, width: usize) -> usize {
+        (self.input.bytes() / (12 * width)).min(self.result.bytes() / (8 * width)).min(self.gate.bytes()/128).min(16)
+    }
+
     pub fn gated_router(
         &mut self, down: &Dense, up: &Dense, norm: &DevBuf, router: &Dense,
         input: &[f32], x: &[f32], message: &[f32], eps: f32,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let width = x.len();
+        let width = router.cols;
+        let tokens = x.len() / width;
+        let size = x.len();
         let scores = router.rows;
-        let bytes = width * 12;
-        let output_bytes = width * 2 + scores * 4;
+        let bytes = size * 12;
+        let output_bytes = size * 2 + tokens * scores * 4;
         ensure!((32..=4096).contains(&width) && width.is_multiple_of(32)
-            && message.len() == width && input.len() == width * 2 && router.cols == width
+            && (1..=self.gate_batch_limit(width)).contains(&tokens) && size == tokens*width
+            && message.len() == size && input.len() == size * 2
             && down.cols == width * 2 && down.rows == 64 && up.rows == width * 2 && up.cols == 64
             && norm.bytes() == width * 4 && bytes.max(output_bytes) <= self.input.bytes()
             && width * 8 <= self.result.bytes() && self.gate.bytes() >= 128, "Inkling gated router exceeds scratch");
         let staging = self.transfer.host_slice_mut();
-        let (normalized, rest) = staging[..bytes].split_at_mut(width * 4);
+        let (normalized, rest) = staging[..bytes].split_at_mut(size * 4);
         for (dst, value) in normalized.chunks_exact_mut(2).zip(input) {
             dst.copy_from_slice(&to_bf16(*value).to_ne_bytes());
         }
-        for (dst, src) in rest.chunks_exact_mut(width * 4).zip([x, message]) {
+        for (dst, src) in rest.chunks_exact_mut(size * 4).zip([x, message]) {
             let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), dst.len()) };
             dst.copy_from_slice(src);
         }
         let key = ProjectionKey::GatedRouter {
             weights: [down.weight.ptr::<u8>() as usize, up.weight.ptr::<u8>() as usize,
                       norm.ptr::<u8>() as usize, router.weight.ptr::<u8>() as usize],
-            eps: eps.to_bits(),
+            eps: eps.to_bits(), tokens,
         };
         let work = self.run_projection(key, |gpu| {
             gpu.copy_staged_input(bytes)?;
-            down.run(gpu, gpu.input.ptr(), gpu.gate.ptr(), 1)?;
+            for r in 0..tokens {
+                down.run(gpu, gpu.input.at(r*2*width), gpu.gate.at(r*64), 1)?;
+            }
             check(unsafe {
                 sys::blz_inkling_controller_up(gpu.gate.ptr(), up.weight.ptr(), std::ptr::null(), std::ptr::null(),
-                    gpu.result.ptr(), up.rows as i32, 1, gpu.stream.0)
+                    gpu.result.ptr(), up.rows as i32, 1, tokens as i32, gpu.stream.0)
             }, "Inkling MLP controller projection")?;
             check(unsafe {
-                sys::blz_inkling_controller_norm(gpu.result.ptr(), gpu.input.at(width), gpu.input.at(width * 2),
-                    norm.ptr(), gpu.input.ptr(), width as i32, eps, gpu.stream.0)
+                sys::blz_inkling_controller_norm(gpu.result.ptr(), gpu.input.at(size), gpu.input.at(size * 2),
+                    norm.ptr(), gpu.input.ptr(), width as i32, eps, tokens as i32, gpu.stream.0)
             }, "Inkling gated MLP normalization")?;
             check(unsafe {
-                sys::blz_inkling_router_logits(router.weight.ptr(), gpu.input.ptr(), gpu.input.at(width / 2),
-                    scores as i32, width as i32, 1, gpu.stream.0)
+                sys::blz_inkling_router_logits(router.weight.ptr(), gpu.input.ptr(), gpu.input.at(size / 2),
+                    scores as i32, width as i32, tokens as i32, gpu.stream.0)
             }, "Inkling gated MoE router")?;
             gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
         });
         let synced = self.stream.sync();
         work?;
         synced?;
-        let activation = self.read_result::<u16>(width).into_iter().map(from_bf16).collect();
+        let activation = self.read_result::<u16>(size).into_iter().map(from_bf16).collect();
         let host = self.transfer.host_ptr().cast::<u16>();
-        let logits = unsafe { std::slice::from_raw_parts(host.add(width).cast::<f32>(), scores) }.to_vec();
+        let logits = unsafe { std::slice::from_raw_parts(host.add(size).cast::<f32>(), tokens*scores) }.to_vec();
         Ok((activation, logits))
     }
 
@@ -1368,7 +1377,7 @@ mod tests {
         let output = DevBuf::new(3 * rows * 4).unwrap();
         check(unsafe {
             sys::blz_inkling_controller_up(input.ptr(), matrices[0].ptr(), matrices[1].ptr(), matrices[2].ptr(),
-                output.ptr(), rows as i32, 3, stream.0)
+                output.ptr(), rows as i32, 3, 1, stream.0)
         }, "controller parity").unwrap();
         stream.sync().unwrap();
         let actual = output.download::<f32>(3 * rows).unwrap();
