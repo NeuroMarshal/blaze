@@ -162,7 +162,19 @@ impl OnDevice {
         };
         check(err, "Inkling packed expert GEMV")
     }
+
+    fn offsets(&self) -> sys::blz_inkling_matrix {
+        sys::blz_inkling_matrix {
+            codes: self.offset as u64,
+            scales: self.scale_offset as u64,
+            alpha: self.alpha_offset as u64,
+        }
+    }
 }
+
+type GroupedExpertGemv = unsafe extern "C" fn(
+    *const u16, i64, *const u8, *const sys::blz_inkling_matrix, *mut u16, i32, i32, i32, sys::cudaStream_t,
+) -> sys::cudaError_t;
 
 #[derive(Clone, Copy, Default)]
 struct Heat {
@@ -373,6 +385,7 @@ pub(super) struct Compute {
     cpu: Option<Arc<rayon::ThreadPool>>,
     cpu_routes: u64,
     projection_graphs: Option<HashMap<ProjectionKey, Option<ProjectionGraph>>>,
+    grouped_experts: bool,
 }
 
 impl Compute {
@@ -392,8 +405,9 @@ impl Compute {
         let batch = prefill_chunk.min(EXPERT_BATCH);
         let input = DevBuf::new((max_in * 3).max(hidden * prefill_chunk * 3) * 2)?;
         let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk).max(hidden * top_k) * 2)?;
-        let gate = DevBuf::new((intermediate * 2 * batch).max(max_in) * 2)?;
-        let glu = DevBuf::new(intermediate * batch * 2)?;
+        let expert_rows = batch.max(top_k);
+        let gate = DevBuf::new((intermediate * 2 * expert_rows).max(max_in) * 2)?;
+        let glu = DevBuf::new(intermediate * expert_rows * 2)?;
         let sum = DevBuf::new(prefill_chunk * hidden * 4)?;
         let scatter_ids = DevBuf::new(batch * 4)?;
         let scatter_weights = DevBuf::new(batch * 4)?;
@@ -420,6 +434,7 @@ impl Compute {
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
+            grouped_experts: std::env::var_os("BLAZE_INKLING_GROUPED_MOE").is_some_and(|value| value == "1"),
         })
     }
 
@@ -627,26 +642,60 @@ impl Compute {
         let work = (|| -> Result<()> {
             let activation_bytes = std::mem::size_of_val(x_bf16.as_slice());
             let offset = activation_bytes.next_multiple_of(std::mem::align_of::<f32>());
-            let end = offset + resident.len() * std::mem::size_of::<f32>();
+            let weights_end = offset + resident.len() * std::mem::size_of::<f32>();
+            let grouped = self.grouped_experts && (2..=65535).contains(&resident.len());
+            let matrix_bytes = std::mem::size_of::<sys::blz_inkling_matrix>();
+            let gate_meta = weights_end.next_multiple_of(std::mem::align_of::<sys::blz_inkling_matrix>());
+            let down_meta = gate_meta + resident.len() * matrix_bytes;
+            let end = if grouped { down_meta + resident.len() * matrix_bytes } else { weights_end };
             ensure!(end <= self.input.bytes() && end <= self.transfer.bytes(), "Inkling MoE input exceeds staging");
+            let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
             let staging = self.transfer.host_slice_mut();
             // SAFETY: these initialized activation values are copied as native-endian bytes.
             let activations = unsafe { std::slice::from_raw_parts(x_bf16.as_ptr().cast::<u8>(), activation_bytes) };
             staging[..activation_bytes].copy_from_slice(activations);
-            for (dst, (_, weight)) in staging[offset..end].chunks_exact_mut(4).zip(&resident) {
+            for (dst, (_, weight)) in staging[offset..weights_end].chunks_exact_mut(4).zip(&resident) {
                 dst.copy_from_slice(&weight.to_ne_bytes());
             }
+            if grouped {
+                // SAFETY: the pinned buffer is page-aligned, the descriptor offsets are aligned,
+                // and the capacity was checked above.
+                unsafe {
+                    let ptr = staging.as_mut_ptr();
+                    let gate = ptr.add(gate_meta).cast::<sys::blz_inkling_matrix>();
+                    let down = ptr.add(down_meta).cast::<sys::blz_inkling_matrix>();
+                    for (row, &(id, _)) in resident.iter().enumerate() {
+                        let expert = &pool.entries[&(layer, id)];
+                        gate.add(row).write(expert.gate_up.offsets());
+                        down.add(row).write(expert.down.offsets());
+                    }
+                }
+            }
             self.copy_staged_input(end)?;
-            let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-            for (row, &(id, _)) in resident.iter().enumerate() {
-                let expert = &pool.entries[&(layer, id)];
-                expert.gate_up.run(&pool.buffer, self.input.ptr(), self.gate.ptr(), 1, &self.stream)?;
+            if grouped {
+                let run: GroupedExpertGemv = match weights.gate_up.packing {
+                    Packing::Nvfp4 => sys::blz_inkling_grouped_nvfp4,
+                    Packing::Mxfp8 => sys::blz_inkling_grouped_mxfp8,
+                };
+                let group_count = resident.len() as i32;
+                let launch = |matrix: &PackedMatrix, meta, x, x_step, y| {
+                    check(
+                        unsafe {
+                            run(
+                                x, x_step, pool.buffer.ptr(), self.input.at::<u8>(meta).cast(), y,
+                                group_count, matrix.rows as i32, matrix.cols as i32, self.stream.0,
+                            )
+                        },
+                        "Inkling grouped expert GEMV",
+                    )
+                };
+                launch(&weights.gate_up, gate_meta, self.input.ptr(), 0, self.gate.ptr())?;
                 check(
                     unsafe {
                         sys::blz_inkling_swiglu(
                             self.gate.ptr(),
                             self.glu.ptr(),
-                            weights.down.cols as i32,
+                            group_count * weights.down.cols as i32,
                             gate_cap,
                             up_cap,
                             self.stream.0,
@@ -654,7 +703,26 @@ impl Compute {
                     },
                     "Inkling expert activation",
                 )?;
-                expert.down.run(&pool.buffer, self.glu.ptr(), self.result.at(row * x.len()), 1, &self.stream)?;
+                launch(&weights.down, down_meta, self.glu.ptr(), weights.down.cols as i64, self.result.ptr())?;
+            } else {
+                for (row, &(id, _)) in resident.iter().enumerate() {
+                    let expert = &pool.entries[&(layer, id)];
+                    expert.gate_up.run(&pool.buffer, self.input.ptr(), self.gate.ptr(), 1, &self.stream)?;
+                    check(
+                        unsafe {
+                            sys::blz_inkling_swiglu(
+                                self.gate.ptr(),
+                                self.glu.ptr(),
+                                weights.down.cols as i32,
+                                gate_cap,
+                                up_cap,
+                                self.stream.0,
+                            )
+                        },
+                        "Inkling expert activation",
+                    )?;
+                    expert.down.run(&pool.buffer, self.glu.ptr(), self.result.at(row * x.len()), 1, &self.stream)?;
+                }
             }
             check(
                 unsafe {

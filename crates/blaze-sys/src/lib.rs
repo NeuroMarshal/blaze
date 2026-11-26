@@ -596,6 +596,18 @@ unsafe extern "C" {
                              stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_reduce_experts(rows: *const u16, weights: *const f32, out: *mut f32,
                                       width: c_int, experts: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_grouped_nvfp4(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,
+                                     y: *mut u16, experts: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_grouped_mxfp8(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,
+                                     y: *mut u16, experts: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_inkling_matrix {
+    pub codes: u64,
+    pub scales: u64,
+    pub alpha: u64,
 }
 
 unsafe extern "C" {

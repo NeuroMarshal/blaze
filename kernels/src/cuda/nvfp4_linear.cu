@@ -10,6 +10,7 @@
 
 
 #include "blaze/nvfp4.h"
+#include "blaze/inkling.h"
 #include "blaze/nvfp4_linear.h"
 
 namespace {
@@ -181,13 +182,23 @@ __device__ __forceinline__ uint32_t bf16x2_splat(float v) {
 }
 
 // kMT 16-row tiles of tokens (up to 64): the weight fragments are widened once per chunk and multiply every tile.
-template <int kTiles, int kSplit, bool kHi, int kMT>
+template <int kTiles, int kSplit, bool kHi, int kMT, bool kGrouped = false>
 __global__ void __launch_bounds__(kSplit * 32) nvfp4_mma_kernel(const uint16_t* __restrict__ x, int64_t ldx,
                                                                 const uint8_t* __restrict__ w,
                                                                 const uint8_t* __restrict__ scale,
                                                                 const float* __restrict__ alpha,
                                                                 uint16_t* __restrict__ y, int64_t ldy, int m, int n,
-                                                                int k) {
+                                                                int k, const blz_inkling_matrix* matrices = nullptr,
+                                                                int64_t x_step = 0) {
+  if constexpr (kGrouped) {
+    const auto matrix = matrices[blockIdx.y];
+    const auto* pool = w;
+    w = pool + matrix.codes;
+    scale = pool + matrix.scales;
+    alpha = reinterpret_cast<const float*>(pool + matrix.alpha);
+    x += blockIdx.y * x_step;
+    y += int64_t(blockIdx.y) * n;
+  }
   constexpr int kTok = 16 * kMT;
   __shared__ float red[kSplit][kTiles * 8][kTok + 1];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -564,6 +575,20 @@ extern "C" cudaError_t blz_nvfp4_gemv_mma(const uint16_t* x, int64_t ldx, const 
                                           const float* alpha, uint16_t* y, int64_t ldy, int rows, int n, int k,
                                           cudaStream_t stream) {
   return blz_nvfp4_gemv_mma_cfg(x, ldx, w, scale, alpha, y, ldy, rows, n, k, 0, 0, stream);
+}
+
+extern "C" cudaError_t blz_inkling_grouped_nvfp4(const uint16_t* x, int64_t x_step, const uint8_t* pool,
+                                                const blz_inkling_matrix* matrices, uint16_t* y,
+                                                int experts, int n, int k, cudaStream_t stream) {
+  if (experts < 1 || experts > 65535 || n < 1 || k < 128 || k % 128) return cudaErrorInvalidValue;
+  const dim3 grid((n + 7) / 8, experts);
+  if (k >= 5120)
+    nvfp4_mma_kernel<1, 8, false, 1, true><<<grid, 256, 0, stream>>>(
+        x, k, pool, nullptr, nullptr, y, n, 1, n, k, matrices, x_step);
+  else
+    nvfp4_mma_kernel<1, 2, false, 1, true><<<grid, 64, 0, stream>>>(
+        x, k, pool, nullptr, nullptr, y, n, 1, n, k, matrices, x_step);
+  return cudaGetLastError();
 }
 
 namespace {

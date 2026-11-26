@@ -7,6 +7,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "blaze/inkling.h"
 
 #include <cstdlib>
 
@@ -155,12 +156,21 @@ __device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a, uint32_t b) {
   return *reinterpret_cast<uint32_t*>(&r);
 }
 
-template <int kTiles, int kSplit, bool kHi, int kMT>
+template <int kTiles, int kSplit, bool kHi, int kMT, bool kGrouped = false>
 __global__ void __launch_bounds__(kSplit * 32) mxfp8_mma_kernel(const uint16_t* __restrict__ x, int64_t ldx,
                                                                const uint8_t* __restrict__ w,
                                                                const uint8_t* __restrict__ scale,
                                                                uint16_t* __restrict__ y, int64_t ldy, int m, int n,
-                                                               int k) {
+                                                               int k, const blz_inkling_matrix* matrices = nullptr,
+                                                               int64_t x_step = 0) {
+  if constexpr (kGrouped) {
+    const auto matrix = matrices[blockIdx.y];
+    const auto* pool = w;
+    w = pool + matrix.codes;
+    scale = pool + matrix.scales;
+    x += blockIdx.y * x_step;
+    y += int64_t(blockIdx.y) * n;
+  }
   constexpr int kTok = 16 * kMT;
   __shared__ uint16_t lut[256];
   __shared__ float red[kSplit][kTiles * 8][kTok + 1];
@@ -457,6 +467,20 @@ extern "C" cudaError_t blz_mxfp8_gemv_mma_cfg(const uint16_t* x, int64_t ldx, co
 extern "C" cudaError_t blz_mxfp8_gemv_mma(const uint16_t* x, int64_t ldx, const uint8_t* w, const uint8_t* scale,
                                           uint16_t* y, int64_t ldy, int rows, int n, int k, cudaStream_t stream) {
   return blz_mxfp8_gemv_mma_cfg(x, ldx, w, scale, y, ldy, rows, n, k, 0, 0, stream);
+}
+
+extern "C" cudaError_t blz_inkling_grouped_mxfp8(const uint16_t* x, int64_t x_step, const uint8_t* pool,
+                                                const blz_inkling_matrix* matrices, uint16_t* y,
+                                                int experts, int n, int k, cudaStream_t stream) {
+  if (experts < 1 || experts > 65535 || n < 1 || k < 128 || k % 128) return cudaErrorInvalidValue;
+  const dim3 grid((n + 7) / 8, experts);
+  if (k >= 5120)
+    mxfp8_mma_kernel<1, 8, false, 1, true><<<grid, 256, 0, stream>>>(x, k, pool, nullptr, y, n, 1, n, k, matrices, x_step);
+  else if (k >= 2048)
+    mxfp8_mma_kernel<1, 4, false, 1, true><<<grid, 128, 0, stream>>>(x, k, pool, nullptr, y, n, 1, n, k, matrices, x_step);
+  else
+    mxfp8_mma_kernel<1, 2, false, 1, true><<<grid, 64, 0, stream>>>(x, k, pool, nullptr, y, n, 1, n, k, matrices, x_step);
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t blz_bf16_gemv_mma_cfg(const uint16_t* x, int64_t ldx, const uint16_t* w, uint16_t* y,
