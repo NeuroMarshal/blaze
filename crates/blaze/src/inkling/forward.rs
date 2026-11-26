@@ -179,7 +179,7 @@ impl Conv {
         let dyn_weights = self.dynamic.as_ref().map(|m| gpu.linear(m, input)).transpose()?;
         let mut out = x.to_vec();
         for lag in 0..k.min(pos + 1) {
-            let src = if lag == 0 { x } else { &state.rows[(pos - lag) % (k - 1)] };
+            let src = if lag == 0 { x } else { &state.rows[(pos - lag) % state.rows.len()] };
             let taps = &self.taps[lag];
             if let Some(d) = &dyn_weights {
                 for (head, ((out, src), taps)) in out
@@ -200,7 +200,8 @@ impl Conv {
             }
         }
         if k > 1 {
-            state.rows[pos % (k - 1)].copy_from_slice(x);
+            let slot = pos % state.rows.len();
+            state.rows[slot].copy_from_slice(x);
         }
         out.iter_mut().for_each(|v| *v = round(*v * self.scale));
         Ok(out)
@@ -212,9 +213,9 @@ struct ConvState {
 }
 
 impl ConvState {
-    fn new(taps: usize, width: usize) -> Self {
+    fn new(taps: usize, width: usize, slack: usize) -> Self {
         Self {
-            rows: vec![vec![0.0; width]; taps - 1],
+            rows: vec![vec![0.0; width]; if taps > 1 { taps - 1 + slack } else { 0 }],
         }
     }
 }
@@ -425,11 +426,13 @@ struct VisitState {
 pub(super) enum Readout {
     None,
     Greedy,
+    Verify,
     Scores,
 }
 
 pub(super) enum Prediction {
     Token(u32),
+    Tokens(Vec<u32>),
     Scores(Vec<f32>),
 }
 
@@ -455,6 +458,7 @@ pub struct Options {
     pub kv_dtype: KvDtype,
     pub max_image_tokens: usize,
     pub prefill_chunk: usize,
+    pub suffix_draft_tokens: usize,
 }
 
 struct Device {
@@ -485,6 +489,7 @@ pub struct Model {
     kv_dtype: KvDtype,
     vision: Option<Vision>,
     prefill_chunk: usize,
+    suffix_draft_tokens: usize,
 }
 
 impl Model {
@@ -499,6 +504,7 @@ impl Model {
             kv_dtype,
             max_image_tokens,
             prefill_chunk,
+            suffix_draft_tokens,
         } = opts;
         ensure!(
             (1..=2).contains(&gpus) && device >= 0 && device <= i32::MAX - 1,
@@ -507,6 +513,10 @@ impl Model {
         ensure!(
             (1..=1024).contains(&prefill_chunk),
             "Inkling prefill chunk must be in 1..=1024"
+        );
+        ensure!(
+            suffix_draft_tokens <= 7 && suffix_draft_tokens < prefill_chunk,
+            "Inkling suffix drafting must be in 0..=7 and smaller than the prefill chunk"
         );
         let root = ModelConfig::read_json(path)?;
         let cfg = ModelConfig::from_json(&root)?;
@@ -581,7 +591,7 @@ impl Model {
                 let layer = &layers[visit.layer];
                 let packing = layer.experts.gate_up.packing as usize;
                 let slots = if layer.local {
-                    loops.window.min(context)
+                    (loops.window + suffix_draft_tokens).min(context)
                 } else if host_kv {
                     context.min(SHORT_KV_TOKENS)
                 } else {
@@ -645,6 +655,7 @@ impl Model {
             kv_dtype,
             vision,
             prefill_chunk,
+            suffix_draft_tokens,
         })
     }
 
@@ -658,6 +669,10 @@ impl Model {
 
     pub fn prefill_chunk(&self) -> usize {
         self.prefill_chunk
+    }
+
+    pub(super) fn suffix_draft_tokens(&self) -> usize {
+        self.suffix_draft_tokens
     }
 
     pub fn sequence(&self, capacity: usize) -> Result<Sequence> {
@@ -674,17 +689,20 @@ impl Model {
             .map(|visit| {
                 gpu::set_device(self.devices[self.placement[visit.layer]].id)?;
                 let local = self.loops.is_local(visit.layer);
+                let window = if local { capacity.min(self.loops.window) } else { capacity };
+                let slots = capacity.min(window + self.suffix_draft_tokens);
                 Ok(VisitState {
                     kv: Kv::new(
-                        if local { capacity.min(self.loops.window) } else { capacity },
+                        slots,
+                        window,
                         s.kv_heads,
                         !local && self.global_kv_host && capacity > SHORT_KV_TOKENS,
                         self.kv_dtype,
                     )?,
-                    key: ConvState::new(s.conv, s.kv_width()),
-                    value: ConvState::new(s.conv, s.kv_width()),
-                    attention: ConvState::new(s.conv, s.hidden),
-                    mlp: ConvState::new(s.conv, s.hidden),
+                    key: ConvState::new(s.conv, s.kv_width(), self.suffix_draft_tokens),
+                    value: ConvState::new(s.conv, s.kv_width(), self.suffix_draft_tokens),
+                    attention: ConvState::new(s.conv, s.hidden, self.suffix_draft_tokens),
+                    mlp: ConvState::new(s.conv, s.hidden, self.suffix_draft_tokens),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -726,6 +744,22 @@ impl Model {
     pub(super) fn forward(&mut self, seq: &mut Sequence, token: u32, readout: Readout) -> Result<Option<Prediction>> {
         let x = self.embedding(token)?;
         self.forward_rows(seq, vec![ForwardRow::new(x)], readout)
+    }
+
+    /// The anchor is committed. The reserved ring slots retain history if any of the drafts are rejected.
+    pub(super) fn verify_suffix(&mut self, seq: &mut Sequence, anchor: u32, draft: &[i32]) -> Result<(usize, u32)> {
+        ensure!(!draft.is_empty() && draft.len() <= self.suffix_draft_tokens, "invalid Inkling draft length");
+        let start = seq.position;
+        let rows = std::iter::once(anchor)
+            .chain(draft.iter().map(|&token| token as u32))
+            .map(|token| self.embedding(token).map(ForwardRow::new))
+            .collect::<Result<_>>()?;
+        let Some(Prediction::Tokens(predicted)) = self.forward_rows(seq, rows, Readout::Verify)? else {
+            anyhow::bail!("Inkling verification produced no predictions");
+        };
+        let accepted = draft.iter().zip(&predicted).take_while(|(draft, target)| **draft as u32 == **target).count();
+        seq.position = start + 1 + accepted;
+        Ok((accepted, predicted[accepted]))
     }
 
     pub(super) fn prefill(&mut self, seq: &mut Sequence, input: &[Input], readout: Readout) -> Result<Option<Prediction>> {
@@ -922,14 +956,21 @@ impl Model {
         let result = if matches!(readout, Readout::None) {
             None
         } else {
-            let row = rows.last().unwrap();
-            let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);
-            let x = normalized(&x, Some(&self.norm_final), s.eps);
+            let normalize = |row: &ForwardRow| {
+                let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);
+                normalized(&x, Some(&self.norm_final), s.eps)
+            };
             let gpu = &mut self.devices[*self.placement.last().unwrap()].compute;
             // The model's tanh softcap is monotonic, so greedy decoding can select on the BF16 head output.
-            if matches!(readout, Readout::Greedy) {
+            if matches!(readout, Readout::Verify) {
+                let tokens = rows.iter().map(|row| gpu.argmax(&self.head, &normalize(row), s.unpadded_vocab))
+                    .collect::<Result<_>>()?;
+                Some(Prediction::Tokens(tokens))
+            } else if matches!(readout, Readout::Greedy) {
+                let x = normalize(rows.last().unwrap());
                 Some(Prediction::Token(gpu.argmax(&self.head, &x, s.unpadded_vocab)?))
             } else {
+                let x = normalize(rows.last().unwrap());
                 let mut logits = gpu.linear(&self.head, &x)?;
                 logits.truncate(s.unpadded_vocab);
                 cpu::softcap(&mut logits, s.logit_cap);

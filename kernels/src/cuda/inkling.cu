@@ -58,13 +58,13 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
                                 const uint8_t* key_scales, const uint8_t* value_scales,
                                 const __nv_bfloat16* relative, const __nv_bfloat16* sinks,
                                 const __nv_bfloat16* gate, __nv_bfloat16* output,
-                                float* scratch, int kv_heads, int capacity, int position,
+                                float* scratch, int kv_heads, int capacity, int window, int position,
                                 int extent, int tile, float global_scale) {
     const int head = blockIdx.x;
     const int kv_head = head / (gridDim.x / kv_heads);
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
-    const int first = max(0, position + 1 - capacity) + blockIdx.y * tile;
+    const int first = max(0, position + 1 - window) + blockIdx.y * tile;
     const int end = min(first + tile, position + 1);
     float query[4], accum[4] = {};
 #pragma unroll
@@ -183,10 +183,10 @@ extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const uint8_t* k
                                             const uint8_t* key_scales, const uint8_t* value_scales,
                                             const uint16_t* relative, const uint16_t* sinks, const uint16_t* gate,
                                             uint16_t* out, float* scratch, int heads, int kv_heads, int capacity,
-                                            int position, int extent, int tiles, float global_scale, cudaStream_t stream) {
-    if (kv_heads < 1 || heads < 1 || heads % kv_heads != 0 || capacity < 1 || position < 0 || tiles < 1)
+                                            int window, int position, int extent, int tiles, float global_scale, cudaStream_t stream) {
+    if (kv_heads < 1 || heads < 1 || heads % kv_heads != 0 || window < 1 || window > capacity || position < 0 || tiles < 1)
         return cudaErrorInvalidValue;
-    const int valid = min(capacity, position + 1);
+    const int valid = min(window, position + 1);
     const int tile = (valid + tiles - 1) / tiles;
     const int blocks = (valid + tile - 1) / tile;
     const dim3 grid(heads, blocks);
@@ -197,10 +197,10 @@ extern "C" cudaError_t blz_inkling_attention(const uint16_t* q, const uint8_t* k
     auto result = reinterpret_cast<__nv_bfloat16*>(out);
     if (key_scales) {
         attention_tiles<true><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, key_scales, value_scales,
-            biases, sink, gated, result, scratch, kv_heads, capacity, position, extent, tile, global_scale);
+            biases, sink, gated, result, scratch, kv_heads, capacity, window, position, extent, tile, global_scale);
     } else {
         attention_tiles<false><<<grid, HEAD_DIM, 0, stream>>>(query, keys, values, nullptr, nullptr,
-            biases, sink, gated, result, scratch, kv_heads, capacity, position, extent, tile, global_scale);
+            biases, sink, gated, result, scratch, kv_heads, capacity, window, position, extent, tile, global_scale);
     }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess || blocks == 1) return err;

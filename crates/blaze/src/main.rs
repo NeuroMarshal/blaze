@@ -401,6 +401,9 @@ enum Command {
         /// Format for both local and global attention KV.
         #[arg(long, value_enum, default_value = "bf16")]
         kv_cache_dtype: blaze::inkling::KvDtype,
+        /// Maximum suffix drafts per greedy step. Zero disables speculative decoding.
+        #[arg(long, default_value_t = 0)]
+        suffix_draft_tokens: usize,
         #[arg(long, default_value_t = 32)]
         prefill_chunk: usize,
         #[arg(long, default_value_t = 1)]
@@ -439,6 +442,9 @@ enum Command {
         /// Format for both local and global attention KV.
         #[arg(long, value_enum, default_value = "bf16")]
         kv_cache_dtype: blaze::inkling::KvDtype,
+        /// Maximum suffix drafts per greedy step. Zero disables speculative decoding.
+        #[arg(long, default_value_t = 0)]
+        suffix_draft_tokens: usize,
         #[arg(long, default_value_t = 32)]
         prefill_chunk: usize,
         /// Maximum tokens per image. Zero leaves the visual encoder unloaded.
@@ -739,15 +745,15 @@ fn main() -> Result<()> {
         }
         Command::Inspect { model } => blaze::inspect::run(&model),
         Command::ServeInkling { model, host, port, served_model_name, context, max_tokens, device, gpus,
-                                expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
+                                expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, suffix_draft_tokens, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
             let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             runtime.block_on(blaze::server::serve_inkling(blaze::server::InklingConfig {
                 path: model, host, port, name: served_model_name, max_tokens, queue: max_queued_requests,
-                options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, expert_threads, host_kv, kv_dtype: kv_cache_dtype, prefill_chunk, max_image_tokens },
+                options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, expert_threads, host_kv, kv_dtype: kv_cache_dtype, prefill_chunk, max_image_tokens, suffix_draft_tokens },
                 allowed_media_domains: allowed_media_domain,
             }))
         }
-        Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_chunk, temperature, seed } => {
+        Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, suffix_draft_tokens, prefill_chunk, temperature, seed } => {
             anyhow::ensure!(temperature.is_finite() && temperature >= 0.0, "--temperature must be finite and nonnegative");
             let text = blaze::text::Text::load(&model)?;
             let images = image.map(std::fs::read).transpose()?.into_iter().collect::<Vec<_>>();
@@ -760,7 +766,7 @@ fn main() -> Result<()> {
                 }))?
             };
             let mut engine = blaze::inkling::Model::load(&model, blaze::inkling::Options {
-                device, gpus, context, expert_cache_mib, expert_threads, host_kv, kv_dtype: kv_cache_dtype, prefill_chunk, max_image_tokens: if images.is_empty() { 0 } else { 1024 },
+                device, gpus, context, expert_cache_mib, expert_threads, host_kv, kv_dtype: kv_cache_dtype, prefill_chunk, suffix_draft_tokens, max_image_tokens: if images.is_empty() { 0 } else { 1024 },
             })?;
             let ids = blaze::inkling::tokenize_prompt(&engine, &text, &rendered, &images)?;
             let params = blaze::sampler::SamplingParams { temperature, seed, ..Default::default() };
