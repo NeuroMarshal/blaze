@@ -660,6 +660,19 @@ pub(super) enum Prediction {
     Scores(Vec<f32>),
 }
 
+enum PrefillPhase {
+    QkvMix,
+    QkvController,
+    QkvNormalize,
+    Attention,
+    MlpMix,
+    MlpController,
+    Router,
+    TopK,
+    Experts,
+    ResidualReadback,
+}
+
 pub struct Sequence {
     draft: Option<DraftCache>,
     position: usize,
@@ -1073,12 +1086,12 @@ impl Model {
             seq.capacity
         );
         let s = &self.cfg;
-        let mut timings = [Duration::ZERO; 5];
+        let mut timings = [Duration::ZERO; 10];
         let mut phase_start = (self.profile_prefill && rows.len() > 1).then(Instant::now);
-        let mut phase = |index: usize| {
+        let mut phase = |phase: PrefillPhase| {
             if let Some(start) = &mut phase_start {
                 let now = Instant::now();
-                timings[index] += now - *start;
+                timings[phase as usize] += now - *start;
                 *start = now;
             }
         };
@@ -1138,6 +1151,7 @@ impl Model {
             } else {
                 rows.iter_mut().map(prepare_qkv).collect()
             };
+            phase(PrefillPhase::QkvMix);
             let count = rows.len();
             let on_device = count > 1 && self.prefill_chunk >= s.conv && !matches!(readout, Readout::Verify(_));
             let normalized_on_gpu = if recurrent.is_none() && let Some(c) = controller {
@@ -1146,6 +1160,7 @@ impl Model {
                         && layer.kv_taps.is_some());
                 c.mix_attention_rows(compute, &mut qkv_rows, &rows, norms, &mut bank_ready, workers.as_deref(), s.eps)?
             } else { false };
+            phase(PrefillPhase::QkvController);
             for qkv in qkv_rows.iter().filter(|_| recurrent.is_none() && !normalized_on_gpu) {
                 let norm = |x: &[f32], weight: &[f32]| normalized(x, Some(weight), s.eps);
                 let q_in = norm(&qkv[0], &layer.norm_q);
@@ -1170,7 +1185,7 @@ impl Model {
                 .zip(&q_refs)
                 .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
-            phase(0);
+            phase(PrefillPhase::QkvNormalize);
             let block_start = id % s.block == 0;
             let (attention, residual_ready) = if on_device
                 && let (Some(clip), Some(weights)) = (&layer.device_clip, &layer.kv_taps)
@@ -1326,7 +1341,7 @@ impl Model {
                 }
                 (attention, false)
             };
-            phase(1);
+            phase(PrefillPhase::Attention);
             let prepare_mlp = |offset: usize, row: &mut ForwardRow| {
                 let position = seq.position + offset;
                 let attn = &attention[offset * s.hidden..][..s.hidden];
@@ -1363,6 +1378,7 @@ impl Model {
             if !residual_ready {
                 state.attention.remember_f32(seq.position, s.hidden, &attention);
             }
+            phase(PrefillPhase::MlpMix);
             let mut inputs = Vec::new();
             let mut mixed = Vec::new();
             let mut messages_batch = Vec::new();
@@ -1404,6 +1420,7 @@ impl Model {
                 activations.push(mlp_in);
                 residuals.push(residual);
             }
+            phase(PrefillPhase::MlpController);
             let route_rows = |logits: &[f32]| {
                 let route = |row: &[f32]| layer.routes(row.iter().copied(), s);
                 if let Some(pool) = &workers {
@@ -1412,14 +1429,21 @@ impl Model {
                     logits.chunks_exact(s.experts).map(route).collect()
                 }
             };
-            let routes: Vec<_> = match (&layer.router, gated_logits) {
-                (_, Some(logits)) => route_rows(&logits),
-                (Router::Device(w), None) => route_rows(&compute.router_logits(w, &activations)?),
-                (Router::Host(w), None) => activations.iter().map(|x| {
-                    layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
-                }).collect(),
+            let logits = match (&layer.router, gated_logits) {
+                (_, Some(logits)) => Some(logits),
+                (Router::Device(w), None) => Some(compute.router_logits(w, &activations)?),
+                (Router::Host(_), None) => None,
             };
-            phase(2);
+            phase(PrefillPhase::Router);
+            let routes: Vec<_> = if let Some(logits) = logits {
+                route_rows(&logits)
+            } else {
+                let Router::Host(w) = &layer.router else { unreachable!() };
+                activations.iter().map(|x| {
+                    layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
+                }).collect()
+            };
+            phase(PrefillPhase::TopK);
             let mlp_history = layer.mlp_conv_device.as_ref().filter(|_| count > 1)
                 .map(|_| state.mlp.bf16_history(seq.position, s.conv));
             let finish = layer.mlp_conv_device.as_ref().zip(mlp_history.as_ref()).map(|(weights, history)| MlpResidual {
@@ -1436,7 +1460,7 @@ impl Model {
                 verify,
                 finish.filter(|_| !verify),
             )?;
-            phase(3);
+            phase(PrefillPhase::Experts);
             match moe {
                 MoeOutput::Routed(moe) => {
                     for (offset, ((row, residual), moe)) in rows.iter_mut().zip(residuals).zip(moe.chunks_exact(s.hidden)).enumerate() {
@@ -1453,11 +1477,15 @@ impl Model {
                     }
                 }
             }
-            phase(4);
+            phase(PrefillPhase::ResidualReadback);
         }
         if phase_start.is_some() {
-            let [qkv_input, attention, routing, experts, mlp_residual] = timings.map(|time| time.as_secs_f64() * 1e3);
-            crate::eprintln!("Inkling prefill {} rows: QKV input {qkv_input:.2} ms, attention {attention:.2} ms, routing {routing:.2} ms, experts {experts:.2} ms, MLP residual {mlp_residual:.2} ms", rows.len());
+            let [qkv_mix, qkv_control, qkv_norm, attention, mlp_mix, mlp_control, router, topk, experts, residual] =
+                timings.map(|time| time.as_secs_f64() * 1e3);
+            crate::eprintln!(
+                "Inkling prefill {} rows (ms): qkv_mix_cpu={qkv_mix:.2} qkv_controller={qkv_control:.2} qkv_norm_cpu={qkv_norm:.2} \
+                 attention={attention:.2} mlp_mix_cpu={mlp_mix:.2} mlp_controller={mlp_control:.2} router={router:.2} \
+                 topk={topk:.2} experts_residual={experts:.2} residual_cpu={residual:.2}", rows.len());
         }
         let normalize = |row: &ForwardRow| {
             let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);
