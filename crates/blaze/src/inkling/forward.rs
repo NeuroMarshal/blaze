@@ -664,12 +664,29 @@ impl Model {
         let placement: Vec<_> = (0..cfg.layers.len())
             .map(|id| usize::from(gpus == 2 && !loops.core.contains(&id)))
             .collect();
-        let layers = (0..cfg.layers.len())
-            .map(|id| {
-                gpu::set_device(device + placement[id] as i32)?;
-                Layer::load(&ckpt, &cfg, loops, &s, id, (&q_msg, &kv_msg))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let load_rank = |rank: usize| -> Result<Vec<(usize, Layer)>> {
+            gpu::set_device(device + rank as i32)?;
+            placement.iter().enumerate().filter(|(_, assigned)| **assigned == rank)
+                .map(|(id, _)| {
+                    let layer = Layer::load(&ckpt, &cfg, loops, &s, id, (&q_msg, &kv_msg))?;
+                    Ok((id, layer))
+                })
+                .collect()
+        };
+        let mut loaded = if gpus == 2 {
+            std::thread::scope(|scope| -> Result<_> {
+                let other = scope.spawn(|| load_rank(1));
+                let first = load_rank(0);
+                let second = other.join().map_err(|_| anyhow::anyhow!("Inkling second GPU loader stopped"))?;
+                let mut layers = first?;
+                layers.extend(second?);
+                Ok(layers)
+            })?
+        } else {
+            load_rank(0)?
+        };
+        loaded.sort_unstable_by_key(|(id, _)| *id);
+        let layers: Vec<_> = loaded.into_iter().map(|(_, layer)| layer).collect();
         let last_device = *placement.last().unwrap();
         gpu::set_device(device + last_device as i32)?;
         let head = Dense::load(&ckpt, "model.llm.unembed.weight", s.vocab, s.hidden)?;
