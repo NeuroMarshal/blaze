@@ -53,6 +53,15 @@ __global__ void controller_up(const __nv_bfloat16* hidden, const __nv_bfloat16* 
     if (lane == 0) out[projection * rows + row] = sum;
 }
 
+__device__ float ordered_sum(float acc) {
+    acc += __shfl_down_sync(0xffffffff, acc, 8);
+    acc += __shfl_down_sync(0xffffffff, acc, 16);
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) sum += __shfl_sync(0xffffffff, acc, i);
+    return sum;
+}
+
 __global__ void router_logits(const __nv_bfloat16* w, const __nv_bfloat16* x, float* out, int cols) {
     const int lane = threadIdx.x;
     w += size_t(blockIdx.x) * cols;
@@ -61,11 +70,7 @@ __global__ void router_logits(const __nv_bfloat16* w, const __nv_bfloat16* x, fl
     for (int k = lane; k < cols; k += 32) {
         acc = fmaf(__bfloat162float(w[k]), __bfloat162float(x[k]), acc);
     }
-    acc += __shfl_down_sync(0xffffffff, acc, 8);
-    acc += __shfl_down_sync(0xffffffff, acc, 16);
-    float sum = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) sum += __shfl_sync(0xffffffff, acc, i);
+    const float sum = ordered_sum(acc);
     if (lane == 0) out[size_t(blockIdx.y) * gridDim.x + blockIdx.x] = sum;
 }
 
@@ -84,14 +89,16 @@ __device__ float controller_tanh(float value) {
 }
 
 __global__ void controller_norm(const float* gates, const float* x, const float* msg,
-                                const float* norm, __nv_bfloat16* output, int width, float eps, bool per_row) {
+                                const float* norm, __nv_bfloat16* output, int width, float eps, int groups,
+                                int projection_stride) {
     extern __shared__ float mixed[];
     const int offset = blockIdx.x * width;
     gates += 2 * offset;
     x += offset;
     msg += offset;
-    output += offset;
-    if (per_row) norm += offset;
+    const int group = blockIdx.x % groups;
+    output += projection_stride ? (size_t(group) * projection_stride + blockIdx.x / groups) * width : offset;
+    norm += group * width;
     __shared__ float scale;
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
         const float keep = __fmul_rn(x[i], 1.0f - controller_tanh(gates[i]));
@@ -102,15 +109,39 @@ __global__ void controller_norm(const float* gates, const float* x, const float*
     if (threadIdx.x < 32) {
         float acc = 0.0f;
         for (int i = threadIdx.x; i < width; i += 32) acc = fmaf(mixed[i], mixed[i], acc);
-        acc += __shfl_down_sync(0xffffffff, acc, 8);
-        acc += __shfl_down_sync(0xffffffff, acc, 16);
-        float sum = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) sum += __shfl_sync(0xffffffff, acc, i);
+        const float sum = ordered_sum(acc);
         if (threadIdx.x == 0) scale = __fdiv_rn(1.0f, __fsqrt_rn(__fdiv_rn(sum, float(width)) + eps));
     }
     __syncthreads();
     for (int i = threadIdx.x; i < width; i += blockDim.x) output[i] = __float2bfloat16(mixed[i] * scale * norm[i]);
+}
+
+__global__ void controller_inputs(const float* x, const float* msg, __nv_bfloat16* out, int width, float eps) {
+    const int group = blockIdx.x;
+    const int operand = blockIdx.y;
+    const float* src = (operand ? msg : x) + group * width;
+    __shared__ float rms;
+    if (threadIdx.x < 32) {
+        float acc = 0.0f;
+        for (int i = threadIdx.x; i < width; i += 32) acc = fmaf(src[i], src[i], acc);
+        const float sum = ordered_sum(acc);
+        if (threadIdx.x == 0) rms = __fdiv_rn(1.0f, __fsqrt_rn(__fdiv_rn(sum, float(width)) + eps));
+    }
+    __syncthreads();
+    auto* dst = out + (2 * group + operand) * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) dst[i] = __float2bfloat16(src[i] * rms);
+}
+
+__global__ void controller_message_mix(const float* bank, const float* mix_weights, float* output, int width) {
+    const int row = blockIdx.y, group = blockIdx.x;
+    const auto* past = bank + size_t(row) * 2 * width;
+    const size_t at = size_t(row) * gridDim.x + group;
+    const float w0 = mix_weights[2 * at], w1 = mix_weights[2 * at + 1];
+    auto* dst = output + at * width;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        const float first = __fadd_rn(0.0f, __fmul_rn(past[i], w0));
+        dst[i] = __fadd_rn(first, __fmul_rn(past[width + i], w1));
+    }
 }
 
 } // namespace
@@ -119,15 +150,30 @@ extern "C" cudaError_t blz_inkling_controller_norm(const float* gates, const flo
         const float* norm, uint16_t* out, int width, float eps, int tokens, cudaStream_t stream) {
     if (width <= 0 || width > 4096 || width % 32) return cudaErrorInvalidValue;
     controller_norm<<<tokens, 256, width * sizeof(float), stream>>>(gates, x, msg, norm,
-        reinterpret_cast<__nv_bfloat16*>(out), width, eps, false);
+        reinterpret_cast<__nv_bfloat16*>(out), width, eps, 1, 0);
     return cudaGetLastError();
 }
 
 extern "C" cudaError_t blz_inkling_controller_qkv(const float* gates, const float* x, const float* msg,
-        const float* norms, uint16_t* out, int width, float eps, cudaStream_t stream) {
-    if (width <= 0 || width > 4096 || width % 32) return cudaErrorInvalidValue;
-    controller_norm<<<3, 256, width * sizeof(float), stream>>>(gates, x, msg, norms,
-        reinterpret_cast<__nv_bfloat16*>(out), width, eps, true);
+        const float* norms, uint16_t* out, int width, int tokens, int projection_stride, float eps, cudaStream_t stream) {
+    if (width <= 0 || width > 4096 || width % 32 || tokens <= 0 || tokens > 65535) return cudaErrorInvalidValue;
+    if (projection_stride && projection_stride < tokens) return cudaErrorInvalidValue;
+    controller_norm<<<3 * tokens, 256, width * sizeof(float), stream>>>(gates, x, msg, norms,
+        reinterpret_cast<__nv_bfloat16*>(out), width, eps, 3, projection_stride);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_controller_inputs(const float* x, const float* msg,
+        uint16_t* out, int width, int rows, float eps, cudaStream_t stream) {
+    if (width <= 0 || width > 4096 || width % 32 || rows <= 0) return cudaErrorInvalidValue;
+    controller_inputs<<<dim3(rows, 2), 128, 0, stream>>>(x, msg, reinterpret_cast<__nv_bfloat16*>(out), width, eps);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_controller_message_mix(const float* bank, const float* queries,
+        float* output, int width, int rows, cudaStream_t stream) {
+    if (width <= 0 || width > 4096 || width % 32 || rows <= 0 || rows > 65535) return cudaErrorInvalidValue;
+    controller_message_mix<<<dim3(3, rows), 128, 0, stream>>>(bank, queries, output, width);
     return cudaGetLastError();
 }
 
@@ -682,7 +728,39 @@ __global__ void residual_conv(const __nv_bfloat16* raw, const __nv_bfloat16* pre
     out[index] = previous ? value + __bfloat162float(previous[index]) : value;
 }
 
+__global__ void mlp_residual_conv(const float* routed, const float* residual, const __nv_bfloat16* history,
+        const float* weights, __nv_bfloat16* output, __nv_bfloat16* tail, int width, int taps,
+        int history_rows, int tail_rows, float scale) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (col >= width) return;
+    const size_t index = size_t(row) * width + col;
+    const auto current = __float2bfloat16(routed[index]);
+    const int lag_count = min(taps, history_rows + row + 1);
+    float value = __bfloat162float(current);
+    for (int lag = 0; lag < lag_count; ++lag) {
+        const int source = row - lag;
+        const auto raw = source >= 0 ? __float2bfloat16(routed[size_t(source) * width + col])
+                                     : history[size_t(history_rows + source) * width + col];
+        value = __fadd_rn(value, __fmul_rn(__bfloat162float(raw), weights[lag * width + col]));
+    }
+    output[index] = __float2bfloat16(residual[index] + __bfloat162float(__float2bfloat16(value * scale)));
+    const int tail_row = row - (int(gridDim.y) - tail_rows);
+    if (tail_row >= 0) tail[size_t(tail_row) * width + col] = current;
+}
+
 } // namespace
+
+extern "C" cudaError_t blz_inkling_mlp_residual_conv(const float* routed, const float* residual,
+        const uint16_t* history, const float* weights, uint16_t* output, uint16_t* tail,
+        int width, int taps, int history_rows, int rows, int tail_rows, float scale, cudaStream_t stream) {
+    if (width < 1 || taps < 1 || history_rows < 0 || history_rows >= taps || rows < 1 || rows > 65535
+        || tail_rows < 0 || tail_rows > rows) return cudaErrorInvalidValue;
+    mlp_residual_conv<<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(routed, residual,
+        reinterpret_cast<const __nv_bfloat16*>(history), weights, reinterpret_cast<__nv_bfloat16*>(output),
+        reinterpret_cast<__nv_bfloat16*>(tail), width, taps, history_rows, tail_rows, scale);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_inkling_residual_conv(const uint16_t* raw, const uint16_t* previous,
         const float* weights, float* out, int width, int taps, int history, int rows, float scale,

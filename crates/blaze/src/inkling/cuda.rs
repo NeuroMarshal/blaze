@@ -464,10 +464,12 @@ struct WideExperts {
     route_of: DevBuf,
     tiles: DevBuf,
     staging: HostMapped,
+    mlp_staging: Option<HostMapped>,
 }
 
 impl WideExperts {
-    fn new(routes: usize, hidden: usize, inter: usize) -> Result<Self> {
+    fn new(tokens: usize, top_k: usize, hidden: usize, inter: usize) -> Result<Self> {
+        let routes = tokens * top_k;
         let tile_bytes = 2 * routes * std::mem::size_of::<sys::blz_moe_matrix_tile>();
         Ok(Self {
             input: DevBuf::new(routes * hidden * 2)?,
@@ -477,6 +479,9 @@ impl WideExperts {
             route_of: DevBuf::new(routes * 4)?,
             tiles: DevBuf::new(tile_bytes)?,
             staging: HostMapped::new(tile_bytes.next_multiple_of(16) + routes * 12)?,
+            mlp_staging: std::env::var_os("BLAZE_INKLING_DEVICE_MLP_RESIDUAL")
+                .is_some_and(|value| value == "1")
+                .then(|| HostMapped::new(tokens * hidden * 6)).transpose()?,
         })
     }
 
@@ -564,6 +569,46 @@ impl WideExperts {
     }
 }
 
+pub(super) struct MlpResidual<'a> {
+    pub weights: &'a DevBuf,
+    pub history: &'a [u16],
+    pub residuals: &'a [Vec<f32>],
+    pub taps: usize,
+    pub tail: usize,
+    pub scale: f32,
+}
+
+pub(super) enum MoeOutput {
+    Routed(Vec<f32>),
+    Residual { hidden: Vec<u16>, history: Vec<u16> },
+}
+
+struct RecurrentBatch {
+    staging: HostMapped,
+    projected_input: DevBuf,
+    bank_staging: HostMapped,
+    message_bank: DevBuf,
+}
+
+impl RecurrentBatch {
+    fn new(rows: usize, width: usize) -> Result<Self> {
+        Ok(Self {
+            staging: HostMapped::new(rows * 3 * width * 8)?,
+            projected_input: DevBuf::new(rows * 3 * width * 2)?,
+            bank_staging: HostMapped::new(rows * 2 * width * 4)?,
+            message_bank: DevBuf::new(rows * 2 * width * 4)?,
+        })
+    }
+}
+
+pub(super) enum RecurrentMessages<'a> {
+    Mixed(&'a [[Vec<f32>; 3]]),
+    Bank {
+        upload: Option<&'a [&'a [Vec<f32>]]>,
+        weights: &'a [[[f32; 2]; 3]],
+    },
+}
+
 // Count token visits, so a prefill chunk advances the heat clock by its length.
 const HEAT_EPOCH_VISITS: usize = 48 * 512;
 
@@ -595,6 +640,7 @@ pub(super) struct Compute {
     cpu_routes: u64,
     prompt_stage: Option<PromptStage>,
     wide_experts: Option<WideExperts>,
+    recurrent_batch: Option<RecurrentBatch>,
     projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
     grouped_experts: bool,
 }
@@ -631,7 +677,10 @@ impl Compute {
         }).transpose()?;
         let wide_experts = (hidden.is_multiple_of(128) && intermediate.is_multiple_of(128) && top_k <= 16
             && std::env::var_os("BLAZE_INKLING_GROUPED_PREFILL").is_some_and(|value| value == "1"))
-            .then(|| WideExperts::new(prefill_chunk * top_k, hidden, intermediate)).transpose()?;
+            .then(|| WideExperts::new(prefill_chunk, top_k, hidden, intermediate)).transpose()?;
+        let recurrent_batch = (prefill_chunk >= 12
+            && std::env::var_os("BLAZE_INKLING_BATCH_QKV").is_some_and(|value| value == "1"))
+            .then(|| RecurrentBatch::new(prefill_chunk, hidden)).transpose()?;
         let mut gemm = null_mut();
         check(unsafe { sys::blz_gemm_create(&mut gemm) }, "Inkling cuBLAS handle")?;
         Ok(Self {
@@ -651,6 +700,7 @@ impl Compute {
             cpu_routes: 0,
             prompt_stage,
             wide_experts,
+            recurrent_batch,
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
@@ -729,7 +779,8 @@ impl Compute {
         let rows = matrices.map(|w| w.rows * m);
         let output_values: usize = rows.iter().sum();
         let enqueue = |gpu: &Self| -> Result<()> {
-            gpu.enqueue_projections(matrices, offsets, end, m, verifying, [0; N])?;
+            gpu.copy_staged_input(end * 2)?;
+            gpu.enqueue_projections(matrices, &gpu.input, offsets, m, verifying, [0; N])?;
             gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
         };
         let work = if m == 1 {
@@ -787,12 +838,11 @@ impl Compute {
     }
 
     fn enqueue_projections<const N: usize>(
-        &self, matrices: [&Dense; N], offsets: [usize; 5], input_values: usize, rows: usize,
+        &self, matrices: [&Dense; N], input: &DevBuf, offsets: [usize; 5], rows: usize,
         verifying: bool, prefix: [usize; N],
     ) -> Result<[*mut u16; N]> {
         let total: usize = matrices.iter().zip(prefix).map(|(w, p)| w.rows * rows + p).sum();
         ensure!(total * 2 <= self.result.bytes(), "Inkling projection output exceeds scratch");
-        self.copy_staged_input(input_values * 2)?;
         let mut out = 0;
         let mut results = [null_mut(); N];
         for i in 0..N {
@@ -800,9 +850,9 @@ impl Compute {
             let result = self.result.at(out);
             results[i] = result;
             if (verifying || i >= 3) && rows > 1 {
-                matrices[i].run_decode_rows(self, self.input.at(offsets[i]), result, rows)?;
+                matrices[i].run_decode_rows(self, input.at(offsets[i]), result, rows)?;
             } else {
-                matrices[i].run(self, self.input.at(offsets[i]), result, rows)?;
+                matrices[i].run(self, input.at(offsets[i]), result, rows)?;
             }
             out += matrices[i].rows * rows;
         }
@@ -982,7 +1032,7 @@ impl Compute {
             }, "Inkling attention controller projection")?;
             check(unsafe {
                 sys::blz_inkling_controller_qkv(gpu.result.ptr(), gpu.input.at(lanes), gpu.input.at(2 * lanes),
-                    norms.ptr(), gpu.input.ptr(), width as i32, eps, gpu.stream.0)
+                    norms.ptr(), gpu.input.ptr(), width as i32, 1, 0, eps, gpu.stream.0)
             }, "Inkling attention controller normalization")?;
             let offsets = [0, width, 2 * width, width, 2 * width];
             let mut first = 0;
@@ -1002,6 +1052,180 @@ impl Compute {
             first += w.rows;
             row
         }))
+    }
+
+    pub fn recurrent_batch_limit(&self, width: usize) -> usize {
+        self.controller_batch_limit::<3>(width).min(self.input.bytes() / (36 * width))
+    }
+
+    fn enqueue_recurrent_attention(
+        &self, down: [&Dense; 3], up: [&Dense; 3], norms: &DevBuf, width: usize, rows: usize,
+        eps: f32, host: *const f32, bank: Option<*const f32>,
+        projected: Option<(*mut u16, i32)>,
+    ) -> Result<*mut u16> {
+        let values = rows * 3 * width;
+        check(unsafe {
+            sys::cudaMemcpyAsync(self.input.ptr(), host.cast(), values * if bank.is_some() { 4 } else { 8 },
+                sys::MEMCPY_H2D, self.stream.0)
+        }, "Inkling recurrent attention upload")?;
+        let states = self.input.ptr::<f32>();
+        let messages = self.input.at::<f32>(values);
+        let normalized = self.input.at::<u16>(4 * values);
+        if let Some(raw) = bank {
+            check(unsafe {
+                sys::cudaMemcpyAsync(self.result.ptr(), host.add(values).cast(), rows * 6 * 4,
+                    sys::MEMCPY_H2D, self.stream.0)
+            }, "Inkling recurrent message weights")?;
+            check(unsafe {
+                sys::blz_inkling_controller_message_mix(raw, self.result.ptr(), messages, width as i32, rows as i32, self.stream.0)
+            }, "Inkling recurrent message mix")?;
+        }
+        check(unsafe {
+            sys::blz_inkling_controller_inputs(states, messages, normalized, width as i32, (rows * 3) as i32,
+                eps, self.stream.0)
+        }, "Inkling recurrent controller inputs")?;
+        let cols = 2 * width;
+        for first in (0..rows).step_by(sys::BLZ_SKINNY_EX_MAX_ROWS) {
+            let batch = (rows - first).min(sys::BLZ_SKINNY_EX_MAX_ROWS);
+            for (group, weights) in down.iter().enumerate() {
+                let at = first * 3 + group;
+                check(unsafe {
+                    sys::blz_skinny_gemm_ex(normalized.add(at * cols).cast(), (3 * cols) as i64,
+                        weights.weight.ptr(), self.gate.at::<u16>(at * 64).cast(), 3 * 64,
+                        batch as i32, 64, cols as i32, sys::BLZ_BF16, self.stream.0)
+                }, "Inkling recurrent controller down batch")?;
+            }
+        }
+        check(unsafe {
+            sys::blz_inkling_controller_up(self.gate.ptr(), up[0].weight.ptr(), up[1].weight.ptr(), up[2].weight.ptr(),
+                self.result.ptr(), cols as i32, 3, rows as i32, self.stream.0)
+        }, "Inkling recurrent controller up batch")?;
+        let (output, stride) = projected.unwrap_or((normalized, 0));
+        check(unsafe {
+            sys::blz_inkling_controller_qkv(self.result.ptr(), states, messages, norms.ptr(), output,
+                width as i32, rows as i32, stride, eps, self.stream.0)
+        }, "Inkling recurrent controller normalization")?;
+        Ok(output)
+    }
+
+    fn pack_recurrent_attention(dst: &mut [f32], width: usize, x: &[Vec<Vec<f32>>], messages: &[[Vec<f32>; 3]]) {
+        let (states, msg) = dst.split_at_mut(x.len() * 3 * width);
+        for (out, src) in states.chunks_exact_mut(width).zip(x.iter().flatten()) {
+            out.copy_from_slice(src);
+        }
+        for (out, src) in msg.chunks_exact_mut(width).zip(messages.iter().flatten()) {
+            out.copy_from_slice(src);
+        }
+    }
+
+    fn validate_recurrent_attention(x: &[Vec<Vec<f32>>], norms: &DevBuf) -> Result<usize> {
+        let width = x.first().and_then(|row| row.first()).map_or(0, Vec::len);
+        ensure!((32..=4096).contains(&width) && width.is_multiple_of(32)
+            && x.iter().all(|row| row.len() == 3 && row.iter().all(|v| v.len() == width))
+            && norms.bytes() == 3 * width * 4, "Inkling recurrent attention shape mismatch");
+        Ok(width)
+    }
+
+    #[cfg(test)]
+    fn recurrent_attention_inputs(
+        &mut self, down: [&Dense; 3], up: [&Dense; 3], x: &[Vec<Vec<f32>>],
+        messages: &[[Vec<f32>; 3]], norms: &DevBuf, eps: f32,
+    ) -> Result<Vec<u16>> {
+        let width = Self::validate_recurrent_attention(x, norms)?;
+        ensure!(x.len() <= self.recurrent_batch_limit(width), "Inkling recurrent attention exceeds scratch");
+        let values = x.len() * 3 * width;
+        let host = self.transfer.host_ptr().cast_mut().cast::<f32>();
+        let dst = unsafe { std::slice::from_raw_parts_mut(host, values * 2) };
+        Self::pack_recurrent_attention(dst, width, x, messages);
+        let work = self.enqueue_recurrent_attention(down, up, norms, width, x.len(), eps, host, None, None)
+            .and_then(|normalized| self.queue_result::<u16>(normalized, values));
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        Ok(self.read_result(values))
+    }
+
+    pub fn queue_recurrent_attention(
+        &mut self, down: [&Dense; 3], up: [&Dense; 3], x: &[Vec<Vec<f32>>],
+        messages: RecurrentMessages<'_>, norms: &DevBuf, eps: f32,
+    ) -> Result<bool> {
+        if self.recurrent_batch.is_none() {
+            return Ok(false);
+        }
+        let width = Self::validate_recurrent_attention(x, norms)?;
+        let rows = x.len();
+        let limit = self.recurrent_batch_limit(width);
+        if limit <= 1 {
+            return Ok(false);
+        }
+        let buffers = self.recurrent_batch.as_mut().unwrap();
+        ensure!(rows * width * 24 <= buffers.staging.bytes()
+            && rows * width * 6 <= buffers.projected_input.bytes(), "Inkling recurrent batch exceeds scratch");
+        let host = buffers.staging.host_ptr().cast_mut().cast::<f32>();
+        let (stride, use_bank, bank_bytes) = match messages {
+            RecurrentMessages::Mixed(messages) => {
+                ensure!(messages.len() == rows && messages.iter().flatten().all(|v| v.len() == width),
+                    "Inkling mixed message shape mismatch");
+                let stride = width * 6;
+                let dst = unsafe { std::slice::from_raw_parts_mut(host, rows * stride) };
+                for ((dst, x), messages) in dst.chunks_mut(limit * stride)
+                    .zip(x.chunks(limit)).zip(messages.chunks(limit))
+                {
+                    Self::pack_recurrent_attention(dst, width, x, messages);
+                }
+                (stride, false, 0)
+            }
+            RecurrentMessages::Bank { upload, weights } => {
+                let bytes = rows * width * 8;
+                ensure!(weights.len() == rows && bytes <= buffers.bank_staging.bytes().min(buffers.message_bank.bytes()),
+                    "Inkling message bank exceeds scratch");
+                if let Some(bank) = upload {
+                    ensure!(bank.len() == rows && bank.iter().all(|r| r.len() == 2 && r.iter().all(|m| m.len() == width)),
+                        "Inkling message bank shape mismatch");
+                    let dst = unsafe {
+                        std::slice::from_raw_parts_mut(buffers.bank_staging.host_ptr().cast_mut().cast::<f32>(), rows * width * 2)
+                    };
+                    for (out, message) in dst.chunks_exact_mut(width).zip(bank.iter().flat_map(|row| row.iter())) {
+                        out.copy_from_slice(message);
+                    }
+                }
+                let stride = width * 3 + 6;
+                let dst = unsafe { std::slice::from_raw_parts_mut(host, rows * stride) };
+                for ((dst, states), weights) in dst.chunks_mut(limit * stride)
+                    .zip(x.chunks(limit)).zip(weights.chunks(limit))
+                {
+                    let (out, mix) = dst.split_at_mut(states.len() * width * 3);
+                    for (out, src) in out.chunks_exact_mut(width).zip(states.iter().flatten()) {
+                        out.copy_from_slice(src);
+                    }
+                    for (dst, &src) in mix.iter_mut().zip(weights.iter().flatten().flatten()) {
+                        *dst = src;
+                    }
+                }
+                (stride, true, if upload.is_some() { bytes } else { 0 })
+            }
+        };
+        let buffers = self.recurrent_batch.as_ref().unwrap();
+        let enqueue = (|| -> Result<()> {
+            if bank_bytes > 0 {
+                check(unsafe {
+                    sys::cudaMemcpyAsync(buffers.message_bank.ptr(), buffers.bank_staging.host_ptr(),
+                        bank_bytes, sys::MEMCPY_H2D, self.stream.0)
+                }, "Inkling recurrent message bank upload")?;
+            }
+            for first in (0..rows).step_by(limit) {
+                let batch = (rows - first).min(limit);
+                let bank = use_bank.then(|| buffers.message_bank.at::<f32>(first * width * 2).cast_const());
+                let output = buffers.projected_input.at::<u16>(first * width);
+                self.enqueue_recurrent_attention(down, up, norms, width, batch, eps,
+                    host.wrapping_add(first * stride), bank, Some((output, rows as i32)))?;
+            }
+            Ok(())
+        })();
+        if enqueue.is_err() {
+            let _ = self.stream.sync();
+        }
+        enqueue.map(|_| true)
     }
 
     pub fn gated_router(
@@ -1289,6 +1513,43 @@ impl Compute {
         Ok(total)
     }
 
+    fn enqueue_mlp_residual(&mut self, params: &MlpResidual<'_>, hidden: usize, tokens: usize) -> Result<bool> {
+        let Some(staging) = self.wide_experts.as_mut().and_then(|wide| wide.mlp_staging.as_mut()) else {
+            return Ok(false);
+        };
+        let values = tokens * hidden;
+        let history_bytes = std::mem::size_of_val(params.history);
+        let bytes = values * 4 + history_bytes;
+        let output_values = values + params.tail * hidden;
+        ensure!(params.residuals.len() == tokens && params.residuals.iter().all(|row| row.len() == hidden)
+            && params.history.len().is_multiple_of(hidden) && params.tail <= tokens
+            && params.weights.bytes() == params.taps * hidden * 4, "Inkling MLP residual shape mismatch");
+        if bytes > self.input.bytes().min(staging.bytes()) || output_values * 2 > self.result.bytes().min(self.transfer.bytes()) {
+            return Ok(false);
+        }
+        let dst = staging.host_slice_mut();
+        let (residuals, history) = dst[..bytes].split_at_mut(values * 4);
+        for (dst, src) in residuals.chunks_exact_mut(4).zip(params.residuals.iter().flatten()) {
+            dst.copy_from_slice(&src.to_ne_bytes());
+        }
+        for (dst, src) in history.chunks_exact_mut(2).zip(params.history) {
+            dst.copy_from_slice(&src.to_ne_bytes());
+        }
+        let input = self.input.ptr::<f32>();
+        check(unsafe {
+            sys::cudaMemcpyAsync(input.cast(), staging.host_ptr(), bytes, sys::MEMCPY_H2D, self.stream.0)
+        }, "Inkling MLP residual inputs")?;
+        let history = input.wrapping_add(values).cast::<u16>();
+        let output = self.result.ptr::<u16>();
+        check(unsafe {
+            sys::blz_inkling_mlp_residual_conv(self.sum.ptr(), input, history, params.weights.ptr(), output,
+                output.wrapping_add(values), hidden as i32, params.taps as i32, (params.history.len() / hidden) as i32,
+                tokens as i32, params.tail as i32, params.scale, self.stream.0)
+        }, "Inkling MLP residual convolution")?;
+        self.queue_result(output, output_values)?;
+        Ok(true)
+    }
+
     pub fn moe_batch(
         &mut self,
         ckpt: &Checkpoint,
@@ -1298,9 +1559,10 @@ impl Compute {
         routes: &[Vec<(usize, f32)>],
         caps: (f32, f32),
         experts: usize,
-    ) -> Result<Vec<f32>> {
+        residual: Option<MlpResidual<'_>>,
+    ) -> Result<MoeOutput> {
         if activations.len() == 1 {
-            return self.moe(ckpt, weights, layer, &activations[0], &routes[0], caps.0, caps.1);
+            return self.moe(ckpt, weights, layer, &activations[0], &routes[0], caps.0, caps.1).map(MoeOutput::Routed);
         }
         let hidden = weights.gate_up.cols;
         let intermediate = weights.down.cols;
@@ -1313,6 +1575,8 @@ impl Compute {
         let activations_bf16: Vec<_> = activations.iter().flatten().copied().map(to_bf16).collect();
         let (ids, probs): (Vec<_>, Vec<_>) = by_expert.iter().flatten().copied().unzip();
         let gather_offset = activations_bf16.len();
+        let output_bytes = gather_offset * std::mem::size_of::<f32>();
+        ensure!(output_bytes <= self.transfer.bytes(), "Inkling expert readback exceeds scratch");
         ensure!((gather_offset + activations.len().min(EXPERT_BATCH) * hidden) * 2 <= self.input.bytes(),
             "Inkling expert gather exceeds scratch");
         self.cache.generation += 1;
@@ -1336,6 +1600,7 @@ impl Compute {
             let workers = self.cpu.clone();
             let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
             let mut cold_count = 0;
+            let mut residual_enqueued = false;
             let work = prefill_cpu_scope(workers.as_deref(), |scope| -> Result<()> {
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
                 for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
@@ -1348,15 +1613,26 @@ impl Compute {
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
                 self.wide_experts.as_mut().unwrap().run(&self.stream, weights, pool, layer, &by_expert,
                     routes, caps, &self.input, &self.sum, &self.scatter_ids, &self.scatter_weights)?;
+                if cold_count == 0 && let Some(params) = &residual {
+                    residual_enqueued = self.enqueue_mlp_residual(params, hidden, activations.len())?;
+                    if residual_enqueued { return Ok(()); }
+                }
                 self.queue_result::<f32>(self.sum.ptr(), activations.len() * hidden)
             });
             let synced = self.stream.sync();
             work?;
             synced?;
+            if residual_enqueued {
+                let values = activations.len() * hidden;
+                let tail = residual.unwrap().tail * hidden;
+                let mut output = self.read_result::<u16>(values + tail);
+                let history = output.split_off(values);
+                return Ok(MoeOutput::Residual { hidden: output, history });
+            }
             self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
             let mut output = self.read_result(activations.len() * hidden);
             merge_cold(&mut output, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
-            return Ok(output);
+            return Ok(MoeOutput::Routed(output));
         }
         let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
         let mut cold_count = 0usize;
@@ -1446,7 +1722,10 @@ impl Compute {
                     slot.release(&self.stream)?;
                 }
             }
-            Ok(())
+            check(unsafe {
+                sys::cudaMemcpyAsync(self.transfer.host_ptr().cast_mut(), self.sum.ptr(), output_bytes,
+                    sys::MEMCPY_D2H, self.stream.0)
+            }, "Inkling expert readback")
         });
         let synced = self.stream.sync();
         if (work.is_err() || synced.is_err()) && let Some(stage) = &self.prompt_stage {
@@ -1455,9 +1734,9 @@ impl Compute {
         work?;
         synced?;
         self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
-        let mut total = self.sum.download(activations.len() * hidden)?;
+        let mut total = self.read_result(activations.len() * hidden);
         merge_cold(&mut total, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
-        Ok(total)
+        Ok(MoeOutput::Routed(total))
     }
 }
 
@@ -1685,6 +1964,11 @@ pub(super) struct AttentionResidual<'a> {
     pub scale: f32,
 }
 
+pub(super) enum ProjectionInputs<'a, const N: usize> {
+    Host([&'a [&'a [f32]]; N]),
+    Recurrent(usize),
+}
+
 impl AttentionRow<'_> {
     fn fields(&self) -> [&[u16]; 6] {
         [&self.q, self.gate, self.sink, &self.relative, &self.key, &self.value]
@@ -1730,28 +2014,37 @@ impl AttentionScratch {
     }
 
     pub fn project_attention<const N: usize>(
-        &mut self, gpu: &mut Compute, kv: &Kv, matrices: [&Dense; N], inputs: [&[&[f32]]; N],
+        &mut self, gpu: &mut Compute, kv: &Kv, matrices: [&Dense; N], inputs: ProjectionInputs<'_, N>,
         bias: &Dense, output: &Dense, start: usize, conv: AttentionConv<'_>, clip: AttentionClip<'_>,
-        tail: usize, residual: AttentionResidual<'_>,
+        tail: usize, residual: Option<AttentionResidual<'_>>,
     ) -> Result<(Vec<f32>, [Vec<u16>; 3])> {
-        let rows = inputs[0].len();
+        let (rows, input, offsets, upload) = match inputs {
+            ProjectionInputs::Host(inputs) => {
+                let (offsets, size) = gpu.stage_projections(matrices, inputs)?;
+                (inputs[0].len(), &gpu.input, offsets, size)
+            }
+            ProjectionInputs::Recurrent(rows) => {
+                let buffer = &gpu.recurrent_batch.as_ref().unwrap().projected_input;
+                let size = rows * matrices[0].cols;
+                (rows, buffer, [0, size, 2 * size, size, 2 * size], 0)
+            }
+        };
         let history = (conv.taps - 1).min(start);
         let width = self.kv_heads * HEAD_DIM;
         let history_values = width * history;
         let mut prefix = [0; N];
         prefix[1] = history_values;
         prefix[2] = history_values;
-        let (offsets, size) = gpu.stage_projections(matrices, inputs)?;
         let q_values = rows * self.heads * HEAD_DIM;
         let rel_values = rows * self.heads * clip.relative;
         let sink_values = rows * self.heads;
         let slot_offset = (2 * q_values + rel_values + sink_values).next_multiple_of(2) / 2;
         let attention_values = rows * output.rows;
-        let history_res = residual.history.len();
-        let [tail, attention_tail] = [tail * width, tail * output.rows];
+        let history_res = residual.as_ref().map_or(0, |r| r.history.len());
+        let [tail, attention_tail] = [tail * width, usize::from(residual.is_some()) * tail * output.rows];
         let slots_end = 4 * (history_values + rows);
         let res_at = slots_end + 2 * history_res;
-        let add_previous = !residual.previous.is_empty();
+        let add_previous = residual.as_ref().is_some_and(|r| !r.previous.is_empty());
         let stage_end = res_at + 2 * usize::from(add_previous) * attention_values;
         let raw_end = history_res + attention_values;
         let tail_values = 2 * tail + attention_tail;
@@ -1759,8 +2052,8 @@ impl AttentionScratch {
             && stage_end.max(tail_values * 2) <= self.staging.bytes()
             && (raw_end + usize::from(add_previous) * attention_values) * 2 <= gpu.input.bytes()
             && attention_values * 4 <= gpu.result.bytes().min(gpu.transfer.bytes())
-            && (!add_previous || (residual.previous.len() == rows
-                && residual.previous.iter().all(|row| row.len() == output.rows))),
+            && residual.as_ref().is_none_or(|r| !add_previous || (r.previous.len() == rows
+                && r.previous.iter().all(|row| row.len() == output.rows))),
             "Inkling device attention exceeds scratch");
         let staging = self.staging.host_slice_mut();
         for (dst, src) in staging[..4 * history_values].chunks_exact_mut(2).zip(conv.history.into_iter().flatten()) {
@@ -1769,14 +2062,19 @@ impl AttentionScratch {
         for (i, dst) in staging[4 * history_values..slots_end].chunks_exact_mut(4).enumerate() {
             dst.copy_from_slice(&(((start + i) % kv.capacity) as i32).to_ne_bytes());
         }
-        for (dst, src) in staging[slots_end..res_at].chunks_exact_mut(2).zip(residual.history) {
-            dst.copy_from_slice(&src.to_ne_bytes());
-        }
-        for (dst, &src) in staging[res_at..stage_end].chunks_exact_mut(2).zip(residual.previous.iter().copied().flatten()) {
-            dst.copy_from_slice(&to_bf16(src).to_ne_bytes());
+        if let Some(residual) = &residual {
+            for (dst, src) in staging[slots_end..res_at].chunks_exact_mut(2).zip(residual.history) {
+                dst.copy_from_slice(&src.to_ne_bytes());
+            }
+            for (dst, &src) in staging[res_at..stage_end].chunks_exact_mut(2).zip(residual.previous.iter().copied().flatten()) {
+                dst.copy_from_slice(&to_bf16(src).to_ne_bytes());
+            }
         }
         let work = (|| -> Result<()> {
-            let projections = gpu.enqueue_projections(matrices, offsets, size, rows, false, prefix)?;
+            if upload > 0 {
+                gpu.copy_staged_input(upload * 2)?;
+            }
+            let projections = gpu.enqueue_projections(matrices, input, offsets, rows, false, prefix)?;
             let slots = self.input.at::<i32>(slot_offset);
             let host = self.staging.host_ptr().cast::<u16>();
             for (i, &raw) in projections[1..3].iter().enumerate().filter(|_| history > 0) {
@@ -1835,23 +2133,31 @@ impl AttentionScratch {
                     raw.add(rows * width - tail).cast(), tail * 2, sys::MEMCPY_D2H, gpu.stream.0) },
                     "Inkling KV convolution tail")?;
             }
-            check(unsafe {
-                sys::blz_inkling_residual_conv(gpu.input.ptr(), previous, residual.weights.ptr(), gpu.result.ptr(),
-                    output.rows as i32, conv.taps as i32, (history_res / output.rows) as i32, rows as i32,
-                    residual.scale, gpu.stream.0)
-            }, "Inkling prefill residual convolution")?;
+            if let Some(residual) = &residual {
+                check(unsafe {
+                    sys::blz_inkling_residual_conv(gpu.input.ptr(), previous, residual.weights.ptr(), gpu.result.ptr(),
+                        output.rows as i32, conv.taps as i32, (history_res / output.rows) as i32, rows as i32,
+                        residual.scale, gpu.stream.0)
+                }, "Inkling prefill residual convolution")?;
+            }
             if attention_tail > 0 {
                 check(unsafe { sys::cudaMemcpyAsync(host.cast_mut().add(2 * tail).cast(),
                     gpu.input.at::<u16>(raw_end - attention_tail).cast(), attention_tail * 2,
                     sys::MEMCPY_D2H, gpu.stream.0) }, "Inkling residual convolution tail")?;
             }
-            gpu.queue_result::<f32>(gpu.result.ptr(), attention_values)
+            if residual.is_some() {
+                gpu.queue_result::<f32>(gpu.result.ptr(), attention_values)
+            } else {
+                gpu.queue_result::<u16>(gpu.input.ptr(), attention_values)
+            }
         })();
         let synced = gpu.stream.sync();
         work?;
         synced?;
         let history = unsafe { std::slice::from_raw_parts(self.staging.host_ptr().cast::<u16>(), tail_values) };
-        Ok((gpu.read_result(attention_values), [
+        let attention = if residual.is_some() { gpu.read_result(attention_values) }
+            else { gpu.read_result::<u16>(attention_values).into_iter().map(from_bf16).collect() };
+        Ok((attention, [
             history[..tail].to_vec(), history[tail..2 * tail].to_vec(), history[2 * tail..].to_vec(),
         ]))
     }
@@ -2081,6 +2387,84 @@ mod tests {
             for (row, (&actual, &expected)) in tensor.iter().zip(&expected).enumerate() {
                 assert!((actual - expected).abs() < 0.002, "{dtype:?} at {row}: {actual} vs {expected}");
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires a CUDA GPU and AVX2/FMA"]
+    fn recurrent_attention_batch_matches_host_normalization() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
+        crate::gpu::set_device(0).unwrap();
+        let width = 2304;
+        let count = 131;
+        let mut gpu = Compute::new(2 * width, 12 * width, width, 1152, 0, [0; 2], [0; 2], 8, 512, None).unwrap();
+        let values = |count, seed: usize| {
+            (0..count).map(move |i| ((i * 641 + (i % 113) * seed) % 719) as f32 / 431.0 - 0.83)
+        };
+        let matrix = |rows, cols, seed| {
+            let data = values(rows * cols, seed).map(|v| to_bf16(v * 0.025)).collect::<Vec<_>>();
+            Dense::from_bf16(&data, rows, cols).unwrap()
+        };
+        let down = [23, 109, 403].map(|seed| matrix(64, width * 2, seed));
+        let up = [57, 179, 929].map(|seed| matrix(width * 2, 64, seed));
+        let norm = values(width * 3, 691).collect::<Vec<_>>();
+        let norms = DevBuf::from_slice(&norm).unwrap();
+        let x: Vec<Vec<Vec<f32>>> = (0..count).map(|row| {
+            (0..3).map(|group| values(width, 19 * row + 33 * group).collect()).collect()
+        }).collect();
+        let messages: Vec<[Vec<f32>; 3]> = (0..count).map(|row| {
+            std::array::from_fn(|group| values(width, 11 * row + 41 * group).collect())
+        }).collect();
+        let eps = 1e-6;
+        let normalize = |row| super::super::forward::normalized(row, None, eps);
+        let inputs: Vec<[Vec<f32>; 3]> = x.iter().zip(&messages).map(|(x, msg)| {
+            std::array::from_fn(|group| normalize(x[group].as_slice()).into_iter()
+                .chain(normalize(msg[group].as_slice())).collect())
+        }).collect();
+        let inputs: Vec<_> = inputs.iter().map(|rows| rows.each_ref().map(Vec::as_slice)).collect();
+        let gates = gpu.controller_gates_batch(down.each_ref(), up.each_ref(), &inputs).unwrap();
+        let expected: Vec<_> = x.iter().flatten().zip(messages.iter().flatten())
+            .zip(gates.chunks_exact(2 * width)).enumerate().flat_map(|(i, ((row, message), gate))| {
+                let mut row = row.clone();
+                let (forget, gain) = gate.split_at(width);
+                super::super::cpu::controller_mix(&mut row, message, forget, gain);
+                let norm = &norm[(i % 3) * width..][..width];
+                super::super::forward::normalized(&row, Some(norm), eps).into_iter().map(to_bf16)
+            }).collect();
+        let limit = gpu.recurrent_batch_limit(width);
+        let actual: Vec<_> = x.chunks(limit).zip(messages.chunks(limit)).flat_map(|(x, messages)| {
+            gpu.recurrent_attention_inputs(down.each_ref(), up.each_ref(), x, messages, &norms, eps).unwrap()
+        }).collect();
+        let different = actual.iter().zip(&expected).position(|(a, b)| a != b);
+        assert_eq!(different.map(|i| (i / width, i % width, actual[i], expected[i])), None);
+        gpu.recurrent_batch = Some(RecurrentBatch::new(count, width).unwrap());
+        assert!(gpu.queue_recurrent_attention(down.each_ref(), up.each_ref(), &x,
+            RecurrentMessages::Mixed(&messages), &norms, eps).unwrap());
+        gpu.stream.sync().unwrap();
+        let output = gpu.recurrent_batch.as_ref().unwrap().projected_input.download::<u16>(count * width * 3).unwrap();
+        for group in 0..3 {
+            for row in 0..count {
+                let offset = (group * count + row) * width;
+                let expected_offset = (row * 3 + group) * width;
+                assert_eq!(&output[offset..][..width], &expected[expected_offset..][..width]);
+            }
+        }
+        let raw: Vec<_> = x.iter().map(|row| &row[..2]).collect();
+        let mixed: Vec<_> = raw.iter().map(|row| std::array::from_fn(|_| {
+            row[0].iter().zip(&row[1]).map(|(a, b)| (a + b) * 0.5).collect::<Vec<_>>()
+        })).collect();
+        let mix_weights = vec![[[0.5f32; 2]; 3]; count];
+        assert!(gpu.queue_recurrent_attention(down.each_ref(), up.each_ref(), &x,
+            RecurrentMessages::Mixed(&mixed), &norms, eps).unwrap());
+        gpu.stream.sync().unwrap();
+        let cpu_message = gpu.recurrent_batch.as_ref().unwrap().projected_input.download::<u16>(count * width * 3).unwrap();
+        for upload in [Some(raw.as_slice()), None] {
+            assert!(gpu.queue_recurrent_attention(down.each_ref(), up.each_ref(), &x,
+                RecurrentMessages::Bank { upload, weights: &mix_weights }, &norms, eps).unwrap());
+            gpu.stream.sync().unwrap();
+            let gpu_message = gpu.recurrent_batch.as_ref().unwrap().projected_input.download::<u16>(count * width * 3).unwrap();
+            assert_eq!(gpu_message, cpu_message);
         }
     }
 

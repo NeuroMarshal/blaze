@@ -597,7 +597,12 @@ unsafe extern "C" {
     pub fn blz_inkling_reduce_experts(rows: *const u16, weights: *const f32, out: *mut f32,
                                       width: c_int, experts: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_qkv(gates: *const f32, x: *const f32, msg: *const f32, norms: *const f32,
-                                      out: *mut u16, width: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
+                                      out: *mut u16, width: c_int, tokens: c_int, projection_stride: c_int, eps: f32,
+                                      stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_controller_inputs(x: *const f32, msg: *const f32, out: *mut u16, width: c_int,
+                                        rows: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_controller_message_mix(bank: *const f32, queries: *const f32, out: *mut f32,
+                                             width: c_int, rows: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_norm(gates: *const f32, x: *const f32, msg: *const f32, norm: *const f32,
                                      out: *mut u16, width: c_int, eps: f32, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_router_logits(w: *const u16, x: *const u16, out: *mut f32, rows: c_int,
@@ -655,6 +660,9 @@ unsafe extern "C" {
         stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_residual_conv(raw: *const u16, previous: *const u16, weights: *const f32, out: *mut f32,
         width: c_int, taps: c_int, history: c_int, rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_mlp_residual_conv(routed: *const f32, residual: *const f32, history: *const u16,
+        weights: *const f32, output: *mut u16, tail: *mut u16, width: c_int, taps: c_int,
+        history_rows: c_int, rows: c_int, tail_rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_dspark_attention(q: *const u16, stride: c_int, rows: c_int, keys: *const u8, values: *const u8,
                                 ks: *const u8, vs: *const u8, sinks: *const u16, gate: *const u16,
                                 out: *mut u16, scratch: *mut f32, heads: c_int, kv_heads: c_int, capacity: c_int,
