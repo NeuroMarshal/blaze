@@ -1,6 +1,7 @@
 //! EAGLE-4 drafter (eagle-hq/EAGLE-4): target features at p and token p + 1 predict token p + 2.
 //! The draft uses a BF16 KV ring; tensor-parallel ranks share the candidate selection.
 
+use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, HostMapped, check};
 use std::sync::Arc;
 use crate::linear::{Cut, Linear};
@@ -201,7 +202,7 @@ pub struct Draft {
     record: DevBuf,
     staging: HostMapped,
     meta: DevBuf,
-    graphs: std::collections::HashMap<DraftKey, DraftGraph>,
+    graphs: std::collections::HashMap<DraftKey, CudaGraph>,
     /// draft trees: (K, D) of the buffers, the device tree, the frontier's hidden inputs, every row's top-K
     tree_shape: (usize, usize),
     tree: Option<TreeBufs>,
@@ -229,20 +230,6 @@ struct TreeBufs {
     cap: usize,
 }
 const MAX_DRAFT_GRAPHS: usize = 192;
-
-struct DraftGraph {
-    exec: sys::cudaGraphExec_t,
-    graph: sys::cudaGraph_t,
-}
-
-impl Drop for DraftGraph {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudaGraphExecDestroy(self.exec);
-            sys::cudaGraphDestroy(self.graph);
-        }
-    }
-}
 
 // The all-reduce handle is used only by the rank's own thread.
 unsafe impl Send for Draft {}
@@ -822,23 +809,15 @@ impl Draft {
     fn graphed(&mut self, model: &Model, key: DraftKey, body: impl Fn(&Self) -> Result<()>) -> Result<()> {
         let s = &model.stream;
         if let Some(g) = self.graphs.get(&key) {
-            return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "draft graph launch");
+            return g.launch(s);
         }
         if self.graphs.len() >= MAX_DRAFT_GRAPHS || self.warmed.insert(key.clone()) {
             return body(self);
         }
         s.sync()?;
-        check(unsafe { sys::cudaStreamBeginCapture(s.0, sys::CAPTURE_MODE_THREAD_LOCAL) }, "draft capture")?;
-        let captured = body(self);
-        let mut graph = std::ptr::null_mut();
-        let end = unsafe { sys::cudaStreamEndCapture(s.0, &mut graph) };
-        captured?;
-        check(end, "draft capture end")?;
-        let mut exec = std::ptr::null_mut();
-        check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "draft graph instantiate")?;
-        let g = DraftGraph { exec, graph };
-        check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "draft graph launch")?;
-        self.graphs.insert(key, g);
+        let graph = Capture::record(s, || body(self))?.instantiate()?;
+        graph.launch(s)?;
+        self.graphs.insert(key, graph);
         Ok(())
     }
 

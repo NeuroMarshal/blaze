@@ -1,6 +1,7 @@
 //! GPU rank workers own model shards, step staging buffers and CUDA graphs.
 //! The engine coordinates sequence rows, KV slots and step commands.
 
+use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{self, HostMapped, check};
 use crate::model::{Model, Options, Span, Tp};
 use anyhow::{Result, anyhow, bail};
@@ -148,20 +149,6 @@ enum Reply {
     Done,
 }
 
-struct Graph {
-    exec: sys::cudaGraphExec_t,
-    graph: sys::cudaGraph_t,
-}
-
-impl Drop for Graph {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudaGraphExecDestroy(self.exec);
-            sys::cudaGraphDestroy(self.graph);
-        }
-    }
-}
-
 /// A captured step: the rows of every sequence (decode: all 1), sampled head, sparse attention, speculative verify,
 /// tree verify.
 type GraphKey = (Vec<usize>, bool, bool, bool, bool, bool, u32);
@@ -183,7 +170,7 @@ struct Runner {
     /// recorded after the last step's metadata copy: the next step writes the staging buffer after it (the parts of a
     /// step are enqueued without waiting for each other)
     meta_copied: Option<crate::gpu::Event>,
-    graphs: HashMap<GraphKey, Graph>,
+    graphs: HashMap<GraphKey, CudaGraph>,
     warmed: HashSet<GraphKey>,
     /// The graphs' device memory, measured at each instantiation, within a budget of half the VRAM free at the first
     /// capture: past it the least recently replayed graphs go (their shapes are captured again when they come back);
@@ -331,7 +318,7 @@ impl Runner {
             if let Some(b) = self.graph_bytes.get_mut(&key) {
                 b.1 = self.graph_tick;
             }
-            return check(unsafe { sys::cudaGraphLaunch(g.exec, self.model.stream.0) }, "cudaGraphLaunch");
+            return g.launch(&self.model.stream);
         }
         if self.no_graph.contains(&key) || self.warmed.insert(key.clone()) {
             return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution);
@@ -341,27 +328,20 @@ impl Runner {
         self.model.stream.sync()?;
         let free0 = crate::gpu::mem_info()?.0;
         let budget = *self.graph_budget.get_or_insert(free0 / 2);
-        let s = self.model.stream.0;
-        check(unsafe { sys::cudaStreamBeginCapture(s, sys::CAPTURE_MODE_THREAD_LOCAL) }, "cudaStreamBeginCapture")?;
-        let captured = self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution);
-        let mut graph = null_mut();
-        let end = unsafe { sys::cudaStreamEndCapture(s, &mut graph) };
-        captured?;
-        check(end, "cudaStreamEndCapture")?;
-        let mut exec = null_mut();
-        if unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) } != 0 {
-            // out of memory: this shape runs eagerly (the capture only recorded the step)
-            unsafe { sys::cudaGraphDestroy(graph) };
+        let capture = Capture::record(&self.model.stream, || {
+            self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution)
+        })?;
+        let Ok(graph) = capture.instantiate() else {
+            // This shape falls back to eager execution when its graph cannot be instantiated.
             if self.no_graph.is_empty() {
                 eprintln!("blaze: a CUDA graph did not instantiate ({:.0} MiB free): its step shape runs eagerly", free0 as f64 / 1048576.0);
             }
             self.no_graph.insert(key);
             return self.model.forward(spans, n, verify, sample, sparse, tree, need_lse, execution);
-        }
+        };
         let used = free0.saturating_sub(crate::gpu::mem_info()?.0);
-        let g = Graph { exec, graph };
-        check(unsafe { sys::cudaGraphLaunch(g.exec, s) }, "cudaGraphLaunch")?;
-        self.graphs.insert(key.clone(), g);
+        graph.launch(&self.model.stream)?;
+        self.graphs.insert(key.clone(), graph);
         self.graph_bytes.insert(key.clone(), (used, self.graph_tick));
         // past the budget: the least recently replayed graphs go (all of them finished: the stream was synchronized)
         let mut total: usize = self.graph_bytes.values().map(|b| b.0).sum();

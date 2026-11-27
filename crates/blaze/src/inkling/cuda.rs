@@ -1,7 +1,9 @@
 use super::KvDtype;
 use super::cpu::Routed;
 use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
-use crate::gpu::{DevBuf, HostMapped, Stream, check};
+use crate::graph::{Capture, CudaGraph};
+use crate::gpu::{DevBuf, Event, HostMapped, Stream, check};
+use crate::matmul::{Bf16Kernel, Matmul};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, ensure};
 use blaze_sys as sys;
@@ -9,7 +11,7 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 pub(super) struct Dense {
     weight: DevBuf,
@@ -80,52 +82,22 @@ impl Dense {
     }
 
     fn run_prefix(&self, gpu: &Compute, x: *const u16, out: *mut u16, m: usize, rows: usize, decode: bool) -> Result<()> {
-        let (n, k) = (rows as i32, self.cols as i32);
-        let weight = self.weight.ptr::<u16>();
-        if decode && (x as usize).is_multiple_of(16) {
-            if rows > 4096 && crate::tune::wide_fits(m, self.cols, self.cols) {
-                return check(
-                    unsafe { sys::blz_gemv_wide(x.cast(), k.into(), weight.cast(), out.cast(), n.into(), m as i32, n, k, gpu.stream.0) },
-                    "Inkling wide GEMV",
-                );
-            }
-            if rows <= 4096 && crate::tune::skinny_fits(m, self.cols, self.cols) {
-                return check(
-                    unsafe {
-                        sys::blz_skinny_gemm_ex(
-                            x.cast(),
-                            k.into(),
-                            weight.cast(),
-                            out.cast(),
-                            n.into(),
-                            m as i32,
-                            n,
-                            k,
-                            sys::BLZ_BF16,
-                            gpu.stream.0,
-                        )
-                    },
-                    "Inkling skinny GEMV",
-                );
-            }
-        }
-        check(
-            unsafe {
-                sys::blz_gemm_bf16(
-                    gpu.gemm,
-                    x,
-                    self.cols as i64,
-                    weight,
-                    out,
-                    n as i64,
-                    m as i32,
-                    n,
-                    self.cols as i32,
-                    gpu.stream.0,
-                )
-            },
-            "Inkling dense projection",
-        )
+        let product = Matmul {
+            input: x, output: out, rows: m, columns: rows, inner: self.cols,
+            input_stride: self.cols, output_stride: rows,
+        };
+        let kernel = if decode && (x as usize).is_multiple_of(16)
+            && rows > 4096 && crate::tune::wide_fits(m, self.cols, self.cols)
+        {
+            Bf16Kernel::Wide
+        } else if decode && (x as usize).is_multiple_of(16)
+            && rows <= 4096 && crate::tune::skinny_fits(m, self.cols, self.cols)
+        {
+            Bf16Kernel::Skinny(0)
+        } else {
+            Bf16Kernel::Cublas
+        };
+        unsafe { product.bf16(gpu.gemm, self.weight.ptr(), kernel, &gpu.stream) }
     }
 }
 
@@ -139,48 +111,48 @@ struct OnDevice {
 }
 
 impl OnDevice {
-    fn store(buffer: &DevBuf, offset: usize, matrix: &PackedMatrix, data: ExpertSlice<'_>) -> Result<Self> {
+    fn layout(offset: usize, matrix: &PackedMatrix, data: &ExpertSlice<'_>) -> Result<Self> {
         let scale_offset = offset + data.codes.len();
         let alpha_offset = scale_offset + data.scales.len();
-        buffer.upload_at(offset, data.codes)?;
-        buffer.upload_at(scale_offset, data.scales)?;
+        ensure!(data.alpha.is_none() || alpha_offset.is_multiple_of(4), "Inkling NVFP4 expert scale alignment");
+        Ok(Self { offset, scale_offset, alpha_offset, packing: matrix.packing, rows: matrix.rows, cols: matrix.cols })
+    }
+
+    fn stage(host: &mut [u8], offset: usize, matrix: &PackedMatrix, data: ExpertSlice<'_>) -> Result<Self> {
+        let layout = Self::layout(offset, matrix, &data)?;
+        host[offset..layout.scale_offset].copy_from_slice(data.codes);
+        host[layout.scale_offset..layout.alpha_offset].copy_from_slice(data.scales);
         if let Some(alpha) = data.alpha {
-            ensure!(alpha_offset % 4 == 0, "Inkling NVFP4 expert scale alignment");
-            buffer.upload_at(alpha_offset, &vec![alpha; matrix.rows])?;
+            for dst in host[layout.alpha_offset..layout.alpha_offset + 4 * matrix.rows].chunks_exact_mut(4) {
+                dst.copy_from_slice(&alpha.to_ne_bytes());
+            }
         }
-        Ok(Self {
-            offset,
-            scale_offset,
-            alpha_offset,
-            packing: matrix.packing,
-            rows: matrix.rows,
-            cols: matrix.cols,
-        })
+        Ok(layout)
+    }
+
+    fn store(buffer: &DevBuf, offset: usize, matrix: &PackedMatrix, data: ExpertSlice<'_>) -> Result<Self> {
+        let layout = Self::layout(offset, matrix, &data)?;
+        buffer.upload_at(offset, data.codes)?;
+        buffer.upload_at(layout.scale_offset, data.scales)?;
+        if let Some(alpha) = data.alpha {
+            buffer.upload_at(layout.alpha_offset, &vec![alpha; matrix.rows])?;
+        }
+        Ok(layout)
     }
 
     fn run(&self, buffer: &DevBuf, x: *const u16, out: *mut u16, m: usize, stream: &Stream) -> Result<()> {
-        let (n, k) = (self.rows as i32, self.cols as i32);
         let codes = buffer.at(self.offset);
         let scales = buffer.at(self.scale_offset);
-        let err = unsafe {
-            match self.packing {
-                Packing::Nvfp4 => sys::blz_nvfp4_gemv_mma(
-                    x,
-                    k.into(),
-                    codes,
-                    scales,
-                    buffer.at(self.alpha_offset / 4),
-                    out,
-                    n.into(),
-                    m as i32,
-                    n,
-                    k,
-                    stream.0,
-                ),
-                Packing::Mxfp8 => sys::blz_mxfp8_gemv_mma(x, k.into(), codes, scales, out, n.into(), m as i32, n, k, stream.0),
-            }
+        let product = Matmul {
+            input: x, output: out, rows: m, columns: self.rows, inner: self.cols,
+            input_stride: self.cols, output_stride: self.rows,
         };
-        check(err, "Inkling packed expert GEMV")
+        unsafe {
+            match self.packing {
+                Packing::Nvfp4 => product.nvfp4(codes, scales, buffer.at(self.alpha_offset / 4), 0, 0, stream),
+                Packing::Mxfp8 => product.mxfp8(codes, scales, 0, 0, stream),
+            }
+        }
     }
 
     fn offsets(&self) -> sys::blz_inkling_matrix {
@@ -189,6 +161,73 @@ impl OnDevice {
             scales: self.scale_offset as u64,
             alpha: self.alpha_offset as u64,
         }
+    }
+}
+
+const PROMPT_STAGE_SLOTS: usize = 2;
+const PROMPT_STAGE_MIN_ROUTES: usize = 8;
+
+pub(super) fn prompt_stage_bytes(expert_sizes: [usize; 2], prefill_chunk: usize, cpu: bool) -> usize {
+    if cpu && prefill_chunk >= 64
+        && std::env::var_os("BLAZE_INKLING_STAGE_PREFILL_EXPERTS").is_some_and(|value| value == "1")
+    {
+        PROMPT_STAGE_SLOTS * expert_sizes.into_iter().max().unwrap()
+    } else { 0 }
+}
+
+struct PromptSlot {
+    host: HostMapped,
+    device: DevBuf,
+    uploaded: Event,
+    consumed: Event,
+    in_flight: bool,
+}
+
+impl PromptSlot {
+    fn new(bytes: usize) -> Result<Self> {
+        Ok(Self {
+            host: HostMapped::new(bytes)?,
+            device: DevBuf::new(bytes)?,
+            uploaded: Event::new()?,
+            consumed: Event::new()?,
+            in_flight: false,
+        })
+    }
+
+    fn load(&mut self, copy: &Stream, compute: &Stream, ckpt: &Checkpoint, weights: &Experts,
+            id: usize) -> Result<(OnDevice, OnDevice)> {
+        if self.in_flight {
+            check(unsafe { sys::cudaEventSynchronize(self.uploaded.0) }, "Inkling staging host reuse")?;
+            check(unsafe { sys::cudaStreamWaitEvent(copy.0, self.consumed.0, 0) }, "Inkling staging device reuse")?;
+        }
+        let host = self.host.host_slice_mut();
+        let gate = OnDevice::stage(host, 0, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
+        let down_at = weights.gate_up.gpu_bytes().next_multiple_of(64);
+        let down = OnDevice::stage(host, down_at, &weights.down, weights.down.expert(ckpt, id)?)?;
+        check(unsafe {
+            sys::cudaMemcpyAsync(self.device.ptr(), self.host.host_ptr(), expert_size(weights), sys::MEMCPY_H2D, copy.0)
+        }, "Inkling prompt expert upload")?;
+        check(unsafe { sys::cudaEventRecord(self.uploaded.0, copy.0) }, "Inkling prompt expert ready")?;
+        check(unsafe { sys::cudaStreamWaitEvent(compute.0, self.uploaded.0, 0) }, "Inkling prompt expert wait")?;
+        Ok((gate, down))
+    }
+
+    fn release(&mut self, stream: &Stream) -> Result<()> {
+        check(unsafe { sys::cudaEventRecord(self.consumed.0, stream.0) }, "Inkling prompt expert consumed")?;
+        self.in_flight = true;
+        Ok(())
+    }
+}
+
+struct PromptStage {
+    copy: Stream,
+    slots: [PromptSlot; PROMPT_STAGE_SLOTS],
+    next: usize,
+}
+
+impl PromptStage {
+    fn new(bytes: usize) -> Result<Self> {
+        Ok(Self { copy: Stream::new()?, slots: [PromptSlot::new(bytes)?, PromptSlot::new(bytes)?], next: 0 })
     }
 }
 
@@ -365,39 +404,6 @@ enum ProjectionKey {
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
 
-struct ProjectionGraph(sys::cudaGraphExec_t);
-
-impl ProjectionGraph {
-    fn capture(stream: &Stream, enqueue: impl FnOnce() -> Result<()>) -> Option<Self> {
-        if unsafe { sys::cudaStreamBeginCapture(stream.0, sys::CAPTURE_MODE_THREAD_LOCAL) } != 0 {
-            return None;
-        }
-        let recorded = enqueue();
-        let mut graph = null_mut();
-        let ended = unsafe { sys::cudaStreamEndCapture(stream.0, &mut graph) };
-        if graph.is_null() {
-            return None;
-        }
-        let mut exec = null_mut();
-        let instantiated = recorded.is_ok() && ended == 0
-            && unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) } == 0;
-        unsafe { sys::cudaGraphDestroy(graph) };
-        instantiated.then_some(Self(exec))
-    }
-
-    fn launch(&self, stream: &Stream) -> Result<()> {
-        check(unsafe { sys::cudaGraphLaunch(self.0, stream.0) }, "Inkling projection graph")
-    }
-}
-
-impl Drop for ProjectionGraph {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { sys::cudaGraphExecDestroy(self.0) };
-        }
-    }
-}
-
 pub(super) struct Compute {
     pub stream: Stream,
     gemm: *mut sys::blz_gemm,
@@ -413,7 +419,8 @@ pub(super) struct Compute {
     cache: ExpertCache,
     cpu: Option<Arc<rayon::ThreadPool>>,
     cpu_routes: u64,
-    projection_graphs: Option<HashMap<ProjectionKey, Option<ProjectionGraph>>>,
+    prompt_stage: Option<PromptStage>,
+    projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
     grouped_experts: bool,
 }
 
@@ -443,6 +450,8 @@ impl Compute {
         let transfer = HostMapped::new(input.bytes().max(result.bytes()))?;
         let next_id = DevBuf::new(4)?;
         let cache = ExpertCache::new(expert_bytes, expert_sizes, layer_visits, top_k)?;
+        let stage_bytes = prompt_stage_bytes(expert_sizes, prefill_chunk, cpu.is_some());
+        let prompt_stage = (stage_bytes > 0).then(|| PromptStage::new(stage_bytes / PROMPT_STAGE_SLOTS)).transpose()?;
         let mut gemm = null_mut();
         check(unsafe { sys::blz_gemm_create(&mut gemm) }, "Inkling cuBLAS handle")?;
         Ok(Self {
@@ -460,6 +469,7 @@ impl Compute {
             cache,
             cpu,
             cpu_routes: 0,
+            prompt_stage,
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
@@ -606,7 +616,8 @@ impl Compute {
         if graphs.len() >= MAX_PROJECTION_GRAPHS {
             return enqueue(self);
         }
-        let captured = ProjectionGraph::capture(&self.stream, || enqueue(self));
+        let captured = Capture::record(&self.stream, || enqueue(self))
+            .and_then(Capture::instantiate).ok();
         let result = captured.as_ref().map_or_else(|| enqueue(self), |graph| graph.launch(&self.stream));
         self.projection_graphs.as_mut().unwrap().insert(key, captured);
         result
@@ -1002,17 +1013,18 @@ impl Compute {
         self.cache.visits += activations.len();
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
-        let work = (|| -> Result<_> {
+        let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
+        let mut cold_count = 0usize;
+        let work = prefill_cpu_scope(self.cpu.as_deref(), |scope| -> Result<()> {
             self.input.upload_async(&activations_bf16, &self.stream)?;
             self.scatter_ids.upload_async(&ids, &self.stream)?;
             self.scatter_weights.upload_async(&probs, &self.stream)?;
             self.sum.zero(&self.stream)?;
             let mut offset = 0;
-            let mut cold = Vec::new();
             for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
                 let start = offset;
                 offset += rows.len();
-                if !pool.use_gpu(
+                let resident = pool.use_gpu(
                     ckpt,
                     weights,
                     (layer, id),
@@ -1021,18 +1033,32 @@ impl Compute {
                     self.cpu.is_some().then_some(rows.len()),
                     false,
                     Some(&self.stream),
-                )? {
-                    for &(row, weight) in rows {
-                        cold.push((
-                            Routed::read(ckpt, weights, id)?,
-                            activations[row as usize].as_slice(),
-                            row as usize,
-                            weight,
-                        ));
-                    }
+                )?;
+                let mut prompt_slot = None;
+                let temporary;
+                let (buffer, gate_up, down) = if resident {
+                    let expert = &pool.entries[&(layer, id)];
+                    (&pool.buffer, &expert.gate_up, &expert.down)
+                } else if activations.len() >= 64 && rows.len() >= PROMPT_STAGE_MIN_ROUTES
+                    && let Some(stage) = &mut self.prompt_stage
+                {
+                    let slot = &mut stage.slots[stage.next];
+                    stage.next = (stage.next + 1) % PROMPT_STAGE_SLOTS;
+                    temporary = slot.load(&stage.copy, &self.stream, ckpt, weights, id)?;
+                    (&prompt_slot.insert(slot).device, &temporary.0, &temporary.1)
+                } else {
+                    let expert = Routed::read(ckpt, weights, id)?;
+                    let result = &cold[id];
+                    cold_count += rows.len();
+                    scope.expect("cold expert without CPU pool").spawn(move |_| {
+                        let output = rows.par_iter().map(|&(row, prob)| {
+                            let row = row as usize;
+                            (row, prob, expert.run(weights, &activations[row], caps))
+                        }).collect::<Vec<_>>();
+                        let _ = result.set(output);
+                    });
                     continue;
-                }
-                let e = &pool.entries[&(layer, id)];
+                };
                 for (index, batch) in rows.chunks(EXPERT_BATCH).enumerate() {
                     let at = start + index * EXPERT_BATCH;
                     let n = batch.len();
@@ -1041,8 +1067,7 @@ impl Compute {
                         sys::blz_gather_rows(self.input.ptr(), hidden as i64, self.scatter_ids.at(at),
                             n as i32, hidden as i32, input, self.stream.0)
                     }, "Inkling gather expert activations")?;
-                    e.gate_up
-                        .run(&pool.buffer, input, self.gate.ptr(), n, &self.stream)?;
+                    gate_up.run(buffer, input, self.gate.ptr(), n, &self.stream)?;
                     check(
                         unsafe {
                             sys::blz_inkling_swiglu(
@@ -1056,7 +1081,7 @@ impl Compute {
                         },
                         "Inkling batched activation",
                     )?;
-                    e.down.run(&pool.buffer, self.glu.ptr(), self.result.ptr(), n, &self.stream)?;
+                    down.run(buffer, self.glu.ptr(), self.result.ptr(), n, &self.stream)?;
                     check(
                         unsafe {
                             sys::blz_inkling_expert_scatter(
@@ -1072,19 +1097,33 @@ impl Compute {
                         "Inkling batched expert reduction",
                     )?;
                 }
+                if let Some(slot) = prompt_slot {
+                    slot.release(&self.stream)?;
+                }
             }
-            Ok(run_cold(self.cpu.as_deref(), cold, weights, caps, &mut self.cpu_routes))
-        })();
+            Ok(())
+        });
         let synced = self.stream.sync();
-        let out_cpu = work?;
+        if (work.is_err() || synced.is_err()) && let Some(stage) = &self.prompt_stage {
+            let _ = stage.copy.sync();
+        }
+        work?;
         synced?;
+        self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
         let mut total = self.sum.download(activations.len() * hidden)?;
-        merge_cold(&mut total, hidden, out_cpu);
+        merge_cold(&mut total, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
         Ok(total)
     }
 }
 
 type ColdRoute<'a> = (Routed<'a>, &'a [f32], usize, f32);
+
+fn prefill_cpu_scope<'scope, T>(cpu: Option<&rayon::ThreadPool>, dispatch: impl FnOnce(Option<&rayon::Scope<'scope>>) -> T) -> T {
+    match cpu {
+        Some(cpu) => cpu.in_place_scope(|scope| dispatch(Some(scope))),
+        None => dispatch(None),
+    }
+}
 
 fn run_cold(
     cpu: Option<&rayon::ThreadPool>,
@@ -1104,7 +1143,7 @@ fn run_cold(
     })
 }
 
-fn merge_cold(output: &mut [f32], hidden: usize, cold: Vec<(usize, f32, Vec<f32>)>) {
+fn merge_cold(output: &mut [f32], hidden: usize, cold: impl IntoIterator<Item = (usize, f32, Vec<f32>)>) {
     for (row, weight, values) in cold {
         for (dst, src) in output[row * hidden..][..hidden].iter_mut().zip(values) {
             *dst += src * weight;
@@ -1283,6 +1322,7 @@ pub(super) struct AttentionScratch {
     attended: DevBuf,
     filtered: DevBuf,
     batch: usize,
+    tensor_prefill: bool,
     heads: usize,
     kv_heads: usize,
 }
@@ -1302,13 +1342,14 @@ impl AttentionScratch {
             attended: DevBuf::new(batch * heads * HEAD_DIM * 2)?,
             filtered: DevBuf::new(batch * 2 * kv_heads * HEAD_DIM * 2)?,
             batch,
+            tensor_prefill: std::env::var_os("BLAZE_INKLING_TENSOR_PREFILL").is_some_and(|value| value == "1"),
             heads,
             kv_heads,
         })
     }
 
     pub fn run_rows(&mut self, gpu: &mut Compute, kv: &Kv, rows: &[AttentionRow<'_>], bias: &Dense,
-                    output: &Dense, start: usize, conv: Option<AttentionConv<'_>>) -> Result<Vec<f32>> {
+                    output: &Dense, start: usize, conv: Option<AttentionConv<'_>>, verify: bool) -> Result<Vec<f32>> {
         if let [row] = rows {
             let [q, gate, sink, relative, key, value] = row.fields();
             return self.run(gpu, kv, q, gate, sink, relative, key, value, bias, output, start);
@@ -1387,7 +1428,7 @@ impl AttentionScratch {
                     sys::blz_inkling_prefill_attention(q, keys, values, ks, vs, self.relative.ptr(), sink, gate,
                         self.attended.ptr(), self.tiles.ptr(), self.heads as i32, self.kv_heads as i32,
                         kv.capacity as i32, kv.window as i32, pos as i32, bias.rows as i32, count as i32,
-                        KV_GLOBAL_SCALE, gpu.stream.0)
+                        KV_GLOBAL_SCALE, i32::from(self.tensor_prefill && !verify && !kv.storage.is_host()), gpu.stream.0)
                 }, "Inkling causal prefill attention")?;
                 output.run_decode_rows(gpu, self.attended.ptr(), gpu.result.ptr(), count)?;
                 gpu.queue_result::<u16>(gpu.result.ptr(), count * output.rows)
@@ -1486,9 +1527,9 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn causal_prefill_matches_decode_across_tiles_and_ring_wrap() {
         crate::gpu::set_device(0).unwrap();
-        let window = 80;
+        let window = 160;
         let capacity = window + PREFILL_ATTENTION_ROWS - 1;
-        let end = 113;
+        let end = 225;
         let mut scratch = AttentionScratch::new(1, 1, window, 8, PREFILL_ATTENTION_ROWS, 4).unwrap();
         let mut gpu = Compute::new(128, 2048, 128, 64, 0, [0; 2], [0; 2], 8, 16, None).unwrap();
         let bias: Vec<_> = (0..window * 8).map(|i| to_bf16((i % 11) as f32 / 32.0)).collect();
@@ -1512,10 +1553,15 @@ mod tests {
             let serial = Kv::new(capacity, window, 1, false, dtype).unwrap();
             let batch = Kv::new(capacity, window, 1, false, dtype).unwrap();
             let expected: Vec<_> = rows.iter().enumerate().flat_map(|(pos, row)| {
-                scratch.run_rows(&mut gpu, &serial, std::slice::from_ref(row), &bias, &output, pos, None).unwrap()
+                scratch.run_rows(&mut gpu, &serial, std::slice::from_ref(row), &bias, &output, pos, None, true).unwrap()
             }).collect();
-            let actual = scratch.run_rows(&mut gpu, &batch, &rows, &bias, &output, 0, None).unwrap();
+            let actual = scratch.run_rows(&mut gpu, &batch, &rows, &bias, &output, 0, None, true).unwrap();
             assert_eq!(actual, expected, "{dtype:?}");
+            scratch.tensor_prefill = true;
+            let tensor = scratch.run_rows(&mut gpu, &batch, &rows, &bias, &output, 0, None, false).unwrap();
+            for (row, (&actual, &expected)) in tensor.iter().zip(&expected).enumerate() {
+                assert!((actual - expected).abs() < 0.002, "{dtype:?} at {row}: {actual} vs {expected}");
+            }
         }
     }
 

@@ -2,6 +2,7 @@
 //! A BF16 KV ring bounds draft context; target verification decides which tokens are accepted.
 
 use crate::eagle::{DraftPlan, MAX_CHAIN};
+use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, HostMapped, check};
 use crate::linear::{Cut, Linear};
 use crate::model::{HcBlock, Model, load_hc};
@@ -167,23 +168,9 @@ pub struct Mtp {
     record: DevBuf,
     staging: HostMapped,
     meta: DevBuf,
-    graphs: std::collections::HashMap<(usize, usize, bool), Graph>,
+    graphs: std::collections::HashMap<(usize, usize, bool), CudaGraph>,
     warmed: std::collections::HashSet<(usize, usize, bool)>,
     dumped: bool,
-}
-
-struct Graph {
-    exec: sys::cudaGraphExec_t,
-    graph: sys::cudaGraph_t,
-}
-
-impl Drop for Graph {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudaGraphExecDestroy(self.exec);
-            sys::cudaGraphDestroy(self.graph);
-        }
-    }
 }
 
 // The all-reduce handle is used only by the rank's own thread.
@@ -676,23 +663,15 @@ impl Mtp {
     fn graphed(&mut self, model: &Model, key: (usize, usize, bool), body: impl Fn(&Self) -> Result<()>) -> Result<()> {
         let s = &model.stream;
         if let Some(g) = self.graphs.get(&key) {
-            return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "MTP graph launch");
+            return g.launch(s);
         }
         if self.graphs.len() >= MAX_GRAPHS || self.warmed.insert(key) {
             return body(self);
         }
         s.sync()?;
-        check(unsafe { sys::cudaStreamBeginCapture(s.0, sys::CAPTURE_MODE_THREAD_LOCAL) }, "MTP capture")?;
-        let captured = body(self);
-        let mut graph = std::ptr::null_mut();
-        let end = unsafe { sys::cudaStreamEndCapture(s.0, &mut graph) };
-        captured?;
-        check(end, "MTP capture end")?;
-        let mut exec = std::ptr::null_mut();
-        check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "MTP graph instantiate")?;
-        let g = Graph { exec, graph };
-        check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "MTP graph launch")?;
-        self.graphs.insert(key, g);
+        let graph = Capture::record(s, || body(self))?.instantiate()?;
+        graph.launch(s)?;
+        self.graphs.insert(key, graph);
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use super::{KvDtype, cpu};
 use super::dspark::{Cache as DraftCache, Draft, Features};
-use super::cuda::{AttentionConv, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, to_bf16};
+use super::cuda::{AttentionConv, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, prompt_stage_bytes, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
 use super::weights::{Experts, read_float};
@@ -735,7 +735,7 @@ impl Model {
             };
             let (free, _) = gpu::mem_info()?;
             let draft_reserve = if draft.is_some() && rank == last_device { DraftCache::bytes(context, kv_dtype) } else { 0 };
-            let reserve = (512 << 20) + vision_reserve + draft_reserve;
+            let reserve = (512 << 20) + vision_reserve + draft_reserve + prompt_stage_bytes(sizes, prefill_chunk, cpu.is_some());
             let max_experts = free.saturating_sub(kv_bytes).saturating_sub(reserve).min(all_experts);
             let expert_bytes = if expert_cache_mib == 0 {
                 max_experts
@@ -1097,6 +1097,7 @@ impl Model {
             });
             let attention = device.scratch.run_rows(
                 compute, &state.kv, &queries, &layer.bias, &layer.output, seq.position, kv_conv,
+                matches!(readout, Readout::Verify(_)),
             )?;
             if kv_weights.is_some() {
                 state.key.remember_bf16(seq.position, s.kv_width(), &k_batch);

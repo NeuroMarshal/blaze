@@ -2,6 +2,7 @@
 //! Tensor-parallel shards are cut before upload.
 
 use crate::gpu::{DevBuf, Stream, check};
+use crate::matmul::Matmul;
 use crate::quant::{Format, QuantConfig, WeightNames};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, bail};
@@ -218,13 +219,8 @@ pub(crate) fn nvfp4_mma(ctx: &LinCtx, w: &Nvfp4Ref, x: *const u16, ldx: usize, m
         );
     }
     let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Nvfp4, n, k, m);
-    check(
-        unsafe {
-            sys::blz_nvfp4_gemv_mma_cfg(x, ldx as i64, w.codes, w.scales, w.alpha, o, ldo as i64, m as c_int, n as c_int, k as c_int, split,
-                                        tiles, s.0)
-        },
-        "blz_nvfp4_gemv_mma",
-    )
+    let product = Matmul { input: x, output: o, rows: m, columns: n, inner: k, input_stride: ldx, output_stride: ldo };
+    unsafe { product.nvfp4(w.codes, w.scales, w.alpha, split, tiles, s) }
 }
 
 impl Linear {
@@ -678,13 +674,11 @@ impl Linear {
                 Store::Mxfp8 { codes, scales } => {
                     if m <= sys::BLZ_MXFP8_MMA_MAX_ROWS {
                         let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Mxfp8, p.n, k, m);
-                        check(
-                            unsafe {
-                                sys::blz_mxfp8_gemv_mma_cfg(x, ldx as i64, codes.ptr(), scales.ptr(), o, ldo as i64, m as c_int, p.n as c_int,
-                                                            k as c_int, split, tiles, s.0)
-                            },
-                            "blz_mxfp8_gemv_mma",
-                        )?;
+                        let product = Matmul {
+                            input: x, output: o, rows: m, columns: p.n, inner: k,
+                            input_stride: ldx, output_stride: ldo,
+                        };
+                        unsafe { product.mxfp8(codes.ptr(), scales.ptr(), split, tiles, s) }?;
                     } else {
                         if p.n * k > ctx.scratch_elems {
                             bail!("MXFP8 scratch of {} elements for a {}x{} part", ctx.scratch_elems, p.n, k);
@@ -705,57 +699,12 @@ impl Linear {
                     }
                 }
                 Store::Bf16(w) => {
-                    use crate::tune::{BF16_CUBLAS, BF16_MMA, BF16_SKINNY, BF16_WIDE, Kernel, mma_fits, skinny_fits, wide_fits};
-                    let aligned = x as usize % 16 == 0;
-                    let skinny = aligned && skinny_fits(m, k, ldx);
-                    let mma = aligned && mma_fits(m, k, ldx);
-                    let wide = wide_fits(m, k, ldx);
-                    // the kernel measured fastest on this GPU for the shape and rows (tune.rs); untuned: the wide GEMV for
-                    // an LM head of a few rows, the skinny kernel for a small n and a row or two, the tensor-core GEMV up
-                    // to 64 rows, cuBLAS otherwise
-                    let (variant, cpb) = match ctx.tune.get(Kernel::Bf16, p.n, k, m) {
-                        (BF16_SKINNY, c) if skinny => (BF16_SKINNY, c),
-                        (BF16_WIDE, _) if wide => (BF16_WIDE, 0),
-                        (BF16_MMA, c) if mma => (BF16_MMA, c),
-                        (BF16_CUBLAS, _) => (BF16_CUBLAS, 0),
-                        _ if wide && p.n > 4096 => (BF16_WIDE, 0),
-                        _ if skinny && p.n <= 4096 && m <= 2 => (BF16_SKINNY, 0),
-                        _ if mma && p.n <= 4096 => (BF16_MMA, 0),
-                        _ => (BF16_CUBLAS, 0),
+                    let product = Matmul {
+                        input: x, output: o, rows: m, columns: p.n, inner: k,
+                        input_stride: ldx, output_stride: ldo,
                     };
-                    if variant == BF16_MMA {
-                        check(
-                            unsafe {
-                                sys::blz_bf16_gemv_mma_cfg(x, ldx as i64, w.ptr(), o, ldo as i64, m as c_int, p.n as c_int, k as c_int,
-                                                           cpb / 8, cpb % 8, s.0)
-                            },
-                            "blz_bf16_gemv_mma",
-                        )?;
-                    } else if variant == BF16_WIDE {
-                        check(
-                            unsafe {
-                                sys::blz_gemv_wide(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), ldo as i64, m as c_int,
-                                                   p.n as c_int, k as c_int, s.0)
-                            },
-                            "blz_gemv_wide",
-                        )?;
-                    } else if variant == BF16_SKINNY {
-                        check(
-                            unsafe {
-                                sys::blz_skinny_gemm_cfg(x.cast(), ldx as i64, w.ptr::<u16>().cast(), o.cast(), ldo as i64, m as c_int,
-                                                         p.n as c_int, k as c_int, sys::BLZ_BF16, cpb, s.0)
-                            },
-                            "blz_skinny_gemm",
-                        )?;
-                    } else {
-                        check(
-                            unsafe {
-                                sys::blz_gemm_bf16(ctx.gemm, x, ldx as i64, w.ptr(), o, ldo as i64, m as c_int, p.n as c_int, k as c_int,
-                                                   s.0)
-                            },
-                            "blz_gemm_bf16",
-                        )?;
-                    }
+                    let kernel = product.tuned_bf16(&ctx.tune);
+                    unsafe { product.bf16(ctx.gemm, w.ptr(), kernel, s) }?;
                 }
             }
         }

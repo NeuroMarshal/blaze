@@ -2,6 +2,7 @@
 //! Projections with a shared input are stacked at load time.
 
 use crate::config::{QSA_TABLE_STRIDE, LayerKind, MlpConfig, ModelConfig, RopeScaling};
+use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check, stream_after};
 use std::cell::{Cell, RefCell};
 use crate::linear::{Cut, LinCtx, Linear};
@@ -194,20 +195,6 @@ pub struct Layer {
     mlp: Mlp,
     /// Index among the softmax-attention layers (KV pool) or among the GDN layers (state).
     slot: usize,
-}
-
-struct CommitGraph {
-    exec: sys::cudaGraphExec_t,
-    graph: sys::cudaGraph_t,
-}
-
-impl Drop for CommitGraph {
-    fn drop(&mut self) {
-        unsafe {
-            sys::cudaGraphExecDestroy(self.exec);
-            sys::cudaGraphDestroy(self.graph);
-        }
-    }
 }
 
 pub struct MoeEngine(*mut sys::blz_moe_engine);
@@ -935,7 +922,7 @@ pub struct Model {
     tree_kv_bufs: Option<(DevBuf, usize)>,
     tree_pairs: DevBuf,
     /// CUDA graph of the GDN commit replay per verify slot
-    commit_graphs: std::cell::RefCell<std::collections::HashMap<usize, CommitGraph>>,
+    commit_graphs: std::cell::RefCell<std::collections::HashMap<usize, CudaGraph>>,
     /// Captured hidden states [max_tokens, capture_layers, hidden] bf16.
     pub aux: Option<DevBuf>,
     work: Work,
@@ -3464,22 +3451,14 @@ impl Model {
         // slot's commit metadata: the kernels' arguments are the same every round, so one CUDA graph per verify slot
         self.commit_meta.upload_at(k * 16, &[offset as i32, (offset + accepted) as i32, row as i32])?;
         if let Some(g) = self.commit_graphs.borrow().get(&k) {
-            return check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "commit graph launch");
+            return g.launch(s);
         }
         if !self.opts.draft_graphs {
             return self.commit_replay(k);
         }
-        check(unsafe { sys::cudaStreamBeginCapture(s.0, sys::CAPTURE_MODE_THREAD_LOCAL) }, "commit capture")?;
-        let captured = self.commit_replay(k);
-        let mut graph = null_mut();
-        let end = unsafe { sys::cudaStreamEndCapture(s.0, &mut graph) };
-        captured?;
-        check(end, "commit capture end")?;
-        let mut exec = null_mut();
-        check(unsafe { sys::cudaGraphInstantiate(&mut exec, graph, 0) }, "commit graph instantiate")?;
-        let g = CommitGraph { exec, graph };
-        check(unsafe { sys::cudaGraphLaunch(g.exec, s.0) }, "commit graph launch")?;
-        self.commit_graphs.borrow_mut().insert(k, g);
+        let graph = Capture::record(s, || self.commit_replay(k))?.instantiate()?;
+        graph.launch(s)?;
+        self.commit_graphs.borrow_mut().insert(k, graph);
         Ok(())
     }
 

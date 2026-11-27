@@ -485,15 +485,10 @@ mod tests {
         };
         run()?;
         stream.sync()?;
-        let mut graph = null_mut();
-        let mut executable = null_mut();
-        check(unsafe { sys::cudaStreamBeginCapture(stream.0, 0) }, "capture")?;
-        run()?;
-        check(unsafe { sys::cudaStreamEndCapture(stream.0, &mut graph) }, "end capture")?;
-        check(unsafe { sys::cudaGraphInstantiate(&mut executable, graph, 0) }, "instantiate")?;
+        let graph = crate::graph::Capture::record(&stream, run)?.instantiate()?;
         for draw in [0.1, 0.9] {
             programs.upload(&[p.row(draw)])?;
-            check(unsafe { sys::cudaGraphLaunch(executable, stream.0) }, "replay")?;
+            graph.launch(&stream)?;
             stream.sync()?;
             let out = results.download::<f32>(132)?;
             let expected = distribution(&vec![0.0; vocab], &edits, &p)?;
@@ -502,10 +497,7 @@ mod tests {
             assert_eq!(out[130], 0.0);
             assert!(out[128].is_finite());
         }
-        unsafe {
-            sys::cudaGraphExecDestroy(executable);
-            sys::cudaGraphDestroy(graph);
-        }
+        drop(graph);
         raw.upload(&vec![f32::NEG_INFINITY; vocab])?;
         run()?;
         stream.sync()?;

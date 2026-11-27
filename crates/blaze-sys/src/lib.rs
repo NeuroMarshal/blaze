@@ -626,7 +626,7 @@ unsafe extern "C" {
                                          vs: *const u8, relative: *const u16, sinks: *const u16, gate: *const u16,
                                          out: *mut u16, scratch: *mut f32, heads: c_int, kv_heads: c_int,
                                          capacity: c_int, window: c_int, start: c_int, extent: c_int, rows: c_int,
-                                         scale: f32, stream: cudaStream_t) -> cudaError_t;
+                                         scale: f32, tensor: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_prefill_conv(key: *const u16, value: *const u16, key_dynamic: *const u16,
                                     value_dynamic: *const u16, weights: *const f32, keys: *mut u16,
                                     values: *mut u16, heads: c_int, taps: c_int, history: c_int,
