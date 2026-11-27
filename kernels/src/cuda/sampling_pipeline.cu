@@ -1,5 +1,6 @@
 #include "blaze/sampling.h"
 #include <cuda_bf16.h>
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
@@ -210,20 +211,45 @@ __global__ void filter(int vocab, int slot, const blz_sampling_row* programs, Wo
     count = int(reduce_sum(float(count))); if (!tid) w.counts[row] = count;
     return;
   }
-  double total = 0, weighted_total = 0;
+  const int count = w.counts[row];
   const float* ranked = w.sorted + size_t(row) * vocab;
-  if ((kind == 5 && p.top_p < 1) || (kind == 8 && p.top_h < 1)) {
-    for (int i = tid; i < w.counts[row]; i += Threads) {
+  int parallel_keep = count;
+  const bool wide_nucleus = kind == 5 && p.top_p < 1 && count > Threads;
+  if (wide_nucleus) {
+    using Scan = cub::BlockScan<double, Threads>;
+    __shared__ Scan::TempStorage scan;
+    const int begin = int(int64_t(count) * tid / Threads);
+    const int end = int(int64_t(count) * (tid + 1) / Threads);
+    const double max_logit = ranked[0];
+    double mass = 0, prefix = 0, total = 0;
+    for (int i = begin; i < end; ++i) mass += exp(double(ranked[i]) - max_logit);
+    Scan(scan).ExclusiveSum(mass, prefix, total);
+    const double cut = double(p.top_p) * total;
+    if (cut >= prefix && cut <= prefix + mass) {
+      for (int i = begin; i < end; ++i) {
+        prefix += exp(double(ranked[i]) - max_logit);
+        if (prefix >= cut) {
+          parallel_keep = i + 1;
+          break;
+        }
+      }
+    }
+    parallel_keep = reduce_min(parallel_keep);
+  }
+  double total = 0, weighted_total = 0;
+  if (!wide_nucleus && ((kind == 5 && p.top_p < 1) || (kind == 8 && p.top_h < 1))) {
+    for (int i = tid; i < count; i += Threads) {
       double d = double(ranked[i]) - double(ranked[0]);
       double x = exp(d); total += x; weighted_total += x * d;
     }
+    total = reduce_double(total);
+    weighted_total = reduce_double(weighted_total);
   }
-  total = reduce_double(total); weighted_total = reduce_double(weighted_total);
   if (!tid) {
-    int n = w.counts[row]; keep = n;
+    int n = count; keep = parallel_keep;
     const float* sorted = w.sorted + size_t(row) * vocab;
     if (kind == 4 && p.top_k > 0) keep = min(n, p.top_k);
-    if ((kind == 5 && p.top_p < 1) || (kind == 6 && p.min_p > 0) || (kind == 8 && p.top_h < 1)) {
+    if (!wide_nucleus && ((kind == 5 && p.top_p < 1) || (kind == 6 && p.min_p > 0) || (kind == 8 && p.top_h < 1))) {
       double sum = total, weighted = weighted_total; float mx = sorted[0];
       double h = sum > 0 ? log(sum) - weighted / sum : 0;
       double mass = 0, wz = 0; keep = 0;

@@ -2660,7 +2660,9 @@ impl Model {
         let vocab = local * self.tp.world;
         self.lm_head.run(&self.lin, normed, self.cfg.hidden, rows, w.logits.ptr(), local, s)?;
         let bytes = (rows * vocab * 4).next_multiple_of(16);
-        check(unsafe { sys::cudaMemsetAsync(w.sampling_logits.ptr(), 0, bytes, s.0) }, "sampling memset")?;
+        if self.tp.world > 1 {
+            check(unsafe { sys::cudaMemsetAsync(w.sampling_logits.ptr(), 0, bytes, s.0) }, "sampling memset")?;
+        }
         check(unsafe { sys::blz_sampling_pack(w.logits.ptr(), local as c_int, vocab as c_int, self.tp.rank as c_int,
             rows as c_int, w.sampling_logits.ptr(), s.0) }, "sampling pack")?;
         if self.tp.world > 1 {

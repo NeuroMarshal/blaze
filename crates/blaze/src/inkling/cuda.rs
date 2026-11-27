@@ -968,9 +968,9 @@ impl Compute {
     pub(super) fn sample_device_rows(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize,
         sample: &super::forward::SampleRow<'_>, cap: f32,
     ) -> Result<Option<Vec<u32>>> {
-        if !(2..=sys::BLZ_TOPK_MAX as i32).contains(&sample.params.top_k)
-            || sample.params.samplers != crate::sampler::SamplingPipeline::default()
-            || !sample.params.row(0.0).bounded()
+        let params = sample.params;
+        if params.samplers != crate::sampler::SamplingPipeline::default()
+            || (params.top_k <= 0 && params.top_p == 1.0 && params.min_p == 0.0)
         {
             return Ok(None);
         }

@@ -406,11 +406,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA"]
-    fn bounded_device_sampling_matches_seeded_softcap_distribution() -> Result<()> {
+    fn device_sampling_matches_seeded_softcap_distribution() -> Result<()> {
         crate::gpu::set_device(0)?;
         let stream = Stream::new()?;
-        let params = SamplingParams { temperature: 0.9, top_k: 7, top_p: 0.9, min_p: 0.03, ..Default::default() };
-        let vocab = 128;
+        let vocab = 8193;
         let rows = 5;
         let cap = 4.0;
         let values: Vec<u16> = (0..rows * vocab).map(|i| {
@@ -420,16 +419,19 @@ mod tests {
         let dev = DevBuf::from_slice(&values)?;
         let sampler = DeviceSampler::new(vocab, rows)?;
         let rng = Rng::new(42);
-        let tokens = unsafe { sampler.sample(dev.ptr(), rows, &params, &rng, cap, &stream) }?;
-        for (i, (bits, &token)) in values.chunks_exact(vocab).zip(&tokens).enumerate() {
-            let logits: Vec<_> = bits.iter().map(|&b| cap * (f32::from_bits(u32::from(b) << 16) / cap).tanh()).collect();
-            let choices = distribution(&logits, &[], &params)?;
-            let mut draw = f64::from(rng.lookahead(i));
-            let expected = choices.iter().find_map(|&(id, p)| {
-                draw -= p;
-                (draw < 0.0).then_some(id)
-            }).unwrap_or(choices.last().unwrap().0);
-            assert_eq!(token as usize, expected);
+        for top_k in [7, -1] {
+            let params = SamplingParams { temperature: 0.9, top_k, top_p: 0.9, min_p: 0.03, ..Default::default() };
+            let tokens = unsafe { sampler.sample(dev.ptr(), rows, &params, &rng, cap, &stream) }?;
+            for (i, (bits, &token)) in values.chunks_exact(vocab).zip(&tokens).enumerate() {
+                let logits: Vec<_> = bits.iter().map(|&b| cap * (f32::from_bits(u32::from(b) << 16) / cap).tanh()).collect();
+                let choices = distribution(&logits, &[], &params)?;
+                let mut draw = f64::from(rng.lookahead(i));
+                let expected = choices.iter().find_map(|&(id, p)| {
+                    draw -= p;
+                    (draw < 0.0).then_some(id)
+                }).unwrap_or(choices.last().unwrap().0);
+                assert_eq!(token as usize, expected);
+            }
         }
         Ok(())
     }
