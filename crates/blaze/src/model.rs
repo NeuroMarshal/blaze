@@ -783,7 +783,7 @@ struct Work {
     sampling_logits: DevBuf,
     sampling_work: DevBuf,
     cand_pairs: DevBuf,
-    head_readback: Option<HostMapped>,
+    head_readback: HostMapped,
     // QSA: index queries [t, heads, 128], block scores [score rows, max blocks], selected KV slots [t, table stride] with
     // their counts, the identity row list of the selection table
     qsa_q: Option<DevBuf>,
@@ -1968,8 +1968,7 @@ impl Model {
             sampling_logits: b((head_rows * d.vocab * world * 4).next_multiple_of(16))?,
             sampling_work: b(unsafe { sys::blz_sampling_workspace_bytes(head_rows as c_int, (d.vocab * world) as c_int) })?,
             cand_pairs: b((head_rows * (sys::BLZ_TOPK_MAX + 2) * 8).next_multiple_of(16))?,
-            head_readback: std::env::var_os("BLAZE_PINNED_HEAD_READBACK").is_some_and(|v| v == "1")
-                .then(|| HostMapped::new(head_rows * (sys::BLZ_TOPK_MAX + 2) * 8)).transpose()?,
+            head_readback: HostMapped::new(head_rows * (sys::BLZ_TOPK_MAX + 2) * 8)?,
             qsa_q: cfg.qsa.as_ref().map(|q| b(t.max(head_rows) * q.heads * q.head_dim * 2)).transpose()?,
             qsa_scores: cfg.qsa.as_ref().map(|q| b(QSA_SCORE_ROWS * (ctx / q.compress_ratio + 1) * 4)).transpose()?,
             qsa_table: cfg.qsa.as_ref().map(|_| b(t.max(head_rows) * QSA_TABLE_STRIDE * 4)).transpose()?,
@@ -2137,25 +2136,7 @@ impl Model {
         let ple = self.layers[pc.layers[0] - self.layer0].ple.as_ref().unwrap();
         let (mult, sizes, offsets) = &ple.host_hash;
         let eos = self.cfg.eos.unwrap_or(0);
-        let mut win: Vec<i64> = vec![eos, eos];
-        for (i, &t) in prev.iter().rev().take(2).enumerate() {
-            win[1 - i] = t;
-        }
-        win.extend_from_slice(tokens);
-        let hpn = pc.heads_per_ngram;
-        let mut ids = Vec::with_capacity(tokens.len() * 2 * hpn);
-        for i in 0..tokens.len() {
-            let (w0, w1, w2) = (win[i], win[i + 1], win[i + 2]);
-            let reach = if w1 == eos { 0 } else if w0 == eos { 1 } else { 2 };
-            let t1 = (if reach >= 1 { w1 } else { eos }) as u64;
-            let t2 = (if reach >= 2 { w0 } else { eos }) as u64;
-            let m2 = (w2 as u64).wrapping_mul(mult[0] as u64) ^ t1.wrapping_mul(mult[1] as u64);
-            let m3 = m2 ^ t2.wrapping_mul(mult[2] as u64);
-            for h in 0..2 * hpn {
-                let mix = (if h < hpn { m2 } else { m3 }) as i64;
-                ids.push(mix.rem_euclid(sizes[h]) + offsets[h]);
-            }
-        }
+        let ids = crate::ngram::embedding_rows(prev, tokens, eos, pc.heads_per_ngram, mult, sizes, offsets);
         unsafe { sys::blz_ple_warm(table.0, ids.as_ptr(), ids.len() as c_int) };
     }
 
@@ -2697,11 +2678,7 @@ impl Model {
     }
 
     fn read_head<T: Copy + Default>(&self, source: &DevBuf, count: usize) -> Result<Vec<T>> {
-        let Some(staging) = &self.work.head_readback else {
-            self.stream.sync()?;
-            self.prefill_report();
-            return source.download(count);
-        };
+        let staging = &self.work.head_readback;
         let bytes = count * size_of::<T>();
         ensure!(bytes <= source.bytes().min(staging.bytes()), "head readback exceeds workspace");
         check(unsafe {

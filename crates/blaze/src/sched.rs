@@ -2447,31 +2447,7 @@ fn idx_k(items: &[(usize, crate::eagle::DraftItem)], active: &[Active]) -> usize
     items.iter().map(|(i, _)| active[*i].eagle_k).max().unwrap_or(1)
 }
 
-/// Prompt-lookup draft: the longest suffix of `ctx` of max_n .. min_n tokens that occurred earlier (most recent
-/// occurrence, within the last 64K tokens), and up to k tokens that followed it.
-pub fn propose(ctx: &[i64], max_n: usize, min_n: usize, k: usize) -> Vec<i64> {
-    let len = ctx.len();
-    let lo = len.saturating_sub(1 << 16);
-    for n in (min_n..=max_n).rev() {
-        if len <= n {
-            continue;
-        }
-        let tail = &ctx[len - n..];
-        // most recent earlier occurrence whose continuation exists
-        let mut i = len - n;
-        while i > lo {
-            i -= 1;
-            if ctx[i..i + n] == *tail {
-                let start = i + n;
-                let end = (start + k).min(len);
-                if start < end {
-                    return ctx[start..end].to_vec();
-                }
-            }
-        }
-    }
-    Vec::new()
-}
+pub use crate::speculation::propose;
 
 /// Logprob of the chosen token from its row's candidates (OpenAI logprobs), with `top` alternatives.
 /// Logprobs as the API shows them: -inf (a token the grammar or a bias ruled out) is -9999 as in vLLM, since JSON has
