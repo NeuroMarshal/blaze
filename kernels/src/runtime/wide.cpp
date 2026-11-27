@@ -45,6 +45,13 @@ void host_alloc(T** p, size_t n, const char* what) {
   check(cudaHostAlloc(reinterpret_cast<void**>(p), std::max<size_t>(1, n) * sizeof(T), cudaHostAllocPortable), what);
 }
 
+void project_experts(const blz_wide_batch& batch, cudaStream_t stream) {
+  check(blz_wide_gate_up(&batch, stream), "gate_up");
+  check(blz_wide_h_encode(&batch, stream), "h_encode");
+  if (batch.a8) check(blz_wide_to_a8(batch.h_planes, batch.n_routes, batch.inter, stream), "h to a8");
+  check(blz_wide_down(&batch, stream), "down");
+}
+
 }  // namespace
 
 struct HybridMoe::Wide {
@@ -63,6 +70,7 @@ struct HybridMoe::Wide {
     int2* tiles = nullptr;
     int32_t* route_token = nullptr;
     int32_t* route_of = nullptr;     // GPU0
+    int32_t* route_counts = nullptr;
     uint16_t* h = nullptr;
     uint8_t* h_planes = nullptr;
     int32_t* h_emax = nullptr;
@@ -127,6 +135,7 @@ void HybridMoe::init_wide() {
     dev_alloc(&d.tiles, size_t(w->tiles_cap), "tiles");
     dev_alloc(&d.route_token, size_t(w->routes_cap), "route tokens");
     if (g == 0) dev_alloc(&d.route_of, size_t(w->routes_cap), "route_of");
+    if (g == 0 && d.native_fp4 && resident_only()) dev_alloc(&d.route_counts, E, "route counts");
     dev_alloc(&d.h, size_t(kBatchRoutes) * I, "h");
     dev_alloc(&d.h_planes, size_t(kBatchRoutes) * 3 * I, "h planes");
     dev_alloc(&d.h_emax, size_t(kBatchRoutes), "h emax");
@@ -167,7 +176,7 @@ void HybridMoe::free_wide() {
     cudaEventDestroy(d.kernels_done);
     for (void* p : {(void*)d.staging, (void*)d.x, (void*)d.x_planes, (void*)d.x_emax, (void*)d.items,
                     (void*)d.tiles, (void*)d.route_token, (void*)d.route_of, (void*)d.h, (void*)d.h_planes,
-                    (void*)d.h_emax, (void*)d.y})
+                    (void*)d.h_emax, (void*)d.y, (void*)d.route_counts})
       if (p) cudaFree(p);
     cudaFreeHost(w->items_host[g]);
     cudaFreeHost(w->tiles_host[g]);
@@ -206,6 +215,7 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
   const int slots = std::max(1, cfg_.wide_slots);
   const int R = T * K;
   const bool has_gpu1 = cfg_.gpu1 >= 0;
+  const bool resident_async = resident_only();
   const auto native = [&](int gpu) { return T >= 256 && W.gpu[gpu].native_fp4; };
   const auto encode = [&](int gpu, const uint16_t* input, cudaStream_t s) {
     auto& d = W.gpu[gpu];
@@ -219,6 +229,25 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
   };
   try {
     check(cudaSetDevice(cfg_.gpu0), "set gpu0");
+    if (resident_async)
+      check(cudaStreamWaitEvent(stream, W.gpu[0].kernels_done, 0), "previous wide pass");
+    auto& local = W.gpu[0];
+    if (local.route_counts && native(0) && R <= kBatchRoutes) {
+      const int tiles = R / BLZ_WIDE_TILE_COLS + E;
+      check(blz_wide_plan_resident(ids, R, K, E, slot0_dev_ + size_t(layer) * E, pool0_, stride_, local.route_counts,
+                                 local.items, local.tiles, tiles, local.route_token, local.route_of, stream), "device routes");
+      encode(0, x, stream);
+      blz_wide_batch bt{};
+      bt.items = local.items, bt.tiles = local.tiles, bt.n_tiles = tiles, bt.n_routes = R;
+      bt.route_token = local.route_token, bt.x_planes = local.x_planes, bt.x_emax = local.x_emax;
+      bt.mult = mult0_ + size_t(layer) * E * 3, bt.hidden = H, bt.inter = I;
+      bt.h = local.h, bt.h_planes = local.h_planes, bt.h_emax = local.h_emax, bt.y = local.y;
+      bt.native_fp4 = 1, bt.tokens = T, bt.gate_cap = cfg_.gate_cap, bt.up_cap = cfg_.up_cap;
+      project_experts(bt, stream);
+      check(blz_wide_combine(local.route_of, wts, local.y, T, K, H, out, stream), "combine");
+      check(cudaEventRecord(local.kernels_done, stream), "wide pass done");
+      return cudaSuccess;
+    }
     check(cudaMemcpyAsync(W.ids, ids, size_t(R) * 4, cudaMemcpyDeviceToHost, stream), "ids");
     // The CPU only needs route IDs before grouping. Mark that transfer separately so grouping overlaps GPU0's
     // encoding and GPU1's x staging; all GPU work still remains ordered on the caller stream.
@@ -450,10 +479,7 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
           bt.y = d.y + size_t(y_half) * kBatchRoutes * H;
           check(cudaStreamWaitEvent(cs, d.y_exported[y_half], 0), "wait y half");
         }
-        check(blz_wide_gate_up(&bt, cs), "gate_up");
-        check(blz_wide_h_encode(&bt, cs), "h_encode");
-        if (bt.a8) check(blz_wide_to_a8(bt.h_planes, b.routes, I, cs), "h to a8");
-        check(blz_wide_down(&bt, cs), "down");
+        project_experts(bt, cs);
         if (b.streamed) check(cudaEventRecord(d.freed[b.half], cs), "freed");
         if (g == 1) {
           // y half -> host -> GPU0's y at the batch's routes.
@@ -480,12 +506,14 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
       check(cudaStreamWaitEvent(stream, W.imports_done, 0), "wait imports");
     }
     check(blz_wide_combine(W.gpu[0].route_of, wts, W.gpu[0].y, T, K, H, out, stream), "combine");
-    // Pinned tables, staging and pool slots are reused by the next pass / the swap engine.
-    check(cudaStreamSynchronize(stream), "wide pass");
+    // ids_ready in the next pass also orders its host writes to the pinned route tables.
+    if (resident_async) check(cudaEventRecord(W.gpu[0].kernels_done, stream), "wide pass done");
+    else check(cudaStreamSynchronize(stream), "wide pass");
     return cudaSuccess;
   } catch (const std::exception& e) {
     log("blaze: %s", e.what());
     cudaSetDevice(cfg_.gpu0);
+    if (resident_async) cudaStreamSynchronize(stream);
     return cudaErrorUnknown;
   }
 }

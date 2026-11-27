@@ -70,6 +70,7 @@ typedef struct {
   // instead of defer_min_rank (their reads are the slow part, so they can be deferred more readily).
   int32_t defer_ssd_rank;
   float gate_cap, up_cap;
+  int resident;
 } blz_moe_layer;
 
 /// \brief Expert-deferral state (KTransformers' Expert Deferral, applied to the CPU tier): a layer call whose CPU

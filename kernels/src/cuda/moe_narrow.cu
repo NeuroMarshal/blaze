@@ -305,6 +305,37 @@ __global__ void plan_kernel(blz_moe_layer layer, int layer_id, const uint16_t* _
   }
   plan_block_done(ws, gridDim.x);
 }
+
+__global__ void plan_resident_decode(blz_moe_layer layer, const uint16_t* x,
+                                     const int32_t* ids, blz_moe_workspace ws) {
+  __shared__ int emax[kMaxCols];
+  const int route = threadIdx.x;
+  auto* plan = ws.plan;
+  if (route == 0) {
+    plan->tokens = 1;
+    plan->n_gpu = layer.topk;
+    plan->n_cpu = 0;
+    plan->n_gpu1 = 0;
+    plan->n_imm = 0;
+  }
+  if (route < layer.topk) {
+    const int expert = ids[route];
+    if (unsigned(expert) >= unsigned(layer.num_experts) || layer.slot_of[expert] < 0) {
+      __trap();
+    } else {
+      auto& item = plan->gpu[route];
+      item.expert = expert;
+      item.slot = layer.slot_of[expert];
+      item.ncols = 1;
+      item.cols[0] = 0;
+      plan->src[0][route] = 0;
+      plan->item[0][route] = int16_t(route);
+      plan->col[0][route] = 0;
+    }
+  }
+  encode_token(layer, x, 0, ws, emax);
+}
+
 template <bool Capped>
 __global__ void finalize_kernel(blz_moe_layer layer, blz_moe_workspace ws) {
   const blz_moe_plan* plan = ws.plan;
@@ -716,7 +747,10 @@ static cudaError_t route_impl(const blz_moe_layer* layer, int layer_id, const ui
   auto mark = [&](int i) {
     if (kernel_ms) cudaEventRecord(ev[i], stream);
   };
-  plan_kernel<<<1 + tokens, 256, 0, stream>>>(*layer, layer_id, x, tokens, topk_ids, *ws);
+  if (tokens == 1 && layer->resident)
+    plan_resident_decode<<<1, 256, 0, stream>>>(*layer, x, topk_ids, *ws);
+  else
+    plan_kernel<<<1 + tokens, 256, 0, stream>>>(*layer, layer_id, x, tokens, topk_ids, *ws);
   mark(1);
   const int max_items = tokens * layer->topk;
   launch_rows<false>(geo.gu_groups(), max_items, tokens, *layer, *ws, stream);

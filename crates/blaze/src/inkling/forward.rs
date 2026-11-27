@@ -802,7 +802,8 @@ impl Model {
             layer_map[layer] = index;
         }
         ensure!(s.hidden.is_multiple_of(16) && s.intermediate.is_multiple_of(16)
-            && s.top_k <= 16, "Inkling does not support this HybridMoe geometry");
+            && (1..=16).contains(&s.top_k) && s.top_k <= s.experts,
+            "Inkling does not support this HybridMoe geometry");
         let threads = std::thread::available_parallelism().map_or(1, usize::from)
             .min(if gpus == 1 { 4 } else { 12 });
         let store = expert_rg16::cached_store(&ckpt, &expert_layout, s.experts, s.hidden, s.intermediate, threads,
@@ -874,11 +875,6 @@ impl Model {
                     .context("expert cache budget overflows")?
                     .min(max_experts)
             };
-            ensure!(
-                expert_bytes > 0,
-                "Inkling: no VRAM for experts on CUDA device {id} after reserving {} MiB for KV",
-                kv_bytes >> 20
-            );
             let mut compute = Compute::new(
                 (s.hidden * 2).max(s.q_width()),
                 s.vocab.max((layers[0].query.rows + 2 * (s.kv_width() + s.kv_heads * s.conv)) * prefill_chunk

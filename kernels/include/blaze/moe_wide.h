@@ -56,6 +56,9 @@ typedef struct {
 
 cudaError_t blz_wide_encode(const uint16_t* x, int tokens, int hidden, uint8_t* planes, int32_t* emax,
                             cudaStream_t stream);
+cudaError_t blz_wide_plan_resident(const int32_t* ids, int routes, int topk, int experts, const int32_t* slots,
+                                   const uint8_t* pool, size_t stride, int32_t* counts, blz_wide_item* items,
+                                   int2* tiles, int tiles_cap, int32_t* route_token, int32_t* route_of, cudaStream_t stream);
 /// \brief In place, rows of limb planes ([rows][3][k_dim]) -> A8 form: per 16-value block the A16 integer keeps its
 /// top 8 bits, q = round(X >> shift) in [-127, 127] (as blaze::cpu::quantize_column_q8); q at [row][0][k], shift at
 /// [row][1][k / 16]. Sums from it are P' << shift, in the exact sums' fixed point, so outputs convert unchanged and

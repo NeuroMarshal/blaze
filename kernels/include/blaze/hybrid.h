@@ -86,6 +86,7 @@ struct HybridConfig {
   blz_rank_experts rank_experts = nullptr;
   bool wide_a8 = false;           // wide (prefill) route on 8-bit block-floating inputs: 1 MMA per unit instead of 3
   bool wide_fp4 = false;
+  bool resident_fast = false;
   float gate_cap = 0, up_cap = 0;
   int cpu_fast_cols = 0;          // CPU items with >= this many columns use the approximate Q8 kernels (0: off)
   // Expert deferral of the CPU tier (decode): layers < defer_last may defer when every CPU route ranks >=
@@ -148,16 +149,20 @@ class HybridMoe {
 
   /// \brief Current placement (changes while the swap engine runs; read it with the engine stopped or for logs).
   const Placement& placement() const { return placement_; }
-  uint64_t cpu_routes() const { return cpu_->routes(); }
+  uint64_t cpu_routes() const { return cpu_ ? cpu_->routes() : 0; }
   const ExpertStore& store() const { return *store_; }
   int num_layers() const { return store_->num_layers(); }
   int num_experts() const { return store_->num_experts(); }
   expert::Geometry geometry() const { return store_->geometry(); }
-  uint64_t cpu_requests() const { return cpu_->served(); }
+  uint64_t cpu_requests() const { return cpu_ ? cpu_->served() : 0; }
   uint64_t gpu1_requests() const { return gpu1_ ? gpu1_->served() : 0; }
   HybridStats stats() const;
 
  private:
+  bool resident_only() const {
+    return cfg_.resident_fast && cfg_.gpu1 < 0 && !cfg_.swap.enabled &&
+           placement_.used[int(Tier::kRam)] == 0 && placement_.used[int(Tier::kSsd)] == 0;
+  }
   void load_tiers();
   // wide.cpp
   struct Wide;

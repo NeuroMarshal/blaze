@@ -107,10 +107,12 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   }
   for (size_t i = 0; i < n; ++i)
     if (placement_.tier[i] == Tier::kRam) host_records_[i] = ram_slot(placement_.slot[i]);
-  const blz_mail_layout ml = blz_mail_layout_for(geo.hidden);
-  check(cudaHostAlloc(reinterpret_cast<void**>(&mail_), ml.total, cudaHostAllocMapped | cudaHostAllocPortable),
-        "mailbox");
-  std::memset(mail_, 0, ml.total);
+  if (!resident_only()) {
+    const blz_mail_layout ml = blz_mail_layout_for(geo.hidden);
+    check(cudaHostAlloc(reinterpret_cast<void**>(&mail_), ml.total, cudaHostAllocMapped | cudaHostAllocPortable),
+          "mailbox");
+    std::memset(mail_, 0, ml.total);
+  }
   check(cudaHostAlloc(reinterpret_cast<void**>(&heat_host_), n * 4, cudaHostAllocPortable), "heat snapshot");
   check(cudaHostAlloc(reinterpret_cast<void**>(&table_host_), kTableStaging * 4, cudaHostAllocPortable),
         "table staging");
@@ -130,11 +132,15 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   check(cudaMemset(heat_dev_, 0, n * 4), "heat");
   check(cudaMalloc(&ws_mem_, blz_moe_workspace_bytes(geo.hidden, geo.inter)), "workspace");
   blz_moe_workspace_carve(ws_mem_, geo.hidden, geo.inter, &ws_);
-  check(cudaMemset(ws_.defer, 0, sizeof(blz_moe_defer)), "defer state");
-  check(cudaMalloc(&counters_, 8), "counters");
-  check(cudaMemset(counters_, 0, 8), "counters");
-  check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&ws_.mail), mail_, 0), "mailbox device pointer");
-  ws_.seq = counters_, ws_.blocks_done = counters_ + 1;
+  if (mail_) {
+    check(cudaMemset(ws_.defer, 0, sizeof(blz_moe_defer)), "defer state");
+    check(cudaMalloc(&counters_, 8), "counters");
+    check(cudaMemset(counters_, 0, 8), "counters");
+    check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&ws_.mail), mail_, 0), "mailbox device pointer");
+    ws_.seq = counters_, ws_.blocks_done = counters_ + 1;
+  } else {
+    ws_.defer = nullptr;
+  }
   check(cudaStreamCreateWithFlags(&swap_stream_[0], cudaStreamNonBlocking), "swap stream");
   check(cudaStreamCreateWithFlags(&d2h_stream_[0], cudaStreamNonBlocking), "swap stream");
 
@@ -161,7 +167,7 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   ec.ssd_direct = cfg_.ssd_direct;
   ec.gate_cap = cfg_.gate_cap;
   ec.up_cap = cfg_.up_cap;
-  cpu_ = std::make_unique<cpu::Engine>(ec, mail_, host_records_.data(), mult_host_.data());
+  if (mail_) cpu_ = std::make_unique<cpu::Engine>(ec, mail_, host_records_.data(), mult_host_.data());
   if (cfg_.gpu1 >= 0) {
     blz_moe_layer helper{geo.hidden, geo.inter, E, cfg_.topk, nullptr, nullptr, pool1_, int64_t(stride_), mult1_,
                          nullptr};
@@ -296,14 +302,15 @@ cudaError_t HybridMoe::forward(int layer, const uint16_t* x, int tokens, const i
                         pool0_,
                         int64_t(stride_),
                         mult0_ + size_t(layer) * E * 3,
-                        heat_dev_ + size_t(layer) * E,
+                        resident_only() ? nullptr : heat_dev_ + size_t(layer) * E,
                         cfg_.defer_last >= 0 && allow_defer && layer < cfg_.defer_last,
                         cfg_.defer_min_rank,
                         w,
                         cfg_.imm_heat,
                         cfg_.defer_ssd_rank >= 0 ? cfg_.defer_ssd_rank : cfg_.defer_min_rank,
                         cfg_.gate_cap,
-                        cfg_.up_cap};
+                        cfg_.up_cap,
+                        resident_only()};
   const bool deferral = cfg_.defer_last >= 0;
   cudaError_t err = deferral ? blz_moe_defer_collect(geo.hidden, tokens, &ws_, stream) : cudaSuccess;
   if (err != cudaSuccess) return err;

@@ -19,6 +19,40 @@ constexpr int kWarps = 4;   // row groups per block
 constexpr int kNTiles = BLZ_WIDE_TILE_COLS / 8;
 constexpr int kUnroll = 4;  // units in flight per lane
 
+__global__ void count_routes(const int32_t* ids, int routes, int experts, int32_t* counts) {
+  const int route = blockIdx.x * blockDim.x + threadIdx.x;
+  if (route >= routes) return;
+  const int expert = ids[route];
+  if (unsigned(expert) >= unsigned(experts)) {
+    __trap();
+    return;
+  }
+  atomicAdd(counts + expert, 1);
+}
+
+__global__ void resident_layout(int32_t* counts, const int32_t* slots, int experts, const uint8_t* pool,
+                                 size_t stride, blz_wide_item* items, int2* tiles) {
+  int route = 0, tile = 0;
+  for (int expert = 0; expert < experts; ++expert) {
+    const int n = counts[expert];
+    counts[expert] = 0;
+    if (n == 0) continue;
+    items[expert] = {pool + size_t(slots[expert]) * stride, expert, route, n, 0};
+    for (int first = 0; first < n; first += BLZ_WIDE_TILE_COLS) tiles[tile++] = make_int2(expert, first);
+    route += n;
+  }
+}
+
+__global__ void assign_routes(const int32_t* ids, int routes, int topk, int32_t* counts,
+                               const blz_wide_item* items, int32_t* route_token, int32_t* route_of) {
+  const int route = blockIdx.x * blockDim.x + threadIdx.x;
+  if (route >= routes) return;
+  const int expert = ids[route];
+  const int dst = items[expert].route_begin + atomicAdd(counts + expert, 1);
+  route_token[dst] = route / topk;
+  route_of[route] = dst;
+}
+
 // Four 4-bit codes (one per byte, 0..15) -> four signed bytes c2(code) (same table as the narrow route).
 __device__ __forceinline__ uint32_t c2x4(uint32_t codes) {
   const uint32_t idx = codes & 0x07070707u;
@@ -152,6 +186,7 @@ template <bool Down, bool Capped>
 __global__ void __launch_bounds__(32 * kWarps) native_fp4_project(blz_wide_batch bt) {
 #ifdef BLZ_FP4_MMA
   const int2 tile = bt.tiles[blockIdx.y];
+  if (tile.x < 0) return;
   const blz_wide_item it = bt.items[tile.x];
   const expert::Geometry geo{bt.hidden, bt.inter};
   const int group = blockIdx.x * kWarps + threadIdx.x / 32;
@@ -459,6 +494,23 @@ __global__ void combine_kernel(const int32_t* __restrict__ route_of, const float
 }  // namespace blaze::wide
 
 using namespace blaze::wide;
+
+extern "C" cudaError_t blz_wide_plan_resident(const int32_t* ids, int routes, int topk, int experts,
+    const int32_t* slots, const uint8_t* pool, size_t stride, int32_t* counts, blz_wide_item* items,
+    int2* tiles, int tiles_cap, int32_t* route_token, int32_t* route_of, cudaStream_t stream) {
+  if (routes <= 0 || topk <= 0 || experts <= 0 || tiles_cap < routes / BLZ_WIDE_TILE_COLS + experts)
+    return cudaErrorInvalidValue;
+  auto status = cudaMemsetAsync(counts, 0, size_t(experts) * sizeof(*counts), stream);
+  if (status != cudaSuccess) return status;
+  status = cudaMemsetAsync(tiles, -1, size_t(tiles_cap) * sizeof(*tiles), stream);
+  if (status != cudaSuccess) return status;
+  constexpr int threads = 256;
+  const int grid = (routes + threads - 1) / threads;
+  count_routes<<<grid, threads, 0, stream>>>(ids, routes, experts, counts);
+  resident_layout<<<1, 1, 0, stream>>>(counts, slots, experts, pool, stride, items, tiles);
+  assign_routes<<<grid, threads, 0, stream>>>(ids, routes, topk, counts, items, route_token, route_of);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_wide_encode(const uint16_t* x, int tokens, int hidden, uint8_t* planes, int32_t* emax,
                                        cudaStream_t stream) {

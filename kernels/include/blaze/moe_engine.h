@@ -46,6 +46,7 @@ uint64_t blz_moe_engine_cpu_routes(const blz_moe_engine* e);
 /// x, out: [tokens, hidden] bf16; ids: [tokens, topk] int32; w: [tokens, topk] float; device pointers on gpu0.
 /// Long inputs outside CUDA-graph capture take the wide (tensor-core, every tier) route and return when done;
 /// otherwise chunks of BLZ_MOE_MAX_TOKENS run asynchronously on `stream` (graph capturable).
+/// The resident_fast option allows an asynchronous wide pass when every expert is on one GPU and swap is disabled.
 cudaError_t blz_moe_engine_forward(blz_moe_engine* e, int layer, const uint16_t* x, int tokens, const int32_t* ids,
                                    const float* w, uint16_t* out, cudaStream_t stream);
 
