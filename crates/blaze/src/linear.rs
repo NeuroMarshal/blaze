@@ -167,7 +167,7 @@ impl Module {
             Format::Nvfp4 { .. } => Kind::Nvfp4,
             Format::Fp8Channel { .. } => Kind::Fp8Channel,
             Format::Fp8Block { block_n, block_k: 128, inverse: false, .. } => Kind::Fp8Block(*block_n),
-            Format::Mxfp8 => Kind::Mxfp8,
+            Format::Mxfp8 | Format::Mxfp6(_) => Kind::Mxfp8,
             _ => Kind::Bf16,
         }
     }
@@ -244,6 +244,7 @@ impl Linear {
                     }
                     info.shape[1] * 2
                 }
+                Format::Mxfp6(_) => info.shape[1] / 3 * 4,
                 _ => info.shape[1..].iter().product(),
             };
             let (rows, cols) = match cut {
@@ -276,7 +277,8 @@ impl Linear {
             let store = match mods[i].kind() {
                 Kind::Nvfp4 => Self::load_nvfp4(ckpt, group, n, k)?,
                 Kind::Fp8Channel | Kind::Fp8Block(_) if k % 128 == 0 => Self::load_fp8(ckpt, group, n, k, mods[i].kind())?,
-                Kind::Mxfp8 if k % 128 == 0 => Self::load_mxfp8(ckpt, group, n, k)?,
+                Kind::Mxfp8 if k % 128 == 0 || group.iter().any(|m| matches!(m.format, Format::Mxfp6(_))) =>
+                    Self::load_mxfp8(ckpt, group, n, k)?,
                 _ => Self::load_16bit(ckpt, group, n, k, s)?,
             };
             parts.push(Part { store, col, n });
@@ -368,8 +370,16 @@ impl Linear {
             if m.cols.start % 32 != 0 || m.cols.end % 32 != 0 {
                 bail!("{}: MXFP8 column cut {:?} not aligned to the 32-value blocks", m.name, m.cols);
             }
-            let full_k = ckpt.info(&m.names.weight)?.shape[1];
-            codes.upload_at(row * k, &cut_rows(ckpt.bytes(&m.names.weight)?, full_k, &m.rows, m.cols.clone()))?;
+            let stored_k = ckpt.info(&m.names.weight)?.shape[1];
+            let source = ckpt.bytes(&m.names.weight)?;
+            let full_k = if let Format::Mxfp6(encoding) = m.format {
+                let packed = cut_rows(source, stored_k, &m.rows, m.cols.start / 4 * 3..m.cols.end / 4 * 3);
+                codes.upload_at(row * k, &encoding.widen(&packed))?;
+                stored_k / 3 * 4
+            } else {
+                codes.upload_at(row * k, &cut_rows(source, stored_k, &m.rows, m.cols.clone()))?;
+                stored_k
+            };
             let sc = cut_rows(ckpt.bytes(m.names.scale.as_ref().unwrap())?, full_k / 32, &m.rows, m.cols.start / 32..m.cols.end / 32);
             scales.upload_at(row * k / 32, &sc)?;
             row += m.n;
@@ -666,7 +676,7 @@ impl Linear {
                     }
                 }
                 Store::Mxfp8 { codes, scales } => {
-                    if m <= sys::BLZ_MXFP8_MMA_MAX_ROWS {
+                    if m <= sys::BLZ_MXFP8_MMA_MAX_ROWS && k.is_multiple_of(128) {
                         let (split, tiles) = ctx.tune.get(crate::tune::Kernel::Mxfp8, p.n, k, m);
                         let product = Matmul {
                             input: x, output: o, rows: m, columns: p.n, inner: k,

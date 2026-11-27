@@ -28,10 +28,47 @@ pub enum Format {
     Fp8Channel { per_tensor: bool },
     /// MXFP8 (OCP microscaling, ModelOpt MXFP8): E4M3 codes with an E8M0 scale (uint8) per 32 values of a row.
     Mxfp8,
+    /// MXFP6 codes packed low-bit first, with an E8M0 scale per 32 values.
+    Mxfp6(Mxfp6),
     /// NVFP4: E2M1 codes two per byte, an E4M3 scale per `group` values, an FP32 global scale.
     /// `global_inverse`: compressed-tensors stores the reciprocal (`weight_global_scale`), ModelOpt the factor
     /// itself (`weight_scale_2`).
     Nvfp4 { group: usize, global_inverse: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mxfp6 {
+    E2M3,
+    E3M2,
+}
+
+impl Mxfp6 {
+    /// All finite FP6 element codes are exactly representable in E4M3.
+    pub(crate) fn widen(self, packed: &[u8]) -> Vec<u8> {
+        let (bits, bias) = match self {
+            Self::E2M3 => (3, 1),
+            Self::E3M2 => (2, 3),
+        };
+        let convert = |code: u8| {
+            let sign = (code & 32) << 2;
+            let exponent = i32::from((code & 31) >> bits);
+            let mantissa = code & ((1 << bits) - 1);
+            if exponent == 0 && mantissa == 0 {
+                return sign;
+            }
+            let (exponent, fraction) = if exponent == 0 {
+                let top = mantissa.ilog2();
+                (1 - bias + top as i32 - bits, (mantissa << (3 - top)) & 7)
+            } else {
+                (exponent - bias, mantissa << (3 - bits))
+            };
+            sign | ((exponent + 7) as u8) << 3 | fraction
+        };
+        packed.chunks_exact(3).flat_map(|word| {
+            let bits = u32::from_le_bytes([word[0], word[1], word[2], 0]);
+            [0, 6, 12, 18].map(|shift| convert(((bits >> shift) & 63) as u8))
+        }).collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +93,7 @@ pub struct QuantConfig {
     rules: Vec<(Vec<Matcher>, ActQuant)>,
     ignore: Vec<Matcher>,
     default_act: ActQuant,
+    mxfp6: Option<Mxfp6>,
 }
 
 enum Matcher {
@@ -108,7 +146,7 @@ impl QuantConfig {
     pub fn from_model_config(root: &Value, hf_quant: Option<&Value>) -> Result<Self> {
         let q = root.get("quantization_config").cloned().or_else(|| hf_quant.and_then(|h| h.get("quantization").cloned()));
         let Some(q) = q else {
-            return Ok(Self { method: "none".into(), block: None, rules: vec![], ignore: vec![], default_act: ActQuant::None });
+            return Ok(Self { method: "none".into(), block: None, rules: vec![], ignore: vec![], default_act: ActQuant::None, mxfp6: None });
         };
         let method = q
             .get("quant_method")
@@ -133,7 +171,7 @@ impl QuantConfig {
             default_act = match algo {
                 "NVFP4" | "NVFP4_AWQ" => ActQuant::Nvfp4,
                 "FP8" => ActQuant::Fp8Static,
-                "FP8_PB_WO" | "W4A16_NVFP4" | "W4A16_AWQ" | "MXFP8" | "" => ActQuant::None,
+                "FP8_PB_WO" | "W4A16_NVFP4" | "W4A16_AWQ" | "MXFP8" | "MXFP6_E2M3" | "MXFP6_E3M2" | "" => ActQuant::None,
                 other => bail!("ModelOpt quant_algo {other} is not supported yet"),
             };
         }
@@ -148,7 +186,12 @@ impl QuantConfig {
             [n, k] => Some((n.as_u64()? as usize, k.as_u64()? as usize)),
             _ => None,
         });
-        Ok(Self { method, block, rules, ignore, default_act })
+        let mxfp6 = match q.get("quant_algo").and_then(Value::as_str) {
+            Some("MXFP6_E2M3") => Some(Mxfp6::E2M3),
+            Some("MXFP6_E3M2") => Some(Mxfp6::E3M2),
+            _ => None,
+        };
+        Ok(Self { method, block, rules, ignore, default_act, mxfp6 })
     }
 
     pub fn method(&self) -> &str {
@@ -190,6 +233,14 @@ impl QuantConfig {
                 Format::Nvfp4 { group, global_inverse: false },
                 WeightNames { weight: name("weight"), scale: Some(name("weight_scale")), global: Some(name("weight_scale_2")), input_scale },
             )
+        } else if let Some(encoding) = self.mxfp6
+            && has("weight") == Some(Dtype::U8) && has("weight_scale") == Some(Dtype::U8) {
+            let w = ckpt.info(&name("weight"))?;
+            let s = ckpt.info(&name("weight_scale"))?;
+            if w.shape.len() != 2 || s.shape.len() != 2 || w.shape[0] != s.shape[0] || s.shape[1].checked_mul(24) != Some(w.shape[1]) {
+                bail!("{module}: MXFP6 expects 24 packed bytes for every 32-value scale");
+            }
+            (Format::Mxfp6(encoding), WeightNames { weight: name("weight"), scale: Some(name("weight_scale")), global: None, input_scale })
         } else if has("weight") == Some(Dtype::F8E4m3) && has("weight_scale") == Some(Dtype::U8) {
             // ModelOpt MXFP8: E8M0 scales [n, k / 32]
             let w = ckpt.info(&name("weight"))?;
@@ -225,6 +276,34 @@ impl QuantConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_fp6_element_widens_to_e4m3_exactly() {
+        let packed = (0..64u32).step_by(4).flat_map(|at| {
+            let word = at | ((at + 1) << 6) | ((at + 2) << 12) | ((at + 3) << 18);
+            let bytes = word.to_le_bytes();
+            [bytes[0], bytes[1], bytes[2]]
+        }).collect::<Vec<_>>();
+        for (encoding, mantissa_bits, bias) in [(Mxfp6::E2M3, 3, 1), (Mxfp6::E3M2, 2, 3)] {
+            for (code, value) in encoding.widen(&packed).into_iter().enumerate() {
+                let exponent = ((code & 31) >> mantissa_bits) as i32;
+                let fraction = (code & ((1 << mantissa_bits) - 1)) as f32 / (1 << mantissa_bits) as f32;
+                let magnitude = if exponent == 0 { fraction * 2f32.powi(1 - bias) }
+                    else { (1.0 + fraction) * 2f32.powi(exponent - bias) };
+                let expected = if code & 32 == 0 { magnitude } else { -magnitude };
+                let expanded = if value & 127 == 0 { 0.0 } else {
+                    (1.0 + f32::from(value & 7) / 8.0) * 2f32.powi(i32::from((value & 127) >> 3) - 7)
+                };
+                let actual = if value & 128 == 0 { expanded } else { -expanded };
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{encoding:?}, code {code}");
+            }
+        }
+    }
+}
+
 impl Format {
     pub fn describe(&self) -> String {
         match self {
@@ -233,6 +312,7 @@ impl Format {
             Format::Fp8Channel { per_tensor: true } => "fp8 per-tensor".into(),
             Format::Fp8Channel { per_tensor: false } => "fp8 per-channel".into(),
             Format::Mxfp8 => "mxfp8".into(),
+            Format::Mxfp6(encoding) => format!("mxfp6 {encoding:?}"),
             Format::Nvfp4 { group, .. } => format!("nvfp4 g{group}"),
         }
     }
