@@ -310,8 +310,9 @@ __global__ void to_a8_kernel(uint8_t* planes, int k_dim) {
 }
 
 // One thread per (token, 8 outputs): all K route outputs loaded, then summed in k order (as the narrow combine).
+template <typename Output>
 __global__ void combine_kernel(const int32_t* __restrict__ route_of, const float* __restrict__ w,
-                               const uint16_t* __restrict__ y, int topk, int H, uint16_t* __restrict__ out) {
+                               const uint16_t* __restrict__ y, int topk, int H, Output* __restrict__ out) {
   const int t = blockIdx.y;
   const int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= H / 8) return;
@@ -320,23 +321,40 @@ __global__ void combine_kernel(const int32_t* __restrict__ route_of, const float
 #pragma unroll
   for (int k = 0; k < kMaxK; ++k) {
     if (k >= topk) break;
-    yv[k] = *reinterpret_cast<const uint4*>(y + size_t(route_of[size_t(t) * topk + k]) * H + size_t(c) * 8);
+    const int route = route_of[size_t(t) * topk + k];
+    if constexpr (sizeof(Output) == sizeof(float)) {
+      if (route < 0) continue;
+    }
+    yv[k] = *reinterpret_cast<const uint4*>(y + size_t(route) * H + size_t(c) * 8);
   }
   float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
   for (int k = 0; k < kMaxK; ++k) {
     if (k >= topk) break;
-    const float wk = w[size_t(t) * topk + k];
+    const size_t index = size_t(t) * topk + k;
+    if constexpr (sizeof(Output) == sizeof(float)) {
+      if (route_of[index] < 0) continue;
+    }
+    const float wk = w[index];
     const uint32_t yw[4] = {yv[k].x, yv[k].y, yv[k].z, yv[k].w};
 #pragma unroll
-    for (int i = 0; i < 8; ++i)
-      acc[i] = __fadd_rn(acc[i], __fmul_rn(wk, canon::bf16_to_f32(uint16_t(yw[i / 2] >> (16 * (i % 2))))));
+    for (int i = 0; i < 8; ++i) {
+      const float value = canon::bf16_to_f32(uint16_t(yw[i / 2] >> (16 * (i % 2))));
+      if constexpr (sizeof(Output) == sizeof(float)) acc[i] = fmaf(value, wk, acc[i]);
+      else acc[i] = __fadd_rn(acc[i], __fmul_rn(wk, value));
+    }
   }
+  if constexpr (sizeof(Output) == sizeof(float)) {
+    auto* dst = reinterpret_cast<float4*>(out + size_t(t) * H + size_t(c) * 8);
+    dst[0] = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    dst[1] = make_float4(acc[4], acc[5], acc[6], acc[7]);
+  } else {
   uint32_t o[4];
 #pragma unroll
   for (int i = 0; i < 4; ++i)
     o[i] = uint32_t(canon::bf16_rn(acc[2 * i])) | (uint32_t(canon::bf16_rn(acc[2 * i + 1])) << 16);
-  *reinterpret_cast<uint4*>(out + size_t(t) * H + size_t(c) * 8) = make_uint4(o[0], o[1], o[2], o[3]);
+    *reinterpret_cast<uint4*>(out + size_t(t) * H + size_t(c) * 8) = make_uint4(o[0], o[1], o[2], o[3]);
+  }
 }
 
 }  // namespace
@@ -381,12 +399,23 @@ extern "C" cudaError_t blz_wide_down(const blz_wide_batch* bt, cudaStream_t stre
   return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_wide_combine(const int32_t* route_of, const float* w, const uint16_t* y, int tokens,
-                                        int topk, int hidden, uint16_t* out, cudaStream_t stream) {
+template <typename Output>
+static cudaError_t launch_combine(const int32_t* route_of, const float* w, const uint16_t* y, int tokens,
+                                  int topk, int hidden, Output* out, cudaStream_t stream) {
   if (tokens <= 0) return cudaSuccess;
   if (hidden % 8 != 0 || topk > 16) return cudaErrorInvalidValue;
   constexpr int kBlock = 64;
   const dim3 grid((hidden / 8 + kBlock - 1) / kBlock, tokens);
   combine_kernel<<<grid, kBlock, 0, stream>>>(route_of, w, y, topk, hidden, out);
   return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_wide_combine(const int32_t* route_of, const float* w, const uint16_t* y, int tokens,
+                                        int topk, int hidden, uint16_t* out, cudaStream_t stream) {
+  return launch_combine(route_of, w, y, tokens, topk, hidden, out, stream);
+}
+
+extern "C" cudaError_t blz_wide_combine_f32(const int32_t* route_of, const float* w, const uint16_t* y, int tokens,
+                                            int topk, int hidden, float* out, cudaStream_t stream) {
+  return launch_combine(route_of, w, y, tokens, topk, hidden, out, stream);
 }

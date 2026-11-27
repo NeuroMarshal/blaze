@@ -616,7 +616,23 @@ pub struct blz_inkling_matrix {
     pub alpha: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_moe_matrix_tile {
+    pub codes: *const u8,
+    pub scales: *const u8,
+    pub alpha: *const f32,
+    pub begin: i32,
+    pub rows: i32,
+}
+
 unsafe extern "C" {
+    pub fn blz_moe_grouped_nvfp4(x: *const u16, tiles: *const blz_moe_matrix_tile, out: *mut u16,
+        count: c_int, row_class: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_moe_grouped_mxfp8(x: *const u16, tiles: *const blz_moe_matrix_tile, out: *mut u16,
+        count: c_int, row_class: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_wide_combine_f32(route_of: *const i32, weights: *const f32, results: *const u16,
+        tokens: c_int, topk: c_int, hidden: c_int, out: *mut f32, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_attention(q: *const u16, keys: *const u8, values: *const u8, key_scales: *const u8,
                                  value_scales: *const u8, relative: *const u16, sinks: *const u16,
                                  gate: *const u16, out: *mut u16, scratch: *mut f32, heads: c_int,

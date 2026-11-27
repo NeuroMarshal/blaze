@@ -64,6 +64,8 @@ cudaError_t blz_wide_down(const blz_wide_batch* batch, cudaStream_t stream);
 /// \brief out[t] (BF16 bits, [T][H]) from y ([routes][H]) and route_of / w ([T][K]).
 cudaError_t blz_wide_combine(const int32_t* route_of, const float* w, const uint16_t* y, int tokens, int topk,
                              int hidden, uint16_t* out, cudaStream_t stream);
+cudaError_t blz_wide_combine_f32(const int32_t* route_of, const float* w, const uint16_t* y, int tokens, int topk,
+                                 int hidden, float* out, cudaStream_t stream);
 
 #ifdef __cplusplus
 }

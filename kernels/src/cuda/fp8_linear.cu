@@ -156,13 +156,13 @@ __device__ __forceinline__ uint32_t bf16x2_mul(uint32_t a, uint32_t b) {
   return *reinterpret_cast<uint32_t*>(&r);
 }
 
-template <int kTiles, int kSplit, bool kHi, int kMT, bool kGrouped = false>
+template <int kTiles, int kSplit, bool kHi, int kMT, bool kGrouped = false, bool kBatch = false>
 __global__ void __launch_bounds__(kSplit * 32) mxfp8_mma_kernel(const uint16_t* __restrict__ x, int64_t ldx,
                                                                const uint8_t* __restrict__ w,
                                                                const uint8_t* __restrict__ scale,
                                                                uint16_t* __restrict__ y, int64_t ldy, int m, int n,
                                                                int k, const blz_inkling_matrix* matrices = nullptr,
-                                                               int64_t x_step = 0) {
+                                                               int64_t x_step = 0, const blz_moe_matrix_tile* batch = nullptr) {
   if constexpr (kGrouped) {
     const auto matrix = matrices[blockIdx.y];
     const auto* pool = w;
@@ -170,6 +170,13 @@ __global__ void __launch_bounds__(kSplit * 32) mxfp8_mma_kernel(const uint16_t* 
     scale = pool + matrix.scales;
     x += blockIdx.y * x_step;
     y += int64_t(blockIdx.y) * n;
+  } else if constexpr (kBatch) {
+    const auto tile = batch[blockIdx.y];
+    w = tile.codes;
+    scale = tile.scales;
+    m = tile.rows;
+    x += int64_t(tile.begin) * ldx;
+    y += int64_t(tile.begin) * ldy;
   }
   constexpr int kTok = 16 * kMT;
   __shared__ uint16_t lut[256];
@@ -564,5 +571,31 @@ extern "C" cudaError_t blz_fp8_weight_dequant(const uint8_t* w, const float* blo
   const int64_t vecs = int64_t(n) * (k >> 4);
   const int blocks = int((vecs + 255) / 256 < 65535 * 8 ? (vecs + 255) / 256 : 65535 * 8);
   fp8_dequant_kernel<<<blocks, 256, 0, stream>>>(w, block_scale, block_n, alpha, n, k, out);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_moe_grouped_mxfp8(const uint16_t* x, const blz_moe_matrix_tile* batch,
+    uint16_t* y, int count, int row_class, int n, int k, cudaStream_t stream) {
+  if (count == 0) return cudaSuccess;
+  if (count < 0 || count > 65535 || n < 1 || k < 128 || k % 128) return cudaErrorInvalidValue;
+#define BLZ_BATCH(T, S, HI, M) \
+  mxfp8_mma_kernel<T, S, HI, M, false, true><<<dim3((n + 8 * T - 1) / (8 * T), count), S * 32, 0, stream>>>( \
+      x, k, nullptr, nullptr, y, n, 0, n, k, nullptr, 0, batch)
+  switch (row_class) {
+    case 8:
+      if (k >= 5120) BLZ_BATCH(1, 8, false, 1);
+      else if (k >= 2048) BLZ_BATCH(1, 4, false, 1);
+      else BLZ_BATCH(1, 2, false, 1);
+      break;
+    case 16:
+      if (k >= 2048) BLZ_BATCH(1, 4, true, 1);
+      else BLZ_BATCH(1, 2, true, 1);
+      break;
+    case 32: BLZ_BATCH(2, 2, true, 2); break;
+    case 48: BLZ_BATCH(4, 2, true, 3); break;
+    case 64: BLZ_BATCH(4, 2, true, 4); break;
+    default: return cudaErrorInvalidValue;
+  }
+#undef BLZ_BATCH
   return cudaGetLastError();
 }

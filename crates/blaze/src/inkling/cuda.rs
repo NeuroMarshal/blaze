@@ -162,6 +162,19 @@ impl OnDevice {
             alpha: self.alpha_offset as u64,
         }
     }
+
+    fn tile(&self, buffer: &DevBuf, begin: usize, rows: usize) -> sys::blz_moe_matrix_tile {
+        sys::blz_moe_matrix_tile {
+            codes: buffer.at(self.offset),
+            scales: buffer.at(self.scale_offset),
+            alpha: match self.packing {
+                Packing::Nvfp4 => buffer.at(self.alpha_offset / 4),
+                Packing::Mxfp8 => std::ptr::null(),
+            },
+            begin: begin as i32,
+            rows: rows as i32,
+        }
+    }
 }
 
 const PROMPT_STAGE_SLOTS: usize = 2;
@@ -391,6 +404,115 @@ impl ExpertCache {
 }
 
 const EXPERT_BATCH: usize = 64;
+const WIDE_ROW_CLASSES: [usize; 5] = [8, 16, 32, 48, EXPERT_BATCH];
+
+struct WideExperts {
+    input: DevBuf,
+    gate: DevBuf,
+    activation: DevBuf,
+    output: DevBuf,
+    route_of: DevBuf,
+    tiles: DevBuf,
+    staging: HostMapped,
+}
+
+impl WideExperts {
+    fn new(routes: usize, hidden: usize, inter: usize) -> Result<Self> {
+        let tile_bytes = 2 * routes * std::mem::size_of::<sys::blz_moe_matrix_tile>();
+        Ok(Self {
+            input: DevBuf::new(routes * hidden * 2)?,
+            gate: DevBuf::new(routes * inter * 4)?,
+            activation: DevBuf::new(routes * inter * 2)?,
+            output: DevBuf::new(routes * hidden * 2)?,
+            route_of: DevBuf::new(routes * 4)?,
+            tiles: DevBuf::new(tile_bytes)?,
+            staging: HostMapped::new(tile_bytes.next_multiple_of(16) + routes * 12)?,
+        })
+    }
+
+    fn run(
+        &mut self, stream: &Stream, weights: &Experts, pool: &ExpertPool, layer: usize,
+        by_expert: &[Vec<(i32, f32)>], routes: &[Vec<(usize, f32)>], caps: (f32, f32),
+        input: &DevBuf, sum: &DevBuf, ids: &DevBuf, probabilities: &DevBuf,
+    ) -> Result<()> {
+        let tokens = routes.len();
+        let top_k = routes[0].len();
+        let hidden = weights.down.rows;
+        let inter = weights.down.cols;
+        let mut permutation = vec![-1i32; tokens * top_k];
+        let mut gather = Vec::with_capacity(permutation.len());
+        let mut tables: [_; 5] = std::array::from_fn(|_| Vec::new());
+        for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            let cached = &pool.entries[&(layer, id)];
+            for rows in rows.chunks(EXPERT_BATCH) {
+                let begin = gather.len();
+                let class = WIDE_ROW_CLASSES.iter().position(|&max| rows.len() <= max).unwrap();
+                tables[class].push([
+                    cached.gate_up.tile(&pool.buffer, begin, rows.len()),
+                    cached.down.tile(&pool.buffer, begin, rows.len()),
+                ]);
+                for &(row, _) in rows {
+                    let slot = routes[row as usize].iter().position(|&(expert, _)| expert == id).unwrap();
+                    permutation[row as usize * top_k + slot] = gather.len() as i32;
+                    gather.push(row);
+                }
+            }
+        }
+        let tile_count: usize = tables.iter().map(Vec::len).sum();
+        let tile_size = std::mem::size_of::<sys::blz_moe_matrix_tile>();
+        let tile_bytes = 2 * tile_count * tile_size;
+        let route_at = tile_bytes.next_multiple_of(16);
+        let ids_at = route_at + permutation.len() * 4;
+        let weights_at = ids_at + gather.len() * 4;
+        let host = self.staging.host_ptr().cast_mut().cast::<u8>();
+        // All regions are disjoint, aligned, and retained until the caller synchronizes the stream.
+        unsafe {
+            let matrices = host.cast::<sys::blz_moe_matrix_tile>();
+            for (i, pair) in tables.iter().flatten().enumerate() {
+                matrices.add(i).write(pair[0]);
+                matrices.add(i + tile_count).write(pair[1]);
+            }
+            host.add(route_at).cast::<i32>().copy_from_nonoverlapping(permutation.as_ptr(), permutation.len());
+            host.add(ids_at).cast::<i32>().copy_from_nonoverlapping(gather.as_ptr(), gather.len());
+            let w = host.add(weights_at).cast::<f32>();
+            for (i, (_, probability)) in routes.iter().flatten().enumerate() {
+                w.add(i).write(*probability);
+            }
+            for (dst, offset, bytes) in [
+                (self.tiles.ptr(), 0, tile_bytes),
+                (self.route_of.ptr(), route_at, permutation.len() * 4),
+                (ids.ptr(), ids_at, gather.len() * 4),
+                (probabilities.ptr(), weights_at, permutation.len() * 4),
+            ] {
+                check(sys::cudaMemcpyAsync(dst, host.add(offset).cast(), bytes, sys::MEMCPY_H2D, stream.0),
+                      "Inkling grouped route tables")?;
+            }
+            check(sys::blz_gather_rows(input.ptr(), hidden as i64, ids.ptr(), gather.len() as i32,
+                hidden as i32, self.input.ptr(), stream.0), "Inkling grouped route gather")?;
+        }
+        let launch = match weights.gate_up.packing {
+            Packing::Nvfp4 => sys::blz_moe_grouped_nvfp4,
+            Packing::Mxfp8 => sys::blz_moe_grouped_mxfp8,
+        };
+        let project = |input, output, offset, columns: usize, inner: usize| -> Result<()> {
+            let mut first = offset;
+            for (&class, table) in WIDE_ROW_CLASSES.iter().zip(&tables) {
+                if table.is_empty() { continue; }
+                check(unsafe { launch(input, self.tiles.at(first), output, table.len() as i32,
+                    class as i32, columns as i32, inner as i32, stream.0) }, "Inkling grouped expert projection")?;
+                first += table.len();
+            }
+            Ok(())
+        };
+        project(self.input.ptr(), self.gate.ptr(), 0, 2 * inter, hidden)?;
+        check(unsafe { sys::blz_inkling_swiglu(self.gate.ptr(), self.activation.ptr(),
+            (gather.len() * inter) as i32, caps.0, caps.1, stream.0) }, "Inkling grouped SwiGLU")?;
+        project(self.activation.ptr(), self.output.ptr(), tile_count, hidden, inter)?;
+        check(unsafe { sys::blz_wide_combine_f32(self.route_of.ptr(), probabilities.ptr(), self.output.ptr(),
+            tokens as i32, top_k as i32, hidden as i32, sum.ptr(), stream.0) }, "Inkling grouped expert reduction")
+    }
+}
+
 // Count token visits, so a prefill chunk advances the heat clock by its length.
 const HEAT_EPOCH_VISITS: usize = 48 * 512;
 
@@ -420,6 +542,7 @@ pub(super) struct Compute {
     cpu: Option<Arc<rayon::ThreadPool>>,
     cpu_routes: u64,
     prompt_stage: Option<PromptStage>,
+    wide_experts: Option<WideExperts>,
     projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
     grouped_experts: bool,
 }
@@ -452,6 +575,9 @@ impl Compute {
         let cache = ExpertCache::new(expert_bytes, expert_sizes, layer_visits, top_k)?;
         let stage_bytes = prompt_stage_bytes(expert_sizes, prefill_chunk, cpu.is_some());
         let prompt_stage = (stage_bytes > 0).then(|| PromptStage::new(stage_bytes / PROMPT_STAGE_SLOTS)).transpose()?;
+        let wide_experts = (hidden.is_multiple_of(128) && intermediate.is_multiple_of(128) && top_k <= 16
+            && std::env::var_os("BLAZE_INKLING_GROUPED_PREFILL").is_some_and(|value| value == "1"))
+            .then(|| WideExperts::new(prefill_chunk * top_k, hidden, intermediate)).transpose()?;
         let mut gemm = null_mut();
         check(unsafe { sys::blz_gemm_create(&mut gemm) }, "Inkling cuBLAS handle")?;
         Ok(Self {
@@ -470,6 +596,7 @@ impl Compute {
             cpu,
             cpu_routes: 0,
             prompt_stage,
+            wide_experts,
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
@@ -1040,6 +1167,26 @@ impl Compute {
         self.cache.visits += activations.len();
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
+        if self.wide_experts.is_some()
+            && routes.iter().all(|route| route.len() == routes[0].len())
+            && by_expert.iter().enumerate().all(|(id, rows)| rows.is_empty() || pool.entries.contains_key(&(layer, id)))
+        {
+            for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                pool.use_gpu(ckpt, weights, (layer, id), tick, epoch,
+                    self.cpu.is_some().then_some(rows.len()), false, None)?;
+            }
+            let work = (|| -> Result<()> {
+                self.stage_input(&activations_bf16)?;
+                let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
+                self.wide_experts.as_mut().unwrap().run(&self.stream, weights, pool, layer, &by_expert,
+                    routes, caps, &self.input, &self.sum, &self.scatter_ids, &self.scatter_weights)?;
+                self.queue_result::<f32>(self.sum.ptr(), activations.len() * hidden)
+            })();
+            let synced = self.stream.sync();
+            work?;
+            synced?;
+            return Ok(self.read_result(activations.len() * hidden));
+        }
         let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
         let mut cold_count = 0usize;
         let work = prefill_cpu_scope(self.cpu.as_deref(), |scope| -> Result<()> {
