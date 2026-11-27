@@ -19,6 +19,7 @@
 
 #include "blaze/hybrid.h"
 #include "blaze/moe_wide.h"
+#include "blaze/nvfp4_gemm.h"
 #include "blaze/log.h"
 
 namespace blaze {
@@ -49,6 +50,7 @@ void host_alloc(T** p, size_t n, const char* what) {
 struct HybridMoe::Wide {
   struct Gpu {
     int device = -1;
+    bool native_fp4 = false;
     cudaStream_t compute = nullptr;  // GPU1 only (GPU0 computes on the caller's stream)
     cudaStream_t copy = nullptr;     // record uploads
     cudaStream_t aux = nullptr;      // GPU0: imports of GPU1's y; GPU1: exports of its y
@@ -110,6 +112,7 @@ void HybridMoe::init_wide() {
     d.device = g == 0 ? cfg_.gpu0 : cfg_.gpu1;
     if (d.device < 0) continue;
     check(cudaSetDevice(d.device), "set device");
+    d.native_fp4 = cfg_.wide_fp4 && H % 64 == 0 && I % 64 == 0 && blz_nvfp4_gemm_w4a4_supported();
     for (cudaStream_t* s : {&d.copy, &d.aux}) check(cudaStreamCreateWithFlags(s, cudaStreamNonBlocking), "stream");
     if (g == 1) check(cudaStreamCreateWithFlags(&d.compute, cudaStreamNonBlocking), "stream");
     for (int h = 0; h < 2; ++h)
@@ -203,6 +206,17 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
   const int slots = std::max(1, cfg_.wide_slots);
   const int R = T * K;
   const bool has_gpu1 = cfg_.gpu1 >= 0;
+  const auto native = [&](int gpu) { return T >= 256 && W.gpu[gpu].native_fp4; };
+  const auto encode = [&](int gpu, const uint16_t* input, cudaStream_t s) {
+    auto& d = W.gpu[gpu];
+    if (native(gpu)) {
+      check(blz_nvfp4_quant_rows(input, H, T, H, d.x_planes, d.x_planes + size_t(T) * (H / 2),
+                                reinterpret_cast<float*>(d.x_emax), s), "encode fp4");
+    } else {
+      check(blz_wide_encode(input, T, H, d.x_planes, d.x_emax, s), "encode");
+      if (cfg_.wide_a8) check(blz_wide_to_a8(d.x_planes, T, H, s), "x to a8");
+    }
+  };
   try {
     check(cudaSetDevice(cfg_.gpu0), "set gpu0");
     check(cudaMemcpyAsync(W.ids, ids, size_t(R) * 4, cudaMemcpyDeviceToHost, stream), "ids");
@@ -213,8 +227,7 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
       check(cudaMemcpyAsync(W.x_host, x, size_t(T) * H * 2, cudaMemcpyDeviceToHost, stream), "x to host");
       check(cudaEventRecord(W.x_ready, stream), "x ready");
     }
-    check(blz_wide_encode(x, T, H, W.gpu[0].x_planes, W.gpu[0].x_emax, stream), "encode");
-    if (cfg_.wide_a8) check(blz_wide_to_a8(W.gpu[0].x_planes, T, H, stream), "x to a8");
+    encode(0, x, stream);
     check(cudaEventSynchronize(W.ids_ready), "ids ready");
 
     auto& start = W.route_offsets;
@@ -343,8 +356,7 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
       if (g == 1 && !batches[1].empty()) {
         check(cudaStreamWaitEvent(cs, W.x_ready, 0), "wait x");
         check(cudaMemcpyAsync(d.x, W.x_host, size_t(T) * H * 2, cudaMemcpyHostToDevice, cs), "x to gpu1");
-        check(blz_wide_encode(d.x, T, H, d.x_planes, d.x_emax, cs), "encode gpu1");
-        if (cfg_.wide_a8) check(blz_wide_to_a8(d.x_planes, T, H, cs), "x to a8 gpu1");
+        encode(1, d.x, cs);
       }
     }
 
@@ -427,7 +439,9 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
         bt.x_planes = d.x_planes, bt.x_emax = d.x_emax, bt.mult = mult[g];
         bt.hidden = H, bt.inter = I;
         bt.h = d.h, bt.h_planes = d.h_planes, bt.h_emax = d.h_emax;
-        bt.a8 = cfg_.wide_a8;
+        bt.native_fp4 = native(g);
+        bt.tokens = T;
+        bt.a8 = cfg_.wide_a8 && !bt.native_fp4;
         bt.gate_cap = cfg_.gate_cap;
         bt.up_cap = cfg_.up_cap;
         if (g == 0) {
@@ -438,7 +452,7 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
         }
         check(blz_wide_gate_up(&bt, cs), "gate_up");
         check(blz_wide_h_encode(&bt, cs), "h_encode");
-        if (cfg_.wide_a8) check(blz_wide_to_a8(bt.h_planes, b.routes, I, cs), "h to a8");
+        if (bt.a8) check(blz_wide_to_a8(bt.h_planes, b.routes, I, cs), "h to a8");
         check(blz_wide_down(&bt, cs), "down");
         if (b.streamed) check(cudaEventRecord(d.freed[b.half], cs), "freed");
         if (g == 1) {

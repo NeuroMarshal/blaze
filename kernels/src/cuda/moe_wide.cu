@@ -9,6 +9,8 @@
 #include "blaze/canon.h"
 #include "blaze/expert.h"
 #include "blaze/moe_wide.h"
+#include "blaze/nvfp4_gemm.h"
+#include "blaze/nvfp4_mma.cuh"
 
 namespace blaze::wide {
 namespace {
@@ -121,8 +123,107 @@ __device__ __forceinline__ void group_sums(const uint8_t* __restrict__ group, in
   }
 }
 
+template <int A8>
+__device__ __forceinline__ void project_group(const uint8_t* weights, int blocks, int width,
+        const uint8_t* const (&planes)[kNTiles], int tiles, int64_t (&acc)[kNTiles][4], bool dynamic_a8) {
+  if constexpr (A8 == 1) {
+    group_sums<true>(weights, blocks, width, planes, tiles, acc);
+  } else if constexpr (A8 == 0) {
+    group_sums<false>(weights, blocks, width, planes, tiles, acc);
+  } else if (dynamic_a8) {
+    group_sums<true>(weights, blocks, width, planes, tiles, acc);
+  } else {
+    group_sums<false>(weights, blocks, width, planes, tiles, acc);
+  }
+}
+
+#ifdef BLZ_FP4_MMA
+__device__ __forceinline__ uint32_t compact_nibbles(uint32_t v) {
+  return (v & 0xfu) | ((v >> 4) & 0xf0u) | ((v >> 8) & 0xf00u) | ((v >> 12) & 0xf000u);
+}
+
+__device__ __forceinline__ uint32_t scale_word(const uint8_t* p, int stride) {
+  return uint32_t(p[0]) | (uint32_t(p[stride]) << 8) | (uint32_t(p[2 * stride]) << 16) |
+         (uint32_t(p[3 * stride]) << 24);
+}
+#endif
+
+template <bool Down, bool Capped>
+__global__ void __launch_bounds__(32 * kWarps) native_fp4_project(blz_wide_batch bt) {
+#ifdef BLZ_FP4_MMA
+  const int2 tile = bt.tiles[blockIdx.y];
+  const blz_wide_item it = bt.items[tile.x];
+  const expert::Geometry geo{bt.hidden, bt.inter};
+  const int group = blockIdx.x * kWarps + threadIdx.x / 32;
+  if (group >= (Down ? geo.d_groups() : geo.gu_groups())) return;
+  const int lane = threadIdx.x & 31, row = lane / 4, lane_k = lane & 3;
+  const int inner = Down ? bt.inter : bt.hidden;
+  const int blocks = inner / 16;
+  const int columns = min(BLZ_WIDE_TILE_COLS, it.ncols - tile.y);
+  const int ntiles = (columns + 7) / 8;
+  const uint8_t* x_codes = Down ? bt.h_planes : bt.x_planes;
+  const uint8_t* x_scales = x_codes + size_t(Down ? bt.n_routes : bt.tokens) * (inner / 2);
+  const float* x_outer = reinterpret_cast<const float*>(Down ? bt.h_emax : bt.x_emax);
+  const uint8_t* weights = it.record + (Down ? geo.gu_bytes() : 0) + expert::unit_offset(group, 0, blocks);
+  int input_rows[kNTiles];
+#pragma unroll
+  for (int nt = 0; nt < kNTiles; ++nt) {
+    const int route = it.route_begin + tile.y + min(nt * 8 + row, columns - 1);
+    input_rows[nt] = Down ? route - bt.route0 : bt.route_token[route];
+  }
+  float acc[kNTiles][4] = {};
+  for (int block = 0; block < blocks; block += 4) {
+    const uint8_t* weight = weights + size_t(block) * expert::kUnitBytes;
+    const uint8_t* word = weight + (lane_k / 2) * expert::kUnitBytes + (lane_k % 2) * 64 + row * 4;
+    const uint32_t lo0 = ld_u32(word), lo1 = ld_u32(word + 32);
+    const uint32_t hi0 = ld_u32(word + 2 * expert::kUnitBytes), hi1 = ld_u32(word + 2 * expert::kUnitBytes + 32);
+    const uint32_t a0 = compact_nibbles(lo0) | (compact_nibbles(lo1) << 16);
+    const uint32_t a1 = compact_nibbles(lo0 >> 4) | (compact_nibbles(lo1 >> 4) << 16);
+    const uint32_t a2 = compact_nibbles(hi0) | (compact_nibbles(hi1) << 16);
+    const uint32_t a3 = compact_nibbles(hi0 >> 4) | (compact_nibbles(hi1 >> 4) << 16);
+    const uint32_t sfa = scale_word(weight + expert::kUnitCodeBytes + row + (lane & 1) * 8, expert::kUnitBytes);
+#pragma unroll
+    for (int nt = 0; nt < kNTiles; ++nt) {
+      if (nt >= ntiles) break;
+      const int input = input_rows[nt];
+      const uint8_t* codes = x_codes + size_t(input) * (inner / 2) + block * 8 + lane_k * 4;
+      const uint32_t sfb = ld_u32(x_scales + size_t(input) * blocks + block);
+      blaze::nvfp4_mma(acc[nt], a0, a1, a2, a3, ld_u32(codes), ld_u32(codes + 16), sfa, sfb);
+    }
+  }
+  const float* mult = bt.mult + size_t(it.expert) * 3;
+#pragma unroll
+  for (int nt = 0; nt < kNTiles; ++nt) {
+    if (nt >= ntiles) break;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      float up = 0.0f;
+      if constexpr (!Down) {
+        up = __shfl_xor_sync(0xffffffffu, acc[nt][j], 4);
+        if (row & 1) continue;
+      }
+      const int c = nt * 8 + lane_k * 2 + (j & 1);
+      if (c >= columns) continue;
+      const int route = it.route_begin + tile.y + c;
+      const int local = route - bt.route0;
+      const int output_row = group * 16 + row + (j < 2 ? 0 : 8);
+      if constexpr (Down) {
+        bt.y[size_t(local) * bt.hidden + output_row] = canon::bf16_rn((acc[nt][j] * x_outer[local]) * mult[2]);
+      } else {
+        const float scale = x_outer[bt.route_token[route]];
+        const uint16_t g = canon::bf16_rn((acc[nt][j] * scale) * mult[0]);
+        const uint16_t u = canon::bf16_rn((up * scale) * mult[1]);
+        bt.h[size_t(local) * bt.inter + output_row / 2] = Capped
+            ? canon::capped_swiglu_bf16(g, u, bt.gate_cap, bt.up_cap)
+            : canon::swiglu_bf16(g, u);
+      }
+    }
+  }
+#endif
+}
+
 // grid (gu_groups / kWarps, n_tiles); warp = one 16-row group of the gate/up matrix (rows 2p gate, 2p + 1 up).
-template <bool Capped>
+template <bool Capped, int A8>
 __global__ void __launch_bounds__(32 * kWarps) gate_up_kernel(blz_wide_batch bt) {
   const int2 tile = bt.tiles[blockIdx.y];
   const blz_wide_item it = bt.items[tile.x];
@@ -141,10 +242,7 @@ __global__ void __launch_bounds__(32 * kWarps) gate_up_kernel(blz_wide_batch bt)
     col_planes[nt] = bt.x_planes + size_t(token) * 3 * H;
   }
   int64_t acc[kNTiles][4];
-  if (bt.a8)
-    group_sums<true>(it.record + expert::unit_offset(g, 0, geo.gu_blocks()), geo.gu_blocks(), H, col_planes, ntiles, acc);
-  else
-    group_sums<false>(it.record + expert::unit_offset(g, 0, geo.gu_blocks()), geo.gu_blocks(), H, col_planes, ntiles, acc);
+  project_group<A8>(it.record + expert::unit_offset(g, 0, geo.gu_blocks()), geo.gu_blocks(), H, col_planes, ntiles, acc, bt.a8);
   const float mg = bt.mult[size_t(it.expert) * 3], mu = bt.mult[size_t(it.expert) * 3 + 1];
   const int r = lane >> 2;
 #pragma unroll
@@ -202,6 +300,7 @@ __global__ void h_encode_kernel(blz_wide_batch bt) {
 }
 
 // grid (d_groups / kWarps, n_tiles); warp = one 16-row group of the down matrix.
+template <int A8>
 __global__ void __launch_bounds__(32 * kWarps) down_kernel(blz_wide_batch bt) {
   const int2 tile = bt.tiles[blockIdx.y];
   const blz_wide_item it = bt.items[tile.x];
@@ -220,10 +319,7 @@ __global__ void __launch_bounds__(32 * kWarps) down_kernel(blz_wide_batch bt) {
   }
   int64_t acc[kNTiles][4];
   const uint8_t* down = it.record + geo.gu_bytes() + expert::unit_offset(g, 0, geo.d_blocks());
-  if (bt.a8)
-    group_sums<true>(down, geo.d_blocks(), I, col_planes, ntiles, acc);
-  else
-    group_sums<false>(down, geo.d_blocks(), I, col_planes, ntiles, acc);
+  project_group<A8>(down, geo.d_blocks(), I, col_planes, ntiles, acc, bt.a8);
   const float md = bt.mult[size_t(it.expert) * 3 + 2];
   const int r = lane >> 2;
 #pragma unroll
@@ -383,13 +479,20 @@ extern "C" cudaError_t blz_wide_gate_up(const blz_wide_batch* bt, cudaStream_t s
   if (bt->n_tiles <= 0) return cudaSuccess;
   const blaze::expert::Geometry geo{bt->hidden, bt->inter};
   const dim3 grid((geo.gu_groups() + kWarps - 1) / kWarps, bt->n_tiles);
-  if (bt->gate_cap > 0) gate_up_kernel<true><<<grid, 32 * kWarps, 0, stream>>>(*bt);
-  else gate_up_kernel<false><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  if (bt->native_fp4 && bt->gate_cap > 0) native_fp4_project<false, true><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else if (bt->native_fp4) native_fp4_project<false, false><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else if (bt->gate_cap <= 0) gate_up_kernel<false, -1><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else if (bt->a8) gate_up_kernel<true, 1><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else gate_up_kernel<true, 0><<<grid, 32 * kWarps, 0, stream>>>(*bt);
   return cudaGetLastError();
 }
 
 extern "C" cudaError_t blz_wide_h_encode(const blz_wide_batch* bt, cudaStream_t stream) {
   if (bt->n_routes <= 0) return cudaSuccess;
+  if (bt->native_fp4)
+    return blz_nvfp4_quant_rows(bt->h, bt->inter, bt->n_routes, bt->inter, bt->h_planes,
+                                bt->h_planes + size_t(bt->n_routes) * (bt->inter / 2),
+                                reinterpret_cast<float*>(bt->h_emax), stream);
   h_encode_kernel<<<bt->n_routes, 128, 0, stream>>>(*bt);
   return cudaGetLastError();
 }
@@ -398,7 +501,10 @@ extern "C" cudaError_t blz_wide_down(const blz_wide_batch* bt, cudaStream_t stre
   if (bt->n_tiles <= 0) return cudaSuccess;
   const blaze::expert::Geometry geo{bt->hidden, bt->inter};
   const dim3 grid((geo.d_groups() + kWarps - 1) / kWarps, bt->n_tiles);
-  down_kernel<<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  if (bt->native_fp4) native_fp4_project<true, false><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else if (bt->gate_cap <= 0) down_kernel<-1><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else if (bt->a8) down_kernel<1><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else down_kernel<0><<<grid, 32 * kWarps, 0, stream>>>(*bt);
   return cudaGetLastError();
 }
 

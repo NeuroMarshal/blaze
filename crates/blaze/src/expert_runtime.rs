@@ -39,7 +39,8 @@ impl MoeEngine {
         let heat = CString::new(heat.as_os_str().as_encoded_bytes())?;
         let wide_min = if stream_gpu_only { 1 } else { chunk.clamp(32, 256) };
         let wide_a8 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_A8").is_some_and(|v| v == "1"));
-        let options = CString::new(format!("layers={}-{},wide_tokens={chunk},wide_min_tokens={wide_min},wide_a8={wide_a8}",
+        let wide_fp4 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_FP4").is_some_and(|v| v == "1"));
+        let options = CString::new(format!("layers={}-{},wide_tokens={chunk},wide_min_tokens={wide_min},wide_a8={wide_a8},wide_fp4={wide_fp4}",
             layers.start, layers.end))?;
         unsafe {
             Self::create(sys::blz_moe_engine_config {

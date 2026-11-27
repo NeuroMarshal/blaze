@@ -744,8 +744,8 @@ impl Model {
             "Inkling requires one or two contiguous CUDA devices"
         );
         ensure!(
-            (1..=1024).contains(&prefill_chunk),
-            "Inkling prefill chunk must be in 1..=1024"
+            (1..=2048).contains(&prefill_chunk),
+            "Inkling prefill chunk must be in 1..=2048"
         );
         let root = ModelConfig::read_json(path)?;
         ensure!(dspark_tokens <= 7 && (dspark_tokens == 0 || dspark_tokens < prefill_chunk),

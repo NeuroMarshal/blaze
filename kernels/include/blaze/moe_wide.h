@@ -50,6 +50,8 @@ typedef struct {
   uint16_t* y;                 // [n_routes][H] BF16 bits (batch-local route index)
   int a8;                      // nonzero: planes hold the A8 form (blz_wide_to_a8), one MMA per unit (approximate)
   float gate_cap, up_cap;
+  int native_fp4;
+  int tokens;
 } blz_wide_batch;
 
 cudaError_t blz_wide_encode(const uint16_t* x, int tokens, int hidden, uint8_t* planes, int32_t* emax,

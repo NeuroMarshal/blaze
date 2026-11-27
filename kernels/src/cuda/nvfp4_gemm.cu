@@ -18,6 +18,7 @@
 
 #include "blaze/nvfp4.h"
 #include "blaze/nvfp4_gemm.h"
+#include "blaze/nvfp4_mma.cuh"
 
 namespace {
 
@@ -85,10 +86,6 @@ __global__ void __launch_bounds__(kQuantThreads) quant_rows_kernel(const uint16_
     scales[int64_t(r) * blocks + b] = sc.__x;
   }
 }
-
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1200 && defined(__CUDA_ARCH_FEAT_SM120_ALL)
-#define BLZ_FP4_MMA 1
-#endif
 
 constexpr int BM = 128, BN = 128, BK = 128, kStages = 3, kRow = 80, kThreads = 256;
 constexpr int kTileBytes = (BM + BN) * kRow + (BM + BN) * 8;
@@ -182,13 +179,7 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
         const uint32_t sfa = *reinterpret_cast<const uint32_t*>(SA + (r + (lane & 1) * 8) * 8 + h * 4);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          float* d = acc[i][j];
-          asm volatile(
-              "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-              "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, {%10}, {%11, %12}, {%13}, {%14, %15};\n"
-              : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-              : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b[j][0]), "r"(b[j][1]), "r"(sfa), "h"(uint16_t(0)),
-                "h"(uint16_t(0)), "r"(sfb[j]), "h"(uint16_t(0)), "h"(uint16_t(0)));
+          blaze::nvfp4_mma(acc[i][j], a0, a1, a2, a3, b[j][0], b[j][1], sfa, sfb[j]);
         }
       }
     }

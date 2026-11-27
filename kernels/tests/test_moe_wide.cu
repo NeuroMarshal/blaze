@@ -15,6 +15,7 @@
 #include "blaze/canon.h"
 #include "blaze/expert.h"
 #include "blaze/moe_wide.h"
+#include "blaze/nvfp4_gemm.h"
 
 #define CHECK_CUDA(x)                                                                              \
   do {                                                                                             \
@@ -160,7 +161,7 @@ T* upload(const std::vector<T>& v) {
 
 // Runs the wide route; returns out [T][H] and the kernel time (ms) of `reps` repetitions.
 std::vector<uint16_t> run_wide(const Bank& bank, const Layer& l, const Plan& p, int reps, double* ms,
-                               bool a8 = false) {
+                               bool a8 = false, bool fp4 = false) {
   const int H = bank.geo.hidden, I = bank.geo.inter, R = int(p.route_token.size());
   uint16_t* dx = upload(l.x);
   float* dw = upload(l.w);
@@ -182,7 +183,12 @@ std::vector<uint16_t> run_wide(const Bank& bank, const Layer& l, const Plan& p, 
   cudaEventCreate(&e0), cudaEventCreate(&e1);
   for (int rep = 0; rep <= reps; ++rep) {
     if (rep == 1) cudaEventRecord(e0);
-    CHECK_CUDA(blz_wide_encode(dx, l.T, H, xplanes, xemax, nullptr));
+    if (fp4) {
+      CHECK_CUDA(blz_nvfp4_quant_rows(dx, H, l.T, H, xplanes, xplanes + size_t(l.T) * (H / 2),
+                                     reinterpret_cast<float*>(xemax), nullptr));
+    } else {
+      CHECK_CUDA(blz_wide_encode(dx, l.T, H, xplanes, xemax, nullptr));
+    }
     if (a8) CHECK_CUDA(blz_wide_to_a8(xplanes, l.T, H, nullptr));
     for (size_t b = 0; b + 1 < p.batch_items.size(); ++b) {
       blz_wide_batch bt{};
@@ -196,6 +202,8 @@ std::vector<uint16_t> run_wide(const Bank& bank, const Layer& l, const Plan& p, 
       bt.h = h + size_t(bt.route0) * I, bt.h_planes = hplanes + size_t(bt.route0) * 3 * I;
       bt.h_emax = hemax + bt.route0, bt.y = y + size_t(bt.route0) * H;
       bt.a8 = a8;
+      bt.native_fp4 = fp4;
+      bt.tokens = l.T;
       CHECK_CUDA(blz_wide_gate_up(&bt, nullptr));
       CHECK_CUDA(blz_wide_h_encode(&bt, nullptr));
       if (a8) CHECK_CUDA(blz_wide_to_a8(bt.h_planes, bt.n_routes, I, nullptr));
@@ -207,6 +215,7 @@ std::vector<uint16_t> run_wide(const Bank& bank, const Layer& l, const Plan& p, 
   CHECK_CUDA(cudaEventSynchronize(e1));
   float t = 0;
   if (reps > 0) cudaEventElapsedTime(&t, e0, e1);
+  cudaEventDestroy(e0), cudaEventDestroy(e1);
   *ms = reps > 0 ? t / reps : 0;
   std::vector<uint16_t> out(size_t(l.T) * H);
   CHECK_CUDA(cudaMemcpy(out.data(), dout, out.size() * 2, cudaMemcpyDeviceToHost));
@@ -221,6 +230,7 @@ std::vector<uint16_t> run_wide(const Bank& bank, const Layer& l, const Plan& p, 
 int main() {
   std::mt19937 rng(11);
   int fail = 0;
+  const bool native = blz_nvfp4_gemm_w4a4_supported();
   {
     Bank bank = make_bank(expert::kFlashNext, 24, rng);
     for (int T : {1, 5, 37, 70}) {
@@ -243,6 +253,17 @@ int main() {
         const double rel = std::sqrt(se / std::max(sr, 1e-30));
         std::printf("            a8: relative RMS error %.2e\n", rel);
         fail += !(rel < 3e-2);
+        if (native) {
+          const auto fp4 = run_wide(bank, l, plan_layer(bank, l, batches), 0, &ms, false, true);
+          se = 0;
+          for (size_t i = 0; i < fp4.size(); ++i) {
+            const double d = canon::bf16_to_f32(fp4[i]) - canon::bf16_to_f32(ref[i]);
+            se += d * d;
+          }
+          const double error = std::sqrt(se / std::max(sr, 1e-30));
+          std::printf("            fp4: relative RMS error %.2e\n", error);
+          fail += !(error < 0.26);
+        }
       }
     }
     cudaFree(bank.dev), cudaFree(bank.dmult);
