@@ -164,12 +164,11 @@ const MAX_VERIFY_GRAPHS: usize = 128;
 struct Runner {
     model: Model,
     draft: Option<crate::drafter::Drafter>,
-    staging: HostMapped,
+    staging: [HostMapped; 2],
+    staging_slot: usize,
     /// the hang report's view of this rank: (the engine's watch, this rank)
     watch: Option<(Arc<Watch>, usize)>,
-    /// recorded after the last step's metadata copy: the next step writes the staging buffer after it (the parts of a
-    /// step are enqueued without waiting for each other)
-    meta_copied: Option<crate::gpu::Event>,
+    meta_copied: [Option<crate::gpu::Event>; 2],
     graphs: HashMap<GraphKey, CudaGraph>,
     warmed: HashSet<GraphKey>,
     /// The graphs' device memory, measured at each instantiation, within a budget of half the VRAM free at the first
@@ -188,7 +187,7 @@ struct Runner {
 impl Runner {
     fn put<T: Copy>(&mut self, offset: usize, values: &[T]) {
         let bytes = std::mem::size_of_val(values);
-        let dst = &mut self.staging.host_slice_mut()[offset..offset + bytes];
+        let dst = &mut self.staging[self.staging_slot].host_slice_mut()[offset..offset + bytes];
         // SAFETY: plain-old-data copy into the pinned staging buffer.
         dst.copy_from_slice(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), bytes) });
     }
@@ -208,7 +207,8 @@ impl Runner {
         if self.model.pp_fault_now() {
             bail!("BLAZE_PP_FAULT: this step fails on the first stage");
         }
-        if let Some(e) = &self.meta_copied {
+        let slot = self.staging_slot;
+        if let Some(e) = &self.meta_copied[slot] {
             check(unsafe { sys::cudaEventSynchronize(e.0) }, "meta copy done")?;
         }
         let m = self.model.meta;
@@ -251,19 +251,23 @@ impl Runner {
             tail.extend([(m.pos_h, meta.pos_h.len() * 8), (m.pos_w, meta.pos_w.len() * 8)]);
         }
         self.model.set_image_rows(meta.mrope, &meta.segs);
-        let copied = match self.meta_copied.take() {
+        let copied = match self.meta_copied[slot].take() {
             Some(e) => e,
             None => crate::gpu::Event::new()?,
         };
         let s = self.model.stream.0;
         let dev = self.model.meta_buffer().ptr::<u8>();
-        let host = self.staging.host_ptr().cast::<u8>();
+        let host = self.staging[slot].host_ptr().cast::<u8>();
         for (at, bytes) in std::iter::once((0, m.base_bytes)).chain(tail).filter(|&(_, b)| b > 0) {
             // SAFETY: offsets and sizes lie within the staging and device metadata buffers (checked above).
-            check(
+            let result = check(
                 unsafe { sys::cudaMemcpyAsync(dev.add(at).cast(), host.add(at).cast(), bytes, sys::MEMCPY_H2D, s) },
                 "meta copy",
-            )?;
+            );
+            if let Err(err) = result {
+                let _ = self.model.stream.sync();
+                return Err(err);
+            }
         }
         let n = meta.logit_rows.len();
         let key = graph_key(meta, verify);
@@ -289,8 +293,12 @@ impl Runner {
                           self.graphs.keys().filter(|k| k.3).count());
             }
         }
-        check(unsafe { sys::cudaEventRecord(copied.0, s) }, "meta copy event")?;
-        self.meta_copied = Some(copied);
+        if let Err(err) = check(unsafe { sys::cudaEventRecord(copied.0, s) }, "meta copy event") {
+            let _ = self.model.stream.sync();
+            return Err(err);
+        }
+        self.meta_copied[slot] = Some(copied);
+        self.staging_slot ^= 1;
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
@@ -730,7 +738,7 @@ fn worker_main(
         }
         let draft_dir = opts.draft.clone();
         let model = Model::load(&dir, opts, Tp { rank: tp_rank, world: tp_world, ar, ar_bytes }, embed)?;
-        let staging = HostMapped::new(model.meta.bytes)?;
+        let staging = [HostMapped::new(model.meta.bytes)?, HostMapped::new(model.meta.bytes)?];
         let stage = |what: String| if rank == 0 { crate::logging::stage(what) } else { crate::logging::Stage::none() };
         let draft = match draft_dir {
             Some(d) => {
@@ -750,7 +758,7 @@ fn worker_main(
             _ => None,
         };
         let graph_log = std::env::var("BLAZE_GRAPH_LOG").ok().and_then(|v| v.parse().ok()).filter(|&n: &usize| n > 0 && rank == 0).map(|n| (n, [0; 4]));
-        Ok(Runner { model, draft, staging, watch: watch.clone().map(|w| (w, rank)), meta_copied: None, graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
+        Ok(Runner { model, draft, staging, staging_slot: 0, watch: watch.clone().map(|w| (w, rank)), meta_copied: [None, None], graphs: HashMap::new(), warmed: HashSet::new(), graph_bytes: HashMap::new(), graph_budget: None, graph_tick: 0, no_graph: HashSet::new(), use_graphs, graph_log })
     };
     let mut runner = match start() {
         Ok(r) => {
