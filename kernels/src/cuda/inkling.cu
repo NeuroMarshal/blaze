@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "blaze/nvfp4.h"
+#include "fa_tile.cuh"
 
 namespace {
 
@@ -330,6 +331,19 @@ __device__ inline float warp_sum(float x) {
     return x;
 }
 
+template <bool Prefill>
+__device__ __forceinline__ float4 unpack_fp4(uint16_t codes) {
+#if __CUDA_FP8_INTERNAL_CAN_RELY_ON_PTX_FOR_SHORTTYPESCVT__
+    if constexpr (Prefill) {
+        const float2 low = __half22float2(blaze::fa::e2m1x2_to_f16x2(codes));
+        const float2 high = __half22float2(blaze::fa::e2m1x2_to_f16x2(codes >> 8));
+        return make_float4(low.x, low.y, high.x, high.y);
+    }
+#endif
+    return make_float4(blaze::e2m1_value(codes & 15), blaze::e2m1_value((codes >> 4) & 15),
+                       blaze::e2m1_value((codes >> 8) & 15), blaze::e2m1_value(codes >> 12));
+}
+
 template <bool Packed, bool Causal = false>
 __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, const uint8_t* values,
                                 const uint8_t* key_scales, const uint8_t* value_scales,
@@ -337,26 +351,29 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
                                 const __nv_bfloat16* gate, __nv_bfloat16* output,
                                 float* scratch, int kv_heads, int capacity, int window, int position,
                                 int extent, int tile, float global_scale, int query_stride) {
-    q += size_t(blockIdx.z) * query_stride;
-    output += size_t(blockIdx.z) * gridDim.x * HEAD_DIM;
-    scratch += size_t(blockIdx.z) * gridDim.x * gridDim.y * (HEAD_DIM + 2);
-    int blocks = gridDim.y;
+    const int query_row = Causal ? blockIdx.y : blockIdx.z;
+    const int split = Causal ? blockIdx.z : blockIdx.y;
+    const int stride = Causal ? gridDim.z : gridDim.y;
+    q += size_t(query_row) * query_stride;
+    output += size_t(query_row) * gridDim.x * HEAD_DIM;
+    scratch += size_t(query_row) * gridDim.x * stride * (HEAD_DIM + 2);
+    int blocks = stride;
     if constexpr (Causal) {
-        position += blockIdx.z;
-        relative += size_t(blockIdx.z) * gridDim.x * extent;
-        sinks += size_t(blockIdx.z) * gridDim.x;
-        gate += size_t(blockIdx.z) * query_stride;
+        position += query_row;
+        relative += size_t(query_row) * gridDim.x * extent;
+        sinks += size_t(query_row) * gridDim.x;
+        gate += size_t(query_row) * query_stride;
         const int valid = min(window, position + 1);
         const int tiles = min(256, (valid + 63) / 64);
         tile = (valid + tiles - 1) / tiles;
         blocks = (valid + tile - 1) / tile;
-        if (blockIdx.y >= blocks) return;
+        if (split >= blocks) return;
     }
     const int head = blockIdx.x;
     const int kv_head = head / (gridDim.x / kv_heads);
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
-    const int first = max(0, position + 1 - window) + blockIdx.y * tile;
+    const int first = max(0, position + 1 - window) + split * tile;
     const int end = min(first + tile, position + 1);
     float query[4], accum[4] = {};
 #pragma unroll
@@ -376,8 +393,11 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
             const int group = lane / (blaze::kNvfp4Block / 4);
             const float ks = blaze::e4m3_to_float(key_scales[row * scales + group]);
             const uint16_t kb = reinterpret_cast<const uint16_t*>(keys + row * codes)[lane];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) dot = fmaf(query[j], blaze::e2m1_value((kb >> (j * 4)) & 15), dot);
+            const float4 k = unpack_fp4<Causal>(kb);
+            dot = fmaf(query[0], k.x, dot);
+            dot = fmaf(query[1], k.y, dot);
+            dot = fmaf(query[2], k.z, dot);
+            dot = fmaf(query[3], k.w, dot);
             dot *= ks;
         } else {
             const auto* k = reinterpret_cast<const __nv_bfloat162*>(keys) + row * (HEAD_DIM / 2) + lane * 2;
@@ -401,8 +421,11 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
             const int group = lane / (blaze::kNvfp4Block / 4);
             const float vs = blaze::e4m3_to_float(value_scales[row * scales + group]) * (global_scale * add);
             const uint16_t vb = reinterpret_cast<const uint16_t*>(values + row * codes)[lane];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) accum[j] = fmaf(vs, blaze::e2m1_value((vb >> (j * 4)) & 15), keep * accum[j]);
+            const float4 v = unpack_fp4<Causal>(vb);
+            accum[0] = fmaf(vs, v.x, keep * accum[0]);
+            accum[1] = fmaf(vs, v.y, keep * accum[1]);
+            accum[2] = fmaf(vs, v.z, keep * accum[2]);
+            accum[3] = fmaf(vs, v.w, keep * accum[3]);
         } else {
             const auto* v = reinterpret_cast<const __nv_bfloat162*>(values) + row * (HEAD_DIM / 2) + lane * 2;
             const float2 lo = __bfloat1622float2(v[0]), hi = __bfloat1622float2(v[1]);
@@ -441,7 +464,7 @@ __global__ void attention_tiles(const __nv_bfloat16* q, const uint8_t* keys, con
                                       * (1.0f + __expf(-__bfloat162float(gate[i])))));
         return;
     }
-    float* partial = scratch + (head * gridDim.y + blockIdx.y) * (HEAD_DIM + 2);
+    float* partial = scratch + (head * stride + split) * (HEAD_DIM + 2);
     partial[threadIdx.x] = out;
     if (threadIdx.x == 0) {
         partial[HEAD_DIM] = maximum;
@@ -658,7 +681,8 @@ extern "C" cudaError_t blz_inkling_prefill_attention(
     if (heads < 1 || kv_heads < 1 || heads % kv_heads || window < 1 || window > capacity || start < 0 || rows < 1)
         return cudaErrorInvalidValue;
     const int tiles = min(256, (min(window, start + rows) + 63) / 64);
-    const dim3 grid(heads, tiles, rows);
+    // Adjacent query blocks reuse the same KV split before advancing to the next one.
+    const dim3 grid(heads, rows, tiles);
     const auto* query = reinterpret_cast<const __nv_bfloat16*>(q);
     const auto* biases = reinterpret_cast<const __nv_bfloat16*>(relative);
     const auto* sink = reinterpret_cast<const __nv_bfloat16*>(sinks);
