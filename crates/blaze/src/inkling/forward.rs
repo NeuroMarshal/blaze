@@ -1,6 +1,6 @@
 use super::{KvDtype, cpu};
 use super::dspark::{Cache as DraftCache, Draft, Features};
-use super::cuda::{AttentionClip, AttentionConv, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, prompt_stage_bytes, to_bf16};
+use super::cuda::{AttentionClip, AttentionConv, AttentionResidual, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, prompt_stage_bytes, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
 use super::weights::{Experts, read_float};
@@ -9,6 +9,7 @@ use crate::gpu;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const PREFIX: &str = "model.llm";
 const SHORT_KV_TOKENS: usize = 8192;
@@ -396,6 +397,7 @@ struct Layer {
     v_conv: Conv,
     kv_taps: Option<gpu::DevBuf>,
     attn_conv: Conv,
+    attn_conv_device: Option<gpu::DevBuf>,
     mlp_conv: Conv,
     router: Router,
     route_bias: Vec<f32>,
@@ -467,7 +469,7 @@ impl Layer {
         }).transpose()?;
         let q_clip = read("attn.q_l2_clip.scale", &[s.heads, s.dim])?;
         let rel_clip = read("attn.rel_l2_clip.scale", &[s.heads, s.relative])?;
-        let device_clip = (avx_controller && s.relative < 32 && s.heads.is_multiple_of(8)
+        let device_clip = (avx_controller && s.relative < 32 && s.hidden <= s.q_width() && s.heads.is_multiple_of(8)
             && std::env::var_os("BLAZE_INKLING_DEVICE_ATTENTION").is_none_or(|value| value != "0"))
             .then(|| {
                 let weights: Vec<_> = q_clip.iter().chain(&rel_clip).copied().collect();
@@ -484,6 +486,10 @@ impl Layer {
                     else { norm_q.iter().chain(&norm_k).chain(&norm_v).copied().collect() };
                 gpu::DevBuf::from_slice(&norms)
             }).transpose()?;
+        let attn_conv = Conv::load(ckpt, &t("attn_sconv"), s.hidden, s, false)?;
+        let attn_conv_device = device_clip.as_ref().map(|_| {
+            gpu::DevBuf::from_slice(&attn_conv.taps.iter().flatten().copied().collect::<Vec<_>>())
+        }).transpose()?;
 
         Ok(Self {
             local,
@@ -516,7 +522,8 @@ impl Layer {
             k_conv,
             v_conv,
             kv_taps,
-            attn_conv: Conv::load(ckpt, &t("attn_sconv"), s.hidden, s, false)?,
+            attn_conv,
+            attn_conv_device,
             mlp_conv: Conv::load(ckpt, &t("mlp_sconv"), s.hidden, s, false)?,
             router: if s.hidden.is_multiple_of(32) && ckpt.info(&t("mlp.gate.weight"))?.dtype == Dtype::Bf16
                 && std::env::var_os("BLAZE_INKLING_GPU_ROUTER").is_some_and(|v| v == "1")
@@ -629,6 +636,7 @@ pub struct Model {
     kv_dtype: KvDtype,
     vision: Option<Vision>,
     prefill_chunk: usize,
+    profile_prefill: bool,
 }
 
 impl Model {
@@ -818,6 +826,7 @@ impl Model {
             kv_dtype,
             vision,
             prefill_chunk,
+            profile_prefill: std::env::var_os("BLAZE_INKLING_PROFILE_PREFILL").is_some_and(|value| value == "1"),
         })
     }
 
@@ -972,6 +981,15 @@ impl Model {
             seq.capacity
         );
         let s = &self.cfg;
+        let mut timings = [Duration::ZERO; 5];
+        let mut phase_start = (self.profile_prefill && rows.len() > 1).then(Instant::now);
+        let mut phase = |index: usize| {
+            if let Some(start) = &mut phase_start {
+                let now = Instant::now();
+                timings[index] += now - *start;
+                *start = now;
+            }
+        };
         let mut active = None;
         let mut features = seq.draft.as_ref().map(|_| vec![Features::default(); rows.len()]);
         // Visit each physical weight bank once per chunk. Per-visit attention and convolution still consume
@@ -1057,8 +1075,12 @@ impl Model {
                 .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
             let count = rows.len();
-            let attention = if count > 1 && !matches!(readout, Readout::Verify(_))
-                && let (Some(clip), Some(weights)) = (&layer.device_clip, &layer.kv_taps)
+            phase(0);
+            let on_device = count > 1 && self.prefill_chunk >= s.conv && !matches!(readout, Readout::Verify(_));
+            let block_start = id % s.block == 0;
+            let (attention, residual_ready) = if on_device
+                && let (Some(clip), Some(weights), Some(residual_weights)) =
+                    (&layer.device_clip, &layer.kv_taps, &layer.attn_conv_device)
             {
                 let conv = AttentionConv {
                     weights,
@@ -1077,20 +1099,28 @@ impl Model {
                     log_floor: s.log_floor,
                     log_alpha: if layer.local { 0.0 } else { s.log_alpha },
                 };
+                let previous: Vec<_> = if block_start { Vec::new() } else { rows.iter().map(|row| row.x.as_slice()).collect() };
+                let residual = AttentionResidual {
+                    weights: residual_weights,
+                    history: &state.attention.bf16_history(seq.position, s.conv),
+                    previous: &previous,
+                    scale: layer.attn_conv.scale,
+                };
                 let tail = state.key.rows.len().min(count);
-                let (output, [key, value]) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
+                let (output, [key, value, attn]) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
                     device.scratch.project_attention(compute, &state.kv,
                         [&layer.query, &layer.key, &layer.value, k, v], [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs],
-                        &layer.bias, &layer.output, seq.position, conv, clip, tail)?
+                        &layer.bias, &layer.output, seq.position, conv, clip, tail, residual)?
                 } else {
                     device.scratch.project_attention(compute, &state.kv,
                         [&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs],
-                        &layer.bias, &layer.output, seq.position, conv, clip, tail)?
+                        &layer.bias, &layer.output, seq.position, conv, clip, tail, residual)?
                 };
                 let start = seq.position + count - tail;
                 state.key.remember_bf16(start, s.kv_width(), &key);
                 state.value.remember_bf16(start, s.kv_width(), &value);
-                output
+                state.attention.remember_bf16(start, s.hidden, &attn);
+                (output, true)
             } else {
                 let (qkv, conv) = if let Some((controller, norms)) = recurrent {
                     let x = std::array::from_fn(|i| qkv_rows[0][i].as_slice());
@@ -1191,8 +1221,9 @@ impl Model {
                     state.key.remember_bf16(seq.position, s.kv_width(), &k_batch);
                     state.value.remember_bf16(seq.position, s.kv_width(), &v_batch);
                 }
-                attention
+                (attention, false)
             };
+            phase(1);
             let mut inputs = Vec::new();
             let mut mixed = Vec::new();
             let mut messages_batch = Vec::new();
@@ -1201,12 +1232,12 @@ impl Model {
             for (offset, (row, attn)) in rows.iter_mut().zip(attention.chunks_exact(s.hidden)).enumerate() {
                 let position = seq.position + offset;
                 let ForwardRow { x, blocks, messages, .. } = row;
-                let mut residual = layer
-                    .attn_conv
-                    .run(&mut state.attention, attn, None, position, s.dim);
-                if id % s.block == 0 {
+                let mut residual = if residual_ready { attn.to_vec() } else {
+                    layer.attn_conv.run(&mut state.attention, attn, None, position, s.dim)
+                };
+                if block_start {
                     blocks.push(normalized(x, None, s.eps));
-                } else {
+                } else if !residual_ready {
                     residual.iter_mut().zip(x.iter()).for_each(|(v, &x)| *v += x);
                 }
                 let mut mlp_in = mix(blocks, &residual, &layer.res_mlp, s.eps).remove(0);
@@ -1251,6 +1282,7 @@ impl Model {
                     layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
                 }).collect(),
             };
+            phase(2);
             let mut moe = if matches!(readout, Readout::Verify(_)) {
                 let mut output = Vec::with_capacity(rows.len()*s.hidden);
                 for (x, route) in activations.iter().zip(&routes) {
@@ -1266,6 +1298,7 @@ impl Model {
                 (s.gate_cap, s.up_cap),
                 s.experts,
             )? };
+            phase(3);
             for (offset, ((row, residual), moe)) in rows.iter_mut().zip(residuals).zip(moe.chunks_exact_mut(s.hidden)).enumerate()
             {
                 moe.iter_mut().for_each(|v| *v = round(*v));
@@ -1274,6 +1307,11 @@ impl Model {
                     .run(&mut state.mlp, moe, None, seq.position + offset, s.dim);
                 row.x = residual.into_iter().zip(mlp).map(|(a, b)| round(a + b)).collect();
             }
+            phase(4);
+        }
+        if phase_start.is_some() {
+            let [qkv_input, attention, routing, experts, mlp_residual] = timings.map(|time| time.as_secs_f64() * 1e3);
+            crate::eprintln!("Inkling prefill {} rows: QKV input {qkv_input:.2} ms, attention {attention:.2} ms, routing {routing:.2} ms, experts {experts:.2} ms, MLP residual {mlp_residual:.2} ms", rows.len());
         }
         let normalize = |row: &ForwardRow| {
             let x = mix(&row.blocks, &row.x, &self.query_final, s.eps).remove(0);

@@ -666,6 +666,37 @@ extern "C" cudaError_t blz_inkling_prefill_conv(const uint16_t* key, const uint1
 
 namespace {
 
+__global__ void residual_conv(const __nv_bfloat16* raw, const __nv_bfloat16* previous,
+        const float* weights, float* out, int width, int taps, int history, float scale) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (col >= width) return;
+    const auto* current = raw + size_t(history + row) * width + col;
+    float value = __bfloat162float(*current);
+    const int count = min(taps, history + row + 1);
+    for (int lag = 0; lag < count; ++lag) {
+        value = __fadd_rn(value, __fmul_rn(__bfloat162float(current[-lag * width]), weights[lag * width + col]));
+    }
+    value = __bfloat162float(__float2bfloat16(value * scale));
+    const size_t index = size_t(row) * width + col;
+    out[index] = previous ? value + __bfloat162float(previous[index]) : value;
+}
+
+} // namespace
+
+extern "C" cudaError_t blz_inkling_residual_conv(const uint16_t* raw, const uint16_t* previous,
+        const float* weights, float* out, int width, int taps, int history, int rows, float scale,
+        cudaStream_t stream) {
+    if (width < 1 || taps < 1 || history < 0 || history >= taps || rows < 1 || rows > 65535)
+        return cudaErrorInvalidValue;
+    residual_conv<<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(raw), reinterpret_cast<const __nv_bfloat16*>(previous),
+        weights, out, width, taps, history, scale);
+    return cudaGetLastError();
+}
+
+namespace {
+
 __global__ void dspark_norm_rope(__nv_bfloat16* x, int stride, const __nv_bfloat16* norm,
                                   const float* freq, int start, int* slots, int capacity) {
     const int row = blockIdx.y;

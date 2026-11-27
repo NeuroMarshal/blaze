@@ -653,6 +653,8 @@ unsafe extern "C" {
         gate: *mut u16, relative: *mut u16, sink: *mut u16, rows: c_int, heads: c_int,
         rel_width: c_int, start: c_int, clip: f32, rel_clip: f32, log_floor: f32, log_alpha: f32,
         stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_residual_conv(raw: *const u16, previous: *const u16, weights: *const f32, out: *mut f32,
+        width: c_int, taps: c_int, history: c_int, rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_dspark_attention(q: *const u16, stride: c_int, rows: c_int, keys: *const u8, values: *const u8,
                                 ks: *const u8, vs: *const u8, sinks: *const u16, gate: *const u16,
                                 out: *mut u16, scratch: *mut f32, heads: c_int, kv_heads: c_int, capacity: c_int,

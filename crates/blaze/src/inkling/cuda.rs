@@ -1588,6 +1588,13 @@ pub(super) struct AttentionClip<'a> {
     pub log_alpha: f32,
 }
 
+pub(super) struct AttentionResidual<'a> {
+    pub weights: &'a DevBuf,
+    pub history: &'a [u16],
+    pub previous: &'a [&'a [f32]],
+    pub scale: f32,
+}
+
 impl AttentionRow<'_> {
     fn fields(&self) -> [&[u16]; 6] {
         [&self.q, self.gate, self.sink, &self.relative, &self.key, &self.value]
@@ -1635,8 +1642,8 @@ impl AttentionScratch {
     pub fn project_attention<const N: usize>(
         &mut self, gpu: &mut Compute, kv: &Kv, matrices: [&Dense; N], inputs: [&[&[f32]]; N],
         bias: &Dense, output: &Dense, start: usize, conv: AttentionConv<'_>, clip: AttentionClip<'_>,
-        tail: usize,
-    ) -> Result<(Vec<f32>, [Vec<u16>; 2])> {
+        tail: usize, residual: AttentionResidual<'_>,
+    ) -> Result<(Vec<f32>, [Vec<u16>; 3])> {
         let rows = inputs[0].len();
         let history = (conv.taps - 1).min(start);
         let width = self.kv_heads * HEAD_DIM;
@@ -1650,17 +1657,33 @@ impl AttentionScratch {
         let sink_values = rows * self.heads;
         let slot_offset = (2 * q_values + rel_values + sink_values).next_multiple_of(2) / 2;
         let attention_values = rows * output.rows;
-        let tail = rows.min(tail) * width;
+        let history_res = residual.history.len();
+        let [tail, attention_tail] = [tail * width, tail * output.rows];
+        let slots_end = 4 * (history_values + rows);
+        let res_at = slots_end + 2 * history_res;
+        let add_previous = !residual.previous.is_empty();
+        let stage_end = res_at + 2 * usize::from(add_previous) * attention_values;
+        let raw_end = history_res + attention_values;
+        let tail_values = 2 * tail + attention_tail;
         ensure!((slot_offset + rows) * 4 <= self.input.bytes()
-            && attention_values * 2 <= gpu.input.bytes()
-            && (attention_values + 2 * tail) * 2 <= gpu.transfer.bytes(),
+            && stage_end.max(tail_values * 2) <= self.staging.bytes()
+            && (raw_end + usize::from(add_previous) * attention_values) * 2 <= gpu.input.bytes()
+            && attention_values * 4 <= gpu.result.bytes().min(gpu.transfer.bytes())
+            && (!add_previous || (residual.previous.len() == rows
+                && residual.previous.iter().all(|row| row.len() == output.rows))),
             "Inkling device attention exceeds scratch");
         let staging = self.staging.host_slice_mut();
         for (dst, src) in staging[..4 * history_values].chunks_exact_mut(2).zip(conv.history.into_iter().flatten()) {
             dst.copy_from_slice(&src.to_ne_bytes());
         }
-        for (i, dst) in staging[4 * history_values..4 * (history_values + rows)].chunks_exact_mut(4).enumerate() {
+        for (i, dst) in staging[4 * history_values..slots_end].chunks_exact_mut(4).enumerate() {
             dst.copy_from_slice(&(((start + i) % kv.capacity) as i32).to_ne_bytes());
+        }
+        for (dst, src) in staging[slots_end..res_at].chunks_exact_mut(2).zip(residual.history) {
+            dst.copy_from_slice(&src.to_ne_bytes());
+        }
+        for (dst, &src) in staging[res_at..stage_end].chunks_exact_mut(2).zip(residual.previous.iter().copied().flatten()) {
+            dst.copy_from_slice(&to_bf16(src).to_ne_bytes());
         }
         let work = (|| -> Result<()> {
             let projections = gpu.enqueue_projections(matrices, offsets, size, rows, false, prefix)?;
@@ -1707,23 +1730,40 @@ impl AttentionScratch {
                     q.wrapping_add(query_offset), gate.wrapping_add(query_offset), sink.wrapping_add(first * self.heads),
                     relative.wrapping_add(first * self.heads * clip.relative),
                 ], bias, pos, count, false)?;
-                output.run_decode_rows(gpu, self.attended.ptr(), gpu.input.at(first * output.rows), count)?;
+                output.run_decode_rows(gpu, self.attended.ptr(), gpu.input.at(history_res + first * output.rows), count)?;
             }
-            gpu.queue_result::<u16>(gpu.input.ptr(), attention_values)?;
+            let previous: *mut u16 = if add_previous { gpu.input.at(raw_end) } else { null_mut() };
+            for (dst, src, count) in [
+                (gpu.input.ptr(), slots_end, history_res),
+                (previous, res_at, usize::from(add_previous) * attention_values),
+            ].into_iter().filter(|&(_, _, count)| count > 0) {
+                check(unsafe { sys::cudaMemcpyAsync(dst.cast(), host.cast::<u8>().add(src).cast(),
+                    count * 2, sys::MEMCPY_H2D, gpu.stream.0) }, "Inkling residual convolution inputs")?;
+            }
             for (i, &raw) in projections[1..3].iter().enumerate().filter(|_| tail > 0) {
-                let host = gpu.transfer.host_ptr().cast_mut().cast::<u16>();
-                check(unsafe { sys::cudaMemcpyAsync(host.add(attention_values + i * tail).cast(),
+                check(unsafe { sys::cudaMemcpyAsync(host.cast_mut().add(i * tail).cast(),
                     raw.add(rows * width - tail).cast(), tail * 2, sys::MEMCPY_D2H, gpu.stream.0) },
                     "Inkling KV convolution tail")?;
             }
-            Ok(())
+            check(unsafe {
+                sys::blz_inkling_residual_conv(gpu.input.ptr(), previous, residual.weights.ptr(), gpu.result.ptr(),
+                    output.rows as i32, conv.taps as i32, (history_res / output.rows) as i32, rows as i32,
+                    residual.scale, gpu.stream.0)
+            }, "Inkling prefill residual convolution")?;
+            if attention_tail > 0 {
+                check(unsafe { sys::cudaMemcpyAsync(host.cast_mut().add(2 * tail).cast(),
+                    gpu.input.at::<u16>(raw_end - attention_tail).cast(), attention_tail * 2,
+                    sys::MEMCPY_D2H, gpu.stream.0) }, "Inkling residual convolution tail")?;
+            }
+            gpu.queue_result::<f32>(gpu.result.ptr(), attention_values)
         })();
         let synced = gpu.stream.sync();
         work?;
         synced?;
-        let result = gpu.read_result::<u16>(attention_values + 2 * tail);
-        let (attention, history) = result.split_at(attention_values);
-        Ok((attention.iter().copied().map(from_bf16).collect(), [history[..tail].to_vec(), history[tail..].to_vec()]))
+        let history = unsafe { std::slice::from_raw_parts(self.staging.host_ptr().cast::<u16>(), tail_values) };
+        Ok((gpu.read_result(attention_values), [
+            history[..tail].to_vec(), history[tail..2 * tail].to_vec(), history[2 * tail..].to_vec(),
+        ]))
     }
 
     fn attend_tile(
