@@ -213,7 +213,68 @@ uint32_t HybridMoe::layer_calls() const {
 }
 
 uint8_t* HybridMoe::gpu_slot(Tier tier, int slot) const {
+  if (tier == Tier::kGpu0 && slot >= capacity_[0]) return extra_pool_ + size_t(slot - capacity_[0]) * stride_;
   return (tier == Tier::kGpu0 ? pool0_ : pool1_) + size_t(slot) * stride_;
+}
+
+cudaError_t HybridMoe::reserve_extra_gpu(size_t bytes, cudaStream_t stream) {
+  if (cfg_.gpu1 >= 0 || !ram_ || cfg_.defer_last >= 0) return cudaSuccess;
+  std::lock_guard<std::mutex> lock(swap_mu_);
+  const size_t old_count = extra_experts_.size(), requested = bytes / stride_;
+  const size_t available = std::count(placement_.tier.begin(), placement_.tier.end(), Tier::kRam) + old_count;
+  const size_t count = std::min(requested, available);
+  if (count == old_count || (count > old_count && (count - old_count) * stride_ < (64u << 20)))
+    return cudaSuccess;
+  cudaError_t err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) return err;
+
+  // The extra GPU records have RAM backing for immediate eviction at a request boundary.
+  std::vector<int32_t> slots(placement_.tier.size(), -1);
+  for (size_t i = 0; i < slots.size(); ++i) {
+    if (placement_.tier[i] == Tier::kGpu0 && placement_.slot[i] < capacity_[0]) slots[i] = placement_.slot[i];
+    else if (placement_.tier[i] == Tier::kSsd) slots[i] = kSlotSsd;
+  }
+  if (old_count) {
+    err = cudaMemcpy(slot0_dev_, slots.data(), slots.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
+    err = cudaFree(extra_pool_);
+    if (err != cudaSuccess) return err;
+    extra_pool_ = nullptr;
+    for (const size_t i : extra_experts_) {
+      placement_.tier[i] = Tier::kRam;
+      placement_.slot[i] = int((host_records_[i] - ram_) / stride_);
+    }
+    extra_experts_.clear();
+  }
+  if (!count) return cudaSuccess;
+
+  std::vector<size_t> hot;
+  for (size_t i = 0; i < score_.size(); ++i)
+    if (!loading_[i] && placement_.tier[i] == Tier::kRam) hot.push_back(i);
+  select(hot, score_, count, true, cfg_.rank_experts);
+  if (hot.empty()) return cudaSuccess;
+  uint8_t* pool = nullptr;
+  err = cudaMalloc(&pool, hot.size() * stride_);
+  if (err == cudaErrorMemoryAllocation) {
+    cudaGetLastError();
+    return cudaSuccess;
+  }
+  if (err != cudaSuccess) return err;
+  for (size_t k = 0; k < hot.size() && err == cudaSuccess; ++k) {
+    slots[hot[k]] = capacity_[0] + int(k);
+    err = cudaMemcpyAsync(pool + k * stride_, host_records_[hot[k]], stride_, cudaMemcpyHostToDevice, swap_stream_[0]);
+  }
+  if (err == cudaSuccess) err = cudaStreamSynchronize(swap_stream_[0]);
+  if (err == cudaSuccess)
+    err = cudaMemcpy(slot0_dev_, slots.data(), slots.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    cudaFree(pool);
+    return err;
+  }
+  extra_pool_ = pool;
+  extra_experts_ = std::move(hot);
+  for (const size_t i : extra_experts_) placement_.tier[i] = Tier::kGpu0, placement_.slot[i] = slots[i];
+  return cudaSuccess;
 }
 
 // Both planning tables live on GPU0: one 4-byte copy per entry from its own staging word, then one sync.
@@ -265,7 +326,7 @@ void HybridMoe::swap_gpu_ram(int max_moves) {
     if (loading_[i]) continue;
     const Tier t = placement_.tier[i];
     if (t == Tier::kRam) hot.push_back(i);
-    else if (t == Tier::kGpu0 || t == Tier::kGpu1) cold.push_back(i);
+    else if ((t == Tier::kGpu0 && placement_.slot[i] < capacity_[0]) || t == Tier::kGpu1) cold.push_back(i);
   }
   select(hot, score_, size_t(max_moves), true, cfg_.rank_experts);
   select(cold, score_, size_t(max_moves), false, cfg_.rank_experts);

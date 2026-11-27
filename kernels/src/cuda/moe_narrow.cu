@@ -598,7 +598,7 @@ __device__ __forceinline__ void mma_s8s8(int32_t (&d)[4], uint32_t a0, uint32_t 
                : "r"(a0), "r"(a1), "r"(b), "r"(0));
 }
 
-template <bool kDown>
+template <bool kDown, bool kExtra = false>
 __global__ void __launch_bounds__(32 * kKSplit) rows_mma_kernel(blz_moe_layer layer, blz_moe_workspace ws) {
   __shared__ int64_t red[kKSplit - 1][32][4];
   const blz_moe_plan* plan = ws.plan;
@@ -611,7 +611,10 @@ __global__ void __launch_bounds__(32 * kKSplit) rows_mma_kernel(blz_moe_layer la
   const int ncols = it.ncols;
   const int blocks = kDown ? geo.d_blocks() : geo.gu_blocks();
   const int k_dim = kDown ? layer.inter : layer.hidden;
-  const uint8_t* group = layer.pool + int64_t(it.slot) * layer.slot_stride + (kDown ? geo.gu_bytes() : 0) +
+  const bool extra = kExtra && it.slot >= layer.base_slots;
+  const auto* pool = extra ? layer.extra_pool : layer.pool;
+  const int slot = extra ? it.slot - layer.base_slots : it.slot;
+  const uint8_t* group = pool + int64_t(slot) * layer.slot_stride + (kDown ? geo.gu_bytes() : 0) +
                          expert::unit_offset(g, 0, blocks);
   const int col = min(lane >> 2, ncols - 1);  // padding columns repeat the last one (not stored)
   const uint8_t* planes = kDown ? ws.h_planes + (size_t(item_idx) * kMaxCols + col) * 3 * layer.inter
@@ -680,7 +683,10 @@ template <bool kDown>
 void launch_rows(int groups, int max_items, int tokens, const blz_moe_layer& layer, const blz_moe_workspace& ws,
                  cudaStream_t stream) {
   (void)tokens;
-  rows_mma_kernel<kDown><<<dim3(groups, max_items), 32 * kKSplit, 0, stream>>>(layer, ws);
+  if (layer.extra_pool)
+    rows_mma_kernel<kDown, true><<<dim3(groups, max_items), 32 * kKSplit, 0, stream>>>(layer, ws);
+  else
+    rows_mma_kernel<kDown><<<dim3(groups, max_items), 32 * kKSplit, 0, stream>>>(layer, ws);
 }
 
 }  // namespace

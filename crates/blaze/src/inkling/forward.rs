@@ -498,6 +498,7 @@ pub struct Model {
     context: usize,
     global_kv_host: bool,
     kv_dtype: KvDtype,
+    elastic_experts: bool,
     vision: Option<Vision>,
     prefill_chunk: usize,
 }
@@ -690,6 +691,8 @@ impl Model {
             super::dflash::Draft::load(path, &device.compute, device.id, ckpt.bytes("model.llm.embed.weight")?,
                 &norm_embed, s.vocab, s.unpadded_vocab, loops.visits.len(), context, prefill_chunk)
         }).transpose()?;
+        let elastic_experts = gpus == 1 && expert_cache_mib == 0 && !host_kv && draft.is_none()
+            && draft_path.is_none() && vision.is_none();
         Ok(Self {
             executor,
             draft,
@@ -707,6 +710,7 @@ impl Model {
             context,
             global_kv_host: host_kv,
             kv_dtype,
+            elastic_experts,
             vision,
             prefill_chunk,
         })
@@ -737,6 +741,14 @@ impl Model {
         let s = &self.cfg;
         let slack = self.draft_limit();
         let kv_slack = (prefill_attention_rows(self.prefill_chunk) - 1).max(slack);
+        if self.elastic_experts {
+            let rows = |length: usize| self.loops.visits.iter().map(|visit| {
+                if self.loops.is_local(visit.layer) { length.min(self.loops.window + kv_slack) } else { length }
+            }).sum::<usize>();
+            let bytes = 2 * Kv::row_bytes(s.kv_heads, self.kv_dtype);
+            gpu::set_device(self.devices[0].id)?;
+            self.devices[0].compute.use_idle_kv_budget(rows(capacity) * bytes, rows(self.context) * bytes)?;
+        }
         let visits = self
             .loops
             .visits

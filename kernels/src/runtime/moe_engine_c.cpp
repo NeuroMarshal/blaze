@@ -56,6 +56,18 @@ extern "C" int blz_moe_engine_layers(const blz_moe_engine* e) { return e->moe->n
 extern "C" int blz_moe_engine_hidden(const blz_moe_engine* e) { return e->moe->geometry().hidden; }
 extern "C" uint64_t blz_moe_engine_cpu_routes(const blz_moe_engine* e) { return e->moe->cpu_routes(); }
 
+extern "C" size_t blz_moe_engine_extra_gpu_bytes(const blz_moe_engine* e) { return e->moe->extra_gpu_bytes(); }
+
+extern "C" cudaError_t blz_moe_engine_reserve_extra_gpu(blz_moe_engine* e, size_t bytes, cudaStream_t stream) {
+  try {
+    return e->moe->reserve_extra_gpu(bytes, stream);
+  } catch (const std::bad_alloc&) {
+    return cudaErrorMemoryAllocation;
+  } catch (...) {
+    return cudaErrorUnknown;
+  }
+}
+
 extern "C" cudaError_t blz_moe_engine_forward(blz_moe_engine* e, int layer, const uint16_t* x, int tokens,
                                               const int32_t* ids, const float* w, uint16_t* out, cudaStream_t stream) {
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;

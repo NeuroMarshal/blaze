@@ -30,6 +30,15 @@ impl MoeEngine {
         unsafe { sys::blz_moe_engine_cpu_routes(self.0) }
     }
 
+    pub(crate) fn use_idle_kv_budget(&self, requested: usize, maximum: usize, stream: &Stream) -> Result<()> {
+        const HEADROOM: usize = 384 << 20;
+        let (free, _) = crate::gpu::mem_info()?;
+        let previous = unsafe { sys::blz_moe_engine_extra_gpu_bytes(self.0) };
+        let budget = free.saturating_add(previous).saturating_sub(requested).saturating_sub(HEADROOM)
+            .min(maximum.saturating_sub(requested));
+        check(unsafe { sys::blz_moe_engine_reserve_extra_gpu(self.0, budget, stream.0) }, "resize expert cache")
+    }
+
     pub(crate) fn packed(
         directory: &Path, layers: Range<usize>, device: i32, budget: usize, top_k: usize,
         threads: usize, chunk: usize, stream_gpu_only: bool, all_resident: bool, device_routes: bool, caps: (f32, f32),

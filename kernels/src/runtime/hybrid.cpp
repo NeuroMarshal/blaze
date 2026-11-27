@@ -199,7 +199,7 @@ HybridMoe::~HybridMoe() {
   gpu1_.reset();
   cpu_.reset();
   cudaSetDevice(cfg_.gpu0);
-  cudaFree(pool0_), cudaFree(slot0_dev_), cudaFree(slot1_dev_), cudaFree(mult0_), cudaFree(heat_dev_);
+  cudaFree(pool0_), cudaFree(extra_pool_), cudaFree(slot0_dev_), cudaFree(slot1_dev_), cudaFree(mult0_), cudaFree(heat_dev_);
   cudaFree(ws_mem_), cudaFree(counters_);
   for (cudaStream_t st : {swap_stream_[0], d2h_stream_[0]})
     if (st) cudaStreamDestroy(st);
@@ -310,7 +310,9 @@ cudaError_t HybridMoe::forward(int layer, const uint16_t* x, int tokens, const i
                         cfg_.defer_ssd_rank >= 0 ? cfg_.defer_ssd_rank : cfg_.defer_min_rank,
                         cfg_.gate_cap,
                         cfg_.up_cap,
-                        resident_only()};
+                        resident_only(),
+                        extra_pool_,
+                        capacity_[0]};
   const bool deferral = cfg_.defer_last >= 0;
   cudaError_t err = deferral ? blz_moe_defer_collect(geo.hidden, tokens, &ws_, stream) : cudaSuccess;
   if (err != cudaSuccess) return err;

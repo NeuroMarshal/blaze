@@ -540,6 +540,8 @@ unsafe extern "C" {
     pub fn blz_moe_engine_destroy(e: *mut blz_moe_engine);
     pub fn blz_moe_engine_layers(e: *const blz_moe_engine) -> c_int;
     pub fn blz_moe_engine_cpu_routes(e: *const blz_moe_engine) -> u64;
+    pub fn blz_moe_engine_extra_gpu_bytes(e: *const blz_moe_engine) -> usize;
+    pub fn blz_moe_engine_reserve_extra_gpu(e: *mut blz_moe_engine, bytes: usize, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_moe_engine_forward(e: *mut blz_moe_engine, layer: c_int, x: *const bf16, tokens: c_int, ids: *const i32,
                                   w: *const f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
 }

@@ -158,6 +158,8 @@ class HybridMoe {
   uint64_t cpu_requests() const { return cpu_ ? cpu_->served() : 0; }
   uint64_t gpu1_requests() const { return gpu1_ ? gpu1_->served() : 0; }
   HybridStats stats() const;
+  size_t extra_gpu_bytes() const { return extra_experts_.size() * stride_; }
+  cudaError_t reserve_extra_gpu(size_t bytes, cudaStream_t stream);
 
  private:
   bool resident_only() const {
@@ -195,6 +197,8 @@ class HybridMoe {
   int capacity_[3] = {0, 0, 0};    // slots per tier (GPU0, GPU1, RAM)
   // GPU0
   uint8_t* pool0_ = nullptr;
+  uint8_t* extra_pool_ = nullptr;
+  std::vector<size_t> extra_experts_;
   int32_t* slot0_dev_ = nullptr;   // [L][E]
   int32_t* slot1_dev_ = nullptr;   // [L][E] on GPU0 (planning view of GPU1 residency)
   float* mult0_ = nullptr;         // [L][E][3]

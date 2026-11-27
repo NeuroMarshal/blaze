@@ -41,6 +41,8 @@ void blz_moe_engine_destroy(blz_moe_engine* e);
 int blz_moe_engine_layers(const blz_moe_engine* e);
 int blz_moe_engine_hidden(const blz_moe_engine* e);
 uint64_t blz_moe_engine_cpu_routes(const blz_moe_engine* e);
+size_t blz_moe_engine_extra_gpu_bytes(const blz_moe_engine* e);
+cudaError_t blz_moe_engine_reserve_extra_gpu(blz_moe_engine* e, size_t bytes, cudaStream_t stream);
 
 /// \brief out[t] = sum_k w[t][k] * expert_{ids[t][k]}(x[t]) for one MoE layer of `tokens` tokens.
 /// x, out: [tokens, hidden] bf16; ids: [tokens, topk] int32; w: [tokens, topk] float; device pointers on gpu0.

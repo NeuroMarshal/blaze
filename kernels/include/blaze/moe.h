@@ -71,6 +71,8 @@ typedef struct {
   int32_t defer_ssd_rank;
   float gate_cap, up_cap;
   int resident;
+  const uint8_t* extra_pool;
+  int base_slots;
 } blz_moe_layer;
 
 /// \brief Expert-deferral state (KTransformers' Expert Deferral, applied to the CPU tier): a layer call whose CPU

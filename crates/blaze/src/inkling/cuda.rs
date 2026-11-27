@@ -803,6 +803,13 @@ impl Compute {
         self.experts.as_ref().map_or(0, MoeEngine::cpu_routes)
     }
 
+    pub(super) fn use_idle_kv_budget(&self, requested: usize, maximum: usize) -> Result<()> {
+        if let Some(experts) = &self.experts {
+            experts.use_idle_kv_budget(requested, maximum, &self.stream)?;
+        }
+        Ok(())
+    }
+
     pub fn enqueue_controller(
         &self, down: &Dense, up: &Dense, norm: *const f32, x: *const f32, message: *const f32,
         output: *mut u16, width: usize, rows: usize, eps: f32, capture: bool,
