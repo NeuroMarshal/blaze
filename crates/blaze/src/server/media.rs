@@ -207,6 +207,26 @@ pub(super) fn load_url(cfg: &MmConfig, url: &str, deadline: Instant) -> std::res
     Err("the image URL must be a data: URL (base64) or an http(s) URL".into())
 }
 
+pub(super) fn load_images(
+    cfg: &MmConfig,
+    urls: &[(String, Option<String>)],
+    deadline: Instant,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut loaded = Vec::with_capacity(urls.len());
+    for batch in urls.chunks(FETCH_PARALLEL) {
+        std::thread::scope(|scope| {
+            let reads: Vec<_> = batch.iter().map(|(url, _)| {
+                scope.spawn(move || load_url(cfg, url, deadline))
+            }).collect();
+            for read in reads {
+                loaded.push(read.join().map_err(|_| "image download failed".to_string())??);
+            }
+            Ok::<_, String>(())
+        })?;
+    }
+    Ok(loaded)
+}
+
 /// The images of a request body: counted against the per-prompt limit, loaded, sized. Empty for a text-only request.
 /// The tokens the images will take are checked against the context before anything is decoded.
 pub(super) async fn gather(st: &Arc<AppState>, body: &Value) -> Checked<Vec<Part>> {
@@ -233,24 +253,11 @@ pub(super) async fn gather(st: &Arc<AppState>, body: &Value) -> Checked<Vec<Part
     let st2 = st.clone();
     let parts = tokio::task::spawn_blocking(move || -> Checked<Vec<Part>> {
         let cfg = &st2.mm;
-        // the downloads FETCH_PARALLEL at a time, within one time limit for the request (four of one image's)
         let deadline = Instant::now() + cfg.fetch_timeout * 4;
-        let mut loaded: Vec<std::result::Result<Vec<u8>, String>> = Vec::with_capacity(urls.len());
-        for batch in urls.chunks(FETCH_PARALLEL) {
-            let got: Vec<_> = std::thread::scope(|sc| {
-                let hs: Vec<_> = batch.iter().map(|(u, _)| sc.spawn(move || load_url(cfg, u, deadline))).collect();
-                hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("image download failed".into()))).collect()
-            });
-            let failed = got.iter().any(|r| r.is_err());
-            loaded.extend(got);
-            if failed {
-                break;
-            }
-        }
+        let loaded = load_images(cfg, &urls, deadline).map_err(|e| bad_param("messages", e))?;
         let mut parts = Vec::new();
         let mut tokens = 0usize;
         for ((_, detail), bytes) in urls.into_iter().zip(loaded) {
-            let bytes = bytes.map_err(|e| bad_param("messages", e))?;
             let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
                 .with_guessed_format()
                 .map_err(|e| bad_param("messages", format!("cannot read the image: {e}")))?

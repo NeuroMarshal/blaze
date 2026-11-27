@@ -1,3 +1,28 @@
+/// Rows of the last target step to extend the draft over, for one sequence.
+#[derive(Clone, Debug)]
+pub struct DraftItem {
+    /// sequence row (the draft's KV ring)
+    pub row: usize,
+    /// first row of the item in the last target step (its captured hidden states)
+    pub aux_row: usize,
+    /// the token after each extended row (the target's input at the next position)
+    pub tokens: Vec<i64>,
+    /// position of the first extended row
+    pub pos0: usize,
+}
+
+/// One draft call: extend every item, then draft `k` tokens after each (0: extend only), or with `tree` = (K, D) a
+/// tree of depth D with K frontier rows per item instead of the chain.
+#[derive(Clone, Debug, Default)]
+pub struct DraftPlan {
+    pub items: Vec<DraftItem>,
+    pub k: usize,
+    pub tree: Option<(usize, usize)>,
+    /// MTP head: per item the token ids its draft head may propose (ascending; empty: the whole vocabulary). Parallel to
+    /// `items` or empty.
+    pub cands: Vec<Vec<i32>>,
+}
+
 /// Prompt-lookup draft: the longest suffix of `ctx` of max_n .. min_n tokens that occurred earlier (most recent
 /// occurrence, within the last 64K tokens), and up to k tokens that followed it.
 pub fn propose(ctx: &[i64], max_n: usize, min_n: usize, k: usize) -> Vec<i64> {
@@ -24,25 +49,15 @@ pub fn propose(ctx: &[i64], max_n: usize, min_n: usize, k: usize) -> Vec<i64> {
     Vec::new()
 }
 
-pub(crate) fn match_picks<T: Eq + Copy>(draft: &[T], picks: &[T]) -> (usize, T) {
-    debug_assert_eq!(picks.len(), draft.len() + 1);
-    let kept = draft
-        .iter()
-        .zip(picks)
-        .take_while(|(proposal, pick)| proposal == pick)
-        .count();
-    (kept, picks[kept])
-}
-
-pub(crate) fn match_chain<T: Eq + Copy, E>(
+pub(crate) fn match_picks<T: Eq + Copy>(
     draft: &[T],
-    mut pending: T,
-    mut predict: impl FnMut(T) -> Result<T, E>,
-) -> Result<(usize, T), E> {
+    picks: impl IntoIterator<Item = T>,
+) -> (usize, T) {
+    let mut picks = picks.into_iter();
     for kept in 0..=draft.len() {
-        pending = predict(pending)?;
-        if draft.get(kept) != Some(&pending) {
-            return Ok((kept, pending));
+        let pick = picks.next().expect("one target prediction per row");
+        if draft.get(kept) != Some(&pick) {
+            return (kept, pick);
         }
     }
     unreachable!("the bonus token always ends verification")
@@ -59,12 +74,10 @@ mod tests {
             (&[2, 3][..], &[2, 4, 5][..], (1, 4)),
             (&[2, 3][..], &[9, 4, 5][..], (0, 9)),
         ] {
+            let mut sampled = 0;
+            let picks = picks.iter().copied().inspect(|_| sampled += 1);
             assert_eq!(match_picks(draft, picks), expected);
-            let mut next = picks.iter().copied();
-            assert_eq!(
-                match_chain(draft, 1, |_| Ok::<_, ()>(next.next().unwrap())),
-                Ok(expected)
-            );
+            assert_eq!(sampled, expected.0 + 1);
         }
     }
 }

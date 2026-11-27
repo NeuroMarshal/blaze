@@ -849,12 +849,17 @@ impl Compute {
         unsafe { experts.forward(layer, x, rows, ids, weights, output, &self.stream) }
     }
 
-    pub fn read_device_picks(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize) -> Result<Vec<u32>> {
-        ensure!(rows * vocab * 2 <= self.result.bytes() && rows * 4 <= self.next_id.bytes(),
-            "Inkling verification head exceeds workspace");
+    fn enqueue_device_scores(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize) -> Result<()> {
+        ensure!(rows * vocab * 2 <= self.result.bytes(), "Inkling verification head exceeds workspace");
         for row in 0..rows {
             head.run_prefix(self, input.wrapping_add(row * head.cols), self.result.at(row * vocab), 1, vocab, true)?;
         }
+        Ok(())
+    }
+
+    pub fn read_device_picks(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize) -> Result<Vec<u32>> {
+        ensure!(rows * 4 <= self.next_id.bytes(), "Inkling verification picks exceed workspace");
+        self.enqueue_device_scores(head, input, vocab, rows)?;
         check(unsafe {
             sys::blz_argmax_bf16(self.result.ptr(), rows as i32, vocab as i32, vocab as i64, self.next_id.ptr(), self.stream.0)
         }, "Inkling argmax")?;
@@ -863,11 +868,12 @@ impl Compute {
         Ok(self.read_result(rows))
     }
 
-    pub fn read_device_scores(&self, head: &Dense, input: *const u16, vocab: usize) -> Result<Vec<u16>> {
-        head.run_prefix(self, input, self.result.ptr(), 1, vocab, true)?;
-        self.queue_result::<u16>(self.result.ptr(), vocab)?;
+    pub fn read_device_scores(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize) -> Result<Vec<u16>> {
+        self.enqueue_device_scores(head, input, vocab, rows)?;
+        let count = rows * vocab;
+        self.queue_result::<u16>(self.result.ptr(), count)?;
         self.stream.sync()?;
-        Ok(self.read_result(vocab))
+        Ok(self.read_result(count))
     }
 
     pub fn linear_context(&self, device: i32) -> crate::linear::LinCtx {

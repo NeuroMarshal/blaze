@@ -1,5 +1,5 @@
 use super::{Checked, bad_param, error, json, media};
-use crate::inkling::{Model, Options, generate, render_chat, tokenize_prompt};
+use crate::inkling::{Model, Options, decode_image, generate, render_chat, tokenize_decoded_prompt};
 use crate::sampler::SamplingParams;
 use crate::text::Text;
 use anyhow::{Context, Result, ensure};
@@ -33,11 +33,12 @@ struct StateData {
     max_tokens: usize,
     context: usize,
     vision: bool,
+    media: media::MmConfig,
 }
 
 struct Job {
     body: Value,
-    urls: Vec<(String, Option<String>)>,
+    images: Vec<crate::vision::RgbImage>,
     sampling: SamplingParams,
     max_tokens: usize,
     stream: bool,
@@ -73,6 +74,9 @@ pub async fn serve(config: Config) -> Result<()> {
         max_tokens: config.max_tokens,
         context: config.options.context,
         vision: config.options.max_image_tokens > 0,
+        media: media::MmConfig::new(
+            None, Default::default(), 4, 0, Duration::from_secs(5), 16 << 20, config.allowed_media_domains,
+        ),
     });
     let (ready, status) = oneshot::channel();
     let worker = std::thread::Builder::new().name("blaze-inkling".into()).spawn(move || {
@@ -91,20 +95,11 @@ pub async fn serve(config: Config) -> Result<()> {
                 return;
             }
         };
-        let cfg = media::MmConfig::new(
-            None,
-            Default::default(),
-            4,
-            0,
-            Duration::from_secs(5),
-            16 << 20,
-            config.allowed_media_domains,
-        );
         while let Some(job) = rx.blocking_recv() {
             if job.tx.is_closed() {
                 continue;
             }
-            match run_job(&mut model, &text, &config.path, &cfg, &job) {
+            match run_job(&mut model, &text, &config.path, &job) {
                 Ok(reply) => {
                     let _ = job.tx.blocking_send(reply);
                 }
@@ -235,22 +230,31 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
     let stream = body["stream"].as_bool().unwrap_or(false);
     let sampling = sampling(&body)?;
     let (tx, mut rx) = mpsc::channel(32);
-    st.tx
-        .try_send(Job {
-            body,
-            urls,
-            sampling,
-            max_tokens,
-            stream,
-            tx,
-        })
-        .map_err(|e| {
-            if matches!(e, mpsc::error::TrySendError::Full(_)) {
-                error(StatusCode::TOO_MANY_REQUESTS, "Inkling generation queue is full")
-            } else {
-                error(StatusCode::SERVICE_UNAVAILABLE, "Inkling worker is unavailable")
+    let slot = st.tx.clone().try_reserve_owned().map_err(|e| {
+        if matches!(e, mpsc::error::TrySendError::Full(_)) {
+            error(StatusCode::TOO_MANY_REQUESTS, "Inkling generation queue is full")
+        } else {
+            error(StatusCode::SERVICE_UNAVAILABLE, "Inkling worker is unavailable")
+        }
+    })?;
+    let (slot, images) = if urls.is_empty() {
+        (slot, Vec::new())
+    } else {
+        let st = st.clone();
+        tokio::task::spawn_blocking(move || -> Checked<_> {
+            let cfg = &st.media;
+            if cfg.allowed_domains.is_empty() && urls.iter().any(|(url, _)| !url.starts_with("data:")) {
+                return Err(bad_param("messages", "remote images require --allowed-media-domain"));
             }
-        })?;
+            let images = media::load_images(cfg, &urls, Instant::now() + cfg.fetch_timeout)
+                .map_err(|e| bad_param("messages", e))?
+                .iter()
+                .map(|bytes| decode_image(bytes).map_err(|e| bad_param("messages", e.to_string())))
+                .collect::<Checked<_>>()?;
+            Ok((slot, images))
+        }).await.map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("image loading failed: {e}")))??
+    };
+    slot.send(Job { body, images, sampling, max_tokens, stream, tx });
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -318,21 +322,9 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
     }
 }
 
-fn run_job(model: &mut Model, text: &Text, path: &std::path::Path, media: &media::MmConfig, job: &Job) -> Result<Reply> {
+fn run_job(model: &mut Model, text: &Text, path: &std::path::Path, job: &Job) -> Result<Reply> {
     let prompt = render_chat(path, &job.body)?;
-    let deadline = Instant::now() + media.fetch_timeout;
-    let images = job
-        .urls
-        .iter()
-        .map(|(url, _)| {
-            ensure!(
-                url.starts_with("data:") || !media.allowed_domains.is_empty(),
-                "remote images require --allowed-media-domain"
-            );
-            media::load_url(media, url, deadline).map_err(anyhow::Error::msg)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let input = tokenize_prompt(model, text, &prompt, &images)?;
+    let input = tokenize_decoded_prompt(model, text, &prompt, &job.images)?;
     let max_tokens = job.max_tokens.min(model.context().saturating_sub(input.len()));
     let names = job.body["tools"].as_array().into_iter().flatten()
         .filter_map(|tool| tool["function"]["name"].as_str())

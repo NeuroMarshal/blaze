@@ -80,30 +80,7 @@ impl DraftConfig {
     }
 }
 
-/// Rows of the last target step to extend the draft over, for one sequence.
-#[derive(Clone, Debug)]
-pub struct DraftItem {
-    /// sequence row (the draft's KV ring)
-    pub row: usize,
-    /// first row of the item in the last target step (its captured hidden states)
-    pub aux_row: usize,
-    /// the token after each extended row (the target's input at the next position)
-    pub tokens: Vec<i64>,
-    /// position of the first extended row
-    pub pos0: usize,
-}
-
-/// One draft call: extend every item, then draft `k` tokens after each (0: extend only), or with `tree` = (K, D) a
-/// tree of depth D with K frontier rows per item instead of the chain.
-#[derive(Clone, Debug, Default)]
-pub struct DraftPlan {
-    pub items: Vec<DraftItem>,
-    pub k: usize,
-    pub tree: Option<(usize, usize)>,
-    /// MTP head: per item the token ids its draft head may propose (ascending; empty: the whole vocabulary). Parallel to
-    /// `items` or empty.
-    pub cands: Vec<Vec<i32>>,
-}
+pub use crate::speculation::{DraftItem, DraftPlan};
 
 /// One item's draft tree (eagle_harness core/draft_tree.py): node n's token, path probability (the product of the
 /// draft's probabilities from the root) and parent node (-1: a child of the root). Depth 1 at [0, K), the children of

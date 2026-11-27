@@ -1,12 +1,13 @@
 //! Checkpoint MTP drafter (vLLM qwen3_5_mtp / SGLang Qwen3_5ForCausalLMMTP).
 //! A BF16 KV ring bounds draft context; target verification decides which tokens are accepted.
 
-use crate::eagle::{DraftPlan, MAX_CHAIN};
+use crate::eagle::MAX_CHAIN;
 use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, HostMapped, check};
 use crate::linear::{Cut, Linear};
 use crate::model::{HcBlock, Model, load_hc};
 use crate::quant::QuantConfig;
+use crate::speculation::DraftPlan;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, anyhow, bail};
 use blaze_sys as sys;

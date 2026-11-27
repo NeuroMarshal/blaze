@@ -1,11 +1,11 @@
 //! DFlash2 block drafter, adapted from vLLM qwen3_dflash / qwen3_dflash2.
 //! Tensor-parallel ranks merge vocabulary candidates before the selector walk.
 
-use crate::eagle::{DraftItem, DraftPlan};
 use crate::gpu::{DevBuf, HostMapped, Stream, check};
 use crate::linear::{Cut, LinCtx, Linear};
 use crate::model::Model;
 use crate::quant::QuantConfig;
+use crate::speculation::{DraftItem, DraftPlan};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, anyhow, bail};
 use blaze_sys as sys;
@@ -202,6 +202,7 @@ pub struct DFlash {
     sel_unary: DevBuf,
     sel_hproj: DevBuf,
     drafts: DevBuf,
+    draft_readback: HostMapped,
     /// the anchors of the call's blocks (in `meta`)
     anchors: *const i64,
     /// per-call metadata: written into the pinned staging at a bump offset, copied to `meta` asynchronously (the
@@ -346,6 +347,7 @@ impl DFlash {
             sel_unary: b(ns * k * 4)?,
             sel_hproj: b(ns * cfg.rank * 2)?,
             drafts: b(ns * 8)?,
+            draft_readback: HostMapped::new(ns * size_of::<i64>())?,
             anchors: std::ptr::null(),
             staging: HostMapped::new(meta_bytes)?,
             meta: b(meta_bytes)?,
@@ -407,6 +409,8 @@ impl DFlash {
         }
         // the previous call ended with a synchronization: its staging is free
         self.staged = 0;
+        let steps = self.cfg.steps();
+        let count = n * steps;
         let enqueue = (|| -> Result<()> {
             if target.features.is_some() {
                 for it in &plan.items {
@@ -416,6 +420,15 @@ impl DFlash {
             if plan.k > 0 {
                 self.block(target, &plan.items)?;
                 self.candidates(target, n)?;
+                check(unsafe {
+                    sys::cudaMemcpyAsync(
+                        self.draft_readback.host_ptr().cast_mut(),
+                        self.drafts.ptr(),
+                        count * size_of::<i64>(),
+                        sys::MEMCPY_D2H,
+                        target.stream.0,
+                    )
+                }, "DFlash draft readback")?;
             }
             Ok(())
         })();
@@ -425,9 +438,10 @@ impl DFlash {
         if plan.k == 0 {
             return Ok(vec![Vec::new(); n]);
         }
-        let steps = self.cfg.steps();
-        let d: Vec<i64> = self.drafts.download(n * steps)?;
-        Ok((0..n).map(|i| d[i * steps..(i + 1) * steps].to_vec()).collect())
+        let drafts = unsafe {
+            std::slice::from_raw_parts(self.draft_readback.host_ptr().cast::<i64>(), count)
+        };
+        Ok(drafts.chunks_exact(steps).map(<[i64]>::to_vec).collect())
     }
 
     /// K/V of one item's context rows (its last `window` ones: no query reads further back) into every layer's ring.

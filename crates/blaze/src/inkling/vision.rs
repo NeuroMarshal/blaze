@@ -179,11 +179,8 @@ impl Vision {
         })
     }
 
-    pub fn encode(&self, gpu: &Compute, bytes: &[u8]) -> Result<Vec<Vec<u16>>> {
-        let img = decode_rgb(bytes, 4096 * 4096, |r, c| if (r / 8 + c / 8) % 2 == 0 { 204 } else { 153 })
-            .map_err(anyhow::Error::msg)?;
-        ensure!(img.w <= 4096 && img.h <= 4096, "Inkling images must fit within 4096x4096");
-        let (pixel_values, height, width) = patchify(&img, self.patch, self.merge, self.max_tokens)?;
+    pub fn encode(&self, gpu: &Compute, img: &crate::vision::RgbImage) -> Result<Vec<Vec<u16>>> {
+        let (pixel_values, height, width) = patchify(img, self.patch, self.merge, self.max_tokens)?;
         let patches = height * width;
         let image_tokens = patches / (self.merge * self.merge);
         let rows = patches + 1;
@@ -274,6 +271,13 @@ impl Vision {
         let values = result.download::<u16>(image_tokens * self.proj_out.rows)?;
         Ok(values.chunks_exact(self.proj_out.rows).map(<[u16]>::to_vec).collect())
     }
+}
+
+pub(crate) fn decode_image(bytes: &[u8]) -> Result<crate::vision::RgbImage> {
+    let img = decode_rgb(bytes, 4096 * 4096, |r, c| if (r / 8 + c / 8) % 2 == 0 { 204 } else { 153 })
+        .map_err(anyhow::Error::msg)?;
+    ensure!(img.w <= 4096 && img.h <= 4096, "Inkling images must fit within 4096x4096");
+    Ok(img)
 }
 
 fn tensor(ckpt: &Checkpoint, name: &str, shape: &[usize]) -> Result<DevBuf> {

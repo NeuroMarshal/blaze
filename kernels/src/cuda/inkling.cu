@@ -149,11 +149,18 @@ __global__ void expand_bf16(const __nv_bfloat16* input, float* output, size_t va
     if (at < values) output[at] = __bfloat162float(input[at]);
 }
 
-__global__ void pack_features(const float* input, __nv_bfloat16* output, int rows, int width, int stride) {
+__global__ void pack_features(const float4* tap0, const float4* tap1, const float4* tap2, const float4* tap3,
+                              __nv_bfloat162* output, int rows, int vectors_per_row) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * width * 4) return;
-    const int row = i / (4 * width), tap = i / width % 4, col = i % width;
-    output[i] = __float2bfloat16(input[tap * stride + row * width + col]);
+    if (i >= rows * vectors_per_row) return;
+    const float4* taps[] = {tap0, tap1, tap2, tap3};
+    const int tap = blockIdx.y;
+    const int row = i / vectors_per_row;
+    const int col = i % vectors_per_row;
+    const float4 value = taps[tap][i];
+    const int dst = 2 * ((4 * row + tap) * vectors_per_row + col);
+    output[dst] = __floats2bfloat162_rn(value.x, value.y);
+    output[dst + 1] = __floats2bfloat162_rn(value.z, value.w);
 }
 
 __global__ void embed_rows(const __nv_bfloat16* input, const uint8_t* image, const float* weight,
@@ -234,8 +241,15 @@ extern "C" cudaError_t blz_inkling_expand_bf16(const uint16_t* input, float* out
     return cudaGetLastError();
 }
 
-extern "C" cudaError_t blz_pack_spec_features(const float* input, uint16_t* output, int rows, int width, int stride, cudaStream_t stream) {
-    pack_features<<<(rows * width * 4 + 255) / 256, 256, 0, stream>>>(input, reinterpret_cast<__nv_bfloat16*>(output), rows, width, stride);
+extern "C" cudaError_t blz_pack_spec_features(const float* tap0, const float* tap1, const float* tap2,
+        const float* tap3, uint16_t* output, int rows, int width, cudaStream_t stream) {
+    if (rows <= 0 || width <= 0 || width % 4 != 0) return cudaErrorInvalidValue;
+    const int vectors_per_row = width / 4;
+    const dim3 grid((rows * vectors_per_row + 255) / 256, 4);
+    pack_features<<<grid, 256, 0, stream>>>(
+        reinterpret_cast<const float4*>(tap0), reinterpret_cast<const float4*>(tap1),
+        reinterpret_cast<const float4*>(tap2), reinterpret_cast<const float4*>(tap3),
+        reinterpret_cast<__nv_bfloat162*>(output), rows, vectors_per_row);
     return cudaGetLastError();
 }
 

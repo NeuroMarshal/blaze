@@ -20,21 +20,37 @@ pub enum Input {
 }
 
 pub fn tokenize_prompt(model: &Model, text: &Text, prompt: &str, images: &[Vec<u8>]) -> Result<Vec<Input>> {
+    tokenize_with_images(model, text, prompt, images.len(), |i| model.encode_image(&images[i]))
+}
+
+pub(crate) fn tokenize_decoded_prompt(
+    model: &Model, text: &Text, prompt: &str, images: &[crate::vision::RgbImage],
+) -> Result<Vec<Input>> {
+    tokenize_with_images(model, text, prompt, images.len(), |i| model.encode_decoded_image(&images[i]))
+}
+
+fn tokenize_with_images(
+    model: &Model,
+    text: &Text,
+    prompt: &str,
+    images: usize,
+    mut encode: impl FnMut(usize) -> Result<Vec<Vec<u16>>>,
+) -> Result<Vec<Input>> {
     let ids = text.encode(prompt)?;
     let placeholder = text
         .token_id("<|unused_200054|>")
         .context("Inkling tokenizer is missing the image token")?;
     let count = ids.iter().filter(|&&id| id == placeholder).count();
     ensure!(
-        count == images.len(),
-        "expected {} image placeholders, found {count}",
-        images.len()
+        count == images,
+        "expected {images} image placeholders, found {count}",
     );
-    let mut images = images.iter();
+    let mut image_index = 0;
     let mut input = Vec::with_capacity(ids.len());
     for id in ids {
         if id == placeholder {
-            input.extend(model.encode_image(images.next().unwrap())?.into_iter().map(Input::Image));
+            input.extend(encode(image_index)?.into_iter().map(Input::Image));
+            image_index += 1;
         } else {
             input.push(Input::Token(id));
         }
@@ -105,13 +121,13 @@ pub fn generate(
     ensure!(!cancelled(), "request cancelled");
     let mut seq = model.sequence(capacity)?;
     let mut prediction = None;
-    let readout = if sampling.greedy() { Readout::Greedy } else { Readout::Scores };
+    let readout = || if sampling.greedy() { Readout::Greedy } else { Readout::Scores };
     let chunk_size = model.prefill_chunk();
     let chunks = prompt.chunks(chunk_size);
     let total_chunks = chunks.len();
     for (i, chunk) in chunks.enumerate() {
         ensure!(!cancelled(), "request cancelled");
-        if let Some(out) = model.prefill(&mut seq, chunk, if i + 1 == total_chunks { readout } else { Readout::None })? {
+        if let Some(out) = model.prefill(&mut seq, chunk, prompt.len(), if i + 1 == total_chunks { readout() } else { Readout::None })? {
             prediction = Some(out);
         }
     }
@@ -146,7 +162,9 @@ pub fn generate(
             let draft = model.draft_tokens(&seq, id, limit)?;
             draft_time += t.elapsed();
             let t = Instant::now();
-            let (kept, next) = model.verify(&mut seq, id, &draft, readout, |logits| draw(logits, sampling, &mut rng))?;
+            let mut sample = |logits: &[f32]| draw(logits, sampling, &mut rng);
+            let sample = (!sampling.greedy()).then_some(&mut sample as super::forward::SampleRow<'_>);
+            let (kept, next) = model.verify(&mut seq, id, &draft, sample)?;
             verify_time += t.elapsed();
             accepted += kept;
             drafted += draft.len();
@@ -157,7 +175,7 @@ pub fn generate(
             }
             prediction = Some(Prediction::Token(next));
         } else {
-            prediction = model.forward(&mut seq, id, readout)?;
+            prediction = model.forward(&mut seq, id, readout())?;
         }
     }
     if drafted > 0 {

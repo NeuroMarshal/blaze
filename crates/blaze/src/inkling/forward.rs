@@ -415,11 +415,12 @@ struct VisitState {
     verification: Option<[gpu::DevBuf; 4]>,
 }
 
-#[derive(Clone, Copy)]
+pub(super) type SampleRow<'a> = &'a mut dyn FnMut(&[f32]) -> u32;
+
 pub(super) enum Readout<'a> {
     None,
     Greedy,
-    Verify(&'a [u32]),
+    Verify { draft: &'a [u32], sample: Option<SampleRow<'a>> },
     Scores,
 }
 
@@ -601,8 +602,15 @@ impl Model {
         let norm_final = read_float(&ckpt, "model.llm.norm.weight", &[s.hidden])?;
         let query_final = read_float(&ckpt, "model.llm.attn_res.output_query", &[s.hidden])?;
         let residual_walk = crate::layer_walk::residual_visits(&loops.visits, loops.core.start, s.block)?;
+        let capture = if draft_path.is_some() {
+            resident::CapturePlacement::Drafter
+        } else if draft.is_some() {
+            resident::CapturePlacement::Host
+        } else {
+            resident::CapturePlacement::None
+        };
         let executor = resident::Executor::new(device, gpus, &placement, &layers, &s, prefill_chunk,
-            verify_limit > 0, &norm_embed, &norm_final, &query_final)?;
+            capture, &loops.visits, &norm_embed, &norm_final, &query_final)?;
         let mut expert_layer_start = 0;
         for rank in 0..gpus {
             let id = device + rank as i32;
@@ -781,37 +789,50 @@ impl Model {
             &self.head, anchor, x, seq.position, self.cfg.unpadded_vocab, limit)
     }
 
-    pub(super) fn verify(&mut self, seq: &mut Sequence, anchor: u32, draft: &[u32], readout: Readout,
-                         mut sample: impl FnMut(&[f32]) -> u32) -> Result<(usize, u32)> {
-        if !draft.is_empty() && matches!(readout, Readout::Greedy) {
+    pub(super) fn verify<'a>(
+        &mut self,
+        seq: &mut Sequence,
+        anchor: u32,
+        draft: &'a [u32],
+        sample: Option<SampleRow<'a>>,
+    ) -> Result<(usize, u32)> {
+        if !draft.is_empty() {
             let input: Vec<_> = std::iter::once(anchor).chain(draft.iter().copied()).map(Input::Token).collect();
-            return match self.forward_gpu(seq, &input, Readout::Verify(draft))? {
+            return match self.forward_gpu(seq, &input, Readout::Verify { draft, sample }, 0)? {
                 Some(Prediction::Verified(kept, next)) => Ok((kept, next)),
                 _ => anyhow::bail!("missing Inkling target verdict"),
             };
         }
-        crate::speculation::match_chain(draft, anchor, |token| {
-            match self.forward(seq, token, readout)? {
-                Some(Prediction::Token(id)) => Ok(id),
-                Some(Prediction::Scores(scores)) => Ok(sample(&scores)),
-                _ => anyhow::bail!("missing Inkling target prediction"),
-            }
-        })
+        let readout = if sample.is_some() { Readout::Scores } else { Readout::Greedy };
+        match (self.forward(seq, anchor, readout)?, sample) {
+            (Some(Prediction::Token(id)), _) => Ok((0, id)),
+            (Some(Prediction::Scores(scores)), Some(sample)) => Ok((0, sample(&scores))),
+            _ => anyhow::bail!("missing Inkling target prediction"),
+        }
     }
 
     pub fn encode_image(&self, bytes: &[u8]) -> Result<Vec<Vec<u16>>> {
+        self.encode_decoded_image(&super::vision::decode_image(bytes)?)
+    }
+
+    pub(super) fn encode_decoded_image(&self, image: &crate::vision::RgbImage) -> Result<Vec<Vec<u16>>> {
         let vision = self.vision.as_ref().context("Inkling vision is disabled")?;
         let device = &self.devices[*self.placement.last().unwrap()];
         gpu::set_device(device.id)?;
-        vision.encode(&device.compute, bytes)
+        vision.encode(&device.compute, image)
     }
 
     pub(super) fn forward(&mut self, seq: &mut Sequence, token: u32, readout: Readout) -> Result<Option<Prediction>> {
-        self.forward_gpu(seq, &[Input::Token(token)], readout)
+        self.forward_gpu(seq, &[Input::Token(token)], readout, 0)
     }
 
-    pub(super) fn prefill(&mut self, seq: &mut Sequence, input: &[Input], readout: Readout) -> Result<Option<Prediction>> {
-        self.forward_gpu(seq, input, readout)
+    pub(super) fn prefill(
+        &mut self, seq: &mut Sequence, input: &[Input], prompt_len: usize, readout: Readout,
+    ) -> Result<Option<Prediction>> {
+        let skip_features = self.dflash.as_ref().map_or(0, |draft| {
+            prompt_len.saturating_sub(draft.window()).saturating_sub(seq.position).min(input.len())
+        });
+        self.forward_gpu(seq, input, readout, skip_features)
     }
 }
 

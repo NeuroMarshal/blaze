@@ -106,12 +106,61 @@ impl Workspace {
     }
 }
 
+const FEATURE_VISITS: [usize; 3] = [5, 23, 41];
+
+pub(super) enum CapturePlacement {
+    None,
+    Host,
+    Drafter,
+}
+
+enum FeatureBuffer {
+    Local(DevBuf),
+    Remote(HostMapped),
+}
+
+impl FeatureBuffer {
+    fn capture(&self, stream: &Stream, source: *const f32, values: usize) -> Result<()> {
+        match self {
+            Self::Local(buffer) => queue_copy(stream, buffer.ptr(), source, values, sys::MEMCPY_D2D),
+            Self::Remote(buffer) => queue_copy(
+                stream, buffer.host_ptr().cast_mut().cast(), source, values, sys::MEMCPY_D2H,
+            ),
+        }
+    }
+
+    fn device_ptr(&self) -> *const f32 {
+        match self {
+            Self::Local(buffer) => buffer.ptr(),
+            Self::Remote(buffer) => buffer.dev_ptr(),
+        }
+    }
+}
+
+enum CapturedFeatures {
+    Host(HostMapped),
+    Drafter([FeatureBuffer; 4]),
+}
+
+impl CapturedFeatures {
+    fn capture(
+        &self, stream: &Stream, tap: usize, source: *const f32, values: usize, pitch: usize,
+    ) -> Result<()> {
+        match self {
+            Self::Host(buffer) => queue_copy(
+                stream, feature_ptr(buffer, pitch, tap), source, values, sys::MEMCPY_D2H,
+            ),
+            Self::Drafter(buffers) => buffers[tap].capture(stream, source, values),
+        }
+    }
+}
+
 pub(super) struct Executor {
     layers: Vec<LayerWeights>,
     workspace: Vec<Workspace>,
     handoff: Vec<DeviceTransfer>,
     staging: HostMapped,
-    features: Option<HostMapped>,
+    features: Option<CapturedFeatures>,
     norm_embed: DevBuf,
     norm_final: DevBuf,
     query_final: DevBuf,
@@ -135,7 +184,8 @@ impl Executor {
         layers: &[Layer],
         s: &Shape,
         chunk: usize,
-        draft: bool,
+        capture: CapturePlacement,
+        visits: &[crate::layer_walk::LayerVisit],
         norm_embed: &[f32],
         norm_final: &[f32],
         query_final: &[f32],
@@ -161,15 +211,31 @@ impl Executor {
         }
         gpu::set_device(first_device + placement[0] as i32)?;
         let norm_embed = DevBuf::from_slice(norm_embed)?;
-        gpu::set_device(first_device + placement.last().copied().unwrap() as i32)?;
+        let final_rank = *placement.last().unwrap();
+        gpu::set_device(first_device + final_rank as i32)?;
+        let feature_bytes = chunk * s.hidden * size_of::<f32>();
+        let features = match capture {
+            CapturePlacement::None => None,
+            CapturePlacement::Host => Some(CapturedFeatures::Host(HostMapped::new(4 * feature_bytes)?)),
+            CapturePlacement::Drafter => {
+                let tap = |visit: usize| -> Result<FeatureBuffer> {
+                    if placement[visits[visit].layer] == final_rank {
+                        Ok(FeatureBuffer::Local(DevBuf::new(feature_bytes)?))
+                    } else {
+                        Ok(FeatureBuffer::Remote(HostMapped::new(feature_bytes)?))
+                    }
+                };
+                let [first, middle, last] = FEATURE_VISITS;
+                let final_output = FeatureBuffer::Local(DevBuf::new(feature_bytes)?);
+                Some(CapturedFeatures::Drafter([tap(first)?, tap(middle)?, tap(last)?, final_output]))
+            }
+        };
         Ok(Self {
             layers: weights,
             workspace,
             handoff,
             staging: HostMapped::new(chunk * (2 * s.hidden + 1))?,
-            features: draft
-                .then(|| HostMapped::new(4 * 4 * chunk * s.hidden))
-                .transpose()?,
+            features,
             norm_embed,
             norm_final: DevBuf::from_slice(norm_final)?,
             query_final: DevBuf::from_slice(query_final)?,
@@ -380,8 +446,9 @@ impl Model {
         seq: &mut Sequence,
         input: &[Input],
         readout: Readout,
+        skip_features: usize,
     ) -> Result<Option<Prediction>> {
-        let result = self.enqueue_forward(seq, input, readout);
+        let result = self.enqueue_forward(seq, input, readout, skip_features);
         if result.is_err() {
             self.drain_resident();
         }
@@ -393,6 +460,7 @@ impl Model {
         seq: &mut Sequence,
         input: &[Input],
         readout: Readout,
+        skip_features: usize,
     ) -> Result<Option<Prediction>> {
         let s = &self.cfg;
         let rows = input.len();
@@ -402,7 +470,7 @@ impl Model {
                 && rows <= seq.capacity.saturating_sub(seq.position),
             "Inkling chunk exceeds workspace or sequence context"
         );
-        let verifying = matches!(readout, Readout::Verify(_));
+        let verifying = matches!(readout, Readout::Verify { .. });
         ensure!(
             !verifying || rows > 1 && self.draft_limit() > 0,
             "invalid Inkling verification block"
@@ -415,6 +483,9 @@ impl Model {
         };
         let values = chunk.values();
         let executor = &mut self.executor;
+        let features = executor.features.as_ref().filter(|_| skip_features < rows);
+        let skip_values = skip_features * s.hidden;
+        let feature_values = values - skip_values;
         let mut active = self.placement[0];
         gpu::set_device(self.devices[active].id)?;
         let width_bytes = 2 * s.hidden;
@@ -497,15 +568,11 @@ impl Model {
             let layer = &self.layers[id];
             let histories = &state.history;
             let candidate = verifying.then(|| state.verification.as_ref().unwrap());
-            if let Some(features) = &executor.features
-                && let Some(tap) = [5, 23, 41].iter().position(|&tap| tap == index)
+            if let Some(features) = features
+                && let Some(tap) = FEATURE_VISITS.iter().position(|&tap| tap == index)
             {
-                queue_copy(
-                    stream,
-                    feature_ptr(features, values, tap),
-                    workspace.hidden.ptr(),
-                    values,
-                    sys::MEMCPY_D2H,
+                features.capture(
+                    stream, tap, workspace.hidden.at(skip_values), feature_values, values,
                 )?;
             }
             depth = step.depth;
@@ -793,7 +860,6 @@ impl Model {
         let device = &self.devices[active];
         let w = &executor.workspace[active];
         let stream = &device.compute.stream;
-        let features = executor.features.as_ref();
         let mut consumed = rows;
         let mut result = None;
         if features.is_some() || !matches!(readout, Readout::None) {
@@ -815,17 +881,11 @@ impl Model {
                 w.current.ptr(),
                 null_mut(),
             )?;
-            queue_copy(
-                stream,
-                feature_ptr(features, values, 3),
-                w.current.ptr(),
-                values,
-                sys::MEMCPY_D2H,
-            )?;
+            features.capture(stream, 3, w.current.at(skip_values), feature_values, values)?;
         }
         match readout {
             Readout::None => stream.sync()?,
-            Readout::Verify(draft) => {
+            Readout::Verify { draft, sample } => {
                 chunk.normalize(
                     stream,
                     w.mixed.ptr(),
@@ -833,13 +893,24 @@ impl Model {
                     null_mut(),
                     w.input.ptr(),
                 )?;
-                let picks = device.compute.read_device_picks(
-                    &self.head,
-                    w.input.ptr(),
-                    s.unpadded_vocab,
-                    rows,
-                )?;
-                let (kept, next) = crate::speculation::match_picks(draft, &picks);
+                let (kept, next) = if let Some(sample) = sample {
+                    let scores = device.compute.read_device_scores(
+                        &self.head, w.input.ptr(), s.unpadded_vocab, rows,
+                    )?;
+                    let mut logits = Vec::with_capacity(s.unpadded_vocab);
+                    let picks = scores.chunks_exact(s.unpadded_vocab).map(|row| {
+                        logits.clear();
+                        logits.extend(row.iter().copied().map(from_bf16));
+                        cpu::softcap(&mut logits, s.logit_cap);
+                        sample(&logits)
+                    });
+                    crate::speculation::match_picks(draft, picks)
+                } else {
+                    let picks = device.compute.read_device_picks(
+                        &self.head, w.input.ptr(), s.unpadded_vocab, rows,
+                    )?;
+                    crate::speculation::match_picks(draft, picks)
+                };
                 consumed = kept + 1;
                 result = Some(Prediction::Verified(kept, next));
             }
@@ -863,7 +934,7 @@ impl Model {
                 } else {
                     let mut logits = device
                         .compute
-                        .read_device_scores(&self.head, w.input.ptr(), s.unpadded_vocab)?
+                        .read_device_scores(&self.head, w.input.ptr(), s.unpadded_vocab, 1)?
                         .into_iter()
                         .map(from_bf16)
                         .collect::<Vec<_>>();
@@ -872,21 +943,27 @@ impl Model {
                 });
             }
         }
-        if let Some(features) = features {
-            if let Some(dflash) = &mut self.dflash {
-                dflash.append(&device.compute, features, seq.position, rows, consumed)?;
-            } else if let (Some(dspark), Some(cache)) = (&self.draft, &mut seq.draft) {
+        match features {
+            Some(CapturedFeatures::Drafter(buffers)) => {
+                let pointers = std::array::from_fn(|tap| buffers[tap].device_ptr());
+                self.dflash.as_mut().unwrap().append(
+                    &device.compute, pointers, seq.position + skip_features, consumed - skip_features,
+                )?;
+            }
+            Some(CapturedFeatures::Host(buffer)) => {
                 let data = (0..consumed)
                     .map(|index| {
                         std::array::from_fn(|tap| {
-                            let row =
-                                feature_ptr(features, values, tap).wrapping_add(index * s.hidden);
+                            let row = feature_ptr(buffer, values, tap).wrapping_add(index * s.hidden);
                             unsafe { std::slice::from_raw_parts(row, s.hidden) }.to_vec()
                         })
                     })
                     .collect::<Vec<_>>();
-                dspark.append(&device.compute, cache, seq.position, &data)?;
+                self.draft.as_ref().unwrap().append(
+                    &device.compute, seq.draft.as_mut().unwrap(), seq.position, &data,
+                )?;
             }
+            None => {}
         }
         if verifying {
             self.commit_verified_history(seq, consumed)?;

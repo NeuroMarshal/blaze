@@ -609,8 +609,8 @@ unsafe extern "C" {
     pub fn blz_inkling_norm_rows(input: *const f32, weight: *const f32, full: *mut f32, rounded: *mut u16,
         rows: c_int, width: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_expand_bf16(input: *const u16, output: *mut f32, values: usize, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_pack_spec_features(input: *const f32, output: *mut u16, rows: c_int, width: c_int, stride: c_int,
-        stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_pack_spec_features(tap0: *const f32, tap1: *const f32, tap2: *const f32, tap3: *const f32,
+        output: *mut u16, rows: c_int, width: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_decode_conv(key: *const u16, value: *const u16, key_dynamic: *const u16, value_dynamic: *const u16,
         weights: *const f32, keys: *mut u16, values: *mut u16, heads: c_int, taps: c_int, history: c_int,
         past_keys: *mut u16, past_values: *mut u16, scale: f32, clip: f32, eps: f32, stream: cudaStream_t) -> cudaError_t;

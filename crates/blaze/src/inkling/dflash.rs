@@ -1,8 +1,8 @@
 use super::cuda::{Compute, Dense, to_bf16};
 use crate::dflash::{DFlash, DFlashConfig, Target};
-use crate::eagle::{DraftItem, DraftPlan};
 use crate::gpu::{self, DevBuf, HostMapped, check};
 use crate::linear::LinCtx;
+use crate::speculation::{DraftItem, DraftPlan};
 use anyhow::{Result, ensure};
 use blaze_sys as sys;
 use std::path::Path;
@@ -84,12 +84,15 @@ impl Draft {
         })
     }
 
+    pub fn window(&self) -> usize {
+        self.engine.cfg.window
+    }
+
     pub fn append(
         &mut self,
         compute: &Compute,
-        buffer: &HostMapped,
+        captures: [*const f32; 4],
         start: usize,
-        rows: usize,
         consumed: usize,
     ) -> Result<()> {
         let Self {
@@ -107,11 +110,13 @@ impl Draft {
         check(
             unsafe {
                 sys::blz_pack_spec_features(
-                    buffer.dev_ptr(),
+                    captures[0],
+                    captures[1],
+                    captures[2],
+                    captures[3],
                     features.ptr(),
                     consumed as i32,
                     *hidden as i32,
-                    (rows * *hidden) as i32,
                     stream.0,
                 )
             },
