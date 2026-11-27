@@ -855,9 +855,7 @@ impl Engine {
             }
             let cfg = crate::config::ModelConfig::load(dir)?;
             let layers = cfg.layers.len();
-            if layers < stages {
-                bail!("{layers} layers for {stages} pipeline stages");
-            }
+            let ranges = crate::layer_walk::pipeline_ranges(layers, stages, None)?;
             let width = cfg.hc.as_ref().map_or(2 * cfg.hidden, |hc| hc.count * cfg.hidden);
             let rows = opts.max_chunk.max(opts.max_seqs * opts.max_verify.max(1)).max(opts.max_seqs);
             let mut links = Vec::new();
@@ -873,7 +871,7 @@ impl Engine {
                 *r = Some(crate::model::PpRank {
                     stage: s,
                     stages,
-                    layers: s * layers / stages..(s + 1) * layers / stages,
+                    layers: ranges[s][0].clone(),
                     prev: (s > 0).then(|| links[s - 1].clone()),
                     next: (s + 1 < stages).then(|| links[s].clone()),
                     tp_rank: rank % tp,

@@ -98,9 +98,29 @@ pub(crate) fn repeated_layers(
     Ok(visits)
 }
 
+pub(crate) fn pipeline_ranges(
+    layers: usize, stages: usize, co_located: Option<Range<usize>>,
+) -> Result<Vec<Vec<Range<usize>>>> {
+    ensure!(stages > 0 && layers >= stages, "{layers} layers for {stages} pipeline stages");
+    if let Some(group) = co_located.filter(|_| stages > 1) {
+        ensure!(group.start < group.end && group.end <= layers, "invalid co-located range {group:?}");
+        ensure!(stages == 2, "co-located layer groups use two pipeline stages");
+        let outside = [0..group.start, group.end..layers].into_iter().filter(|range| !range.is_empty()).collect();
+        return Ok(vec![vec![group], outside]);
+    }
+    Ok((0..stages).map(|stage| vec![stage * layers / stages..(stage + 1) * layers / stages]).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_keeps_repeated_layers_together() -> Result<()> {
+        assert_eq!(pipeline_ranges(10, 3, None)?, [vec![0..3], vec![3..6], vec![6..10]]);
+        assert_eq!(pipeline_ranges(24, 2, Some(6..18))?, [vec![6..18], vec![0..6, 18..24]]);
+        Ok(())
+    }
 
     #[test]
     fn loop_rewinds_to_entry_and_addresses_only_previous_pass_messages() -> Result<()> {

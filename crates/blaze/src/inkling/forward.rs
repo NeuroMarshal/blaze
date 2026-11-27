@@ -552,11 +552,13 @@ impl Model {
         let q_msg = read_float(&ckpt, "model.llm.middle_cycle_cross_pass_queries", &msg_shape)?;
         let kv_msg = read_float(&ckpt, "model.llm.middle_cycle_cross_pass_kv_queries", &msg_shape)?;
         ensure!(resident::Executor::supports(&s, cfg.layers.len()), "unsupported Inkling execution geometry");
-        // Keep the entire recurrent core on one GPU. With two devices, the prelude and coda share the other GPU
-        // and forward has only two device transitions, independently of the number of loop passes.
-        let placement: Vec<_> = (0..cfg.layers.len())
-            .map(|id| usize::from(gpus == 2 && !loops.core.contains(&id)))
-            .collect();
+        let ranges = crate::layer_walk::pipeline_ranges(cfg.layers.len(), gpus, Some(loops.core.clone()))?;
+        let mut placement = vec![0; cfg.layers.len()];
+        for (rank, ranges) in ranges.into_iter().enumerate() {
+            for range in ranges {
+                placement[range].fill(rank);
+            }
+        }
         let load_rank = |rank: usize| -> Result<Vec<(usize, Layer)>> {
             gpu::set_device(device + rank as i32)?;
             placement.iter().enumerate().filter(|(_, assigned)| **assigned == rank)
