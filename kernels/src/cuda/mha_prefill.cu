@@ -25,87 +25,36 @@
 
 #include "blaze/mha.h"
 #include "blaze/nvfp4.h"
+#include "fa_tile.cuh"
 
 namespace blaze {
 namespace {
 
-constexpr int kD = 256;               // head dim
-constexpr int kTok = 16;              // query tokens per CTA: a warp's 16 MMA rows
-constexpr int kN = 32;                // positions per key tile
-constexpr int kStride = kD + 8;       // f16 per row of Q, K, V in shared memory (conflict-free ldmatrix)
-constexpr int kRawRow = kD / 2;       // code bytes of a position and side
-constexpr int kRawScale = kD / 16;    // scale bytes of a position and side
-constexpr int kChunks = 2 * (kRawRow / 16 + 1);  // 16-byte copies of a position (K and V, codes and scales)
-constexpr float kLog2e = 1.4426950408f;
-constexpr float kSlack = 8.0f;
+using fa::add_h2;
+using fa::cp16;
+using fa::cp_commit;
+using fa::cp_wait;
+using fa::dequant_block;
+using fa::kD;
+using fa::kLog2e;
+using fa::kRawRow;
+using fa::kRawScale;
+using fa::kSlack;
+using fa::kStride;
+using fa::ldsm4;
+using fa::ldsm4t;
+using fa::mma_f16;
+using fa::mma_f16h;
+using fa::pack_f16;
+
+constexpr int kTok = 16;
+constexpr int kN = 32;
+constexpr int kChunks = 2 * (kRawRow / 16 + 1);
 
 // Q [G][16][kStride], K and V [kN][kStride] in f16; raw K / V codes [kN][128] and scales [kN][16]
 template <int G>
 constexpr size_t smem_bytes() {
   return (size_t(G) * kTok + 2 * kN) * kStride * sizeof(__half) + size_t(2) * kN * (kRawRow + kRawScale);
-}
-
-__device__ __forceinline__ void cp16(void* smem, const void* gmem, bool ok) {
-  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(ok ? 16 : 0));
-}
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-__device__ __forceinline__ void cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::); }
-
-__device__ __forceinline__ void ldsm4(uint32_t (&r)[4], const __half* p) {
-  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(a));
-}
-__device__ __forceinline__ void ldsm4t(uint32_t (&r)[4], const __half* p) {
-  const uint32_t a = static_cast<uint32_t>(__cvta_generic_to_shared(p));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-               : "r"(a));
-}
-
-__device__ __forceinline__ void mma_f16(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-      "{%0,%1,%2,%3};\n"
-      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-// FP16 accumulation: twice the MMA rate of FP32 accumulation on GeForce GPUs (RTX 4060: 58 against 29 TFLOPS).
-__device__ __forceinline__ void mma_f16h(uint32_t d[2], const uint32_t a[4], uint32_t b0, uint32_t b1) {
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-               : "+r"(d[0]), "+r"(d[1])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-__device__ __forceinline__ void add_h2(float& x, float& y, uint32_t h) {
-  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h));
-  x += f.x, y += f.y;
-}
-
-__device__ __forceinline__ uint32_t pack_f16(float lo, float hi) {
-  const __half2 v = __floats2half2_rn(lo, hi);
-  return *reinterpret_cast<const uint32_t*>(&v);
-}
-
-// An E4M3 scale byte as f16x2 (both halves), exactly (cvt.rn.f16x2.e4m3x2 on SM89+).
-__device__ __forceinline__ __half2 e4m3_h2(uint8_t b) {
-  const __half2_raw r = __nv_cvt_fp8x2_to_halfraw2(__nv_fp8x2_storage_t(uint16_t(b) * 0x0101u), __NV_E4M3);
-  return *reinterpret_cast<const __half2*>(&r);
-}
-
-// Two E2M1 codes (one byte, the first in the low nibble) as f16x2.
-__device__ __forceinline__ __half2 e2m1x2_to_f16x2(uint32_t byte) {
-#if __CUDA_FP8_INTERNAL_CAN_RELY_ON_PTX_FOR_SHORTTYPESCVT__
-  const __half2_raw r = __nv_cvt_fp4x2_to_halfraw2(__nv_fp4x2_storage_t(byte & 0xff), __NV_E2M1);
-  return *reinterpret_cast<const __half2*>(&r);
-#else
-  // code s e1 e0 m into FP16 bits s << 15 | e1 e0 m << 9: times 2^14 that is the E2M1 value (0.5 a subnormal)
-  const uint32_t bits = ((byte & 0x8u) << 12) | ((byte & 0x7u) << 9) | ((byte & 0x80u) << 24) | ((byte & 0x70u) << 21);
-  return __hmul2(*reinterpret_cast<const __half2*>(&bits), __half2half2(__float2half_rn(16384.0f)));
-#endif
 }
 
 // Bench-only cuts (BLAZE_PREFILL_ABLATE builds): no dequantization, no Q K^T, no P V.
@@ -188,20 +137,9 @@ __global__ void __launch_bounds__(32 * G, 1)
     const int u = int(threadIdx.x) + 32 * G * i;
     if (u >= kUnits) return;
     const int pos = u / (kD / 16), blk = u % (kD / 16);
-    const uint2 w = *reinterpret_cast<const uint2*>((v ? rv : rk) + pos * kRawRow + 8 * blk);
-    const __half2 s2 = e4m3_h2((v ? rvs : rks)[pos * kRawScale + blk]);
-    uint4 lo, hi;
-    uint32_t* l = reinterpret_cast<uint32_t*>(&lo);
-    uint32_t* h = reinterpret_cast<uint32_t*>(&hi);
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const __half2 a = __hmul2(e2m1x2_to_f16x2(w.x >> (8 * j)), s2), b = __hmul2(e2m1x2_to_f16x2(w.y >> (8 * j)), s2);
-      l[j] = *reinterpret_cast<const uint32_t*>(&a);
-      h[j] = *reinterpret_cast<const uint32_t*>(&b);
-    }
-    __half* dst = (v ? sv : sk) + pos * kStride + 16 * blk;
-    *reinterpret_cast<uint4*>(dst) = lo;
-    *reinterpret_cast<uint4*>(dst + 8) = hi;
+    dequant_block((v ? rv : rk) + pos * kRawRow + 8 * blk,
+                  (v ? rvs : rks)[pos * kRawScale + blk],
+                  (v ? sv : sk) + pos * kStride + 16 * blk);
   };
   constexpr int kUnitSteps = (kUnits + 32 * G - 1) / (32 * G);  // units a thread takes per side and tile
   auto dequant_all = [&](bool v) {
@@ -222,7 +160,7 @@ __global__ void __launch_bounds__(32 * G, 1)
   //   2: the next tile's V bytes in flight; O += P V of this tile while the next tile's K goes into f16
   load_side(0, false);
   load_side(0, true);
-  cp_wait_all();
+  cp_wait<0>();
   __syncthreads();
   if constexpr (!(CUT & kNoDequant)) dequant_all(false);
   __syncthreads();
@@ -338,7 +276,7 @@ __global__ void __launch_bounds__(32 * G, 1)
     }
     lrow[0] = lrow[0] * alpha[0] + sum[0];
     lrow[1] = lrow[1] * alpha[1] + sum[1];
-    cp_wait_all();
+    cp_wait<0>();
     __syncthreads();  // this tile's V in f16, the next tile's K bytes in; every warp is done with this tile's K
     if (more) load_side(p0 + kN, true);
     // the next tile's K units, spread over the steps of P V
@@ -376,7 +314,7 @@ __global__ void __launch_bounds__(32 * G, 1)
 #pragma unroll
       for (int step = 0; step < kD / 8; ++step) dq_k(step);
     }
-    cp_wait_all();
+    cp_wait<0>();
     __syncthreads();  // the next tile's K in f16 and its V bytes in; every warp is done with this tile's V
   }
 
