@@ -28,6 +28,8 @@ cudaError_t blz_skinny_gemm(const void* x, int64_t x_stride, const void* w, void
 /// BLZ_SKINNY_EX_MAX_ROWS rows (verify and draft-tree steps). Wide n shares each load of x among 2 or 4 columns.
 cudaError_t blz_skinny_gemm_ex(const void* x, int64_t x_stride, const void* w, void* y, int64_t y_stride, int rows,
                                int n, int k, blz_half_t dtype, cudaStream_t stream);
+cudaError_t blz_skinny_gemm_bf16_tiled(const uint16_t* x, int64_t x_stride, const uint16_t* w, uint16_t* y,
+                                      int64_t y_stride, int rows, int n, int k, cudaStream_t stream);
 
 /// \brief blz_skinny_gemm_ex with the columns per block given (1, 2, 4; 0: chosen from n and the SM count), the
 /// configuration the autotuner measures (crates/blaze/src/tune.rs).

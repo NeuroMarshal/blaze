@@ -454,6 +454,7 @@ impl ExpertCache {
 }
 
 const EXPERT_BATCH: usize = 64;
+const MAX_DEVICE_COLD_ROUTES: usize = 64;
 const WIDE_ROW_CLASSES: [usize; 5] = [8, 16, 32, 48, EXPERT_BATCH];
 
 struct WideExperts {
@@ -465,12 +466,15 @@ struct WideExperts {
     tiles: DevBuf,
     staging: HostMapped,
     mlp_staging: Option<HostMapped>,
+    cold_staging: Option<HostMapped>,
+    activation_input: Option<DevBuf>,
 }
 
 impl WideExperts {
     fn new(tokens: usize, top_k: usize, hidden: usize, inter: usize) -> Result<Self> {
         let routes = tokens * top_k;
         let tile_bytes = 2 * routes * std::mem::size_of::<sys::blz_moe_matrix_tile>();
+        let device_residual = std::env::var_os("BLAZE_INKLING_DEVICE_MLP_RESIDUAL").is_some_and(|value| value == "1");
         Ok(Self {
             input: DevBuf::new(routes * hidden * 2)?,
             gate: DevBuf::new(routes * inter * 4)?,
@@ -479,21 +483,26 @@ impl WideExperts {
             route_of: DevBuf::new(routes * 4)?,
             tiles: DevBuf::new(tile_bytes)?,
             staging: HostMapped::new(tile_bytes.next_multiple_of(16) + routes * 12)?,
-            mlp_staging: std::env::var_os("BLAZE_INKLING_DEVICE_MLP_RESIDUAL")
+            mlp_staging: device_residual.then(|| HostMapped::new(tokens * hidden * 6)).transpose()?,
+            cold_staging: device_residual
+                .then(|| HostMapped::new((MAX_DEVICE_COLD_ROUTES * (hidden + 3) + 1) * 4)).transpose()?,
+            activation_input: std::env::var_os("BLAZE_INKLING_PARALLEL_PREFILL")
                 .is_some_and(|value| value == "1")
-                .then(|| HostMapped::new(tokens * hidden * 6)).transpose()?,
+                .then(|| DevBuf::new(tokens * hidden * 2)).transpose()?,
         })
     }
 
     fn run(
         &mut self, stream: &Stream, weights: &Experts, pool: &ExpertPool, layer: usize,
         by_expert: &[Vec<(i32, f32)>], routes: &[Vec<(usize, f32)>], caps: (f32, f32),
-        input: &DevBuf, sum: &DevBuf, ids: &DevBuf, probabilities: &DevBuf,
+        input: Option<&DevBuf>, sum: &DevBuf, ids: &DevBuf, probabilities: &DevBuf,
     ) -> Result<()> {
         let tokens = routes.len();
         let top_k = routes[0].len();
         let hidden = weights.down.rows;
         let inter = weights.down.cols;
+        let input = input.or(self.activation_input.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Inkling grouped activations are unavailable"))?;
         let mut permutation = vec![-1i32; tokens * top_k];
         let mut gather = Vec::with_capacity(permutation.len());
         let mut tables: [_; 5] = std::array::from_fn(|_| Vec::new());
@@ -643,6 +652,7 @@ pub(super) struct Compute {
     recurrent_batch: Option<RecurrentBatch>,
     projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
     grouped_experts: bool,
+    tiled_skinny: bool,
 }
 
 impl Compute {
@@ -705,6 +715,7 @@ impl Compute {
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
             grouped_experts: std::env::var_os("BLAZE_INKLING_GROUPED_MOE").is_some_and(|value| value == "1"),
+            tiled_skinny: std::env::var_os("BLAZE_INKLING_TILED_SKINNY").is_some_and(|value| value == "1"),
         })
     }
 
@@ -985,6 +996,11 @@ impl Compute {
             .min(self.gate.bytes() / 128).min(65535)
     }
 
+    pub fn retain_prefill_activations(&self) -> bool {
+        self.prompt_stage.is_none() && self.cpu.is_some()
+            && self.wide_experts.as_ref().is_some_and(|wide| wide.activation_input.is_some())
+    }
+
     pub fn recurrent_qkv_fits(&self, width: usize) -> bool {
         self.input.bytes() >= width * 36 && self.transfer.bytes() >= width * 36
             && self.result.bytes() >= width * 24 && self.gate.bytes() >= 3 * 128
@@ -1085,15 +1101,23 @@ impl Compute {
                 eps, self.stream.0)
         }, "Inkling recurrent controller inputs")?;
         let cols = 2 * width;
-        for first in (0..rows).step_by(sys::BLZ_SKINNY_EX_MAX_ROWS) {
-            let batch = (rows - first).min(sys::BLZ_SKINNY_EX_MAX_ROWS);
-            for (group, weights) in down.iter().enumerate() {
-                let at = first * 3 + group;
+        for (group, weights) in down.iter().enumerate() {
+            if self.tiled_skinny && rows >= 32 {
                 check(unsafe {
-                    sys::blz_skinny_gemm_ex(normalized.add(at * cols).cast(), (3 * cols) as i64,
-                        weights.weight.ptr(), self.gate.at::<u16>(at * 64).cast(), 3 * 64,
-                        batch as i32, 64, cols as i32, sys::BLZ_BF16, self.stream.0)
-                }, "Inkling recurrent controller down batch")?;
+                    sys::blz_skinny_gemm_bf16_tiled(normalized.add(group * cols), (3 * cols) as i64,
+                        weights.weight.ptr(), self.gate.at(group * 64), 3 * 64,
+                        rows as i32, 64, cols as i32, self.stream.0)
+                }, "Inkling recurrent controller row tiles")?;
+            } else {
+                for first in (0..rows).step_by(sys::BLZ_SKINNY_EX_MAX_ROWS) {
+                    let batch = (rows - first).min(sys::BLZ_SKINNY_EX_MAX_ROWS);
+                    let at = first * 3 + group;
+                    check(unsafe {
+                        sys::blz_skinny_gemm_ex(normalized.add(at * cols).cast(), (3 * cols) as i64,
+                            weights.weight.ptr(), self.gate.at::<u16>(at * 64).cast(), 3 * 64,
+                            batch as i32, 64, cols as i32, sys::BLZ_BF16, self.stream.0)
+                    }, "Inkling recurrent controller down batch")?;
+                }
             }
         }
         check(unsafe {
@@ -1230,7 +1254,7 @@ impl Compute {
 
     pub fn gated_router(
         &mut self, down: &Dense, up: &Dense, norm: &DevBuf, router: &Dense,
-        input: &[f32], x: &[f32], message: &[f32], eps: f32,
+        input: Option<&[f32]>, x: &[f32], message: &[f32], eps: f32, retain_at: Option<usize>,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let width = router.cols;
         let tokens = x.len() / width;
@@ -1240,14 +1264,24 @@ impl Compute {
         let output_bytes = size * 2 + tokens * scores * 4;
         ensure!((32..=4096).contains(&width) && width.is_multiple_of(32)
             && (1..=self.gate_batch_limit(width)).contains(&tokens) && size == tokens*width
-            && message.len() == size && input.len() == size * 2
+            && message.len() == size && input.is_none_or(|input| input.len() == size * 2)
             && down.cols == width * 2 && down.rows == 64 && up.rows == width * 2 && up.cols == 64
             && norm.bytes() == width * 4 && bytes.max(output_bytes) <= self.input.bytes()
             && width * 8 <= self.result.bytes() && self.gate.bytes() >= 128, "Inkling gated router exceeds scratch");
+        let activation = if let Some(first) = retain_at {
+            let buffer = self.wide_experts.as_ref().and_then(|wide| wide.activation_input.as_ref())
+                .ok_or_else(|| anyhow::anyhow!("Inkling routed activations are unavailable"))?;
+            ensure!((first * width + size) * 2 <= buffer.bytes(), "Inkling retained activations exceed scratch");
+            buffer.at(first * width)
+        } else {
+            self.input.ptr::<u16>()
+        };
         let staging = self.transfer.host_slice_mut();
         let (normalized, rest) = staging[..bytes].split_at_mut(size * 4);
-        for (dst, value) in normalized.chunks_exact_mut(2).zip(input) {
-            dst.copy_from_slice(&to_bf16(*value).to_ne_bytes());
+        if let Some(input) = input {
+            for (dst, value) in normalized.chunks_exact_mut(2).zip(input) {
+                dst.copy_from_slice(&to_bf16(*value).to_ne_bytes());
+            }
         }
         for (dst, src) in rest.chunks_exact_mut(size * 4).zip([x, message]) {
             let src = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), dst.len()) };
@@ -1259,26 +1293,58 @@ impl Compute {
             eps: eps.to_bits(), tokens,
         };
         let enqueue = |gpu: &Self| {
-            gpu.copy_staged_input(bytes)?;
-            down.run_decode_rows(gpu, gpu.input.ptr(), gpu.gate.ptr(), tokens)?;
+            if input.is_some() {
+                gpu.copy_staged_input(bytes)?;
+            } else {
+                check(unsafe {
+                    sys::cudaMemcpyAsync(gpu.input.at::<f32>(size).cast(),
+                        gpu.transfer.host_ptr().cast::<u8>().add(size * 4).cast(), size * 8,
+                        sys::MEMCPY_H2D, gpu.stream.0)
+                }, "Inkling recurrent MLP inputs")?;
+                check(unsafe {
+                    sys::blz_inkling_controller_inputs(gpu.input.at(size), gpu.input.at(size * 2),
+                        gpu.input.ptr(), width as i32, tokens as i32, eps, gpu.stream.0)
+                }, "Inkling recurrent MLP input normalization")?;
+            }
+            if gpu.tiled_skinny && tokens >= 32 {
+                check(unsafe {
+                    sys::blz_skinny_gemm_bf16_tiled(gpu.input.ptr(), down.cols as i64, down.weight.ptr(),
+                        gpu.gate.ptr(), down.rows as i64, tokens as i32,
+                        down.rows as i32, down.cols as i32, gpu.stream.0)
+                }, "Inkling MLP controller row tiles")?;
+            } else {
+                down.run_decode_rows(gpu, gpu.input.ptr(), gpu.gate.ptr(), tokens)?;
+            }
             check(unsafe {
                 sys::blz_inkling_controller_up(gpu.gate.ptr(), up.weight.ptr(), std::ptr::null(), std::ptr::null(),
                     gpu.result.ptr(), up.rows as i32, 1, tokens as i32, gpu.stream.0)
             }, "Inkling MLP controller projection")?;
             check(unsafe {
                 sys::blz_inkling_controller_norm(gpu.result.ptr(), gpu.input.at(size), gpu.input.at(size * 2),
-                    norm.ptr(), gpu.input.ptr(), width as i32, eps, tokens as i32, gpu.stream.0)
+                    norm.ptr(), activation, width as i32, eps, tokens as i32, gpu.stream.0)
             }, "Inkling gated MLP normalization")?;
+            let scores_out = if retain_at.is_some() { gpu.input.ptr() } else { gpu.input.at(size / 2) };
             check(unsafe {
-                sys::blz_inkling_router_logits(router.weight.ptr(), gpu.input.ptr(), gpu.input.at(size / 2),
+                sys::blz_inkling_router_logits(router.weight.ptr(), activation, scores_out,
                     scores as i32, width as i32, tokens as i32, gpu.stream.0)
             }, "Inkling gated MoE router")?;
-            gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
+            if retain_at.is_some() {
+                gpu.queue_result(scores_out, tokens * scores)
+            } else {
+                gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
+            }
         };
-        let work = if tokens == 1 { self.run_projection(key, enqueue) } else { enqueue(self) };
+        let work = if tokens == 1 && input.is_some() && retain_at.is_none() {
+            self.run_projection(key, enqueue)
+        } else {
+            enqueue(self)
+        };
         let synced = self.stream.sync();
         work?;
         synced?;
+        if retain_at.is_some() {
+            return Ok((Vec::new(), self.read_result(tokens * scores)));
+        }
         let activation = self.read_result::<u16>(size).into_iter().map(from_bf16).collect();
         let host = self.transfer.host_ptr().cast::<u16>();
         let logits = unsafe { std::slice::from_raw_parts(host.add(size).cast::<f32>(), tokens*scores) }.to_vec();
@@ -1319,6 +1385,10 @@ impl Compute {
 
     pub fn cpu_routes(&self) -> u64 {
         self.cpu_routes
+    }
+
+    pub fn host_workers(&self) -> Option<Arc<rayon::ThreadPool>> {
+        self.cpu.clone()
     }
 
     pub fn prefetch_experts(&mut self, ckpt: &Checkpoint, weights: &Experts,
@@ -1550,19 +1620,82 @@ impl Compute {
         Ok(true)
     }
 
+    fn queue_cold_merge(&mut self, cold: &[OnceLock<Vec<ColdOutput>>], hidden: usize) -> Result<()> {
+        let mut corrections: Vec<_> = cold.iter().filter_map(OnceLock::get).flatten().collect();
+        corrections.sort_by_key(|(row, _, _)| *row);
+        let count = corrections.len();
+        let weight_at = count * hidden;
+        let token_at = weight_at + count;
+        let offset_at = token_at + count;
+        let max_bytes = (offset_at + count + 1) * 4;
+        let staging = self.wide_experts.as_mut().and_then(|wide| wide.cold_staging.as_mut()).unwrap();
+        ensure!((1..=MAX_DEVICE_COLD_ROUTES).contains(&count) && max_bytes <= self.result.bytes().min(staging.bytes()),
+            "Inkling cold expert merge exceeds scratch");
+        let dst = staging.host_slice_mut();
+        let mut last = None;
+        let mut rows = 0;
+        for (index, (row, weight, values)) in corrections.into_iter().enumerate() {
+            if last != Some(*row) {
+                dst[(token_at + rows) * 4..(token_at + rows + 1) * 4].copy_from_slice(&(*row as i32).to_ne_bytes());
+                dst[(offset_at + rows) * 4..(offset_at + rows + 1) * 4].copy_from_slice(&(index as i32).to_ne_bytes());
+                rows += 1;
+                last = Some(*row);
+            }
+            dst[(weight_at + index) * 4..(weight_at + index + 1) * 4].copy_from_slice(&weight.to_ne_bytes());
+            let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), hidden * 4) };
+            dst[index * hidden * 4..(index + 1) * hidden * 4].copy_from_slice(bytes);
+        }
+        dst[(offset_at + rows) * 4..(offset_at + rows + 1) * 4].copy_from_slice(&(count as i32).to_ne_bytes());
+        check(unsafe {
+            sys::cudaMemcpyAsync(self.result.ptr(), staging.host_ptr(), (offset_at + rows + 1) * 4,
+                sys::MEMCPY_H2D, self.stream.0)
+        }, "Inkling sparse cold expert upload")?;
+        check(unsafe {
+            sys::blz_inkling_merge_cold(self.result.ptr(), self.sum.ptr(), self.result.at(token_at),
+                self.result.at(offset_at), self.result.at(weight_at), rows as i32, hidden as i32, self.stream.0)
+        }, "Inkling sparse cold expert merge")
+    }
+
+    fn read_cold_activations(&mut self, indices: &[i32], tokens: usize, hidden: usize) -> Result<Vec<Vec<f32>>> {
+        let mut rows = vec![Vec::new(); tokens];
+        if indices.is_empty() {
+            return Ok(rows);
+        }
+        let wide = self.wide_experts.as_ref().unwrap();
+        let activation = wide.activation_input.as_ref().unwrap();
+        ensure!(indices.len() * 4 <= self.scatter_ids.bytes()
+            && indices.len() * hidden * 2 <= wide.input.bytes(), "Inkling cold activations exceed scratch");
+        let work = (|| -> Result<()> {
+            self.scatter_ids.upload_async(indices, &self.stream)?;
+            check(unsafe {
+                sys::blz_gather_rows(activation.ptr(), hidden as i64, self.scatter_ids.ptr(), indices.len() as i32,
+                    hidden as i32, wide.input.ptr(), self.stream.0)
+            }, "Inkling gather cold activations")?;
+            self.queue_result::<u16>(wide.input.ptr(), indices.len() * hidden)
+        })();
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        for (&index, act) in indices.iter().zip(self.read_result::<u16>(indices.len() * hidden).chunks_exact(hidden)) {
+            rows[index as usize] = act.iter().copied().map(from_bf16).collect();
+        }
+        Ok(rows)
+    }
+
     pub fn moe_batch(
         &mut self,
         ckpt: &Checkpoint,
         weights: &Experts,
         layer: usize,
-        activations: &[Vec<f32>],
+        activations: Option<&[Vec<f32>]>,
         routes: &[Vec<(usize, f32)>],
         caps: (f32, f32),
         experts: usize,
         residual: Option<MlpResidual<'_>>,
     ) -> Result<MoeOutput> {
-        if activations.len() == 1 {
-            return self.moe(ckpt, weights, layer, &activations[0], &routes[0], caps.0, caps.1).map(MoeOutput::Routed);
+        let tokens = routes.len();
+        if tokens == 1 {
+            return self.moe(ckpt, weights, layer, &activations.unwrap()[0], &routes[0], caps.0, caps.1).map(MoeOutput::Routed);
         }
         let hidden = weights.gate_up.cols;
         let intermediate = weights.down.cols;
@@ -1572,16 +1705,16 @@ impl Compute {
                 by_expert[id].push((row as i32, w));
             }
         }
-        let activations_bf16: Vec<_> = activations.iter().flatten().copied().map(to_bf16).collect();
+        let activations_bf16 = activations.map(|rows| rows.iter().flatten().copied().map(to_bf16).collect::<Vec<_>>());
         let (ids, probs): (Vec<_>, Vec<_>) = by_expert.iter().flatten().copied().unzip();
-        let gather_offset = activations_bf16.len();
+        let gather_offset = tokens * hidden;
         let output_bytes = gather_offset * std::mem::size_of::<f32>();
         ensure!(output_bytes <= self.transfer.bytes(), "Inkling expert readback exceeds scratch");
-        ensure!((gather_offset + activations.len().min(EXPERT_BATCH) * hidden) * 2 <= self.input.bytes(),
+        ensure!((gather_offset + tokens.min(EXPERT_BATCH) * hidden) * 2 <= self.input.bytes(),
             "Inkling expert gather exceeds scratch");
         self.cache.generation += 1;
         let tick = self.cache.generation;
-        self.cache.visits += activations.len();
+        self.cache.visits += tokens;
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
         let all_resident = || by_expert.iter().enumerate()
@@ -1597,10 +1730,23 @@ impl Compute {
                 pool.use_gpu(ckpt, weights, (layer, id), tick, epoch,
                     self.cpu.is_some().then_some(rows.len()), true, None)?;
             }
+            let fetched;
+            let activations = if let Some(host) = activations {
+                host
+            } else {
+                let mut indices: Vec<_> = by_expert.iter().enumerate()
+                    .filter(|(id, rows)| !rows.is_empty() && !pool.entries.contains_key(&(layer, *id)))
+                    .flat_map(|(_, rows)| rows.iter().map(|&(row, _)| row)).collect();
+                indices.sort_unstable();
+                indices.dedup();
+                fetched = self.read_cold_activations(&indices, tokens, hidden)?;
+                &fetched
+            };
             let workers = self.cpu.clone();
             let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
             let mut cold_count = 0;
             let mut residual_enqueued = false;
+            let mut merge_queued = false;
             let work = prefill_cpu_scope(workers.as_deref(), |scope| -> Result<()> {
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
                 for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
@@ -1609,31 +1755,52 @@ impl Compute {
                         dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
                     }
                 }
-                self.stage_input(&activations_bf16)?;
+                if let Some(input) = &activations_bf16 {
+                    self.stage_input(input)?;
+                }
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
                 self.wide_experts.as_mut().unwrap().run(&self.stream, weights, pool, layer, &by_expert,
-                    routes, caps, &self.input, &self.sum, &self.scatter_ids, &self.scatter_weights)?;
+                    routes, caps, activations_bf16.as_ref().map(|_| &self.input), &self.sum,
+                    &self.scatter_ids, &self.scatter_weights)?;
                 if cold_count == 0 && let Some(params) = &residual {
-                    residual_enqueued = self.enqueue_mlp_residual(params, hidden, activations.len())?;
+                    residual_enqueued = self.enqueue_mlp_residual(params, hidden, tokens)?;
                     if residual_enqueued { return Ok(()); }
                 }
-                self.queue_result::<f32>(self.sum.ptr(), activations.len() * hidden)
+                if (1..=MAX_DEVICE_COLD_ROUTES).contains(&cold_count) && residual.is_some()
+                    && self.wide_experts.as_ref().is_some_and(|wide| wide.cold_staging.is_some())
+                    && (cold_count * (hidden + 3) + 1) * 4 <= self.result.bytes()
+                {
+                    merge_queued = true;
+                    return Ok(());
+                }
+                self.queue_result::<f32>(self.sum.ptr(), tokens * hidden)
+            });
+            let work = work.and_then(|()| {
+                if !merge_queued { return Ok(()); }
+                self.queue_cold_merge(&cold, hidden)?;
+                residual_enqueued = self.enqueue_mlp_residual(residual.as_ref().unwrap(), hidden, tokens)?;
+                if residual_enqueued { return Ok(()); }
+                self.queue_result::<f32>(self.sum.ptr(), tokens * hidden)
             });
             let synced = self.stream.sync();
             work?;
             synced?;
+            self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
             if residual_enqueued {
-                let values = activations.len() * hidden;
+                let values = tokens * hidden;
                 let tail = residual.unwrap().tail * hidden;
                 let mut output = self.read_result::<u16>(values + tail);
                 let history = output.split_off(values);
                 return Ok(MoeOutput::Residual { hidden: output, history });
             }
-            self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
-            let mut output = self.read_result(activations.len() * hidden);
-            merge_cold(&mut output, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
+            let mut output = self.read_result(tokens * hidden);
+            if !merge_queued {
+                merge_cold(&mut output, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
+            }
             return Ok(MoeOutput::Routed(output));
         }
+        let activations = activations.ok_or_else(|| anyhow::anyhow!("Inkling retained activations require grouped MoE"))?;
+        let activations_bf16 = activations_bf16.unwrap();
         let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
         let mut cold_count = 0usize;
         let work = prefill_cpu_scope(self.cpu.as_deref(), |scope| -> Result<()> {
@@ -1660,7 +1827,7 @@ impl Compute {
                 let (buffer, gate_up, down) = if resident {
                     let expert = &pool.entries[&(layer, id)];
                     (&pool.buffer, &expert.gate_up, &expert.down)
-                } else if activations.len() >= 64 && rows.len() >= PROMPT_STAGE_MIN_ROUTES
+                } else if tokens >= 64 && rows.len() >= PROMPT_STAGE_MIN_ROUTES
                     && let Some(stage) = &mut self.prompt_stage
                 {
                     if let Some(bank) = stage.banks.iter_mut().find(|bank| {
@@ -1734,7 +1901,7 @@ impl Compute {
         work?;
         synced?;
         self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
-        let mut total = self.read_result(activations.len() * hidden);
+        let mut total = self.read_result(tokens * hidden);
         merge_cold(&mut total, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
         Ok(MoeOutput::Routed(total))
     }
@@ -1929,6 +2096,12 @@ impl Kv {
 
 pub(super) const PREFILL_ATTENTION_ROWS: usize = 16;
 
+pub(super) fn prefill_attention_rows(chunk: usize) -> usize {
+    let wide = std::env::var_os("BLAZE_INKLING_WIDE_ATTENTION").is_some_and(|value| value == "1")
+        && std::env::var_os("BLAZE_INKLING_TENSOR_PREFILL").is_none_or(|value| value != "1");
+    chunk.min(if wide { 64 } else { PREFILL_ATTENTION_ROWS })
+}
+
 pub(super) struct AttentionRow<'a> {
     pub q: Vec<u16>,
     pub gate: &'a [u16],
@@ -1986,6 +2159,8 @@ pub(super) struct AttentionScratch {
     filtered: DevBuf,
     block_bytes: usize,
     batch: usize,
+    projection_batch: usize,
+    filtered_rows: usize,
     tensor_prefill: bool,
     heads: usize,
     kv_heads: usize,
@@ -1995,18 +2170,23 @@ impl AttentionScratch {
     pub fn new(heads: usize, kv_heads: usize, extent: usize, relative: usize, chunk: usize, taps: usize) -> Result<Self> {
         let values = heads * (HEAD_DIM * 2 + relative + 1) + kv_heads * HEAD_DIM * 2;
         let batch = chunk.min(PREFILL_ATTENTION_ROWS);
+        let projection_batch = prefill_attention_rows(chunk);
+        let full_kv_projection = std::env::var_os("BLAZE_INKLING_WIDE_ATTENTION").is_some_and(|value| value == "1");
+        let filtered_rows = if full_kv_projection { chunk } else { batch };
         let bytes = (values * batch + 2 * taps * kv_heads * (HEAD_DIM + batch)) * 2 + 9 * 16 + batch * 4;
         Ok(Self {
             input: DevBuf::new(bytes.next_multiple_of(16) * chunk.div_ceil(batch))?,
             staging: HostMapped::new(bytes.next_multiple_of(16) * chunk.div_ceil(batch))?,
-            relative: DevBuf::new(batch * heads * extent * 2)?,
+            relative: DevBuf::new(projection_batch * heads * extent * 2)?,
             zero: DevBuf::from_slice(&[0i32])?,
             kv_scale: DevBuf::from_slice(&[KV_GLOBAL_SCALE])?,
             tiles: DevBuf::new(batch * heads * MAX_TILES * (HEAD_DIM + 2) * 4)?,
-            attended: DevBuf::new(batch * heads * HEAD_DIM * 2)?,
-            filtered: DevBuf::new(batch * 2 * kv_heads * HEAD_DIM * 2)?,
+            attended: DevBuf::new(projection_batch * heads * HEAD_DIM * 2)?,
+            filtered: DevBuf::new(filtered_rows * 2 * kv_heads * HEAD_DIM * 2)?,
             block_bytes: bytes.next_multiple_of(16),
             batch,
+            projection_batch,
+            filtered_rows,
             tensor_prefill: std::env::var_os("BLAZE_INKLING_TENSOR_PREFILL").is_some_and(|value| value == "1"),
             heads,
             kv_heads,
@@ -2093,32 +2273,41 @@ impl AttentionScratch {
                     clip.threshold, clip.relative_threshold, clip.log_floor, clip.log_alpha, gpu.stream.0)
             }, "Inkling Q and relative clipping")?;
 
-            for first in (0..rows).step_by(self.batch) {
-                let count = (rows - first).min(self.batch);
+            let grouped = self.filtered_rows > self.batch;
+            if grouped {
+                self.convolve_kv(gpu, &conv, &projections, history, 0, history, rows)?;
+            }
+            let mut first = 0;
+            while first < rows {
                 let pos = start + first;
+                let max_count = (rows - first).min(self.projection_batch);
+                let max_tiles = kv.window.min(pos + max_count).div_ceil(64).clamp(1, MAX_TILES);
+                let count = max_count.min(self.batch * MAX_TILES / max_tiles);
                 let oldest = (pos + 1).saturating_sub(kv.window);
                 ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
-                let prefix = (conv.taps - 1).min(pos);
-                let raw_offset = (history + first - prefix) * width;
-                let key = projections[1].wrapping_sub(history_values).wrapping_add(raw_offset);
-                let value = projections[2].wrapping_sub(history_values).wrapping_add(raw_offset);
-                let dynamic = |i: usize| projections.get(i).map_or(std::ptr::null(), |p| {
-                    p.wrapping_add(first * self.kv_heads * conv.taps) as *const u16
-                });
-                let keys = self.filtered.ptr();
-                let values = self.filtered.at(self.batch * width);
-                check(unsafe {
-                    sys::blz_inkling_prefill_conv(key, value, dynamic(3), dynamic(4), conv.weights.ptr(), keys, values,
-                        self.kv_heads as i32, conv.taps as i32, prefix as i32, count as i32,
-                        conv.scale, conv.clip, conv.eps, gpu.stream.0)
-                }, "Inkling prefill KV convolution")?;
+                let filtered_at = if grouped { first * width } else {
+                    self.convolve_kv(gpu, &conv, &projections, history, first, (conv.taps - 1).min(pos), count)?;
+                    0
+                };
+                let keys = self.filtered.at(filtered_at);
+                let values = self.filtered.at(self.filtered_rows * width + filtered_at);
                 kv.store_rows(0, keys, values, slots.wrapping_add(first), count, &self.kv_scale, &gpu.stream)?;
                 let query_offset = first * self.heads * HEAD_DIM;
                 self.attend_tile(gpu, kv, [
                     q.wrapping_add(query_offset), gate.wrapping_add(query_offset), sink.wrapping_add(first * self.heads),
                     relative.wrapping_add(first * self.heads * clip.relative),
                 ], bias, pos, count, false)?;
-                output.run_decode_rows(gpu, self.attended.ptr(), gpu.input.at(history_res + first * output.rows), count)?;
+                let dst = gpu.input.at(history_res + first * output.rows);
+                if gpu.tiled_skinny && count >= 32 && output.cols.is_multiple_of(8) {
+                    check(unsafe {
+                        sys::blz_skinny_gemm_bf16_tiled(self.attended.ptr(), output.cols as i64, output.weight.ptr(),
+                            dst, output.rows as i64, count as i32,
+                            output.rows as i32, output.cols as i32, gpu.stream.0)
+                    }, "Inkling attention output row tiles")?;
+                } else {
+                    output.run_decode_rows(gpu, self.attended.ptr(), dst, count)?;
+                }
+                first += count;
             }
             let previous: *mut u16 = if add_previous { gpu.input.at(raw_end) } else { null_mut() };
             for (dst, src, count) in [
@@ -2160,6 +2349,25 @@ impl AttentionScratch {
         Ok((attention, [
             history[..tail].to_vec(), history[tail..2 * tail].to_vec(), history[2 * tail..].to_vec(),
         ]))
+    }
+
+    fn convolve_kv(
+        &self, gpu: &Compute, conv: &AttentionConv<'_>, projections: &[*mut u16],
+        available_history: usize, first: usize, history: usize, count: usize,
+    ) -> Result<()> {
+        let width = self.kv_heads * HEAD_DIM;
+        let offset = (first + available_history - history) * width;
+        let raw = |i: usize| projections[i].wrapping_sub(available_history * width).wrapping_add(offset);
+        let dynamic = |i: usize| projections.get(i).map_or(std::ptr::null(), |p| {
+            p.wrapping_add(first * self.kv_heads * conv.taps).cast_const()
+        });
+        let key = self.filtered.ptr();
+        let value = self.filtered.at(self.filtered_rows * width);
+        check(unsafe {
+            sys::blz_inkling_prefill_conv(raw(1), raw(2), dynamic(3), dynamic(4), conv.weights.ptr(), key, value,
+                self.kv_heads as i32, conv.taps as i32, history as i32, count as i32,
+                conv.scale, conv.clip, conv.eps, gpu.stream.0)
+        }, "Inkling prefill KV convolution")
     }
 
     fn attend_tile(
@@ -2503,7 +2711,7 @@ mod tests {
                 *v = from_bf16(to_bf16(*v * rms * weight));
             }
             let scores = gpu.router_logits(&router, std::slice::from_ref(&expected)).unwrap();
-            let (actual, logits) = gpu.gated_router(&down, &up, &norm, &router, &input, &x, &msg, eps).unwrap();
+            let (actual, logits) = gpu.gated_router(&down, &up, &norm, &router, Some(&input), &x, &msg, eps, None).unwrap();
             assert_eq!(actual, expected);
             assert_eq!(logits, scores);
             inputs.extend(input);
@@ -2512,8 +2720,15 @@ mod tests {
             activations.extend(expected);
             routes.extend(scores);
         }
-        let batch = gpu.gated_router(&down, &up, &norm, &router, &inputs, &xs, &messages, 1e-6).unwrap();
+        let batch = gpu.gated_router(&down, &up, &norm, &router, Some(&inputs), &xs, &messages, 1e-6, None).unwrap();
         assert_eq!(batch, (activations, routes));
+        let normalized: Vec<_> = xs.chunks_exact(width).zip(messages.chunks_exact(width)).flat_map(|(x, m)| {
+            super::super::forward::normalized(x, None, 1e-6).into_iter()
+                .chain(super::super::forward::normalized(m, None, 1e-6))
+        }).collect();
+        let host = gpu.gated_router(&down, &up, &norm, &router, Some(&normalized), &xs, &messages, 1e-6, None).unwrap();
+        let device = gpu.gated_router(&down, &up, &norm, &router, None, &xs, &messages, 1e-6, None).unwrap();
+        assert_eq!(device, host);
     }
 
     #[test]
@@ -2672,6 +2887,59 @@ mod tests {
             stream.sync().unwrap();
             assert_eq!(actual.download::<u16>(rows * n).unwrap(), expected.download::<u16>(rows * n).unwrap(), "{packing:?}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn tiled_skinny_prefill_matches_decode_order_for_strided_rows() {
+        crate::gpu::set_device(0).unwrap();
+        let (rows, columns, inner) = (67usize, 259usize, 256usize);
+        let (input_stride, output_stride) = (inner + 32, columns + 5);
+        let values = |len, salt| (0..len).map(|i| to_bf16(((i * salt % 97) as f32 - 48.0) / 31.0)).collect::<Vec<_>>();
+        let input = DevBuf::from_slice(&values(rows * input_stride, 13)).unwrap();
+        let weights = DevBuf::from_slice(&values(columns * inner, 61)).unwrap();
+        let stream = Stream::new().unwrap();
+        let eager = DevBuf::zeroed(rows * output_stride * 2, &stream).unwrap();
+        let tiled = DevBuf::zeroed(rows * output_stride * 2, &stream).unwrap();
+        for start in [0, 64] {
+            let n = (rows - start).min(64);
+            check(unsafe {
+                sys::blz_skinny_gemm_cfg(input.at::<u16>(start * input_stride).cast(), input_stride as i64,
+                    weights.ptr(), eager.at::<u16>(start * output_stride).cast(), output_stride as i64,
+                    n as i32, columns as i32, inner as i32, sys::BLZ_BF16, 4, stream.0)
+            }, "reference skinny projection").unwrap();
+        }
+        check(unsafe {
+            sys::blz_skinny_gemm_bf16_tiled(input.ptr(), input_stride as i64, weights.ptr(), tiled.ptr(),
+                output_stride as i64, rows as i32, columns as i32, inner as i32, stream.0)
+        }, "tiled skinny projection").unwrap();
+        stream.sync().unwrap();
+        assert_eq!(eager.download::<u16>(rows * output_stride).unwrap(), tiled.download::<u16>(rows * output_stride).unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn sparse_expert_merge_preserves_cpu_sum_and_untouched_rows() {
+        crate::gpu::set_device(0).unwrap();
+        let width = 257;
+        let stream = Stream::new().unwrap();
+        let starting: Vec<_> = (0..width * 4).map(|i| (i as f32 - 500.0) / 419.0).collect();
+        let values: Vec<_> = (0..width * 3).map(|i| ((i * 17 % 511) as f32 - 300.0) / 89.0).collect();
+        let weights = [0.71, -0.121, 0.045];
+        let initial = DevBuf::from_slice(&starting).unwrap();
+        let payload = DevBuf::from_slice(&values).unwrap();
+        let tokens = DevBuf::from_slice(&[1i32, 3]).unwrap();
+        let offsets = DevBuf::from_slice(&[0i32, 2, 3]).unwrap();
+        let probs = DevBuf::from_slice(&weights).unwrap();
+        check(unsafe {
+            sys::blz_inkling_merge_cold(payload.ptr(), initial.ptr(), tokens.ptr(), offsets.ptr(), probs.ptr(),
+                2, width as i32, stream.0)
+        }, "sparse cold expert merge").unwrap();
+        stream.sync().unwrap();
+        let mut expected = starting;
+        merge_cold(&mut expected, width, [1, 1, 3].into_iter().zip(weights).zip(values.chunks_exact(width))
+            .map(|((token, weight), row)| (token, weight, row.to_vec())));
+        assert_eq!(initial.download::<f32>(width * 4).unwrap(), expected);
     }
 
     #[test]

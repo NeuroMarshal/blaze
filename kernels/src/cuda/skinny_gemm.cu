@@ -35,11 +35,17 @@ __device__ __forceinline__ __half from_float(float v, __half) { return __float2h
 
 // grid: (ceil(n / CPB)), block: kThreads. The CPB columns of a block share every load of x; rows beyond
 // BLZ_SKINNY_MAX_ROWS take further passes over the block's weight rows (from L1 / L2 after the first).
-template <typename T, int CPB>
+template <typename T, int CPB, bool tiled_rows = false>
 __global__ void __launch_bounds__(kThreads) skinny_gemm_kernel(const T* __restrict__ x, int64_t x_stride,
                                                                const T* __restrict__ w, T* __restrict__ y,
                                                                int64_t y_stride, int rows, int n, int k) {
   constexpr int R = BLZ_SKINNY_MAX_ROWS;
+  if constexpr (tiled_rows) {
+    const int first = blockIdx.y * R;
+    x += int64_t(first) * x_stride;
+    y += int64_t(first) * y_stride;
+    rows = min(rows - first, R);
+  }
   const int col0 = blockIdx.x * CPB, tid = threadIdx.x;
   const int cols = min(CPB, n - col0);
   const int warp = tid / 32, lane = tid % 32;
@@ -215,6 +221,25 @@ extern "C" cudaError_t blz_skinny_gemm_cfg(const void* x, int64_t x_stride, cons
 extern "C" cudaError_t blz_skinny_gemm_ex(const void* x, int64_t x_stride, const void* w, void* y, int64_t y_stride,
                                           int rows, int n, int k, blz_half_t dtype, cudaStream_t stream) {
   return blz_skinny_gemm_cfg(x, x_stride, w, y, y_stride, rows, n, k, dtype, 0, stream);
+}
+
+extern "C" cudaError_t blz_skinny_gemm_bf16_tiled(const uint16_t* x, int64_t x_stride, const uint16_t* w, uint16_t* y,
+                                                  int64_t y_stride, int rows, int n, int k, cudaStream_t stream) {
+  if (rows < 1 || rows > 65535 || n < 1 || k < 1 || k % 8 || x_stride % 8 || y_stride < n ||
+      reinterpret_cast<uintptr_t>(x) % 16 || reinterpret_cast<uintptr_t>(w) % 16)
+    return cudaErrorInvalidValue;
+  const int row_tiles = (rows + BLZ_SKINNY_MAX_ROWS - 1) / BLZ_SKINNY_MAX_ROWS;
+  const auto* bf_x = reinterpret_cast<const __nv_bfloat16*>(x);
+  const auto* bf_w = reinterpret_cast<const __nv_bfloat16*>(w);
+  auto* bf_y = reinterpret_cast<__nv_bfloat16*>(y);
+  if (n >= 256) {
+    blaze::skinny_gemm_kernel<__nv_bfloat16, 4, true><<<dim3((n + 3) / 4, row_tiles), blaze::kThreads, 0, stream>>>(
+        bf_x, x_stride, bf_w, bf_y, y_stride, rows, n, k);
+  } else {
+    blaze::skinny_gemm_kernel<__nv_bfloat16, 1, true><<<dim3(n, row_tiles), blaze::kThreads, 0, stream>>>(
+        bf_x, x_stride, bf_w, bf_y, y_stride, rows, n, k);
+  }
+  return cudaGetLastError();
 }
 
 extern "C" cudaError_t blz_skinny_gemm(const void* x, int64_t x_stride, const void* w, void* y, int rows, int n,

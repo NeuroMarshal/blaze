@@ -1,6 +1,6 @@
 use super::{KvDtype, cpu};
 use super::dspark::{Cache as DraftCache, Draft, Features};
-use super::cuda::{AttentionClip, AttentionConv, AttentionResidual, AttentionRow, AttentionScratch, Compute, Dense, Kv, MlpResidual, MoeOutput, ProjectionInputs, RecurrentMessages, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, prompt_stage_bytes, to_bf16};
+use super::cuda::{AttentionClip, AttentionConv, AttentionResidual, AttentionRow, AttentionScratch, Compute, Dense, Kv, MlpResidual, MoeOutput, ProjectionInputs, RecurrentMessages, expert_size, from_bf16, prefill_attention_rows, prompt_stage_bytes, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
 use super::weights::{Experts, read_float};
@@ -8,6 +8,7 @@ use crate::config::{InklingLoop, MlpConfig, ModelConfig};
 use crate::gpu;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, ensure};
+use rayon::prelude::*;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -177,9 +178,24 @@ impl Conv {
         dim: usize,
     ) -> Vec<f32> {
         let k = self.taps.len();
+        let out = self.apply(x, dyn_weights, k.min(pos + 1), dim, |lag| {
+            &state.rows[(pos - lag) % state.rows.len()]
+        });
+        if k > 1 {
+            let slot = pos % state.rows.len();
+            state.rows[slot].copy_from_slice(x);
+        }
+        out
+    }
+
+    fn apply<'a>(
+        &self, x: &[f32], dyn_weights: Option<&[u16]>, taps: usize, dim: usize,
+        previous: impl Fn(usize) -> &'a [f32],
+    ) -> Vec<f32> {
+        let k = self.taps.len();
         let mut out = x.to_vec();
-        for lag in 0..k.min(pos + 1) {
-            let src = if lag == 0 { x } else { &state.rows[(pos - lag) % state.rows.len()] };
+        for lag in 0..taps {
+            let src = if lag == 0 { x } else { previous(lag) };
             let taps = &self.taps[lag];
             if let Some(d) = dyn_weights {
                 for (head, ((out, src), taps)) in out
@@ -198,10 +214,6 @@ impl Conv {
                     *o += v * w;
                 }
             }
-        }
-        if k > 1 {
-            let slot = pos % state.rows.len();
-            state.rows[slot].copy_from_slice(x);
         }
         out.iter_mut().for_each(|v| *v = round(*v * self.scale));
         out
@@ -233,6 +245,14 @@ impl ConvState {
             for (dst, &value) in self.rows[slot].iter_mut().zip(&rows[r * width..(r + 1) * width]) {
                 *dst = from_bf16(value);
             }
+        }
+    }
+
+    fn remember_f32(&mut self, start: usize, width: usize, rows: &[f32]) {
+        let slots = self.rows.len();
+        let count = rows.len() / width;
+        for r in count.saturating_sub(slots)..count {
+            self.rows[(start + r) % slots].copy_from_slice(&rows[r * width..(r + 1) * width]);
         }
     }
 }
@@ -305,7 +325,8 @@ struct LoopInputs {
 
 impl LoopInputs {
     fn mix_attention_rows(&self, gpu: &mut Compute, qkv: &mut [Vec<Vec<f32>>],
-                          rows: &[ForwardRow], norms: Option<&gpu::DevBuf>, bank_ready: &mut bool, eps: f32) -> Result<bool> {
+                          rows: &[ForwardRow], norms: Option<&gpu::DevBuf>, bank_ready: &mut bool,
+                          workers: Option<&rayon::ThreadPool>, eps: f32) -> Result<bool> {
         let controllers = self.controllers.first_chunk::<3>().unwrap();
         let width = qkv[0][0].len();
         if qkv.len() > 1
@@ -319,13 +340,18 @@ impl LoopInputs {
                         rows.iter().map(|row| row.messages.as_slice()).collect()
                     };
                     let scale = (width as f32).sqrt().recip();
-                    let weights: Vec<_> = rows.iter().map(|row| std::array::from_fn(|group| {
+                    let prepare = |row: &ForwardRow| std::array::from_fn(|group| {
                         let logits = [0, 1].map(|i| dot(&row.messages[i], &self.queries[group]) * scale);
                         let peak = logits[0].max(logits[1]);
                         let exp = logits.map(|v| (v - peak).exp());
                         let sum = (exp[0] + exp[1]).recip();
                         exp.map(|v| v * sum)
-                    })).collect();
+                    });
+                    let weights: Vec<_> = if let Some(pool) = workers {
+                        pool.install(|| rows.par_iter().map(prepare).collect())
+                    } else {
+                        rows.iter().map(prepare).collect()
+                    };
                     let messages = RecurrentMessages::Bank {
                         upload: (!*bank_ready).then_some(&bank),
                         weights: &weights,
@@ -337,9 +363,14 @@ impl LoopInputs {
                         return Ok(true);
                     }
                 }
-                let messages: Vec<[Vec<f32>; 3]> = rows.iter().map(|row| {
+                let prepare = |row: &ForwardRow| {
                     std::array::from_fn(|i| mix_normalized(&row.messages, &self.queries[i]))
-                }).collect();
+                };
+                let messages: Vec<[Vec<f32>; 3]> = if let Some(pool) = workers {
+                    pool.install(|| rows.par_iter().map(prepare).collect())
+                } else {
+                    rows.iter().map(prepare).collect()
+                };
                 if gpu.queue_recurrent_attention(controllers.each_ref().map(|c| &c.down), [q, k, v],
                     qkv, RecurrentMessages::Mixed(&messages), norms, eps)?
                 {
@@ -686,6 +717,7 @@ pub struct Model {
     profile_prefill: bool,
     recurrent_qkv: bool,
     batch_qkv: bool,
+    parallel_prefill: bool,
 }
 
 impl Model {
@@ -807,7 +839,7 @@ impl Model {
                 let layer = &layers[visit.layer];
                 let packing = layer.experts.gate_up.packing as usize;
                 let slots = if layer.local {
-                    (loops.window + prefill_chunk.min(PREFILL_ATTENTION_ROWS).saturating_sub(1).max(dspark_tokens)).min(context)
+                    (loops.window + prefill_attention_rows(prefill_chunk).saturating_sub(1).max(dspark_tokens)).min(context)
                 } else if host_kv {
                     context.min(SHORT_KV_TOKENS)
                 } else {
@@ -878,6 +910,7 @@ impl Model {
             profile_prefill: std::env::var_os("BLAZE_INKLING_PROFILE_PREFILL").is_some_and(|value| value == "1"),
             recurrent_qkv: std::env::var_os("BLAZE_INKLING_RECURRENT_QKV").is_some_and(|value| value == "1"),
             batch_qkv: std::env::var_os("BLAZE_INKLING_BATCH_QKV").is_some_and(|value| value == "1"),
+            parallel_prefill: std::env::var_os("BLAZE_INKLING_PARALLEL_PREFILL").is_some_and(|value| value == "1"),
         })
     }
 
@@ -901,7 +934,7 @@ impl Model {
         );
         let s = &self.cfg;
         let slack = self.draft.as_ref().map_or(0, |draft| draft.limit);
-        let kv_slack = (self.prefill_chunk.min(PREFILL_ATTENTION_ROWS) - 1).max(slack);
+        let kv_slack = (prefill_attention_rows(self.prefill_chunk) - 1).max(slack);
         let visits = self
             .loops
             .visits
@@ -1062,6 +1095,8 @@ impl Model {
             }
             let compute = &mut device.compute;
             let layer = &self.layers[id];
+            let workers = if self.parallel_prefill && rows.len() >= 128
+                && !matches!(readout, Readout::Verify(_)) { compute.host_workers() } else { None };
             if !matches!(readout, Readout::Verify(_))
                 && let Some(next) = self.loops.visits.get(index + 1)
                 && self.placement[next.layer] == rank
@@ -1076,15 +1111,16 @@ impl Model {
             let controller = (visit.pass > 0).then(|| layer.loop_inputs.as_ref().unwrap());
             let recurrent = controller.zip(layer.device_qkv_norms.as_ref())
                 .filter(|_| self.recurrent_qkv && rows.len() == 1 && compute.recurrent_qkv_fits(s.hidden));
-            let mut qkv_rows = Vec::with_capacity(rows.len());
-            for row in &mut rows {
+            let restart = id == self.loops.core.start;
+            let end = id == self.loops.core.end;
+            let prepare_qkv = |row: &mut ForwardRow| {
                 let ForwardRow {
                     x,
                     blocks,
                     prelude,
                     messages,
                 } = row;
-                if id == self.loops.core.start {
+                if restart {
                     if visit.pass == 0 {
                         *prelude = Some((x.clone(), blocks.len()));
                     } else {
@@ -1095,7 +1131,7 @@ impl Model {
                         x.clone_from(start);
                     }
                 }
-                if id == self.loops.core.end {
+                if end {
                     messages.clear();
                 }
                 let mut qkv = if id == 0 {
@@ -1106,15 +1142,20 @@ impl Model {
                 if qkv.len() == 1 && controller.is_some() {
                     qkv.resize(3, qkv[0].clone());
                 }
-                qkv_rows.push(qkv);
-            }
+                qkv
+            };
+            let mut qkv_rows: Vec<_> = if let Some(pool) = &workers {
+                pool.install(|| rows.par_iter_mut().map(prepare_qkv).collect())
+            } else {
+                rows.iter_mut().map(prepare_qkv).collect()
+            };
             let count = rows.len();
             let on_device = count > 1 && self.prefill_chunk >= s.conv && !matches!(readout, Readout::Verify(_));
             let normalized_on_gpu = if recurrent.is_none() && let Some(c) = controller {
                 let norms = layer.device_qkv_norms.as_ref()
                     .filter(|_| self.batch_qkv && on_device && layer.device_clip.is_some()
                         && layer.kv_taps.is_some());
-                c.mix_attention_rows(compute, &mut qkv_rows, &rows, norms, &mut bank_ready, s.eps)?
+                c.mix_attention_rows(compute, &mut qkv_rows, &rows, norms, &mut bank_ready, workers.as_deref(), s.eps)?
             } else { false };
             for qkv in qkv_rows.iter().filter(|_| recurrent.is_none() && !normalized_on_gpu) {
                 let norm = |x: &[f32], weight: &[f32]| normalized(x, Some(weight), s.eps);
@@ -1297,37 +1338,67 @@ impl Model {
                 (attention, false)
             };
             phase(1);
+            let prepare_mlp = |offset: usize, row: &mut ForwardRow| {
+                let position = seq.position + offset;
+                let attn = &attention[offset * s.hidden..][..s.hidden];
+                let mut residual = if residual_ready {
+                    attn.to_vec()
+                } else {
+                    layer.attn_conv.apply(attn, None, s.conv.min(position + 1), s.dim, |lag| {
+                        if let Some(earlier) = offset.checked_sub(lag) {
+                            &attention[earlier * s.hidden..][..s.hidden]
+                        } else {
+                            &state.attention.rows[(position - lag) % state.attention.rows.len()]
+                        }
+                    })
+                };
+                if block_start {
+                    row.blocks.push(normalized(&row.x, None, s.eps));
+                } else if !residual_ready {
+                    residual.iter_mut().zip(&row.x).for_each(|(v, &x)| *v += x);
+                }
+                let mixed = mix(&row.blocks, &residual, &layer.res_mlp, s.eps).remove(0);
+                let message = controller.map(|c| mix_normalized(&row.messages, &c.queries[3]));
+                let activation = if message.is_none() {
+                    normalized(&mixed, Some(&layer.norm_mlp), s.eps).into_iter().map(round).collect()
+                } else {
+                    mixed
+                };
+                (residual, activation, message)
+            };
+            let prepared: Vec<_> = if let Some(pool) = &workers {
+                pool.install(|| rows.par_iter_mut().enumerate().map(|(i, row)| prepare_mlp(i, row)).collect())
+            } else {
+                rows.iter_mut().enumerate().map(|(i, row)| prepare_mlp(i, row)).collect()
+            };
+            if !residual_ready {
+                state.attention.remember_f32(seq.position, s.hidden, &attention);
+            }
             let mut inputs = Vec::new();
             let mut mixed = Vec::new();
             let mut messages_batch = Vec::new();
             let limit = compute.gate_batch_limit(s.hidden);
             let mut gated_logits = None;
-            for (offset, (row, attn)) in rows.iter_mut().zip(attention.chunks_exact(s.hidden)).enumerate() {
-                let position = seq.position + offset;
-                let ForwardRow { x, blocks, messages, .. } = row;
-                let mut residual = if residual_ready { attn.to_vec() } else {
-                    layer.attn_conv.run(&mut state.attention, attn, None, position, s.dim)
-                };
-                if block_start {
-                    blocks.push(normalized(x, None, s.eps));
-                } else if !residual_ready {
-                    residual.iter_mut().zip(x.iter()).for_each(|(v, &x)| *v += x);
-                }
-                let mut mlp_in = mix(blocks, &residual, &layer.res_mlp, s.eps).remove(0);
-                if visit.pass > 0 {
-                    let c = layer.loop_inputs.as_ref().unwrap();
-                    let msg = mix_normalized(messages, &c.queries[3]);
+            let retain_activations = workers.is_some() && compute.retain_prefill_activations()
+                && layer.gated_norm.is_some() && matches!(layer.router, Router::Device(_))
+                && controller.is_some_and(|c| matches!(c.controllers[3].up, GateWeights::Device(_)));
+            for (offset, (residual, mut mlp_in, message)) in prepared.into_iter().enumerate() {
+                if let (Some(c), Some(msg)) = (controller, message) {
                     let gate = &c.controllers[3];
                     if let (Some(norm), GateWeights::Device(up), Router::Device(router)) =
                         (&layer.gated_norm, &gate.up, &layer.router)
                     {
-                        inputs.extend(Controller::input(&mlp_in, &msg, s.eps));
+                        if workers.is_none() {
+                            inputs.extend(Controller::input(&mlp_in, &msg, s.eps));
+                        }
                         mixed.extend(mlp_in);
                         messages_batch.extend(msg);
                         residuals.push(residual);
                         if offset+1 == count || mixed.len() >= limit*s.hidden {
+                            let retain_at = retain_activations.then(|| offset + 1 - mixed.len() / s.hidden);
                             let (activation, logits) = compute.gated_router(
-                                &gate.down, up, norm, router, &inputs, &mixed, &messages_batch, s.eps,
+                                &gate.down, up, norm, router, workers.is_none().then_some(inputs.as_slice()),
+                                &mixed, &messages_batch, s.eps, retain_at,
                             )?;
                             if count == 1 { activations.push(activation); }
                             else { activations.extend(activation.chunks_exact(s.hidden).map(<[f32]>::to_vec)); }
@@ -1339,18 +1410,22 @@ impl Model {
                         continue;
                     }
                     gate.merge(compute, &mut mlp_in, &msg, s.eps)?;
+                    mlp_in = normalized(&mlp_in, Some(&layer.norm_mlp), s.eps).into_iter().map(round).collect();
                 }
-                let mlp_in = normalized(&mlp_in, Some(&layer.norm_mlp), s.eps)
-                    .into_iter()
-                    .map(round)
-                    .collect::<Vec<_>>();
                 activations.push(mlp_in);
                 residuals.push(residual);
             }
+            let route_rows = |logits: &[f32]| {
+                let route = |row: &[f32]| layer.routes(row.iter().copied(), s);
+                if let Some(pool) = &workers {
+                    pool.install(|| logits.par_chunks_exact(s.experts).map(route).collect())
+                } else {
+                    logits.chunks_exact(s.experts).map(route).collect()
+                }
+            };
             let routes: Vec<_> = match (&layer.router, gated_logits) {
-                (_, Some(logits)) => logits.chunks_exact(s.experts).map(|row| layer.routes(row.iter().copied(), s)).collect(),
-                (Router::Device(w), None) => compute.router_logits(w, &activations)?.chunks_exact(s.experts)
-                    .map(|row| layer.routes(row.iter().copied(), s)).collect(),
+                (_, Some(logits)) => route_rows(&logits),
+                (Router::Device(w), None) => route_rows(&compute.router_logits(w, &activations)?),
                 (Router::Host(w), None) => activations.iter().map(|x| {
                     layer.routes(w.chunks_exact(s.hidden).map(|row| dot(row, x)), s)
                 }).collect(),
@@ -1372,7 +1447,7 @@ impl Model {
                 &self.ckpt,
                 &layer.experts,
                 id,
-                &activations,
+                (!retain_activations).then_some(activations.as_slice()),
                 &routes,
                 (s.gate_cap, s.up_cap),
                 s.experts,

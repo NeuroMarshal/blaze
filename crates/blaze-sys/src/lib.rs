@@ -453,6 +453,8 @@ unsafe extern "C" {
                                w_alpha: *const f32, y: *mut u16, ldy: i64, m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, rows: c_int, n: c_int,
                            k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_skinny_gemm_bf16_tiled(x: *const u16, x_stride: i64, w: *const u16, y: *mut u16,
+        y_stride: i64, rows: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_skinny_gemm_ex(x: *const c_void, x_stride: i64, w: *const c_void, y: *mut c_void, y_stride: i64, rows: c_int,
                               n: c_int, k: c_int, dtype: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_f16_rows(x: *const u16, ldx: i64, rows: c_int, k: c_int, x16: *mut u16, shift: *mut i32, s: cudaStream_t) -> cudaError_t;
@@ -663,6 +665,8 @@ unsafe extern "C" {
     pub fn blz_inkling_mlp_residual_conv(routed: *const f32, residual: *const f32, history: *const u16,
         weights: *const f32, output: *mut u16, tail: *mut u16, width: c_int, taps: c_int,
         history_rows: c_int, rows: c_int, tail_rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_merge_cold(input: *const f32, output: *mut f32, tokens: *const i32, offsets: *const i32,
+        weights: *const f32, rows: c_int, width: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_dspark_attention(q: *const u16, stride: c_int, rows: c_int, keys: *const u8, values: *const u8,
                                 ks: *const u8, vs: *const u8, sinks: *const u16, gate: *const u16,
                                 out: *mut u16, scratch: *mut f32, heads: c_int, kv_heads: c_int, capacity: c_int,

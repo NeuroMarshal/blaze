@@ -916,7 +916,28 @@ __global__ void scatter_expert(const __nv_bfloat16* input, float* output, const 
         dst = fmaf(__bfloat162float(input[row * hidden + col]), weights[row], dst);
     }
 }
+
+__global__ void merge_cold_experts(const float* input, float* output, const int* tokens,
+        const int* offsets, const float* weights, int width) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int index = blockIdx.y;
+    if (col >= width) return;
+    auto& sum = output[size_t(tokens[index]) * width + col];
+    float value = sum;
+    for (int i = offsets[index]; i < offsets[index + 1]; ++i) {
+        value = __fadd_rn(value, __fmul_rn(input[size_t(i) * width + col], weights[i]));
+    }
+    sum = value;
+}
 } // namespace
+
+extern "C" cudaError_t blz_inkling_merge_cold(const float* input, float* output, const int32_t* tokens,
+    const int32_t* offsets, const float* weights, int rows, int width, cudaStream_t stream) {
+    if (rows < 1 || rows > 65535 || width < 1) return cudaErrorInvalidValue;
+    merge_cold_experts<<<dim3((width + 255) / 256, rows), 256, 0, stream>>>(
+        input, output, tokens, offsets, weights, width);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_inkling_expert_scatter(const uint16_t* input, float* output, const int32_t* ids,
                                                  const float* weights, int rows, int hidden, cudaStream_t stream) {
