@@ -20,23 +20,22 @@ pub enum Input {
 }
 
 pub fn tokenize_prompt(model: &Model, text: &Text, prompt: &str, images: &[Vec<u8>]) -> Result<Vec<Input>> {
-    tokenize_with_images(model, text, prompt, images.len(), |i| model.encode_image(&images[i]))
+    inputs_with_images(model, text, text.encode(prompt)?, images.len(), |i| model.encode_image(&images[i]))
 }
 
-pub(crate) fn tokenize_decoded_prompt(
-    model: &Model, text: &Text, prompt: &str, images: &[crate::vision::RgbImage],
+pub(crate) fn inputs_from_tokens(
+    model: &Model, text: &Text, tokens: Vec<u32>, images: &[crate::vision::RgbImage],
 ) -> Result<Vec<Input>> {
-    tokenize_with_images(model, text, prompt, images.len(), |i| model.encode_decoded_image(&images[i]))
+    inputs_with_images(model, text, tokens, images.len(), |i| model.encode_decoded_image(&images[i]))
 }
 
-fn tokenize_with_images(
+fn inputs_with_images(
     model: &Model,
     text: &Text,
-    prompt: &str,
+    ids: Vec<u32>,
     images: usize,
     mut encode: impl FnMut(usize) -> Result<Vec<Vec<u16>>>,
 ) -> Result<Vec<Input>> {
-    let ids = text.encode(prompt)?;
     let placeholder = text
         .token_id("<|unused_200054|>")
         .context("Inkling tokenizer is missing the image token")?;

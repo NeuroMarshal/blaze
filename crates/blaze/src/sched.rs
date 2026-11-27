@@ -84,6 +84,7 @@ pub struct GenRequest {
     /// the images of the prompt: their rows in `tokens` are prefix-cache keys (MmInput::keyed), their embeddings and
     /// M-RoPE positions come from here
     pub mm: Option<Arc<crate::mm::MmInput>>,
+    pub(crate) images: Vec<crate::vision::RgbImage>,
     pub events: UnboundedSender<GenEvent>,
     /// set by the client side (stop string seen, connection closed)
     pub cancel: Arc<AtomicBool>,
@@ -594,15 +595,7 @@ impl Drop for SchedulerLifecycle {
 
 impl Scheduler {
     pub fn start(engine: Engine, cfg: SchedConfig) -> Self {
-        let (tx, rx) = channel();
-        let stats = Arc::new(SchedStats::default());
-        let loop_stats = stats.clone();
-        let max_requests = cfg.max_requests;
-        let stop = Arc::new(AtomicBool::new(false));
-        let loop_stop = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("blaze-sched".into())
-            .spawn(move || {
+        Self::start_worker(cfg.max_requests, "blaze-sched", move |rx, loop_stop, loop_stats| {
                 let mut s = Loop {
                     engine,
                     cfg,
@@ -631,12 +624,26 @@ impl Scheduler {
                 };
                 s.run();
             })
-            .expect("scheduler thread");
-        Self {
+            .expect("scheduler thread")
+    }
+
+    pub(crate) fn start_worker(
+        max_requests: usize, name: &str,
+        run: impl FnOnce(Receiver<GenRequest>, Arc<AtomicBool>, Arc<SchedStats>) + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (tx, rx) = channel();
+        let stats = Arc::new(SchedStats::default());
+        let loop_stats = stats.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let loop_stop = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || run(rx, loop_stop, loop_stats))?;
+        Ok(Self {
             lifecycle: Arc::new(SchedulerLifecycle { tx: Mutex::new(Some(tx)), thread: Mutex::new(Some(thread)), stop }),
             stats,
             max_requests,
-        }
+        })
     }
 
     pub fn submit(&self, mut req: GenRequest) -> Result<(), SubmitError> {
@@ -985,7 +992,7 @@ mod scheduler_lifecycle_tests {
 impl GenRequest {
     pub fn new(tokens: Vec<i64>, params: SamplingParams, events: UnboundedSender<GenEvent>, cancel: Arc<AtomicBool>) -> Self {
         Self { trace: crate::logging::request_trace(0), permit: None, tokens, params, max_tokens: 1,
-            stop_ids: Vec::new(), cache_points: Vec::new(), think: None, constraint: None, mm: None,
+            stop_ids: Vec::new(), cache_points: Vec::new(), think: None, constraint: None, mm: None, images: Vec::new(),
             events, cancel, embed: false }
     }
 }

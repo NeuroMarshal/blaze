@@ -79,6 +79,7 @@ struct AppState {
     sched: Scheduler,
     text: Arc<Text>,
     formatter: Option<blaze_chat::ChatFormatter>,
+    native_chat: Option<inkling::Chat>,
     cfg: ServeConfig,
     max_context: usize,
     vocab: usize,
@@ -249,16 +250,21 @@ fn loading(req: &Request, started: std::time::Instant) -> Response {
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(early: Early, sched: Scheduler, model_dir: &std::path::Path, text: Text, grammars: Option<Grammars>, cfg: ServeConfig,
                    max_context: usize, vocab: usize, mm: MmConfig) -> Result<()> {
+    serve_with(early, sched, model_dir, Arc::new(text), grammars, cfg, max_context, vocab, mm, None).await
+}
+
+async fn serve_with(early: Early, sched: Scheduler, model_dir: &std::path::Path, text: Arc<Text>, grammars: Option<Grammars>, cfg: ServeConfig,
+                   max_context: usize, vocab: usize, mm: MmConfig, native_chat: Option<inkling::Chat>) -> Result<()> {
     let template = model_dir.join("chat_template.jinja");
     let config = model_dir.join("tokenizer_config.json");
-    let formatter = blaze_chat::load_chat_formatter(
+    let formatter = native_chat.is_none().then(|| blaze_chat::load_chat_formatter(
         config.exists().then(|| config.to_string_lossy().into_owned()).as_deref(),
         Some(&model_dir.to_string_lossy()),
         None,
         template.exists().then(|| template.to_string_lossy().into_owned()).as_deref(),
     )
     .map_err(|e| eprintln!("blaze: chat completions disabled: {e}"))
-    .ok();
+    .ok()).flatten();
     // the template's text: chat_template.jinja, else tokenizer_config.json's chat_template (one or a list of named ones)
     let template_text = std::fs::read_to_string(&template).ok().or_else(|| {
         let c: Value = serde_json::from_str(&std::fs::read_to_string(&config).ok()?).ok()?;
@@ -271,8 +277,9 @@ pub async fn serve(early: Early, sched: Scheduler, model_dir: &std::path::Path, 
         key_hashes: cfg.api_keys.iter().map(|k| blake3::hash(k.as_bytes())).collect(),
         mm,
         sched,
-        text: Arc::new(text),
+        text,
         formatter,
+        native_chat,
         cfg,
         max_context,
         vocab,
@@ -292,13 +299,18 @@ pub async fn serve(early: Early, sched: Scheduler, model_dir: &std::path::Path, 
         .route("/v1/models/{*id}", get(model))
         .route("/v1/chat/completions", post(chat::chat))
         .route("/v1/completions", post(completions::completions))
-        .route("/v1/embeddings", post(embeddings::embeddings))
         .route("/v1/responses", post(responses::create))
         .route("/v1/messages", post(messages::create))
         .route("/v1/messages/count_tokens", post(messages::count_tokens))
         .route("/v1/responses/{id}", get(responses::get_one))
         .route("/tokenize", post(tokenize::tokenize))
-        .route("/detokenize", post(tokenize::detokenize))
+        .route("/detokenize", post(tokenize::detokenize));
+    let app = if state.native_chat.is_none() {
+        app.route("/v1/embeddings", post(embeddings::embeddings))
+    } else {
+        app
+    };
+    let app = app
         .fallback(|| async { api_error(StatusCode::NOT_FOUND, "no such endpoint", Some("not_found"), None) })
         .method_not_allowed_fallback(|| async { error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed") })
         .layer(DefaultBodyLimit::max(body_limit))
@@ -306,19 +318,22 @@ pub async fn serve(early: Early, sched: Scheduler, model_dir: &std::path::Path, 
         .with_state(state.clone());
     let Early { app: slot, mut serving, stop, mut signal, listen, started } = early;
     let _ = slot.set(app);
-    let endpoints = ["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages", "/v1/embeddings"];
+    let mut endpoints = vec!["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/messages"];
+    if state.native_chat.is_none() {
+        endpoints.push("/v1/embeddings");
+    }
     if crate::logging::options().format == crate::logging::Format::Json {
         crate::logging::event(crate::logging::Level::Info,"server.ready",json!({"listen":listen.to_string(),
             "model":state.cfg.served_name,"max_model_len":max_context,"api_auth":!state.key_hashes.is_empty(),
             "load_s":started.elapsed().as_secs_f64(),
-            "endpoints":["/v1/chat/completions","/v1/completions","/v1/responses","/v1/messages","/v1/embeddings","/metrics","/server_info"]}));
+            "endpoints": endpoints.iter().copied().chain(["/metrics", "/server_info"]).collect::<Vec<_>>()}));
     } else {
         let mut rows = vec![
             ("API".to_string(), endpoints.join("  ")),
             ("service".to_string(), "/health  /metrics  /server_info  /v1/models  /tokenize  /detokenize  /version".to_string()),
             ("API keys".to_string(), if state.key_hashes.is_empty() { "none: any client".to_string() } else { format!("{} accepted", state.key_hashes.len()) }),
             ("structured outputs".to_string(), if state.grammars.is_some() { "on".into() } else { "off (no grammar compiler)".into() }),
-            ("chat template".to_string(), if state.formatter.is_some() { "from the checkpoint".into() } else { "none: /v1/chat/completions disabled".into() }),
+            ("chat template".to_string(), if state.formatter.is_some() || state.native_chat.is_some() { "from the checkpoint".into() } else { "none: /v1/chat/completions disabled".into() }),
         ];
         let stages = {
             let mut f = crate::logging::finished();
@@ -817,6 +832,20 @@ impl Gen {
         self.detok.cutter.matched.clone().map_or(Value::Null, Value::from)
     }
 
+    async fn next_event(&mut self) -> GenEvent {
+        let event = self.rx.recv().await.unwrap_or_else(|| GenEvent::Error("generation ended unexpectedly".into()));
+        match &event {
+            GenEvent::Started { prompt_tokens, cached_tokens } => {
+                self.prompt_tokens = *prompt_tokens;
+                self.cached_tokens = *cached_tokens;
+            }
+            GenEvent::Token(..) => self.completion_tokens += 1,
+            GenEvent::Done(_) | GenEvent::Error(_) => self.done = true,
+            GenEvent::Embedding(_) => {}
+        }
+        event
+    }
+
     async fn next(&mut self) -> Option<Piece> {
         if let Some(p) = self.queued.take() {
             return Some(p);
@@ -825,18 +854,9 @@ impl Gen {
             return None;
         }
         loop {
-            let Some(ev) = self.rx.recv().await else {
-                self.done = true;
-                return Some(Piece::Error("generation ended unexpectedly".into()));
-            };
-            match ev {
-                GenEvent::Started { prompt_tokens, cached_tokens } => {
-                    self.prompt_tokens = prompt_tokens;
-                    self.cached_tokens = cached_tokens;
-                }
-                GenEvent::Embedding(_) => {}
+            match self.next_event().await {
+                GenEvent::Started { .. } | GenEvent::Embedding(_) => {}
                 GenEvent::Token(t, lp) => {
-                    self.completion_tokens += 1;
                     if let Some(lp) = lp {
                         self.logprobs.push((t as u32, lp));
                     }
@@ -852,7 +872,6 @@ impl Gen {
                     }
                 }
                 GenEvent::Done(f) => {
-                    self.done = true;
                     let f = if self.detok.stopped() { Finish::Stop } else { f };
                     let tail = self.detok.cutter.flush();
                     if tail.is_empty() {
@@ -862,7 +881,6 @@ impl Gen {
                     return Some(Piece::Text(tail, std::mem::take(&mut self.logprobs)));
                 }
                 GenEvent::Error(e) => {
-                    self.done = true;
                     return Some(Piece::Error(e));
                 }
             }
@@ -885,7 +903,7 @@ impl Drop for Gen {
 
 /// Token counts of one API request, summed over its generations.
 struct Totals {
-    prompt: usize,
+    prompt: AtomicUsize,
     cached: AtomicUsize,
     completion: AtomicUsize,
     /// the stop string that ended each choice
@@ -894,7 +912,7 @@ struct Totals {
 
 impl Totals {
     fn new(prompt: usize) -> Arc<Self> {
-        Arc::new(Self { prompt, cached: AtomicUsize::new(0), completion: AtomicUsize::new(0), stops: Default::default() })
+        Arc::new(Self { prompt: AtomicUsize::new(prompt), cached: AtomicUsize::new(0), completion: AtomicUsize::new(0), stops: Default::default() })
     }
 
     fn note_stop(&self, choice: usize, g: &Gen) {
@@ -916,7 +934,8 @@ impl Totals {
 
     fn usage(&self) -> Value {
         let c = self.completion.load(Ordering::Relaxed);
-        json!({"prompt_tokens": self.prompt, "completion_tokens": c, "total_tokens": self.prompt + c,
+        let prompt = self.prompt.load(Ordering::Relaxed);
+        json!({"prompt_tokens": prompt, "completion_tokens": c, "total_tokens": prompt + c,
                "prompt_tokens_details": {"cached_tokens": self.cached.load(Ordering::Relaxed)}})
     }
 }
@@ -943,6 +962,11 @@ fn submit(st: &Arc<AppState>, tokens: &[i64], spec: &Spec, choice: usize, constr
     req.think = spec.think.clone();
     req.constraint = constraint;
     req.mm = spec.mm.clone();
+    submit_prepared(st, req, rx, spec)
+}
+
+fn submit_prepared(st: &Arc<AppState>, req: GenRequest, rx: tokio::sync::mpsc::UnboundedReceiver<GenEvent>, spec: &Spec) -> Checked<Gen> {
+    let cancel = req.cancel.clone();
     st.sched.submit(req).map_err(control::submit_error)?;
     st.metrics.requests.fetch_add(1, Ordering::Relaxed);
     st.metrics.open.fetch_add(1, Ordering::Relaxed);

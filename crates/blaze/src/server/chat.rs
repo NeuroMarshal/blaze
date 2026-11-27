@@ -265,7 +265,7 @@ type Decoded = Pin<Box<dyn Stream<Item = std::result::Result<DecodedChatEvent, A
 
 /// One choice's generation as decoded chat events (prompt tokens ride on every event; counts are per event).
 fn decoded_events(mut g: Gen, choice: usize, totals: Arc<Totals>, text: Arc<Text>) -> Decoded {
-    let prompt_tokens = totals.prompt as u32;
+    let prompt_tokens = totals.prompt.load(Ordering::Relaxed) as u32;
     Box::pin(async_stream::stream! {
         let mut seen = 0;
         while let Some(piece) = g.next().await {
@@ -334,6 +334,10 @@ pub(super) async fn call(st: Arc<AppState>, mut body: Value) -> ChatOut {
 }
 
 async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
+    if let Some(chat) = &st.native_chat {
+        let (events, totals) = super::inkling::chat(chat, &st, body).await?;
+        return respond(&st, body, 1, events, totals).await;
+    }
     let prepared_at=std::time::Instant::now();
     check_ranges(&st, body)?;
     let images = super::media::gather(&st, body).await?;
@@ -346,9 +350,6 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let n = n_of(body);
     #[allow(deprecated)]
     let max_tokens = p.request.max_completion_tokens.or(p.request.max_tokens).map(|x| x as usize).unwrap_or(st.cfg.default_max_tokens);
-    let stream = p.request.stream.unwrap_or(false);
-    let include_usage = p.request.stream_options.as_ref().is_some_and(|o| o.include_usage);
-    let include_reasoning = body.get("include_reasoning").and_then(Value::as_bool).unwrap_or(true);
     let mut spec = Spec::of(&st, body, max_tokens, think_budget(&st, body, p.starts_in_reasoning), p.instruct)?;
     // images: encoded now (the prompt fits the context), their rows in the token list become prefix-cache keys
     let mut tokens = p.tokens;
@@ -378,7 +379,16 @@ async fn run(st: Arc<AppState>, body: &mut Value) -> Checked<Response> {
     let decoded = futures::stream::select_all(
         gens.into_iter().enumerate().map(|(i, g)| decoded_events(g, i, totals.clone(), st.text.clone())).collect::<Vec<_>>(),
     );
-    let mut events = processor.process_stream(decoded);
+    let events = processor.process_stream(decoded);
+    respond(&st, body, n, events, totals).await
+}
+
+pub(super) type ChatEvents = Pin<Box<dyn Stream<Item = std::result::Result<ChatEvent, ApiError>> + Send>>;
+
+async fn respond(st: &AppState, body: &Value, n: usize, mut events: ChatEvents, totals: Arc<Totals>) -> Checked<Response> {
+    let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let include_usage = body.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false);
+    let include_reasoning = body.get("include_reasoning").and_then(Value::as_bool).unwrap_or(true);
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let model = st.cfg.served_name.clone();
     let created = now();

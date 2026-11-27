@@ -26,7 +26,7 @@ struct EngineArgs {
     #[arg(long, alias = "model-path")]
     model: PathBuf,
     /// Limit the model context (cannot exceed the checkpoint's context plus explicit YaRN)
-    #[arg(long, alias = "context-length")]
+    #[arg(long, aliases = ["context-length", "context"])]
     max_model_len: Option<usize>,
     /// KV cache size in tokens, or auto: the VRAM left once the model is loaded, less what the drafter and the vision
     /// tower will take and --vram-reserve, up to the contexts the sequences and prompt-cache snapshots can use (a model
@@ -34,7 +34,7 @@ struct EngineArgs {
     #[arg(long, default_value = "auto")]
     kv_tokens: String,
     /// prefill chunk in tokens
-    #[arg(long, alias = "chunked-prefill-size", default_value_t = 2048)]
+    #[arg(long, aliases = ["chunked-prefill-size", "prefill-chunk"], default_value_t = 2048)]
     chunk: usize,
     /// VRAM left free after the KV cache (auto) or the expert slots, GiB
     #[arg(long, default_value_t = 0.8)]
@@ -99,7 +99,7 @@ struct EngineArgs {
     #[arg(long)]
     yarn_factor: Option<f64>,
     /// EAGLE-4 drafter checkpoint (speculative decoding with --spec-method eagle)
-    #[arg(long)]
+    #[arg(long, alias = "draft")]
     draft_model: Option<PathBuf>,
     /// the checkpoint's own MTP head (its `mtp.*` tensors) as the drafter, with a KV ring of this many positions (0: off;
     /// `serve --spec-method mtp` takes 8192 when this is 0)
@@ -423,7 +423,7 @@ enum Command {
         seed: Option<u64>,
     },
     /// Serve Inkling 2 Mini with a native looped backend.
-    #[command(args_override_self = true)]
+    #[command(args_override_self = true, hide = true)]
     ServeInkling {
         #[arg(long)]
         model: PathBuf,
@@ -766,9 +766,19 @@ fn main() -> Result<()> {
                                 expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
             let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
             runtime.block_on(blaze::server::serve_inkling(blaze::server::InklingConfig {
-                path: model, host, port, name: served_model_name, max_tokens, queue: max_queued_requests,
+                path: model, queue: max_queued_requests,
                 options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, expert_threads, host_kv, kv_dtype: kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, max_image_tokens },
-                allowed_media_domains: allowed_media_domain,
+                service: blaze::server::ServeConfig {
+                    host, port, served_name: served_model_name, default_max_tokens: max_tokens,
+                    defaults: Default::default(), instruct_defaults: None, api_keys: Vec::new(),
+                    max_concurrent_requests: max_queued_requests.max(1), request_timeout: std::time::Duration::ZERO,
+                    shutdown_timeout: std::time::Duration::from_secs(10), body_limit: 32 << 20,
+                    allowed_origins: Vec::new(), effective, tool_parser: None, reasoning_parser: None,
+                    thinking_budget: None, grammar_whitespace: 0,
+                },
+                media: blaze::server::MmConfig::new(
+                    None, Default::default(), 4, 0, std::time::Duration::from_secs(5), 16 << 20, allowed_media_domain,
+                ),
             }))
         }
         Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, temperature, seed } => {
@@ -1063,6 +1073,65 @@ fn main() -> Result<()> {
             let defaults = service.sampling(&engine.model, &cli_sampling)?;
             let instruct_defaults = service.instruct_sampling(&engine.model, &cli_sampling)?;
             let api_keys = service.keys()?;
+            let name = served_model_name
+                .unwrap_or_else(|| engine.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            let cfg = blaze::server::ServeConfig {
+                served_name: name,
+                host,
+                port,
+                defaults,
+                instruct_defaults,
+                api_keys,
+                max_concurrent_requests: service.max_concurrent_requests,
+                request_timeout: std::time::Duration::from_secs_f64(service.request_timeout),
+                shutdown_timeout: std::time::Duration::from_secs_f64(service.shutdown_timeout),
+                body_limit: service.max_request_body_mib << 20,
+                allowed_origins: service.allowed_origins.split(',').map(str::trim).filter(|s| !s.is_empty() && *s != "none").map(str::to_owned).collect(),
+                effective,
+                default_max_tokens: max_tokens,
+                tool_parser: (!tool_call_parser.is_empty() && tool_call_parser != "none").then_some(tool_call_parser),
+                reasoning_parser: (!reasoning_parser.is_empty() && reasoning_parser != "none").then_some(reasoning_parser),
+                thinking_budget,
+                grammar_whitespace,
+            };
+            let checkpoint = blaze::config::ModelConfig::load(&engine.model)?;
+            let media_domains = allowed_media_domains.split(',').map(str::trim)
+                .filter(|domain| !domain.is_empty()).map(str::to_owned).collect();
+            if checkpoint.inkling_loop.is_some() {
+                anyhow::ensure!(engine.tp == 1 && (1..=2).contains(&engine.pp),
+                    "this checkpoint supports --pp 1 or --pp 2 with --tp 1");
+                anyhow::ensure!(engine.max_seqs == 1, "this checkpoint supports --max-seqs 1");
+                anyhow::ensure!(matches!(spec_method.as_str(), "auto" | "none" | "draft" | "dflash"),
+                    "this checkpoint supports DFlash2 via --draft-model");
+                anyhow::ensure!(!matches!(spec_method.as_str(), "draft" | "dflash") || engine.draft_model.is_some(),
+                    "--spec-method {spec_method} needs --draft-model");
+                let kv_dtype = match engine.kv_cache_dtype {
+                    blaze::model::KvDtype::Bf16 => blaze::inkling::KvDtype::Bf16,
+                    blaze::model::KvDtype::Nvfp4 => blaze::inkling::KvDtype::Nvfp4,
+                    blaze::model::KvDtype::Nvfp4FourOverSix => blaze::inkling::KvDtype::Nvfp4FourOverSix,
+                    dtype => anyhow::bail!("KV cache dtype {dtype:?} is unavailable for this checkpoint"),
+                };
+                let prefill_attention = match engine.prefill_attention {
+                    blaze::model::PrefillAttention::Auto => blaze::inkling::PrefillAttention::Tensor,
+                    blaze::model::PrefillAttention::Split => blaze::inkling::PrefillAttention::Scalar,
+                };
+                let options = blaze::inkling::Options {
+                    device: 0, gpus: engine.pp, context: engine.max_model_len.unwrap_or(checkpoint.max_positions),
+                    expert_cache_mib: 0, expert_threads: Some(engine.expert_threads), host_kv: engine.kv_host,
+                    kv_dtype, prefill_attention, draft: engine.draft_model, dspark_tokens: 0, dspark_head_vocab: 0,
+                    prefill_chunk: engine.chunk,
+                    max_image_tokens: if vision == blaze::vision::VisionMode::Off { 0 } else { 1024 },
+                };
+                let media = blaze::server::MmConfig::new(
+                    None, Default::default(), if limit_mm_per_prompt.is_empty() { 4 } else {
+                        blaze::server::parse_limit(&limit_mm_per_prompt).map_err(|err| anyhow::anyhow!(err))?
+                    }, 0, std::time::Duration::from_secs(image_fetch_timeout), image_fetch_max_mib << 20, media_domains,
+                );
+                let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
+                return runtime.block_on(blaze::server::serve_inkling(blaze::server::InklingConfig {
+                    path: engine.model, options, service: cfg, queue: service.max_queued_requests, media,
+                }));
+            }
             if spec_method == "mtp" {
                 // the checkpoint's own MTP head drafts chains
                 if engine.mtp_window == 0 {
@@ -1081,10 +1150,10 @@ fn main() -> Result<()> {
             // the API's port first: a port in use fails now, not after minutes of load, and until the model is ready every
             // request gets 503 with the load's progress
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build()?;
-            let early = rt.block_on(blaze::server::listen(&host, port))?;
+            let early = rt.block_on(blaze::server::listen(&cfg.host, cfg.port))?;
             let st = blaze::logging::stage("tokenizer and chat template");
             let text = blaze::text::Text::load(&engine.model)?;
-            let vocab = blaze::config::ModelConfig::load(&engine.model)?.vocab;
+            let vocab = checkpoint.vocab;
             st.done(format!("vocabulary {vocab}, end tokens {:?}", text.eos));
             // the grammar compiler of structured outputs and forced tool calls (llguidance's token trie: about 1.5 s for a
             // 248k vocabulary) works next to the load
@@ -1119,7 +1188,7 @@ fn main() -> Result<()> {
                 mm_low_detail_pixels,
                 std::time::Duration::from_secs(image_fetch_timeout),
                 image_fetch_max_mib << 20,
-                allowed_media_domains.split(',').map(str::trim).filter(|d| !d.is_empty()).map(str::to_string).collect(),
+                media_domains,
             );
             let max_context = e.info.ctx_stride;
             let drafter = e.info.draft_window > 0;
@@ -1161,27 +1230,6 @@ fn main() -> Result<()> {
                     },
                 },
             );
-            let name = served_model_name
-                .unwrap_or_else(|| engine.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-            let cfg = blaze::server::ServeConfig {
-                served_name: name,
-                host,
-                port,
-                defaults,
-                instruct_defaults,
-                api_keys,
-                max_concurrent_requests: service.max_concurrent_requests,
-                request_timeout: std::time::Duration::from_secs_f64(service.request_timeout),
-                shutdown_timeout: std::time::Duration::from_secs_f64(service.shutdown_timeout),
-                body_limit: service.max_request_body_mib << 20,
-                allowed_origins: service.allowed_origins.split(',').map(str::trim).filter(|s| !s.is_empty() && *s != "none").map(str::to_owned).collect(),
-                effective,
-                default_max_tokens: max_tokens,
-                tool_parser: (!tool_call_parser.is_empty() && tool_call_parser != "none").then_some(tool_call_parser),
-                reasoning_parser: (!reasoning_parser.is_empty() && reasoning_parser != "none").then_some(reasoning_parser),
-                thinking_budget,
-                grammar_whitespace,
-            };
             let grammars = {
                 let st = (!grammar_job.is_finished()).then(|| blaze::logging::stage("grammar compiler (finishing)"));
                 let (grammars, secs) = grammar_job.join().map_err(|_| anyhow::anyhow!("the grammar compiler panicked"))?;
