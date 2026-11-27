@@ -175,10 +175,16 @@ __global__ void dflash_walk_kernel(const int32_t* __restrict__ cand, const float
     const int64_t prev_tok = s == 0 ? anchor[item] : int64_t(cand[base - k + prev_idx]);
     // v = pred[prev] * hproj[s]
     for (int r = threadIdx.x; r < rank; r += blockDim.x)
-      v[r] = bf(pred[prev_tok * rank + r]) * bf(hproj[(int64_t(item) * steps + s) * rank + r]);
+      v[r] = prev_tok < 0 ? 0.0f
+                         : bf(pred[prev_tok * rank + r]) * bf(hproj[(int64_t(item) * steps + s) * rank + r]);
     __syncthreads();
     for (int c = warp; c < k; c += warps) {
-      const uint16_t* sv = succ + int64_t(cand[base + c]) * rank;
+      const int token = cand[base + c];
+      if (token < 0) {
+        if (lane == 0) score[c] = -INFINITY;
+        continue;
+      }
+      const uint16_t* sv = succ + int64_t(token) * rank;
       float d = 0.0f;
       for (int r = lane; r < rank; r += 32) d += v[r] * bf(sv[r]);
       for (int o = 16; o > 0; o >>= 1) d += __shfl_xor_sync(0xffffffffu, d, o);
@@ -189,7 +195,7 @@ __global__ void dflash_walk_kernel(const int32_t* __restrict__ cand, const float
       int best = 0;
       for (int c = 1; c < k; ++c)
         if (score[c] > score[best]) best = c;
-      out[int64_t(item) * steps + s] = cand[base + best];
+      out[int64_t(item) * steps + s] = prev_tok < 0 ? -1 : cand[base + best];
       prev_idx = best;
     }
     __syncthreads();

@@ -2,6 +2,7 @@
 //! Tensor-parallel ranks merge vocabulary candidates before the selector walk.
 
 use crate::gpu::{DevBuf, HostMapped, Stream, check};
+use crate::graph::GraphCache;
 use crate::linear::{Cut, LinCtx, Linear};
 use crate::model::Model;
 use crate::quant::QuantConfig;
@@ -153,7 +154,17 @@ struct Layer {
 /// Context rows of one forward of the KV precompute.
 const ROWS: usize = 512;
 
+struct BlockMeta {
+    positions: *const i64,
+    slots: *const i64,
+    requests: *const i32,
+    lengths: *const i32,
+    tokens: *const i64,
+    anchors: *const i64,
+}
+
 pub struct DFlash {
+    graphs: GraphCache<(usize, usize)>,
     pub cfg: DFlashConfig,
     fc: Linear,
     hidden_norm: DevBuf,
@@ -196,19 +207,17 @@ pub struct DFlash {
     logits: DevBuf,
     cand_vals: DevBuf,
     cand_ids: DevBuf,
-    cand_lse: DevBuf,
     cand_pairs: DevBuf,
     sel_ids: DevBuf,
     sel_unary: DevBuf,
     sel_hproj: DevBuf,
     drafts: DevBuf,
     draft_readback: HostMapped,
-    /// the anchors of the call's blocks (in `meta`)
-    anchors: *const i64,
     /// per-call metadata: written into the pinned staging at a bump offset, copied to `meta` asynchronously (the
     /// staging is reused only after the call's final synchronization)
     staging: HostMapped,
     meta: DevBuf,
+    block_meta_start: usize,
     staged: usize,
 }
 
@@ -301,8 +310,10 @@ impl DFlash {
         let k = cfg.top_k;
         // a call's metadata: positions and slots of every context row (at most `window` per item), the blocks'
         // positions, slots, tokens, rows, lengths, anchors
-        let meta_bytes = (max_items * w * 16 + nq * 24 + max_items * 16 + 64 * 8).next_multiple_of(4096);
+        let block_meta_start = (max_items * (w * 16 + 128)).next_multiple_of(64);
+        let meta_bytes = (block_meta_start + nq * 24 + max_items * 16 + 64 * 6).next_multiple_of(4096);
         Ok(Self {
+            graphs: GraphCache::new(16),
             fc: lin(&[("fc".to_string(), Cut::All)])?,
             hidden_norm: vec("hidden_norm.weight")?,
             norm: vec("norm.weight")?,
@@ -341,16 +352,15 @@ impl DFlash {
             logits: b(ns * v_local * 2)?,
             cand_vals: b(ns * k * 4)?,
             cand_ids: b(ns * k * 4)?,
-            cand_lse: b(ns * 4)?,
             cand_pairs: b((world * ns * (k + 1) * 8).next_multiple_of(16))?,
             sel_ids: b(ns * k * 4)?,
             sel_unary: b(ns * k * 4)?,
             sel_hproj: b(ns * cfg.rank * 2)?,
             drafts: b(ns * 8)?,
             draft_readback: HostMapped::new(ns * size_of::<i64>())?,
-            anchors: std::ptr::null(),
             staging: HostMapped::new(meta_bytes)?,
             meta: b(meta_bytes)?,
+            block_meta_start,
             staged: 0,
             cfg,
         })
@@ -364,25 +374,35 @@ impl DFlash {
     }
 
     /// Copy `data` into the call's metadata (pinned staging, an async copy on the stream); its device pointer.
-    fn stage<T: Copy>(&mut self, s: &Stream, data: &[T]) -> Result<*const T> {
+    fn stage_host<T: Copy>(&mut self, data: &[T], limit: usize) -> Result<*const T> {
         let bytes = std::mem::size_of_val(data);
         let at = self.staged;
-        if at + bytes > self.meta.bytes() {
+        let next = (at + bytes).next_multiple_of(64);
+        if next > limit {
             bail!("DFlash metadata of {} bytes exceeds its buffer", at + bytes);
         }
         // SAFETY: plain-old-data copy into the pinned staging buffer.
         self.staging.host_slice_mut()[at..at + bytes].copy_from_slice(unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), bytes) });
+        self.staged = next;
+        Ok(self.meta.at::<u8>(at).cast())
+    }
+
+    fn copy_meta(&self, s: &Stream, at: usize, bytes: usize) -> Result<()> {
         let host: *const u8 = self.staging.host_ptr().cast();
         check(
             unsafe { sys::cudaMemcpyAsync(self.meta.at::<u8>(at).cast(), host.add(at).cast(), bytes, sys::MEMCPY_H2D, s.0) },
             "DFlash meta copy",
-        )?;
-        self.staged = (at + bytes).next_multiple_of(64);
-        Ok(self.meta.at::<u8>(at).cast())
+        )
     }
 
-    /// Context K/V of the items' rows (the last step's hidden states) into every layer, then the drafts after each
-    /// item (`steps()` tokens; `plan.k` is not used: a block is drafted whole).
+    fn stage<T: Copy>(&mut self, s: &Stream, data: &[T]) -> Result<*const T> {
+        let at = self.staged;
+        let ptr = self.stage_host(data, self.block_meta_start)?;
+        self.copy_meta(s, at, std::mem::size_of_val(data))?;
+        Ok(ptr)
+    }
+
+    /// Extend the context with the last target step, then score the requested prefix of each draft block.
     pub fn run(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<Vec<i64>>> {
         anyhow::ensure!(plan.items.is_empty() || model.aux.is_some(), "DFlash without captured hidden states");
         let hidden = self.cfg.hidden;
@@ -409,7 +429,7 @@ impl DFlash {
         }
         // the previous call ended with a synchronization: its staging is free
         self.staged = 0;
-        let steps = self.cfg.steps();
+        let steps = plan.k.min(self.cfg.steps());
         let count = n * steps;
         let enqueue = (|| -> Result<()> {
             if target.features.is_some() {
@@ -417,9 +437,17 @@ impl DFlash {
                     self.context(target, it)?;
                 }
             }
-            if plan.k > 0 {
-                self.block(target, &plan.items)?;
-                self.candidates(target, n)?;
+            if steps > 0 {
+                let meta = self.prepare_block(target.stream, &plan.items)?;
+                let forward = || {
+                    self.block(target, n, &meta, steps)?;
+                    self.candidates(target, n, steps, meta.anchors)
+                };
+                if self.world == 1 {
+                    self.graphs.launch((n, steps), target.stream, forward)?;
+                } else {
+                    forward()?;
+                }
                 check(unsafe {
                     sys::cudaMemcpyAsync(
                         self.draft_readback.host_ptr().cast_mut(),
@@ -435,7 +463,7 @@ impl DFlash {
         let waited = target.stream.sync();
         enqueue?;
         waited?;
-        if plan.k == 0 {
+        if steps == 0 {
             return Ok(vec![Vec::new(); n]);
         }
         let drafts = unsafe {
@@ -490,17 +518,12 @@ impl DFlash {
         Ok(())
     }
 
-    /// The query blocks: [anchor, mask...] per item through every layer; leaves the mask rows' final hidden in `hm`.
-    fn block(&mut self, target: &Target<'_>, items: &[DraftItem]) -> Result<()> {
-        let cfg = self.cfg.clone();
-        let (c, s, lin) = (&cfg, target.stream, target.linear);
-        let (h, hd, bl) = (c.hidden, c.head_dim, c.block);
+    fn prepare_block(&mut self, stream: &Stream, items: &[DraftItem]) -> Result<BlockMeta> {
+        let bl = self.cfg.block;
+        let w = self.cfg.window;
+        let mask_token = self.cfg.mask_token;
         let n = items.len();
         let nq = n * bl;
-        let (qr, kr) = (self.heads * hd, self.kv_heads * hd);
-        let ldq = qr + 2 * kr;
-        let groups = h / c.group;
-        let w = c.window;
         // query tokens and positions: the anchor (the token after the item's last row) and masks after it
         let mut tok = Vec::with_capacity(nq);
         let mut pos = Vec::with_capacity(nq);
@@ -510,7 +533,7 @@ impl DFlash {
         for it in items {
             let p0 = it.pos0 + it.tokens.len();
             for j in 0..bl {
-                tok.push(if j == 0 { *it.tokens.last().unwrap() } else { c.mask_token });
+                tok.push(if j == 0 { *it.tokens.last().unwrap() } else { mask_token });
                 pos.push((p0 + j) as i64);
                 loc.push((it.row * w + (p0 + j) % w) as i64);
             }
@@ -518,14 +541,31 @@ impl DFlash {
             kvl.push((p0 + bl) as i32);
         }
         let anchors: Vec<i64> = items.iter().map(|it| *it.tokens.last().unwrap()).collect();
-        let posp = self.stage(s, &pos)?;
-        let locp = self.stage(s, &loc)?;
-        let reqp = self.stage(s, &req)?;
-        let kvlp = self.stage(s, &kvl)?;
-        let tokp = self.stage(s, &tok)?;
-        self.anchors = self.stage(s, &anchors)?;
+        // Graphs retain these device addresses across windows of the same shape.
+        self.staged = self.block_meta_start;
+        let limit = self.meta.bytes();
+        let meta = BlockMeta {
+            positions: self.stage_host(&pos, limit)?,
+            slots: self.stage_host(&loc, limit)?,
+            requests: self.stage_host(&req, limit)?,
+            lengths: self.stage_host(&kvl, limit)?,
+            tokens: self.stage_host(&tok, limit)?,
+            anchors: self.stage_host(&anchors, limit)?,
+        };
+        self.copy_meta(stream, self.block_meta_start, self.staged - self.block_meta_start)?;
+        Ok(meta)
+    }
+
+    /// Runs the anchor and mask rows through every layer, then gathers the requested rows for the head.
+    fn block(&self, target: &Target<'_>, n: usize, meta: &BlockMeta, steps: usize) -> Result<()> {
+        let (c, s, lin) = (&self.cfg, target.stream, target.linear);
+        let (h, hd, bl) = (c.hidden, c.head_dim, c.block);
+        let nq = n * bl;
+        let (qr, kr) = (self.heads * hd, self.kv_heads * hd);
+        let ldq = qr + 2 * kr;
+        let groups = h / c.group;
         check(
-            unsafe { sys::blz_embed_gather(tokp, nq as i64, target.embedding.cast(), c.vocab as i64, (h * 2) as i64, self.h.ptr(), s.0) },
+            unsafe { sys::blz_embed_gather(meta.tokens, nq as i64, target.embedding.cast(), c.vocab as i64, (h * 2) as i64, self.h.ptr(), s.0) },
             "DFlash embed",
         )?;
         if let Some(norm) = target.embedding_norm {
@@ -569,11 +609,11 @@ impl DFlash {
             let v: *const u16 = self.qkv_out.at(qr + kr);
             check(unsafe { sys::blz_head_rmsnorm(q, ldq as i64, nq as c_int, self.heads as c_int, hd as c_int, l.q_norm.ptr(), c.eps, s.0) }, "DFlash q norm")?;
             check(unsafe { sys::blz_head_rmsnorm(k, ldq as i64, nq as c_int, self.kv_heads as c_int, hd as c_int, l.k_norm.ptr(), c.eps, s.0) }, "DFlash k norm")?;
-            check(unsafe { sys::blz_rope_neox(q, ldq as i64, nq as c_int, self.heads as c_int, hd as c_int, posp, self.inv_freq.ptr(), s.0) }, "DFlash rope q")?;
-            check(unsafe { sys::blz_rope_neox(k, ldq as i64, nq as c_int, self.kv_heads as c_int, hd as c_int, posp, self.inv_freq.ptr(), s.0) }, "DFlash rope k")?;
+            check(unsafe { sys::blz_rope_neox(q, ldq as i64, nq as c_int, self.heads as c_int, hd as c_int, meta.positions, self.inv_freq.ptr(), s.0) }, "DFlash rope q")?;
+            check(unsafe { sys::blz_rope_neox(k, ldq as i64, nq as c_int, self.kv_heads as c_int, hd as c_int, meta.positions, self.inv_freq.ptr(), s.0) }, "DFlash rope k")?;
             check(
                 unsafe {
-                    sys::blz_kv_store_dense(k.cast(), v.cast(), ldq as i64, ldq as i64, locp.cast(), sys::BLZ_I64, nq as i64, self.kv_heads as c_int,
+                    sys::blz_kv_store_dense(k.cast(), v.cast(), ldq as i64, ldq as i64, meta.slots.cast(), sys::BLZ_I64, nq as i64, self.kv_heads as c_int,
                                             hd as c_int, sys::BLZ_KV_BF16, l.k_pool.ptr(), l.v_pool.ptr(), self.one.ptr(), self.one.ptr(), s.0)
                 },
                 "DFlash block kv",
@@ -599,8 +639,8 @@ impl DFlash {
                         pool,
                         self.r2t.ptr(),
                         self.stride as i64,
-                        sys::blz_index_ptr { ptr: reqp.cast(), kind: sys::BLZ_I32 },
-                        sys::blz_index_ptr { ptr: kvlp.cast(), kind: sys::BLZ_I32 },
+                        sys::blz_index_ptr { ptr: meta.requests.cast(), kind: sys::BLZ_I32 },
+                        sys::blz_index_ptr { ptr: meta.lengths.cast(), kind: sys::BLZ_I32 },
                         n as c_int,
                         bl as c_int,
                         self.attn_splits(target.sms, n, bl) as c_int,
@@ -639,7 +679,6 @@ impl DFlash {
         }
         // final norm of h + residual; the mask rows (1 .. block of every item) to `hm`
         check(unsafe { sys::blz_rmsnorm(self.h.ptr(), self.residual.ptr(), self.norm.ptr(), c.eps, nq as c_int, h as c_int, 0, self.x.ptr(), s.0) }, "DFlash final norm")?;
-        let steps = c.steps();
         check(
             unsafe {
                 sys::cudaMemcpy2DAsync(self.hm.ptr(), steps * h * 2, self.x.at::<u16>(h).cast(), bl * h * 2, steps * h * 2, n, sys::MEMCPY_D2D, s.0)
@@ -649,10 +688,10 @@ impl DFlash {
     }
 
     /// Top-k of the target's LM head at every mask row (merged over the ranks), the selector's projection, the walk.
-    fn candidates(&self, target: &Target<'_>, n: usize) -> Result<()> {
+    fn candidates(&self, target: &Target<'_>, n: usize, steps: usize, anchors: *const i64) -> Result<()> {
         let (c, s, lin) = (&self.cfg, target.stream, target.linear);
         let (h, k) = (c.hidden, c.top_k);
-        let ns = n * c.steps();
+        let ns = n * steps;
         let v_local = target.local_vocab;
         (target.head)(self.hm.ptr(), ns, self.logits.ptr())?;
         check(
@@ -662,29 +701,32 @@ impl DFlash {
             },
             "DFlash candidates",
         )?;
-        let k1 = k + 1;
-        let bytes = (self.world * ns * k1 * 8).next_multiple_of(16);
-        check(unsafe { sys::cudaMemsetAsync(self.cand_pairs.ptr(), 0, bytes, s.0) }, "memset")?;
-        check(
-            unsafe {
-                sys::blz_topk_pack(self.cand_vals.ptr(), self.cand_ids.ptr(), self.cand_lse.ptr(), ns as c_int, k as c_int,
-                                   self.cand_pairs.at::<f32>(self.rank * ns * k1 * 2), s.0)
-            },
-            "DFlash pack",
-        )?;
-        if !self.ar.is_null() {
+        let (ids, unary) = if self.world == 1 {
+            (self.cand_ids.ptr(), self.cand_vals.ptr())
+        } else {
+            let k1 = k + 1;
+            let bytes = (self.world * ns * k1 * 8).next_multiple_of(16);
+            check(unsafe { sys::cudaMemsetAsync(self.cand_pairs.ptr(), 0, bytes, s.0) }, "DFlash rank staging")?;
+            check(
+                unsafe {
+                    sys::blz_topk_pack(self.cand_vals.ptr(), self.cand_ids.ptr(), std::ptr::null(), ns as c_int, k as c_int,
+                                       self.cand_pairs.at::<f32>(self.rank * ns * k1 * 2), s.0)
+                },
+                "DFlash pack",
+            )?;
             check(unsafe { sys::blz_host_ar_all_reduce(self.ar, self.cand_pairs.ptr(), bytes as i64, sys::BLZ_AR_FP32, s.0) }, "DFlash all-reduce")?;
-        }
+            check(
+                unsafe { sys::blz_cand_merge(self.cand_pairs.ptr(), self.world as c_int, ns as c_int, k as c_int,
+                    self.sel_ids.ptr(), self.sel_unary.ptr(), s.0) },
+                "DFlash merge",
+            )?;
+            (self.sel_ids.ptr(), self.sel_unary.ptr())
+        };
         self.hproj.run(lin, self.hm.ptr(), h, ns, self.sel_hproj.ptr(), c.rank, s)?;
-        // the k best of the ranks' lists per row, on the GPU (no host round trip)
-        check(
-            unsafe { sys::blz_cand_merge(self.cand_pairs.ptr(), self.world as c_int, ns as c_int, k as c_int, self.sel_ids.ptr(), self.sel_unary.ptr(), s.0) },
-            "DFlash merge",
-        )?;
         check(
             unsafe {
-                sys::blz_dflash_walk(self.sel_ids.ptr(), self.sel_unary.ptr(), self.sel_hproj.ptr(), self.anchors, self.pred.ptr(),
-                                     self.succ.ptr(), n as c_int, c.steps() as c_int, k as c_int, c.rank as c_int, self.drafts.ptr(), s.0)
+                sys::blz_dflash_walk(ids, unary, self.sel_hproj.ptr(), anchors, self.pred.ptr(),
+                                     self.succ.ptr(), n as c_int, steps as c_int, k as c_int, c.rank as c_int, self.drafts.ptr(), s.0)
             },
             "DFlash walk",
         )

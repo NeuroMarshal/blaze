@@ -37,7 +37,7 @@ cudaError_t blz_skinny_gemm_cfg(const void* x, int64_t x_stride, const void* w, 
                                 int n, int k, blz_half_t dtype, int cols_per_block, cudaStream_t stream);
 
 /// Most rows and largest k of blz_gemv_wide.
-#define BLZ_GEMV_WIDE_MAX_ROWS 4
+#define BLZ_GEMV_WIDE_MAX_ROWS 8
 #define BLZ_GEMV_WIDE_MAX_K 16384
 /// Shared memory blz_gemv_wide may take for x (rows * k * 2 bytes).
 #define BLZ_GEMV_WIDE_MAX_SMEM (96 * 1024)

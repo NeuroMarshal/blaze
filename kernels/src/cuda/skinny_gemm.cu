@@ -196,7 +196,11 @@ extern "C" cudaError_t blz_gemv_wide(const void* x, int64_t x_stride, const void
     case 1: launch(blaze::gemv_wide_kernel<1, 8>); break;
     case 2: launch(blaze::gemv_wide_kernel<2, 8>); break;
     case 3: launch(blaze::gemv_wide_kernel<3, 4>); break;
-    default: launch(blaze::gemv_wide_kernel<4, 4>); break;
+    case 4: launch(blaze::gemv_wide_kernel<4, 4>); break;
+    case 5: launch(blaze::gemv_wide_kernel<5, 4>); break;
+    case 6: launch(blaze::gemv_wide_kernel<6, 4>); break;
+    case 7: launch(blaze::gemv_wide_kernel<7, 4>); break;
+    case 8: launch(blaze::gemv_wide_kernel<8, 4>); break;
   }
   return cudaGetLastError();
 }

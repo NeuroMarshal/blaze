@@ -1635,7 +1635,7 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn batched_vocabulary_head_matches_single_rows() -> Result<()> {
         crate::gpu::set_device(0)?;
-        let (rows, width, vocab) = (7usize, 2304usize, 4099usize);
+        let (rows, width, vocab) = (8usize, 2304usize, 4099usize);
         let make_values = |count: usize, salt: usize| {
             (0..count)
                 .map(|i| to_bf16(((i * 37 + i / 19 * salt) % 509) as f32 / 1024.0 - 0.25))
@@ -1644,9 +1644,13 @@ mod tests {
         let matrix = Dense::from_bf16(&make_values(vocab * width, 13), vocab, width)?;
         let input = DevBuf::from_slice(&make_values(rows * width, 7))?;
         let compute = Compute::new(width, rows * vocab, width, rows)?;
-        let batched = compute.read_device_scores(&matrix, input.ptr(), vocab, rows)?;
-        for (row, got) in batched.chunks_exact(vocab).enumerate() {
-            assert_eq!(got, compute.read_device_scores(&matrix, input.at(row * width), vocab, 1)?);
+        let single = (0..rows).map(|row| compute.read_device_scores(&matrix, input.at(row * width), vocab, 1))
+            .collect::<Result<Vec<_>>>()?;
+        for rows in [5, 6, 7, 8] {
+            let batched = compute.read_device_scores(&matrix, input.ptr(), vocab, rows)?;
+            for (got, expected) in batched.chunks_exact(vocab).zip(&single) {
+                assert_eq!(got, expected);
+            }
         }
         Ok(())
     }

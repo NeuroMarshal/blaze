@@ -416,7 +416,7 @@ pub const BLZ_MXFP8_MMA_MAX_ROWS: usize = 64;
 pub const BLZ_TOPK_MAX: usize = 64;
 /// largest k of blz_topk
 pub const BLZ_TOPK_LIMIT: usize = 128;
-pub const BLZ_GEMV_WIDE_MAX_ROWS: usize = 4;
+pub const BLZ_GEMV_WIDE_MAX_ROWS: usize = 8;
 pub const BLZ_GEMV_WIDE_MAX_K: usize = 16384;
 pub const BLZ_GEMV_WIDE_MAX_SMEM: usize = 96 * 1024;
 

@@ -123,7 +123,7 @@ impl Matmul {
         let aligned = (input as usize).is_multiple_of(16);
         let skinny = aligned && tune::skinny_fits(rows, inner, input_stride);
         let mma = aligned && tune::mma_fits(rows, inner, input_stride);
-        let wide = tune::wide_fits(rows, inner, input_stride);
+        let wide = aligned && tune::wide_fits(rows, inner, input_stride);
         match tuning.get(tune::Kernel::Bf16, columns, inner, rows) {
             (BF16_SKINNY, cpb) if skinny => Bf16Kernel::Skinny(cpb),
             (BF16_WIDE, _) if wide => Bf16Kernel::Wide,
