@@ -319,9 +319,29 @@ __global__ void __launch_bounds__(kArgmaxThreads) argmax_kernel(const uint16_t* 
   const uint16_t* row = logits + int64_t(blockIdx.x) * ld;
   float best = -FLT_MAX;
   int best_i = 0x7fffffff;
-  for (int i = threadIdx.x; i < vocab; i += kArgmaxThreads) {
-    const float v = bf(row[i]);
+  const auto consider = [&](int i, uint16_t bits) {
+    const float v = bf(bits);
     if (v > best) best = v, best_i = i;
+  };
+  if (vocab >= 32 * 1024) {
+    const int lead = int((-reinterpret_cast<uintptr_t>(row)) & 15u) / 2;
+    const int packs = (vocab - lead) / 8;
+    const auto* aligned = reinterpret_cast<const uint4*>(row + lead);
+    if (threadIdx.x < lead) consider(threadIdx.x, row[threadIdx.x]);
+    for (int p = threadIdx.x; p < packs; p += kArgmaxThreads) {
+      const uint4 data = aligned[p];
+      const uint32_t pairs[4] = {data.x, data.y, data.z, data.w};
+      const int i = lead + p * 8;
+#pragma unroll
+      for (int h = 0; h < 4; ++h) {
+        consider(i + 2 * h, uint16_t(pairs[h]));
+        consider(i + 2 * h + 1, uint16_t(pairs[h] >> 16));
+      }
+    }
+    const int tail = lead + 8 * packs + threadIdx.x;
+    if (tail < vocab) consider(tail, row[tail]);
+  } else {
+    for (int i = threadIdx.x; i < vocab; i += kArgmaxThreads) consider(i, row[i]);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {

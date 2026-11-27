@@ -435,6 +435,30 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn vocabulary_argmax_handles_unaligned_rows_and_ties() -> Result<()> {
+        crate::gpu::set_device(0)?;
+        let stream = Stream::new()?;
+        let vocab = 32_771;
+        let mut logits = vec![0u16; vocab * 3];
+        let one = (1.0f32.to_bits() >> 16) as u16;
+        for (row, (first, second)) in logits.chunks_exact_mut(vocab)
+            .zip([(vocab - 1, vocab - 2), (0, vocab - 1), (733, 921)])
+        {
+            row[first] = one;
+            row[second] = one;
+        }
+        let logits = DevBuf::from_slice(&logits)?;
+        let picked = DevBuf::new(3 * size_of::<i32>())?;
+        check(unsafe {
+            sys::blz_argmax_bf16(logits.ptr(), 3, vocab as i32, vocab as i64, picked.ptr(), stream.0)
+        }, "vocabulary argmax")?;
+        stream.sync()?;
+        assert_eq!(picked.download::<i32>(3)?, [(vocab - 2) as i32, 0, 733]);
+        Ok(())
+    }
     #[test]
     fn pipeline_validation_and_stage_order() {
         assert!("temperature,temperature".parse::<SamplingPipeline>().is_err());
