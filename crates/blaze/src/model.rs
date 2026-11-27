@@ -197,15 +197,7 @@ pub struct Layer {
     slot: usize,
 }
 
-pub struct MoeEngine(*mut sys::blz_moe_engine);
-
-unsafe impl Send for MoeEngine {}
-
-impl Drop for MoeEngine {
-    fn drop(&mut self) {
-        unsafe { sys::blz_moe_engine_destroy(self.0) };
-    }
-}
+pub use crate::expert_runtime::MoeEngine;
 
 /// --kv-tokens auto: the ranks' agreement on the KV cache size. Every rank measures its free VRAM once the model is
 /// loaded (weights, states, activations, scratch: everything but the KV pools), leaves Options::later_vram for what loads
@@ -1511,7 +1503,7 @@ impl Model {
                 scratch_elems,
                 tune: std::sync::Arc::new(crate::tune::Tuning::open(rank)),
                 route: opts.gemm,
-                w4a4: unsafe { sys::blz_nvfp4_gemm_w4a4_supported() } != 0,
+                w4a4: crate::matmul::Nvfp4Rows::supported(),
             },
             _scratch: scratch,
             inv_freq,
@@ -1636,7 +1628,7 @@ impl Model {
             // the engine indexes its tables by the model's layer index: it must hold every routed layer (an MTP
             // head's layer comes after them)
             let routed = model.layers.iter().rposition(|l| matches!(l.mlp, Mlp::Moe { .. }));
-            let mut held = unsafe { sys::blz_moe_engine_layers(model.moe.as_ref().unwrap().0) };
+            let mut held = model.moe.as_ref().unwrap().layers();
             if model.opts.mtp_window > 0 {
                 held -= 1;
                 model.mtp_moe_layer = Some(held as usize);
@@ -1854,16 +1846,11 @@ impl Model {
             swap_options: null(),
             options: options.as_ptr(),
         };
-        let mut engine = null_mut();
-        let mut err = vec![0i8; 1024];
         let free_before = free;
         let stage = logging::stage(format!("routed experts → GPU{gpu0}{} slots, pinned RAM{} ({threads} CPU expert workers)",
                                            if gpu1 >= 0 { format!(" + GPU{gpu1}") } else { String::new() },
                                            if self.opts.moe_ram_gib >= 0.0 { ", SSD" } else { "" }));
-        if unsafe { sys::blz_moe_engine_create(&cfg, &mut engine, err.as_mut_ptr().cast(), err.len()) } != 0 {
-            let msg = unsafe { std::ffi::CStr::from_ptr(err.as_ptr().cast()) }.to_string_lossy().into_owned();
-            return Err(anyhow!("MoE engine: {msg}"));
-        }
+        let engine = unsafe { MoeEngine::create(&cfg) }?;
         let free_after = crate::gpu::mem_info()?.0;
         let gib_of = |b: usize| b as f64 / (1u64 << 30) as f64;
         stage.done(format!(
@@ -1873,7 +1860,7 @@ impl Model {
             gib_of(free_before.saturating_sub(free_after)),
             gib_of(free_after)
         ));
-        Ok(MoeEngine(engine))
+        Ok(engine)
     }
 
     fn alloc_work(cfg: &ModelConfig, d: &Dims, world: usize, layers: &[Layer], opts: &Options, meta: &MetaLayout, valid_ids: &[u32], s: &Stream) -> Result<Work> {
@@ -2030,7 +2017,7 @@ impl Model {
     /// The routed experts of `layer` (the expert engine's index) for `t` rows of x.
     pub fn moe_forward(&self, layer: usize, x: *const u16, t: usize, ids: *const i32, weights: *const f32, out: *mut u16) -> Result<()> {
         let moe = self.moe.as_ref().ok_or_else(|| anyhow!("MoE engine not started"))?;
-        check(unsafe { sys::blz_moe_engine_forward(moe.0, layer as c_int, x, t as c_int, ids, weights, out, self.stream.0) }, "moe")
+        unsafe { moe.forward(layer, x, t, ids, weights, out, &self.stream) }
     }
 
     pub fn rope_tables(&self) -> (*const f32, f32) {
@@ -3587,14 +3574,7 @@ impl Model {
                     },
                     "router",
                 )?;
-                let moe = self.moe.as_ref().ok_or_else(|| anyhow!("MoE engine not started"))?;
-                check(
-                    unsafe {
-                        sys::blz_moe_engine_forward(moe.0, (self.layer0 + li) as c_int, w.normed.ptr(), t as c_int, w.ids.ptr(), w.weights.ptr(),
-                                                    w.moe_out.ptr(), s.0)
-                    },
-                    "moe",
-                )?;
+                self.moe_forward(self.layer0 + li, w.normed.ptr(), t, w.ids.ptr(), w.weights.ptr(), w.moe_out.ptr())?;
                 // shared expert
                 let gu_ld = shared_gu.n;
                 shared_gu.run(&self.lin, w.normed.ptr(), h, t, w.gu.ptr(), gu_ld, s)?;

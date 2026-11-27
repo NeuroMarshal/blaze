@@ -84,11 +84,7 @@ pub struct QsaConfig {
     pub compress_ratio: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LayerVisit {
-    pub layer: usize,
-    pub pass: usize,
-}
+pub use crate::layer_walk::LayerVisit;
 
 #[derive(Debug, Clone)]
 pub struct InklingLoop {
@@ -119,16 +115,7 @@ impl InklingLoop {
             anyhow::ensure!(!*slot, "Inkling: duplicate local attention layer {id}");
             *slot = true;
         }
-        let count = core.len().checked_mul(passes).and_then(|n| n.checked_add(layers - core.len()))
-            .context("Inkling: loop visit count overflows")?;
-        let visit = |layer| LayerVisit { layer, pass: 0 };
-        let mut visits = Vec::new();
-        visits.try_reserve_exact(count).context("Inkling: allocating layer visits")?;
-        visits.extend((0..core.start).map(visit));
-        for pass in 0..passes {
-            visits.extend(core.clone().map(|layer| LayerVisit { layer, pass }));
-        }
-        visits.extend((core.end..layers).map(visit));
+        let visits = crate::layer_walk::repeated_layers(layers, core.clone(), passes)?;
         Ok(Self { core, passes, gate_rank, variable: c["is_varloop"].as_bool().unwrap_or(false), window, local, visits })
     }
 

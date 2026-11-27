@@ -1,9 +1,10 @@
 use super::KvDtype;
 use super::cpu::Routed;
 use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
+use crate::expert_cache::{ExpertResidency, ExpertVisit};
 use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check};
-use crate::matmul::{Bf16Kernel, Matmul};
+use crate::matmul::{Bf16Kernel, Matmul, Mxfp8Rows, Nvfp4Rows};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, ensure};
 use blaze_sys as sys;
@@ -298,37 +299,15 @@ type GroupedExpertGemv = unsafe extern "C" fn(
     *const u16, i64, *const u8, *const sys::blz_inkling_matrix, *mut u16, i32, i32, i32, sys::cudaStream_t,
 ) -> sys::cudaError_t;
 
-#[derive(Clone, Copy, Default)]
-struct Heat {
-    count: usize,
-    epoch: usize,
-}
-
-impl Heat {
-    fn at(self, epoch: usize) -> usize {
-        self.count >> epoch.saturating_sub(self.epoch).min(usize::BITS as usize - 1)
-    }
-
-    fn add(&mut self, epoch: usize, observations: usize) {
-        self.count = self.at(epoch).saturating_add(observations);
-        self.epoch = epoch;
-    }
-}
-
 struct DeviceExpert {
     gate_up: OnDevice,
     down: OnDevice,
-    slot: usize,
-    last_used: usize,
-    heat: Heat,
 }
 
 struct ExpertPool {
     buffer: DevBuf,
     stride: usize,
-    free_slots: Vec<usize>,
-    entries: HashMap<(usize, usize), DeviceExpert>,
-    hits: HashMap<(usize, usize), Heat>,
+    residency: ExpertResidency<DeviceExpert>,
 }
 
 impl ExpertPool {
@@ -337,9 +316,7 @@ impl ExpertPool {
         Ok(Self {
             buffer: DevBuf::new(slots * stride)?,
             stride,
-            free_slots: (0..slots).rev().collect(),
-            entries: HashMap::new(),
-            hits: HashMap::new(),
+            residency: ExpertResidency::new(slots),
         })
     }
 
@@ -354,68 +331,15 @@ impl ExpertPool {
         preserve_group: bool,
         pending: Option<&Stream>,
     ) -> Result<bool> {
-        let mut heat = Heat::default();
-        if let Some(observations) = observations {
-            let hits = self.hits.entry(key).or_default();
-            hits.add(epoch, observations);
-            heat = *hits;
-        }
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used = tick;
-            entry.heat = heat;
-            return Ok(true);
-        }
-        if observations.is_some() && heat.count < 2 {
-            return Ok(false);
-        }
-        let slot = match self.free_slots.pop() {
-            Some(slot) => slot,
-            None => {
-                let victim = self
-                    .entries
-                    .iter()
-                    .filter(|(_, e)| !preserve_group || e.last_used != tick)
-                    .min_by_key(|(key, e)| (e.heat.at(epoch), e.last_used, **key));
-                let Some((&old, entry)) = victim else {
-                    ensure!(observations.is_some(), "Inkling GPU expert slots exhausted");
-                    return Ok(false);
-                };
-                let old_count = entry.heat.at(epoch);
-                if observations.is_some() && heat.count < old_count.saturating_add(16.max(old_count / 4)) {
-                    return Ok(false);
-                }
-                if let Some(stream) = pending { stream.sync()?; }
-                self.entries.remove(&old).unwrap().slot
-            }
-        };
-        let id = key.1;
-        let offset = slot * self.stride;
-        let data = (|| -> Result<_> {
+        let visit = ExpertVisit { tick, epoch, observations, preserve_group };
+        self.residency.admit(key, visit, || pending.map_or(Ok(()), Stream::sync), |slot| {
+            let id = key.1;
+            let offset = slot * self.stride;
             let gate_up = OnDevice::store(&self.buffer, offset, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
-            let offset_down = offset + weights.gate_up.gpu_bytes().next_multiple_of(64);
-            let down = OnDevice::store(&self.buffer, offset_down, &weights.down, weights.down.expert(ckpt, id)?)?;
-            Ok((gate_up, down))
-        })();
-        match data {
-            Ok((gate_up, down)) => {
-                self.entries.insert(
-                    key,
-                    DeviceExpert {
-                        gate_up,
-                        down,
-                        slot,
-                        last_used: tick,
-                        heat,
-                    },
-                );
-                Ok(true)
-            }
-            Err(err) => {
-                // A partially copied record cannot be dispatched. Its slot is reusable on the next call.
-                self.free_slots.push(slot);
-                Err(err)
-            }
-        }
+            let down_offset = offset + weights.gate_up.gpu_bytes().next_multiple_of(64);
+            let down = OnDevice::store(&self.buffer, down_offset, &weights.down, weights.down.expert(ckpt, id)?)?;
+            Ok(DeviceExpert { gate_up, down })
+        })
     }
 }
 
@@ -468,6 +392,7 @@ struct WideExperts {
     mlp_staging: Option<HostMapped>,
     cold_staging: Option<HostMapped>,
     activation_input: Option<DevBuf>,
+    native_input: Option<DevBuf>,
 }
 
 impl WideExperts {
@@ -489,6 +414,10 @@ impl WideExperts {
             activation_input: std::env::var_os("BLAZE_INKLING_PARALLEL_PREFILL")
                 .is_some_and(|value| value == "1")
                 .then(|| DevBuf::new(tokens * hidden * 2)).transpose()?,
+            native_input: (std::env::var_os("BLAZE_INKLING_NATIVE_MOE").is_some_and(|value| value == "1")
+                && Nvfp4Rows::supported())
+                .then(|| DevBuf::new(2 * Nvfp4Rows::bytes(routes, hidden.max(inter)).next_multiple_of(64)))
+                .transpose()?,
         })
     }
 
@@ -505,12 +434,17 @@ impl WideExperts {
             .ok_or_else(|| anyhow::anyhow!("Inkling grouped activations are unavailable"))?;
         let mut permutation = vec![-1i32; tokens * top_k];
         let mut gather = Vec::with_capacity(permutation.len());
-        let mut tables: [_; 5] = std::array::from_fn(|_| Vec::new());
+        let mut tables: [_; 6] = std::array::from_fn(|_| Vec::new());
+        let native = self.native_input.as_ref();
         for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let Some(cached) = pool.entries.get(&(layer, id)) else { continue };
+            let Some(cached) = pool.residency.get((layer, id)) else { continue };
             for rows in rows.chunks(EXPERT_BATCH) {
                 let begin = gather.len();
-                let class = WIDE_ROW_CLASSES.iter().position(|&max| rows.len() <= max).unwrap();
+                let class = if native.is_some() && rows.len() >= 32 {
+                    WIDE_ROW_CLASSES.len()
+                } else {
+                    WIDE_ROW_CLASSES.iter().position(|&max| rows.len() <= max).unwrap()
+                };
                 tables[class].push([
                     cached.gate_up.tile(&pool.buffer, begin, rows.len()),
                     cached.down.tile(&pool.buffer, begin, rows.len()),
@@ -566,6 +500,33 @@ impl WideExperts {
                 check(unsafe { launch(input, self.tiles.at(first), output, table.len() as i32,
                     class as i32, columns as i32, inner as i32, stream.0) }, "Inkling grouped expert projection")?;
                 first += table.len();
+            }
+            let native_count = tables[WIDE_ROW_CLASSES.len()].len();
+            if native_count > 0 {
+                let quant = native.unwrap();
+                let rows = gather.len();
+                let tiles = self.tiles.at(first);
+                match weights.gate_up.packing {
+                    Packing::Nvfp4 => {
+                        let stride = Nvfp4Rows::bytes(rows, inner).next_multiple_of(64);
+                        ensure!(2 * stride <= quant.bytes(), "Inkling grouped NVFP4 scratch exceeds capacity");
+                        unsafe {
+                            let primary = Nvfp4Rows::from_scratch(quant.ptr(), rows, inner);
+                            let residual = Nvfp4Rows::from_scratch(quant.at(stride), rows, inner);
+                            primary.quantize(input, inner, rows, inner, stream)?;
+                            residual.quantize_residual(primary, input, rows, inner, stream)?;
+                            primary.grouped(residual, tiles, output, native_count, columns, inner, stream)?;
+                        }
+                    }
+                    Packing::Mxfp8 => {
+                        ensure!(Mxfp8Rows::bytes(rows, inner) <= quant.bytes(), "Inkling grouped MXFP8 scratch exceeds capacity");
+                        unsafe {
+                            let primary = Mxfp8Rows::from_scratch(quant.ptr(), rows, inner);
+                            primary.quantize(input, rows, inner, stream)?;
+                            primary.grouped(tiles, output, native_count, columns, inner, stream)?;
+                        }
+                    }
+                }
             }
             Ok(())
         };
@@ -1403,11 +1364,9 @@ impl Compute {
         };
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
-        let mut candidates: Vec<_> = pool.hits.iter().filter_map(|(&(layer, id), heat)| {
-            let score = heat.at(epoch);
-            (layer == next && score >= PROMPT_STAGE_MIN_ROUTES && !pool.entries.contains_key(&(layer, id)))
-                .then_some((std::cmp::Reverse(score), id))
-        }).collect();
+        let mut candidates: Vec<_> = pool.residency.cold_scores(next, epoch)
+            .filter(|&(_, score)| score >= PROMPT_STAGE_MIN_ROUTES)
+            .map(|(id, score)| (std::cmp::Reverse(score), id)).collect();
         candidates.sort_unstable();
         let ids: Vec<_> = candidates.into_iter().take(PREFETCH_BANK_EXPERTS).map(|(_, id)| id).collect();
         if ids.is_empty() {
@@ -1439,9 +1398,7 @@ impl Compute {
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
         // Touch hits first. Cache misses then evict only experts outside this route group.
         for &(id, _) in routes {
-            if let Some(entry) = pool.entries.get_mut(&(layer, id)) {
-                entry.last_used = tick;
-            }
+            pool.residency.touch((layer, id), tick);
         }
         let mut cold = Vec::new();
         let mut resident = Vec::new();
@@ -1485,7 +1442,7 @@ impl Compute {
                     let gate = ptr.add(gate_meta).cast::<sys::blz_inkling_matrix>();
                     let down = ptr.add(down_meta).cast::<sys::blz_inkling_matrix>();
                     for (row, &(id, _)) in resident.iter().enumerate() {
-                        let expert = &pool.entries[&(layer, id)];
+                        let expert = pool.residency.get((layer, id)).unwrap();
                         gate.add(row).write(expert.gate_up.offsets());
                         down.add(row).write(expert.down.offsets());
                     }
@@ -1528,7 +1485,7 @@ impl Compute {
                     launch(&weights.down, down_meta, gpu.glu.ptr(), weights.down.cols as i64, gpu.result.ptr())?;
                 } else {
                     for (row, &(id, _)) in resident.iter().enumerate() {
-                        let expert = &pool.entries[&(layer, id)];
+                        let expert = pool.residency.get((layer, id)).unwrap();
                         expert.gate_up.run(&pool.buffer, gpu.input.ptr(), gpu.gate.ptr(), 1, &gpu.stream)?;
                         check(
                             unsafe {
@@ -1718,13 +1675,13 @@ impl Compute {
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
         let all_resident = || by_expert.iter().enumerate()
-            .all(|(id, rows)| rows.is_empty() || pool.entries.contains_key(&(layer, id)));
+            .all(|(id, rows)| rows.is_empty() || pool.residency.get((layer, id)).is_some());
         if self.wide_experts.is_some()
             && routes.iter().all(|route| route.len() == routes[0].len())
             && (all_resident() || (self.cpu.is_some() && self.prompt_stage.is_none()))
         {
             for (id, _) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-                if let Some(hit) = pool.entries.get_mut(&(layer, id)) { hit.last_used = tick; }
+                pool.residency.touch((layer, id), tick);
             }
             for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
                 pool.use_gpu(ckpt, weights, (layer, id), tick, epoch,
@@ -1735,7 +1692,7 @@ impl Compute {
                 host
             } else {
                 let mut indices: Vec<_> = by_expert.iter().enumerate()
-                    .filter(|(id, rows)| !rows.is_empty() && !pool.entries.contains_key(&(layer, *id)))
+                    .filter(|(id, rows)| !rows.is_empty() && pool.residency.get((layer, *id)).is_none())
                     .flat_map(|(_, rows)| rows.iter().map(|&(row, _)| row)).collect();
                 indices.sort_unstable();
                 indices.dedup();
@@ -1750,7 +1707,7 @@ impl Compute {
             let work = prefill_cpu_scope(workers.as_deref(), |scope| -> Result<()> {
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
                 for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-                    if !pool.entries.contains_key(&(layer, id)) {
+                    if pool.residency.get((layer, id)).is_none() {
                         cold_count += rows.len();
                         dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
                     }
@@ -1825,7 +1782,7 @@ impl Compute {
                 let mut prompt_slot = None;
                 let temporary;
                 let (buffer, gate_up, down) = if resident {
-                    let expert = &pool.entries[&(layer, id)];
+                    let expert = pool.residency.get((layer, id)).unwrap();
                     (&pool.buffer, &expert.gate_up, &expert.down)
                 } else if tokens >= 64 && rows.len() >= PROMPT_STAGE_MIN_ROUTES
                     && let Some(stage) = &mut self.prompt_stage
@@ -2886,6 +2843,36 @@ mod tests {
             }
             stream.sync().unwrap();
             assert_eq!(actual.download::<u16>(rows * n).unwrap(), expected.download::<u16>(rows * n).unwrap(), "{packing:?}");
+            if Nvfp4Rows::supported() {
+                let bytes = Nvfp4Rows::bytes(rows, k).next_multiple_of(64);
+                let scratch = DevBuf::new(2 * bytes).unwrap();
+                unsafe {
+                    match packing {
+                        Packing::Nvfp4 => {
+                            let primary = Nvfp4Rows::from_scratch(scratch.ptr(), rows, k);
+                            let residual = Nvfp4Rows::from_scratch(scratch.at(bytes), rows, k);
+                            primary.quantize(input.ptr(), k, rows, k, &stream).unwrap();
+                            residual.quantize_residual(primary, input.ptr(), rows, k, &stream).unwrap();
+                            primary.grouped(residual, descriptors.ptr(), actual.ptr(), tiles.len(), n, k, &stream).unwrap();
+                        }
+                        Packing::Mxfp8 => {
+                            let primary = Mxfp8Rows::from_scratch(scratch.ptr(), rows, k);
+                            primary.quantize(input.ptr(), rows, k, &stream).unwrap();
+                            primary.grouped(descriptors.ptr(), actual.ptr(), tiles.len(), n, k, &stream).unwrap();
+                        }
+                    }
+                }
+                stream.sync().unwrap();
+                let got = actual.download::<u16>(rows * n).unwrap();
+                let want = expected.download::<u16>(rows * n).unwrap();
+                let (error, power) = got.into_iter().zip(want).fold((0.0f64, 0.0f64), |(error, power), (got, want)| {
+                    let got = f64::from(from_bf16(got));
+                    let want = f64::from(from_bf16(want));
+                    (error + (got - want).powi(2), power + want.powi(2))
+                });
+                let relative_rms = (error / power).sqrt();
+                assert!(relative_rms < 0.06, "{packing:?} relative RMS error {relative_rms}");
+            }
         }
     }
 

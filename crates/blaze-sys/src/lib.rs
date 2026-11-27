@@ -447,6 +447,16 @@ unsafe extern "C" {
     pub fn blz_nvfp4_quant_rows(x: *const u16, ldx: i64, m: c_int, k: c_int, codes: *mut u8, scales: *mut u8, row_scale: *mut f32,
                                 s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_w4a4_supported() -> c_int;
+    pub fn blz_nvfp4_quant_residual(x: *const u16, ldx: i64, m: c_int, k: c_int,
+        first_codes: *const u8, first_scales: *const u8, first_row_scale: *const f32,
+        codes: *mut u8, scales: *mut u8, row_scale: *mut f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_nvfp4_grouped_w4a4(xc: *const u8, xs: *const u8, xr: *const f32,
+        xc2: *const u8, xs2: *const u8, xr2: *const f32, items: *const blz_moe_matrix_tile,
+        y: *mut u16, count: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_mxfp8_quant_rows(input: *const u16, codes: *mut u8, scales: *mut u8,
+        rows: c_int, inner: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_mxfp8_grouped_native(input: *const u8, scales: *const u8, tiles: *const blz_moe_matrix_tile,
+        output: *mut u16, count: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_f16(x16: *const u16, shift: *const i32, w_codes: *const u8, w_scales: *const u8, w_alpha: *const f32,
                               wshift: c_int, y: *mut u16, ldy: i64, m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_w4a4(x_codes: *const u8, x_scales: *const u8, x_row_scale: *const f32, w_codes: *const u8, w_scales: *const u8,

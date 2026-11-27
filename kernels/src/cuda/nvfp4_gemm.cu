@@ -18,6 +18,7 @@
 
 #include "blaze/nvfp4.h"
 #include "blaze/nvfp4_gemm.h"
+#include "blaze/moe_packed.h"
 
 namespace {
 
@@ -30,15 +31,29 @@ __device__ __forceinline__ uint32_t e2m1_code(float v) {
   return s | uint32_t(blaze::e2m1_index(fabsf(v)));
 }
 
+template<bool residual = false>
 __global__ void __launch_bounds__(kQuantThreads) quant_rows_kernel(const uint16_t* __restrict__ x, int64_t ldx, int k,
                                                                    uint8_t* __restrict__ codes,
                                                                    uint8_t* __restrict__ scales,
-                                                                   float* __restrict__ row_scale) {
+                                                                   float* __restrict__ row_scale,
+                                                                   const uint8_t* first_codes = nullptr,
+                                                                   const uint8_t* first_scales = nullptr,
+                                                                   const float* first_row_scale = nullptr) {
   __shared__ float red[kQuantThreads / 32];
   const int r = blockIdx.x, tid = threadIdx.x;
   const uint16_t* row = x + int64_t(r) * ldx;
+  auto load = [&](int col) {
+    float value = bf16f(row[col]);
+    if constexpr (residual) {
+      const uint8_t packed = first_codes[int64_t(r) * (k / 2) + col / 2];
+      const int code = (packed >> (4 * (col & 1))) & 15;
+      const float step = blaze::e4m3_to_float(first_scales[int64_t(r) * (k / 16) + col / 16]);
+      value -= blaze::e2m1_value(code) * (step * first_row_scale[r]);
+    }
+    return value;
+  };
   float amax = 0.0f;
-  for (int i = tid; i < k; i += kQuantThreads) amax = fmaxf(amax, fabsf(bf16f(row[i])));
+  for (int i = tid; i < k; i += kQuantThreads) amax = fmaxf(amax, fabsf(load(i)));
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
   if ((tid & 31) == 0) red[tid >> 5] = amax;
   __syncthreads();
@@ -55,7 +70,7 @@ __global__ void __launch_bounds__(kQuantThreads) quant_rows_kernel(const uint16_
     float v[16], bmax = 0.0f;
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
-      v[j] = bf16f(row[b * 16 + j]);
+      v[j] = load(b * 16 + j);
       bmax = fmaxf(bmax, fabsf(v[j]));
     }
     // four over six: the block's largest value at 6 or at 4 of the E2M1 grid (4: finer steps for the rest, the
@@ -111,16 +126,38 @@ __global__ void probe_kernel(int* out) {
 #endif
 }
 
+template<int terms = 1>
 __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restrict__ xc, const uint8_t* __restrict__ xs,
                                                         const float* __restrict__ xrow, const uint8_t* __restrict__ wc,
                                                         const uint8_t* __restrict__ ws, const float* __restrict__ walpha,
-                                                        uint16_t* __restrict__ y, int64_t ldy, int m, int n, int k) {
+                                                        uint16_t* __restrict__ y, int64_t ldy, int m, int n, int k,
+                                                        const blz_moe_matrix_tile* grouped = nullptr,
+                                                        const uint8_t* xc2 = nullptr, const uint8_t* xs2 = nullptr,
+                                                        const float* xrow2 = nullptr) {
 #ifdef BLZ_FP4_MMA
+  constexpr int tile_m = BM / terms;
+  constexpr int mt = 4 / terms;
+  static_assert(terms == 1 || terms == 2);
+  const int kc = k / 2, ks = k / 16, tiles = k / BK;
+  if constexpr (terms == 2) {
+    const auto item = grouped[blockIdx.z];
+    xc += int64_t(item.begin) * kc;
+    xs += int64_t(item.begin) * ks;
+    xrow += item.begin;
+    xc2 += int64_t(item.begin) * kc;
+    xs2 += int64_t(item.begin) * ks;
+    xrow2 += item.begin;
+    y += int64_t(item.begin) * ldy;
+    wc = item.codes;
+    ws = item.scales;
+    walpha = item.alpha;
+    m = item.rows;
+  }
   extern __shared__ __align__(16) uint8_t smem[];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int wm = warp >> 2, wn = warp & 3, g = lane >> 2, t = lane & 3;
-  const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-  const int kc = k / 2, ks = k / 16, tiles = k / BK;
+  const int m0 = blockIdx.y * tile_m, n0 = blockIdx.x * BN;
+  if (m0 >= m) return;
   auto stage = [&](int s) { return smem + s * kTileBytes; };
   auto load = [&](int kt, int s) {
     uint8_t* A = stage(s);
@@ -130,13 +167,17 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
 #pragma unroll
     for (int c = tid; c < BM * 4; c += kThreads) {
       const int r = c >> 2, ch = c & 3;
-      const bool va = m0 + r < m, vb = n0 + r < n;
-      cp_async(A + r * kRow + ch * 16, xc + int64_t(va ? m0 + r : 0) * kc + kt * 64 + ch * 16, 16, va);
+      const int x_index = m0 + r % tile_m;
+      const bool va = x_index < m, vb = n0 + r < n;
+      const auto* codes = terms == 2 && r >= tile_m ? xc2 : xc;
+      cp_async(A + r * kRow + ch * 16, codes + int64_t(va ? x_index : 0) * kc + kt * 64 + ch * 16, 16, va);
       cp_async(B + r * kRow + ch * 16, wc + int64_t(vb ? n0 + r : 0) * kc + kt * 64 + ch * 16, 16, vb);
     }
     if (tid < BM) {
-      const bool v = m0 + tid < m;
-      cp_async(SA + tid * 8, xs + int64_t(v ? m0 + tid : 0) * ks + kt * 8, 8, v);
+      const int x_index = m0 + tid % tile_m;
+      const bool v = x_index < m;
+      const auto* scales = terms == 2 && tid >= tile_m ? xs2 : xs;
+      cp_async(SA + tid * 8, scales + int64_t(v ? x_index : 0) * ks + kt * 8, 8, v);
     } else {
       const int r = tid - BM;
       const bool v = n0 + r < n;
@@ -174,7 +215,7 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
       }
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int r = wm * 64 + i * 16 + g;
+        const int r = (i / mt) * tile_m + wm * (tile_m / 2) + (i % mt) * 16 + g;
         const uint32_t a0 = *reinterpret_cast<const uint32_t*>(A + r * kRow + h * 32 + t * 4);
         const uint32_t a1 = *reinterpret_cast<const uint32_t*>(A + (r + 8) * kRow + h * 32 + t * 4);
         const uint32_t a2 = *reinterpret_cast<const uint32_t*>(A + r * kRow + h * 32 + 16 + t * 4);
@@ -198,8 +239,8 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
   }
   asm volatile("cp.async.wait_group 0;\n");
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const int r0 = m0 + wm * 64 + i * 16 + g;
+  for (int i = 0; i < mt; ++i) {
+    const int r0 = m0 + wm * (tile_m / 2) + i * 16 + g;
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
       const int c = n0 + wn * 32 + j * 8 + 2 * t;
@@ -210,7 +251,15 @@ __global__ void __launch_bounds__(kThreads) w4a4_kernel(const uint8_t* __restric
         const int r = r0 + half * 8;
         if (r >= m) continue;
         const float s = xrow[r];
-        const float v0 = acc[i][j][2 * half] * s * a0, v1 = acc[i][j][2 * half + 1] * s * a1;
+        float v0 = acc[i][j][2 * half] * s;
+        float v1 = acc[i][j][2 * half + 1] * s;
+        if constexpr (terms == 2) {
+          const float residual_scale = xrow2[r];
+          v0 = fmaf(acc[i + mt][j][2 * half], residual_scale, v0);
+          v1 = fmaf(acc[i + mt][j][2 * half + 1], residual_scale, v1);
+        }
+        v0 *= a0;
+        v1 *= a1;
         uint16_t* out = y + int64_t(r) * ldy + c;
         if (c + 1 < n && (ldy & 1) == 0) {
           const __nv_bfloat162 p = __floats2bfloat162_rn(v0, v1);
@@ -409,7 +458,17 @@ extern "C" cudaError_t blz_nvfp4_quant_rows(const uint16_t* x, int64_t ldx, int 
                                             float* row_scale, cudaStream_t stream) {
   if (m <= 0) return cudaSuccess;
   if (k % 16 != 0) return cudaErrorInvalidValue;
-  quant_rows_kernel<<<m, kQuantThreads, 0, stream>>>(x, ldx, k, codes, scales, row_scale);
+  quant_rows_kernel<><<<m, kQuantThreads, 0, stream>>>(x, ldx, k, codes, scales, row_scale);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_nvfp4_quant_residual(const uint16_t* x, int64_t ldx, int m, int k,
+        const uint8_t* first_codes, const uint8_t* first_scales, const float* first_row_scale,
+        uint8_t* codes, uint8_t* scales, float* row_scale, cudaStream_t stream) {
+  if (m <= 0) return cudaSuccess;
+  if (k < 16 || k % 16) return cudaErrorInvalidValue;
+  quant_rows_kernel<true><<<m, kQuantThreads, 0, stream>>>(x, ldx, k, codes, scales, row_scale,
+      first_codes, first_scales, first_row_scale);
   return cudaGetLastError();
 }
 
@@ -439,11 +498,25 @@ extern "C" cudaError_t blz_nvfp4_gemm_w4a4(const uint8_t* x_codes, const uint8_t
   int dev = 0;
   cudaGetDevice(&dev);
   if (dev >= 16 || !attr[dev]) {
-    cudaFuncSetAttribute(w4a4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+    cudaFuncSetAttribute(w4a4_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
     if (dev < 16) attr[dev] = true;
   }
   const dim3 grid((n + BN - 1) / BN, (m + BM - 1) / BM);
-  w4a4_kernel<<<grid, kThreads, kSmem, stream>>>(x_codes, x_scales, x_row_scale, w_codes, w_scales, w_alpha, y, ldy, m, n,
+  w4a4_kernel<1><<<grid, kThreads, kSmem, stream>>>(x_codes, x_scales, x_row_scale, w_codes, w_scales, w_alpha, y, ldy, m, n,
                                                  k);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_nvfp4_grouped_w4a4(const uint8_t* xc, const uint8_t* xs, const float* xr,
+        const uint8_t* xc2, const uint8_t* xs2, const float* xr2, const blz_moe_matrix_tile* items,
+        uint16_t* y, int count, int n, int k, cudaStream_t stream) {
+  if (count == 0) return cudaSuccess;
+  if (count < 0 || count > 65535 || n < 1 || k < BK || k % BK) return cudaErrorInvalidValue;
+  if (!blz_nvfp4_gemm_w4a4_supported()) return cudaErrorNotSupported;
+  const auto status = cudaFuncSetAttribute(w4a4_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  if (status != cudaSuccess) return status;
+  const dim3 grid((n + BN - 1) / BN, 1, count);
+  w4a4_kernel<2><<<grid, kThreads, kSmem, stream>>>(
+      xc, xs, xr, nullptr, nullptr, nullptr, y, n, 0, n, k, items, xc2, xs2, xr2);
   return cudaGetLastError();
 }

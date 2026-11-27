@@ -6,6 +6,86 @@ use anyhow::Result;
 use blaze_sys as sys;
 
 #[derive(Clone, Copy)]
+pub(crate) struct Nvfp4Rows {
+    codes: *mut u8,
+    scales: *mut u8,
+    row_scales: *mut f32,
+}
+
+impl Nvfp4Rows {
+    pub fn supported() -> bool {
+        unsafe { sys::blz_nvfp4_gemm_w4a4_supported() != 0 }
+    }
+
+    pub fn bytes(rows: usize, inner: usize) -> usize {
+        ((rows * (inner / 2)).next_multiple_of(64) + rows * (inner / 16)).next_multiple_of(64) + rows * 4
+    }
+
+    pub unsafe fn from_scratch(base: *mut u8, rows: usize, inner: usize) -> Self {
+        let code_bytes = rows * (inner / 2);
+        let scale_at = code_bytes.next_multiple_of(64);
+        let scales_end = (scale_at + rows * (inner / 16)).next_multiple_of(64);
+        Self {
+            codes: base,
+            scales: base.wrapping_add(scale_at),
+            row_scales: base.wrapping_add(scales_end).cast(),
+        }
+    }
+
+    pub unsafe fn quantize(self, input: *const u16, stride: usize, rows: usize, inner: usize,
+        stream: &Stream) -> Result<()> {
+        check(unsafe {
+            sys::blz_nvfp4_quant_rows(input, stride as i64, rows as i32, inner as i32,
+                self.codes, self.scales, self.row_scales, stream.0)
+        }, "NVFP4 activation quantization")
+    }
+
+    pub unsafe fn quantize_residual(self, first: Self, input: *const u16, rows: usize, inner: usize,
+        stream: &Stream) -> Result<()> {
+        check(unsafe {
+            sys::blz_nvfp4_quant_residual(input, inner as i64, rows as i32, inner as i32,
+                first.codes, first.scales, first.row_scales, self.codes, self.scales, self.row_scales, stream.0)
+        }, "NVFP4 activation residual quantization")
+    }
+
+    pub unsafe fn grouped(self, residual: Self, tiles: *const sys::blz_moe_matrix_tile, output: *mut u16,
+        count: usize, columns: usize, inner: usize, stream: &Stream) -> Result<()> {
+        check(unsafe {
+            sys::blz_nvfp4_grouped_w4a4(self.codes, self.scales, self.row_scales, residual.codes, residual.scales,
+                residual.row_scales, tiles, output, count as i32, columns as i32, inner as i32, stream.0)
+        }, "NVFP4 native grouped matrix multiplication")
+    }
+}
+
+pub(crate) struct Mxfp8Rows {
+    codes: *mut u8,
+    scales: *mut u8,
+}
+
+impl Mxfp8Rows {
+    pub fn bytes(rows: usize, inner: usize) -> usize {
+        rows * (inner + inner / 32)
+    }
+
+    pub unsafe fn from_scratch(base: *mut u8, rows: usize, inner: usize) -> Self {
+        Self { codes: base, scales: base.wrapping_add(rows * inner) }
+    }
+
+    pub unsafe fn quantize(&self, input: *const u16, rows: usize, inner: usize, stream: &Stream) -> Result<()> {
+        check(unsafe { sys::blz_mxfp8_quant_rows(input, self.codes, self.scales, rows as i32, inner as i32, stream.0) },
+            "MXFP8 activation quantization")
+    }
+
+    pub unsafe fn grouped(&self, tiles: *const sys::blz_moe_matrix_tile, output: *mut u16,
+        count: usize, columns: usize, inner: usize, stream: &Stream) -> Result<()> {
+        check(unsafe {
+            sys::blz_mxfp8_grouped_native(self.codes, self.scales, tiles, output, count as i32,
+                columns as i32, inner as i32, stream.0)
+        }, "MXFP8 native grouped matrix multiplication")
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(crate) enum Bf16Kernel {
     Cublas,
     Skinny(i32),
@@ -24,6 +104,14 @@ pub(crate) struct Matmul {
 }
 
 impl Matmul {
+    pub unsafe fn nvfp4_native(&self, input: Nvfp4Rows, codes: *const u8, scales: *const u8, alpha: *const f32,
+        stream: &Stream) -> Result<()> {
+        check(unsafe {
+            sys::blz_nvfp4_gemm_w4a4(input.codes, input.scales, input.row_scales, codes, scales, alpha,
+                self.output, self.output_stride as i64, self.rows as i32, self.columns as i32, self.inner as i32, stream.0)
+        }, "NVFP4 native matrix multiplication")
+    }
+
     /// Device pointers must cover the indicated matrices, block scales and row multipliers.
     pub unsafe fn nvfp4(
         &self,

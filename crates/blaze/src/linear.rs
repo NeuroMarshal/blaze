@@ -2,7 +2,7 @@
 //! Tensor-parallel shards are cut before upload.
 
 use crate::gpu::{DevBuf, Stream, check};
-use crate::matmul::Matmul;
+use crate::matmul::{Matmul, Nvfp4Rows};
 use crate::quant::{Format, QuantConfig, WeightNames};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Result, bail};
@@ -534,7 +534,7 @@ impl Linear {
         // scratch the prefill's widened weights use; tensor-core calls never widen)
         let mut x16: Option<(*const u16, *mut u16, *mut i32)> = None;
         // the NVFP4 rows of x for the W4A4 GEMM, quantized once for every part (in the scratch)
-        let mut xq: Option<(*const u8, *const u8, *const f32)> = None;
+        let mut xq = None;
         // the FP16 rows of all of x for the W4A16 GEMM (key, rows, values, shifts)
         let mut x16g: Option<(*const u16, usize, *mut u16, *mut i32)> = None;
         for p in &self.parts {
@@ -542,28 +542,22 @@ impl Linear {
             match &p.store {
                 Store::Nvfp4 { codes, scales, alpha, act4, f16, .. }
                     if m > sys::BLZ_NVFP4_MMA_MAX_ROWS && k % 128 == 0 && !(self.a16 && *f16) && ctx.use_w4a4(*act4)
-                        && m * k / 2 + m * k / 16 + 4 * m + 256 <= ctx.scratch_elems * 2 =>
+                        && Nvfp4Rows::bytes(m, k) <= ctx.scratch_elems * 2 =>
                 {
-                    let (xc, xs, xr) = match xq {
+                    let quantized = match xq {
                         Some(q) => q,
                         None => {
                             x16 = None;
                             x16g = None;
-                            let base = ctx.scratch.cast::<u8>();
-                            let q = unsafe { (base, base.add((m * k / 2).next_multiple_of(64)), base.add((m * k / 2 + m * k / 16).next_multiple_of(64))) };
-                            check(unsafe { sys::blz_nvfp4_quant_rows(x, ldx as i64, m as c_int, k as c_int, q.0, q.1, q.2.cast(), s.0) }, "x to NVFP4")?;
-                            let q = (q.0.cast_const(), q.1.cast_const(), q.2.cast::<f32>().cast_const());
+                            let q = unsafe { Nvfp4Rows::from_scratch(ctx.scratch.cast(), m, k) };
+                            unsafe { q.quantize(x, ldx, m, k, s) }?;
                             xq = Some(q);
                             q
                         }
                     };
-                    check(
-                        unsafe {
-                            sys::blz_nvfp4_gemm_w4a4(xc, xs, xr, codes.ptr(), scales.ptr(), alpha.ptr(), o, ldo as i64, m as c_int, p.n as c_int,
-                                                     k as c_int, s.0)
-                        },
-                        "blz_nvfp4_gemm_w4a4",
-                    )?;
+                    let product = Matmul { input: x, output: o, rows: m, columns: p.n, inner: k,
+                        input_stride: ldx, output_stride: ldo };
+                    unsafe { product.nvfp4_native(quantized, codes.ptr(), scales.ptr(), alpha.ptr(), s) }?;
                 }
                 Store::Nvfp4 { codes, scales, alpha, f16, wshift, .. } => {
                     // its FP16 inputs or widened weights take the scratch (the W4A16 rows stay for its own GEMM)
