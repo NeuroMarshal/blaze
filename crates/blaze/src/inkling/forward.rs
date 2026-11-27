@@ -1007,6 +1007,12 @@ impl Model {
             }
             let compute = &mut device.compute;
             let layer = &self.layers[id];
+            if !matches!(readout, Readout::Verify(_))
+                && let Some(next) = self.loops.visits.get(index + 1)
+                && self.placement[next.layer] == rank
+            {
+                compute.prefetch_experts(&self.ckpt, &self.layers[next.layer].experts, id, next.layer, rows.len())?;
+            }
             let mut residuals = Vec::with_capacity(rows.len());
             let mut activations = Vec::with_capacity(rows.len());
             let mut q_inputs = Vec::with_capacity(rows.len());

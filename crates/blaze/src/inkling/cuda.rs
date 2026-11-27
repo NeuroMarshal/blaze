@@ -179,12 +179,20 @@ impl OnDevice {
 
 const PROMPT_STAGE_SLOTS: usize = 2;
 const PROMPT_STAGE_MIN_ROUTES: usize = 8;
+const PREFETCH_MIN_ROWS: usize = 512;
+const PREFETCH_BANK_EXPERTS: usize = 8;
+
+fn prompt_prefetch_enabled(prefill_chunk: usize) -> bool {
+    prefill_chunk >= PREFETCH_MIN_ROWS
+        && std::env::var_os("BLAZE_INKLING_PREFETCH_EXPERTS").is_some_and(|value| value == "1")
+}
 
 pub(super) fn prompt_stage_bytes(expert_sizes: [usize; 2], prefill_chunk: usize, cpu: bool) -> usize {
     if cpu && prefill_chunk >= 64
         && std::env::var_os("BLAZE_INKLING_STAGE_PREFILL_EXPERTS").is_some_and(|value| value == "1")
     {
-        PROMPT_STAGE_SLOTS * expert_sizes.into_iter().max().unwrap()
+        let banks = usize::from(prompt_prefetch_enabled(prefill_chunk)) * 2 * PREFETCH_BANK_EXPERTS;
+        (PROMPT_STAGE_SLOTS + banks) * expert_sizes.into_iter().max().unwrap()
     } else { 0 }
 }
 
@@ -193,7 +201,8 @@ struct PromptSlot {
     device: DevBuf,
     uploaded: Event,
     consumed: Event,
-    in_flight: bool,
+    copied: bool,
+    consumed_in_flight: bool,
 }
 
 impl PromptSlot {
@@ -203,44 +212,85 @@ impl PromptSlot {
             device: DevBuf::new(bytes)?,
             uploaded: Event::new()?,
             consumed: Event::new()?,
-            in_flight: false,
+            copied: false,
+            consumed_in_flight: false,
         })
     }
 
     fn load(&mut self, copy: &Stream, compute: &Stream, ckpt: &Checkpoint, weights: &Experts,
             id: usize) -> Result<(OnDevice, OnDevice)> {
-        if self.in_flight {
+        let mut records = self.upload(copy, ckpt, weights, &[id])?;
+        self.wait(compute)?;
+        Ok(records.pop().unwrap())
+    }
+
+    fn upload(&mut self, copy: &Stream, ckpt: &Checkpoint, weights: &Experts,
+              ids: &[usize]) -> Result<Vec<(OnDevice, OnDevice)>> {
+        if self.copied {
             check(unsafe { sys::cudaEventSynchronize(self.uploaded.0) }, "Inkling staging host reuse")?;
+        }
+        if self.consumed_in_flight {
             check(unsafe { sys::cudaStreamWaitEvent(copy.0, self.consumed.0, 0) }, "Inkling staging device reuse")?;
         }
+        let stride = expert_size(weights);
+        let bytes = stride * ids.len();
+        ensure!(bytes > 0 && bytes <= self.device.bytes(), "Inkling expert bank exceeds scratch");
         let host = self.host.host_slice_mut();
-        let gate = OnDevice::stage(host, 0, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
         let down_at = weights.gate_up.gpu_bytes().next_multiple_of(64);
-        let down = OnDevice::stage(host, down_at, &weights.down, weights.down.expert(ckpt, id)?)?;
+        let records = ids.iter().enumerate().map(|(i, &id)| {
+            let start = i * stride;
+            let gate = OnDevice::stage(host, start, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
+            let down = OnDevice::stage(host, start + down_at, &weights.down, weights.down.expert(ckpt, id)?)?;
+            Ok((gate, down))
+        }).collect::<Result<_>>()?;
         check(unsafe {
-            sys::cudaMemcpyAsync(self.device.ptr(), self.host.host_ptr(), expert_size(weights), sys::MEMCPY_H2D, copy.0)
+            sys::cudaMemcpyAsync(self.device.ptr(), self.host.host_ptr(), bytes, sys::MEMCPY_H2D, copy.0)
         }, "Inkling prompt expert upload")?;
-        check(unsafe { sys::cudaEventRecord(self.uploaded.0, copy.0) }, "Inkling prompt expert ready")?;
-        check(unsafe { sys::cudaStreamWaitEvent(compute.0, self.uploaded.0, 0) }, "Inkling prompt expert wait")?;
-        Ok((gate, down))
+        if let Err(error) = check(unsafe { sys::cudaEventRecord(self.uploaded.0, copy.0) }, "Inkling prompt expert ready") {
+            let _ = copy.sync();
+            return Err(error);
+        }
+        self.copied = true;
+        Ok(records)
+    }
+
+    fn wait(&self, compute: &Stream) -> Result<()> {
+        check(unsafe { sys::cudaStreamWaitEvent(compute.0, self.uploaded.0, 0) }, "Inkling prompt expert wait")
     }
 
     fn release(&mut self, stream: &Stream) -> Result<()> {
         check(unsafe { sys::cudaEventRecord(self.consumed.0, stream.0) }, "Inkling prompt expert consumed")?;
-        self.in_flight = true;
+        self.consumed_in_flight = true;
         Ok(())
     }
 }
 
 struct PromptStage {
     copy: Stream,
+    prefetch: Option<Stream>,
     slots: [PromptSlot; PROMPT_STAGE_SLOTS],
     next: usize,
+    banks: Vec<PromptBank>,
+}
+
+struct PromptBank {
+    layer: Option<usize>,
+    slot: PromptSlot,
+    experts: HashMap<usize, (OnDevice, OnDevice)>,
 }
 
 impl PromptStage {
-    fn new(bytes: usize) -> Result<Self> {
-        Ok(Self { copy: Stream::new()?, slots: [PromptSlot::new(bytes)?, PromptSlot::new(bytes)?], next: 0 })
+    fn new(bytes: usize, prefetch: bool) -> Result<Self> {
+        let banks = (0..2).filter(|_| prefetch).map(|_| {
+            Ok(PromptBank { layer: None, slot: PromptSlot::new(bytes * PREFETCH_BANK_EXPERTS)?, experts: HashMap::new() })
+        }).collect::<Result<_>>()?;
+        Ok(Self {
+            copy: Stream::new()?,
+            prefetch: prefetch.then(Stream::new).transpose()?,
+            slots: [PromptSlot::new(bytes)?, PromptSlot::new(bytes)?],
+            next: 0,
+            banks,
+        })
     }
 }
 
@@ -576,7 +626,9 @@ impl Compute {
         let next_id = DevBuf::new(4)?;
         let cache = ExpertCache::new(expert_bytes, expert_sizes, layer_visits, top_k)?;
         let stage_bytes = prompt_stage_bytes(expert_sizes, prefill_chunk, cpu.is_some());
-        let prompt_stage = (stage_bytes > 0).then(|| PromptStage::new(stage_bytes / PROMPT_STAGE_SLOTS)).transpose()?;
+        let prompt_stage = (stage_bytes > 0).then(|| {
+            PromptStage::new(expert_sizes.into_iter().max().unwrap(), prompt_prefetch_enabled(prefill_chunk))
+        }).transpose()?;
         let wide_experts = (hidden.is_multiple_of(128) && intermediate.is_multiple_of(128) && top_k <= 16
             && std::env::var_os("BLAZE_INKLING_GROUPED_PREFILL").is_some_and(|value| value == "1"))
             .then(|| WideExperts::new(prefill_chunk * top_k, hidden, intermediate)).transpose()?;
@@ -1045,6 +1097,36 @@ impl Compute {
         self.cpu_routes
     }
 
+    pub fn prefetch_experts(&mut self, ckpt: &Checkpoint, weights: &Experts,
+                            current: usize, next: usize, rows: usize) -> Result<()> {
+        let Some(stage) = &mut self.prompt_stage else { return Ok(()) };
+        let Some(copy) = &stage.prefetch else { return Ok(()) };
+        if rows < PREFETCH_MIN_ROWS || stage.banks.iter().any(|bank| bank.layer == Some(next)) {
+            return Ok(());
+        }
+        let Some(bank) = stage.banks.iter_mut().find(|bank| bank.layer != Some(current)) else {
+            return Ok(());
+        };
+        let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
+        let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
+        let mut candidates: Vec<_> = pool.hits.iter().filter_map(|(&(layer, id), heat)| {
+            let score = heat.at(epoch);
+            (layer == next && score >= PROMPT_STAGE_MIN_ROUTES && !pool.entries.contains_key(&(layer, id)))
+                .then_some((std::cmp::Reverse(score), id))
+        }).collect();
+        candidates.sort_unstable();
+        let ids: Vec<_> = candidates.into_iter().take(PREFETCH_BANK_EXPERTS).map(|(_, id)| id).collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        bank.layer = None;
+        bank.experts.clear();
+        let staged = bank.slot.upload(copy, ckpt, weights, &ids)?;
+        bank.experts.extend(ids.into_iter().zip(staged));
+        bank.layer = Some(next);
+        Ok(())
+    }
+
     pub(super) fn moe(
         &mut self,
         ckpt: &Checkpoint,
@@ -1305,10 +1387,18 @@ impl Compute {
                 } else if activations.len() >= 64 && rows.len() >= PROMPT_STAGE_MIN_ROUTES
                     && let Some(stage) = &mut self.prompt_stage
                 {
-                    let slot = &mut stage.slots[stage.next];
-                    stage.next = (stage.next + 1) % PROMPT_STAGE_SLOTS;
-                    temporary = slot.load(&stage.copy, &self.stream, ckpt, weights, id)?;
-                    (&prompt_slot.insert(slot).device, &temporary.0, &temporary.1)
+                    if let Some(bank) = stage.banks.iter_mut().find(|bank| {
+                        bank.layer == Some(layer) && bank.experts.contains_key(&id)
+                    }) {
+                        bank.slot.wait(&self.stream)?;
+                        let (gate, down) = &bank.experts[&id];
+                        (&prompt_slot.insert(&mut bank.slot).device, gate, down)
+                    } else {
+                        let slot = &mut stage.slots[stage.next];
+                        stage.next = (stage.next + 1) % PROMPT_STAGE_SLOTS;
+                        temporary = slot.load(&stage.copy, &self.stream, ckpt, weights, id)?;
+                        (&prompt_slot.insert(slot).device, &temporary.0, &temporary.1)
+                    }
                 } else {
                     cold_count += rows.len();
                     dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
