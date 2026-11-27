@@ -1,7 +1,6 @@
 #pragma once
 
 #include <math_constants.h>
-#include <mma.h>
 
 #include "blaze/nvfp4.h"
 #include "fa_tile.cuh"
@@ -16,137 +15,198 @@ __device__ inline float warp_sum(float x) {
 constexpr int kPromptQueries = 16;
 constexpr int kPromptKeys = 32;
 
-template<int HeadDim, bool Packed>
+template<int HeadDim, bool Packed, int Group>
 __global__ void window_prefill(const __nv_bfloat16* q, const uint8_t* keys, const uint8_t* values,
-        const uint8_t* ks, const uint8_t* vs, const __nv_bfloat16* relative, float* scratch, int kv_heads,
-        int capacity, int window, int start, int extent, int span, int rows, float scale) {
+        const uint8_t* ks, const uint8_t* vs, const __nv_bfloat16* relative, float* scratch, int heads,
+        int kv_heads, int capacity, int window, int start, int extent, int span, int rows, float scale) {
     static_assert(HeadDim == 128);
-    constexpr int kWarps = HeadDim / 32;
-    namespace wmma = nvcuda::wmma;
-    const int head = blockIdx.x;
-    const int kv_head = head / (gridDim.x / kv_heads);
+    constexpr int kLeading = HeadDim + 8;
+    constexpr int kGroups = HeadDim / blaze::kNvfp4Block;
+    constexpr int kRawBytes = HeadDim / 2;
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
+    const int head = Group == 1 ? blockIdx.x : blockIdx.x * Group + warp;
+    const int kv_head = head / (heads / kv_heads);
     const int query_base = blockIdx.z * kPromptQueries;
     const int active = min(kPromptQueries, rows - query_base);
-    const int leading = HeadDim + 8;
-    q += size_t(query_base) * gridDim.x * HeadDim;
-    if (relative) relative += size_t(query_base) * gridDim.x * extent;
-    scratch += size_t(query_base) * gridDim.x * gridDim.y * (HeadDim + 2);
-    start += query_base;
-    const int first = max(0, start + 1 - window) + blockIdx.y * span;
-    const int end = min(first + span, start + active);
-    __align__(32) __shared__ __half q_tile[kPromptQueries][HeadDim];
-    __align__(32) __shared__ __half k_tile[kPromptKeys][leading];
-    __align__(32) __shared__ __half v_tile[kPromptKeys][leading];
-    __align__(32) __shared__ float score[kPromptQueries][kPromptKeys];
-    __align__(32) __shared__ __half probability[kPromptQueries][kPromptKeys];
-    __align__(32) __shared__ float numerator[kPromptQueries][HeadDim];
-    __align__(32) __shared__ float product[kPromptQueries][HeadDim];
-    __shared__ float maximum[kPromptQueries], mass[kPromptQueries], keep[kPromptQueries];
+    const int first_pos = start + query_base;
+    const int first = max(0, first_pos + 1 - window) + blockIdx.y * span;
+    const int end = min(first + span, first_pos + active);
 
-    for (int i = threadIdx.x; i < kPromptQueries * HeadDim; i += blockDim.x) {
-        const int row = i / HeadDim;
-        const int col = i % HeadDim;
-        q_tile[row][col] = row < active ? __float2half(__bfloat162float(q[(size_t(row) * gridDim.x + head) * HeadDim + col])) : __float2half(0.0f);
-        numerator[row][col] = 0.0f;
+    __align__(32) __shared__ __half q_tile[Group][kPromptQueries][kLeading];
+    __align__(32) __shared__ __half kv_tile[2][kPromptKeys][kLeading];
+    __align__(16) __shared__ uint8_t raw[2][kPromptKeys][Packed ? kRawBytes : 1];
+    __align__(8) __shared__ uint8_t scales[2][kPromptKeys][Packed ? kGroups : 1];
+
+    for (int i = lane; i < kPromptQueries * HeadDim; i += 32) {
+        const int row = i / HeadDim, col = i % HeadDim;
+        q_tile[warp][row][col] = row < active
+            ? __float2half(__bfloat162float(q[(size_t(query_base + row) * heads + head) * HeadDim + col]))
+            : __float2half(0.0f);
     }
-    if (threadIdx.x < kPromptQueries) {
-        maximum[threadIdx.x] = -CUDART_INF_F;
-        mass[threadIdx.x] = 0.0f;
+
+    const auto queue_packed = [&](int base) {
+        constexpr int kChunks = kRawBytes / 16;
+        for (int i = threadIdx.x; i < 2 * kPromptKeys * kChunks; i += blockDim.x) {
+            const int side = i / (kPromptKeys * kChunks);
+            const int row = (i / kChunks) % kPromptKeys;
+            const int off = (i % kChunks) * 16;
+            const bool valid = base + row < end;
+            const size_t slot = valid ? size_t((base + row) % capacity) * kv_heads + kv_head : 0;
+            cp16(&raw[side][row][off], (side ? values : keys) + slot * kRawBytes + off, valid);
+            if (off == 0) {
+                *reinterpret_cast<uint64_t*>(scales[side][row]) = valid
+                    ? *reinterpret_cast<const uint64_t*>((side ? vs : ks) + slot * kGroups) : 0;
+            }
+        }
+        cp_commit();
+    };
+    if constexpr (Packed) {
+        if (first < end) queue_packed(first);
     }
     __syncthreads();
+
+    const int row0 = lane / 4, row1 = row0 + 8, col2 = (lane % 4) * 2;
+    float maxima[2] = {-CUDART_INF_F, -CUDART_INF_F};
+    float masses[2] = {};
+    float numerators[HeadDim / 8][4] = {};
     for (int base = first; base < end; base += kPromptKeys) {
         if constexpr (Packed) {
-            constexpr int groups = HeadDim / blaze::kNvfp4Block;
-            for (int i = threadIdx.x; i < kPromptKeys * groups; i += blockDim.x) {
-                const int key = i / groups;
-                const int group = i % groups;
-                const int pos = base + key;
-                const int col = group * blaze::kNvfp4Block;
-                if (pos < end) {
-                    const size_t kv_row = size_t(pos % capacity) * kv_heads + kv_head;
-                    const size_t bytes = kv_row * (HeadDim / 2) + col / 2;
-                    blaze::fa::dequant_block(keys + bytes, ks[kv_row * groups + group], &k_tile[key][col], scale);
-                    blaze::fa::dequant_block(values + bytes, vs[kv_row * groups + group], &v_tile[key][col], scale);
-                } else {
-                    const uint4 zero = {};
-                    auto* k = reinterpret_cast<uint4*>(&k_tile[key][col]);
-                    auto* v = reinterpret_cast<uint4*>(&v_tile[key][col]);
-                    k[0] = k[1] = v[0] = v[1] = zero;
-                }
+            cp_wait<0>();
+            __syncthreads();
+            for (int i = threadIdx.x; i < 2 * kPromptKeys * kGroups; i += blockDim.x) {
+                const int side = i / (kPromptKeys * kGroups);
+                const int row = (i / kGroups) % kPromptKeys;
+                const int group = i % kGroups;
+                dequant_block(raw[side][row] + group * 8, scales[side][row][group],
+                              &kv_tile[side][row][group * blaze::kNvfp4Block], scale);
             }
         } else {
-            for (int i = threadIdx.x; i < kPromptKeys * HeadDim; i += blockDim.x) {
-                const int pos = base + i / HeadDim;
+            for (int i = threadIdx.x; i < 2 * kPromptKeys * HeadDim; i += blockDim.x) {
+                const int side = i / (kPromptKeys * HeadDim);
+                const int row = (i / HeadDim) % kPromptKeys;
                 const int col = i % HeadDim;
-                const size_t kv_row = size_t(pos % capacity) * kv_heads + kv_head;
-                k_tile[i / HeadDim][col] = __float2half(pos < end ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(keys)[kv_row * HeadDim + col]) : 0.0f);
-                v_tile[i / HeadDim][col] = __float2half(pos < end ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(values)[kv_row * HeadDim + col]) : 0.0f);
+                const auto* data = reinterpret_cast<const __nv_bfloat16*>(side ? values : keys);
+                const size_t slot = size_t((base + row) % capacity) * kv_heads + kv_head;
+                kv_tile[side][row][col] = __float2half(base + row < end ? __bfloat162float(data[slot * HeadDim + col]) : 0.0f);
             }
         }
         __syncthreads();
-        if (warp < kPromptKeys / 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> q_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> k_fragment;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
-            wmma::fill_fragment(dot, 0.0f);
-            for (int k = 0; k < HeadDim; k += 16) {
-                wmma::load_matrix_sync(q_fragment, &q_tile[0][k], HeadDim);
-                wmma::load_matrix_sync(k_fragment, &k_tile[warp * 16][k], leading);
-                wmma::mma_sync(dot, q_fragment, k_fragment, dot);
-            }
-            wmma::store_matrix_sync(&score[0][warp * 16], dot, kPromptKeys, wmma::mem_row_major);
+        if constexpr (Packed) {
+            if (base + kPromptKeys < end) queue_packed(base + kPromptKeys);
         }
-        __syncthreads();
-        for (int row = warp; row < kPromptQueries; row += kWarps) {
-            const int distance = start + row - (base + lane);
-            const bool visible = row < active && base + lane < end && distance >= 0 && distance < window;
-            const float bias = visible && relative && distance < extent
-                ? __bfloat162float(relative[(size_t(row) * gridDim.x + head) * extent + distance]) : 0.0f;
-            const float logit = visible ? score[row][lane] * rsqrtf(float(HeadDim)) + bias : -CUDART_INF_F;
-            float peak = logit;
-            for (int shift = 16; shift; shift /= 2) peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, shift));
-            const float next = fmaxf(maximum[row], peak);
-            const float carry = next == -CUDART_INF_F ? 0.0f : __expf(maximum[row] - next);
-            const float p = visible ? __expf(logit - next) : 0.0f;
-            const float sum = warp_sum(p);
-            probability[row][lane] = __float2half(p);
-            if (lane == 0) {
-                mass[row] = fmaf(mass[row], carry, sum);
-                maximum[row] = next;
-                keep[row] = carry;
+
+        float scores[kPromptKeys / 8][4] = {};
+        const auto* qt = &q_tile[warp][0][0];
+        const auto* kt = &kv_tile[0][0][0];
+#pragma unroll
+        for (int k = 0; k < HeadDim; k += 16) {
+            uint32_t a[4];
+            ldsm4(a, qt + (lane & 15) * kLeading + k + (lane >> 4) * 8);
+#pragma unroll
+            for (int n = 0; n < kPromptKeys; n += 16) {
+                uint32_t b[4];
+                ldsm4(b, kt + (n + (lane & 7) + ((lane >> 4) << 3)) * kLeading + k + ((lane >> 3) & 1) * 8);
+                mma_f16(scores[n / 8], a, b[0], b[1]);
+                mma_f16(scores[n / 8 + 1], a, b[2], b[3]);
             }
         }
-        __syncthreads();
-        for (int col = warp * 16; col < HeadDim; col += kWarps * 16) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> p_fragment;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> v_fragment;
-            wmma::fragment<wmma::accumulator, 16, 16, 16, float> accum;
-            wmma::fill_fragment(accum, 0.0f);
-            for (int k = 0; k < kPromptKeys; k += 16) {
-                wmma::load_matrix_sync(p_fragment, &probability[0][k], kPromptKeys);
-                wmma::load_matrix_sync(v_fragment, &v_tile[k][col], leading);
-                wmma::mma_sync(accum, p_fragment, v_fragment, accum);
+
+        float peaks[2] = {-CUDART_INF_F, -CUDART_INF_F};
+#pragma unroll
+        for (int tile = 0; tile < kPromptKeys / 8; ++tile) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int row = j < 2 ? row0 : row1;
+                const int key = base + tile * 8 + col2 + (j & 1);
+                const int distance = first_pos + row - key;
+                const bool visible = row < active && key < end && distance >= 0 && distance < window;
+                const float bias = visible && relative && distance < extent
+                    ? __bfloat162float(relative[(size_t(query_base + row) * heads + head) * extent + distance]) : 0.0f;
+                const float score = visible ? scores[tile][j] * rsqrtf(float(HeadDim)) + bias : -CUDART_INF_F;
+                scores[tile][j] = score;
+                peaks[j / 2] = fmaxf(peaks[j / 2], score);
             }
-            wmma::store_matrix_sync(&product[0][col], accum, HeadDim, wmma::mem_row_major);
         }
-        __syncthreads();
-        for (int i = threadIdx.x; i < kPromptQueries * HeadDim; i += blockDim.x) {
-            const int row = i / HeadDim;
-            const int col = i % HeadDim;
-            numerator[row][col] = fmaf(numerator[row][col], keep[row], product[row][col]);
+        float keep[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            peaks[r] = fmaxf(peaks[r], __shfl_xor_sync(0xffffffffu, peaks[r], 1));
+            peaks[r] = fmaxf(peaks[r], __shfl_xor_sync(0xffffffffu, peaks[r], 2));
+            const float next = fmaxf(maxima[r], peaks[r]);
+            keep[r] = next == -CUDART_INF_F ? 0.0f : __expf(maxima[r] - next);
+            maxima[r] = next;
+        }
+#pragma unroll
+        for (int tile = 0; tile < HeadDim / 8; ++tile) {
+            numerators[tile][0] *= keep[0], numerators[tile][1] *= keep[0];
+            numerators[tile][2] *= keep[1], numerators[tile][3] *= keep[1];
+        }
+        float sums[2] = {};
+        const auto* vt = &kv_tile[1][0][0];
+#pragma unroll
+        for (int k = 0; k < kPromptKeys / 16; ++k) {
+            uint32_t p[4];
+#pragma unroll
+            for (int tile = 0; tile < 2; ++tile) {
+                const auto& s = scores[2 * k + tile];
+                const float ref0 = maxima[0] == -CUDART_INF_F ? 0.0f : maxima[0];
+                const float ref1 = maxima[1] == -CUDART_INF_F ? 0.0f : maxima[1];
+                const float p0 = __expf(s[0] - ref0), p1 = __expf(s[1] - ref0);
+                const float p2 = __expf(s[2] - ref1), p3 = __expf(s[3] - ref1);
+                p[2 * tile] = pack_f16(p0, p1);
+                p[2 * tile + 1] = pack_f16(p2, p3);
+                sums[0] += p0 + p1;
+                sums[1] += p2 + p3;
+            }
+#pragma unroll
+            for (int d = 0; d < HeadDim; d += 16) {
+                uint32_t b[4];
+                ldsm4t(b, vt + (16 * k + (lane & 7) + ((lane >> 3) & 1) * 8) * kLeading + d + (lane >> 4) * 8);
+                mma_f16(numerators[d / 8], p, b[0], b[1]);
+                mma_f16(numerators[d / 8 + 1], p, b[2], b[3]);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            sums[r] += __shfl_xor_sync(0xffffffffu, sums[r], 1);
+            sums[r] += __shfl_xor_sync(0xffffffffu, sums[r], 2);
+            masses[r] = fmaf(masses[r], keep[r], sums[r]);
         }
         __syncthreads();
     }
-    for (int row = 0; row < active; ++row) {
-        auto* part = scratch + ((size_t(row) * gridDim.x + head) * gridDim.y + blockIdx.y) * (HeadDim + 2);
-        part[threadIdx.x] = numerator[row][threadIdx.x];
-        if (threadIdx.x == 0) {
-            part[HeadDim] = maximum[row];
-            part[HeadDim + 1] = mass[row];
+
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int row = r == 0 ? row0 : row1;
+        if (row >= active) continue;
+        auto* part = scratch + ((size_t(query_base + row) * heads + head) * gridDim.y + blockIdx.y) * (HeadDim + 2);
+#pragma unroll
+        for (int d = 0; d < HeadDim; d += 8) {
+            part[d + col2] = numerators[d / 8][2 * r];
+            part[d + col2 + 1] = numerators[d / 8][2 * r + 1];
+        }
+        if (col2 == 0) {
+            part[HeadDim] = maxima[r];
+            part[HeadDim + 1] = masses[r];
         }
     }
+}
+
+template<int HeadDim, bool Packed>
+cudaError_t launch_window_prefill(const __nv_bfloat16* q, const uint8_t* keys, const uint8_t* values,
+        const uint8_t* ks, const uint8_t* vs, const __nv_bfloat16* relative, float* scratch, int heads,
+        int kv_heads, int capacity, int window, int start, int extent, int span, int splits, int rows,
+        float scale, cudaStream_t stream) {
+    const int queries = (rows + kPromptQueries - 1) / kPromptQueries;
+    if (heads / kv_heads == 3) {
+        window_prefill<HeadDim, Packed, 3><<<dim3(kv_heads, splits, queries), 96, 0, stream>>>(
+            q, keys, values, ks, vs, relative, scratch, heads, kv_heads, capacity, window, start, extent, span, rows, scale);
+    } else {
+        window_prefill<HeadDim, Packed, 1><<<dim3(heads, splits, queries), 32, 0, stream>>>(
+            q, keys, values, ks, vs, relative, scratch, heads, kv_heads, capacity, window, start, extent, span, rows, scale);
+    }
+    return cudaGetLastError();
 }
 
 }  // namespace blaze::fa

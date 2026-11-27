@@ -12,6 +12,35 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
+pub(crate) fn prefill_chunks<T>(prompt: &[T], max_rows: usize, min_rows: usize, alignment: usize)
+    -> impl Iterator<Item = &[T]>
+{
+    let tail = prompt.len() % max_rows;
+    let (split, last_size) = if prompt.len() > max_rows && tail > 0 && tail < min_rows {
+        let pair = max_rows + tail;
+        let split_size = pair.div_ceil(2).next_multiple_of(alignment);
+        if split_size < max_rows && pair - split_size >= min_rows {
+            (prompt.len() - pair, split_size)
+        } else {
+            (prompt.len(), max_rows)
+        }
+    } else {
+        (prompt.len(), max_rows)
+    };
+    prompt[..split].chunks(max_rows).chain(prompt[split..].chunks(last_size))
+}
+
+#[cfg(test)]
+#[test]
+fn prefill_chunk_tail_preserves_order_and_leaves_two_wide_batches() {
+    let prompt: Vec<_> = (0..16_387).collect();
+    let chunks: Vec<_> = prefill_chunks(&prompt, 2048, 256, 16).collect();
+    assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+        [2048, 2048, 2048, 2048, 2048, 2048, 2048, 1040, 1011]);
+    assert!(chunks.into_iter().flatten().eq(&prompt));
+    assert_eq!(prefill_chunks(&prompt[..42], 2048, 256, 16).next(), Some(&prompt[..42]));
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Finish {
     Stop,

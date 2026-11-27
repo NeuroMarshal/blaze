@@ -50,14 +50,24 @@ pub(crate) enum Bf16Kernel {
     Mma(i32),
 }
 
-pub(crate) struct Matmul {
+pub(crate) struct Matmul<T = u16> {
     pub input: *const u16,
-    pub output: *mut u16,
+    pub output: *mut T,
     pub rows: usize,
     pub columns: usize,
     pub inner: usize,
     pub input_stride: usize,
     pub output_stride: usize,
+}
+
+impl Matmul<f32> {
+    pub unsafe fn bf16_f32(&self, gemm: *mut sys::blz_gemm, weight: *const u16, stream: &Stream) -> Result<()> {
+        check(unsafe {
+            sys::blz_gemm_bf16_f32(gemm, self.input, self.input_stride as i64, weight,
+                self.output, self.output_stride as i64, self.rows as i32, self.columns as i32,
+                self.inner as i32, stream.0)
+        }, "BF16 GEMM with FP32 output")
+    }
 }
 
 impl Matmul {

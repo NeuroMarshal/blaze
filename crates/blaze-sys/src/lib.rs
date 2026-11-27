@@ -80,6 +80,14 @@ pub struct blz_gemm {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct blz_row_copy {
+    pub dst: *mut bf16,
+    pub src: *const bf16,
+    pub width: i64,
+}
+
 unsafe extern "C" {
     pub fn blz_rmsnorm(x: *const bf16, residual: *mut bf16, w: *const bf16, eps: f32, rows: c_int, dim: c_int,
                        zero_centered: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
@@ -105,6 +113,8 @@ unsafe extern "C" {
     pub fn blz_router_sigmoid_topk(logits: *const f32, bias: *const f32, tokens: c_int, experts: c_int,
         k: c_int, scale: f32, ids: *mut i32, weights: *mut f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_add(a: *const bf16, b: *const bf16, n: i64, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_copy_row_windows(copies: *const blz_row_copy, count: c_int, start: c_int,
+        rows: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_gdn_gate(a: *const bf16, ld_a: i64, b: *const bf16, ld_b: i64, a_log: *const bf16, dt_bias: *const bf16,
                         tokens: c_int, v_heads: c_int, g: *mut f32, beta: *mut f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_gdn_conv(x: *const bf16, ldx: i64, seq_start: *const i32, slots: *const i32, seqs: c_int,
@@ -136,6 +146,8 @@ unsafe extern "C" {
     pub fn blz_gemm_destroy(g: *mut blz_gemm);
     pub fn blz_gemm_bf16(g: *mut blz_gemm, x: *const bf16, ldx: i64, w: *const bf16, out: *mut bf16, ldo: i64,
                          m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_gemm_bf16_f32(g: *mut blz_gemm, x: *const bf16, ldx: i64, w: *const bf16, out: *mut f32, ldo: i64,
+                             m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
 }
 
 // blaze/vision.h
@@ -599,6 +611,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn blz_sampling_workspace_bytes(rows: c_int, vocab: c_int) -> usize;
     pub fn blz_sampling_pack(local: *const bf16, local_vocab: c_int, vocab: c_int, rank: c_int, rows: c_int, full: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_sampling_pack_softcap(logits: *const bf16, vocab: c_int, rows: c_int, cap: f32,
+        out: *mut f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_sampling_run(raw: *const f32, rows: c_int, vocab: c_int, true_vocab: c_int, valid_ids: *const u32, programs: *const std::ffi::c_void,
         edit_ids: *const i32, edits: *const f32, offsets: *const i32, masks: *const u32, mask_rows: *const i32,
         mask_words: c_int, execution: u32, logprobs: bool, workspace: *mut std::ffi::c_void, bytes: usize,
@@ -624,6 +638,9 @@ unsafe extern "C" {
         rows: c_int, width: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_mix_normalized_rows(bank: *const f32, current: *const f32, query: *const f32,
         output: *mut f32, depth: c_int, rows: c_int, width: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_mix_normalized_batch(bank: *const f32, current: *const f32, queries: *const f32,
+        output: *mut f32, depth: c_int, bank_rows: c_int, rows: c_int, width: c_int, groups: c_int,
+        query_stride: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_kv_slots(slots: *mut i32, start: c_int, capacity: c_int, rows: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_qkv(gates: *const f32, x: *const f32, msg: *const f32, norms: *const f32,
                                       out: *mut u16, width: c_int, tokens: c_int, projection_stride: c_int, eps: f32,

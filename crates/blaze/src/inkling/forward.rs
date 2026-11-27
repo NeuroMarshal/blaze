@@ -415,19 +415,27 @@ struct VisitState {
     verification: Option<[gpu::DevBuf; 4]>,
 }
 
-pub(super) type SampleRow<'a> = &'a mut dyn FnMut(&[f32]) -> u32;
+pub(super) struct SampleRow<'a> {
+    pub params: &'a crate::sampler::SamplingParams,
+    pub rng: &'a mut crate::sampler::Rng,
+}
 
 pub(super) enum Readout<'a> {
     None,
     Greedy,
     Verify { draft: &'a [u32], sample: Option<SampleRow<'a>> },
-    Scores,
+    Sample(SampleRow<'a>),
+}
+
+impl<'a> Readout<'a> {
+    pub fn next(params: &'a crate::sampler::SamplingParams, rng: &'a mut crate::sampler::Rng) -> Self {
+        if params.greedy() { Self::Greedy } else { Self::Sample(SampleRow { params, rng }) }
+    }
 }
 
 pub(super) enum Prediction {
     Token(u32),
     Verified(usize, u32),
-    Scores(Vec<f32>),
 }
 
 pub struct Sequence {
@@ -435,6 +443,7 @@ pub struct Sequence {
     position: usize,
     capacity: usize,
     visits: Vec<VisitState>,
+    history_copies: Vec<(gpu::DevBuf, i32)>,
 }
 
 impl Sequence {
@@ -463,6 +472,7 @@ struct Device {
     id: i32,
     compute: Compute,
     scratch: AttentionScratch,
+    resident_moe: bool,
 }
 
 impl Drop for Device {
@@ -663,15 +673,16 @@ impl Model {
                 s.hidden,
                 prefill_chunk,
             )?;
+            compute.tensor_prefill = prefill_attention == super::PrefillAttention::Tensor;
             let end = expert_layer_start + expert_layer_count;
             let threads = cpu_threads.div_ceil(gpus);
             let all_resident = expert_bytes >= all_experts;
             let stream_gpu_only = expert_threads.is_none() && !all_resident;
             let engine = MoeEngine::packed(&store, expert_layer_start..end, id, expert_bytes, s.top_k,
-                threads, prefill_chunk, stream_gpu_only, all_resident, true, (s.gate_cap, s.up_cap))?;
+                threads, prefill_chunk, stream_gpu_only, all_resident, true, (s.gate_cap, s.up_cap), compute.tensor_prefill)?;
             compute.attach_expert_engine(engine);
             expert_layer_start = end;
-            devices.push(Device { id, compute, scratch });
+            devices.push(Device { id, compute, scratch, resident_moe: all_resident });
         }
         let dflash = draft_path.as_ref().map(|path| {
             let device = &devices[last_device];
@@ -713,6 +724,10 @@ impl Model {
         self.prefill_chunk
     }
 
+    pub(super) fn prefill_wide_min(&self) -> usize {
+        if self.devices[0].compute.tensor_prefill { self.prefill_chunk.clamp(32, 256) } else { 1 }
+    }
+
     pub fn sequence(&self, capacity: usize) -> Result<Sequence> {
         ensure!(
             capacity > 0 && capacity <= self.context,
@@ -742,11 +757,32 @@ impl Model {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut history_copies = Vec::new();
+        if slack > 0 {
+            let widths = [s.kv_width(), s.kv_width(), s.hidden, s.hidden];
+            for (rank, device) in self.devices.iter().enumerate() {
+                gpu::set_device(device.id)?;
+                let mut copies = Vec::new();
+                for (visit, state) in self.loops.visits.iter().zip(&visits) {
+                    if self.placement[visit.layer] != rank {
+                        continue;
+                    }
+                    let pending = state.verification.as_ref().unwrap();
+                    copies.extend(widths.iter().enumerate().map(|(i, &width)| blaze_sys::blz_row_copy {
+                        dst: state.history[i].ptr(),
+                        src: pending[i].ptr(),
+                        width: width as i64,
+                    }));
+                }
+                history_copies.push((gpu::DevBuf::from_slice(&copies)?, copies.len() as i32));
+            }
+        }
         Ok(Sequence {
             draft: self.draft.as_ref().map(|_| DraftCache::new(capacity, self.kv_dtype)).transpose()?,
             position: 0,
             capacity,
             visits,
+            history_copies,
         })
     }
 
@@ -806,10 +842,9 @@ impl Model {
                 _ => anyhow::bail!("missing Inkling target verdict"),
             };
         }
-        let readout = if sample.is_some() { Readout::Scores } else { Readout::Greedy };
-        match (self.forward(seq, anchor, readout)?, sample) {
-            (Some(Prediction::Token(id)), _) => Ok((0, id)),
-            (Some(Prediction::Scores(scores)), Some(sample)) => Ok((0, sample(&scores))),
+        let readout = sample.map_or(Readout::Greedy, Readout::Sample);
+        match self.forward(seq, anchor, readout)? {
+            Some(Prediction::Token(id)) => Ok((0, id)),
             _ => anyhow::bail!("missing Inkling target prediction"),
         }
     }

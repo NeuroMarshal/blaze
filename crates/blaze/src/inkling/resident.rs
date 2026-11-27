@@ -364,6 +364,7 @@ impl Chunk {
         input: *const f32,
         norm: *const f32,
         output: *mut u16,
+        capture: bool,
     ) -> Result<()> {
         if let Some((controller, query)) = controller {
             self.mix(
@@ -384,6 +385,7 @@ impl Chunk {
                 self.width,
                 self.rows,
                 self.eps,
+                capture,
             )
         } else {
             self.normalize(&compute.stream, input, norm, null_mut(), output)
@@ -400,32 +402,13 @@ impl Model {
         if keep == 0 {
             return Ok(());
         }
-        let widths = [
-            self.cfg.kv_width(),
-            self.cfg.kv_width(),
-            self.cfg.hidden,
-            self.cfg.hidden,
-        ];
-        for (rank, device) in self.devices.iter().enumerate() {
+        ensure!(seq.history_copies.len() == self.devices.len(), "missing verification history tables");
+        for (device, (copies, count)) in self.devices.iter().zip(&seq.history_copies) {
             gpu::set_device(device.id)?;
-            for (visit, state) in self.loops.visits.iter().zip(&seq.visits) {
-                if self.placement[visit.layer] != rank {
-                    continue;
-                }
-                let candidate = state.verification.as_ref().unwrap();
-                for (i, width) in widths.into_iter().enumerate() {
-                    copy_device(
-                        &device.compute.stream,
-                        state.history[i].ptr(),
-                        candidate[i].at::<u16>((total - keep) * width),
-                        keep * width,
-                    )?;
-                }
-            }
-        }
-        for device in &self.devices {
-            gpu::set_device(device.id)?;
-            device.compute.stream.sync()?;
+            check(unsafe {
+                sys::blz_copy_row_windows(copies.ptr(), *count, (total - keep) as i32,
+                    keep as i32, device.compute.stream.0)
+            }, "commit verified convolution history")?;
         }
         Ok(())
     }
@@ -628,42 +611,70 @@ impl Model {
             } else {
                 3
             };
-            for group in 0..groups {
-                let input = if id == 0 {
-                    workspace.hidden.ptr()
-                } else {
-                    let q = if layer.local { 0 } else { group };
-                    chunk.mix(
-                        stream,
-                        workspace.bank.ptr(),
-                        depth,
-                        workspace.current.ptr(),
-                        weights.qkv_query.at(q * s.hidden),
-                        workspace.mixed.ptr(),
+            let controller_batch = compute.qkv_controller_rows(s.hidden)
+                .min(workspace.mixed.bytes() / (3 * s.hidden * size_of::<f32>()));
+            if let Some(c) = controller.filter(|_| controller_batch > 0 && (rows <= 16 || compute.tensor_prefill)) {
+                let queries = weights.messages.as_ref().unwrap();
+                let down = std::array::from_fn(|i| &c.controllers[i].down);
+                let up = std::array::from_fn(|i| &c.controllers[i].up);
+                for first in (0..rows).step_by(controller_batch) {
+                    let count = (rows - first).min(controller_batch);
+                    let offset = first * s.hidden;
+                    check(unsafe {
+                        sys::blz_mix_normalized_batch(workspace.bank.at::<f32>(offset),
+                            workspace.current.at::<f32>(offset), weights.qkv_query.ptr(), workspace.mixed.ptr(),
+                            depth as i32, rows as i32, count as i32, s.hidden as i32, 3,
+                            if layer.local { 0 } else { s.hidden as i32 }, stream.0)
+                    }, "Inkling batched QKV residual mix")?;
+                    check(unsafe {
+                        sys::blz_mix_normalized_batch(workspace.messages.at::<f32>(offset), null(),
+                            queries.ptr(), workspace.message.ptr(), step.messages as i32, rows as i32,
+                            count as i32, s.hidden as i32, 3, s.hidden as i32, stream.0)
+                    }, "Inkling batched QKV message mix")?;
+                    compute.enqueue_qkv_controllers(down, up, workspace.mixed.ptr(), workspace.message.ptr(),
+                        weights.qkv_norm.ptr(), workspace.input.at(offset), s.hidden, count, rows, s.eps)?;
+                }
+                offsets[1] = values;
+                offsets[2] = 2 * values;
+            } else {
+                for group in 0..groups {
+                    let input = if id == 0 {
+                        workspace.hidden.ptr()
+                    } else {
+                        let q = if layer.local { 0 } else { group };
+                        chunk.mix(
+                            stream,
+                            workspace.bank.ptr(),
+                            depth,
+                            workspace.current.ptr(),
+                            weights.qkv_query.at(q * s.hidden),
+                            workspace.mixed.ptr(),
+                        )?;
+                        workspace.mixed.ptr()
+                    };
+                    let control = controller.map(|c| {
+                        (
+                            &c.controllers[group],
+                            weights
+                                .messages
+                                .as_ref()
+                                .unwrap()
+                                .at::<f32>(group * s.hidden)
+                                .cast_const(),
+                        )
+                    });
+                    offsets[group] = group * values;
+                    chunk.activate(
+                        compute,
+                        workspace,
+                        control,
+                        step.messages,
+                        input,
+                        weights.qkv_norm.at(group * s.hidden),
+                        workspace.input.at(offsets[group]),
+                        true,
                     )?;
-                    workspace.mixed.ptr()
-                };
-                let control = controller.map(|c| {
-                    (
-                        &c.controllers[group],
-                        weights
-                            .messages
-                            .as_ref()
-                            .unwrap()
-                            .at::<f32>(group * s.hidden)
-                            .cast_const(),
-                    )
-                });
-                offsets[group] = group * values;
-                chunk.activate(
-                    compute,
-                    workspace,
-                    control,
-                    step.messages,
-                    input,
-                    weights.qkv_norm.at(group * s.hidden),
-                    workspace.input.at(offsets[group]),
-                )?;
+                }
             }
             offsets[3] = offsets[1];
             offsets[4] = offsets[2];
@@ -744,21 +755,6 @@ impl Model {
                 )?;
                 depth += 1;
             }
-            chunk.normalize(
-                stream,
-                workspace.residual.ptr(),
-                null(),
-                workspace.current.ptr(),
-                null_mut(),
-            )?;
-            chunk.mix(
-                stream,
-                workspace.bank.ptr(),
-                depth,
-                workspace.current.ptr(),
-                weights.mlp_query.ptr(),
-                workspace.mixed.ptr(),
-            )?;
             let control = controller.map(|c| {
                 (
                     &c.controllers[3],
@@ -770,36 +766,26 @@ impl Model {
                         .cast_const(),
                 )
             });
-            chunk.activate(
-                compute,
-                workspace,
-                control,
-                step.messages,
-                workspace.mixed.ptr(),
-                weights.mlp_norm.ptr(),
-                workspace.input.ptr(),
-            )?;
-            compute.enqueue_routes(
-                &layer.router,
-                workspace.input.ptr(),
-                &weights.route_bias,
-                rows,
-                s.top_k,
-                s.route_scale,
-                workspace.routes.ptr(),
-                workspace.route_weights.ptr(),
-            )?;
             let history = (s.conv - 1).min(chunk.start);
             let prefix = if rows == 1 { 0 } else { history * s.hidden };
             let raw = workspace.raw_moe.at::<u16>(prefix);
-            compute.enqueue_experts(
-                self.expert_layers[id],
-                workspace.input.ptr(),
-                rows,
-                workspace.routes.ptr(),
-                workspace.route_weights.ptr(),
-                raw,
-            )?;
+            let graph_moe = rows == 1 && device.resident_moe;
+            let enqueue = || {
+                chunk.normalize(stream, workspace.residual.ptr(), null(), workspace.current.ptr(), null_mut())?;
+                chunk.mix(stream, workspace.bank.ptr(), depth, workspace.current.ptr(),
+                    weights.mlp_query.ptr(), workspace.mixed.ptr())?;
+                chunk.activate(compute, workspace, control, step.messages, workspace.mixed.ptr(),
+                    weights.mlp_norm.ptr(), workspace.input.ptr(), !graph_moe)?;
+                compute.enqueue_routes(&layer.router, workspace.input.ptr(), &weights.route_bias, rows, s.top_k,
+                    s.route_scale, workspace.routes.ptr(), workspace.route_weights.ptr())?;
+                compute.enqueue_experts(self.expert_layers[id], workspace.input.ptr(), rows, workspace.routes.ptr(),
+                    workspace.route_weights.ptr(), raw)
+            };
+            if graph_moe {
+                compute.moe_graphs.launch(index, stream, enqueue)?;
+            } else {
+                enqueue()?;
+            }
             if rows == 1 {
                 check(
                     unsafe {
@@ -894,17 +880,27 @@ impl Model {
                     w.input.ptr(),
                 )?;
                 let (kept, next) = if let Some(sample) = sample {
-                    let scores = device.compute.read_device_scores(
-                        &self.head, w.input.ptr(), s.unpadded_vocab, rows,
-                    )?;
-                    let mut logits = Vec::with_capacity(s.unpadded_vocab);
-                    let picks = scores.chunks_exact(s.unpadded_vocab).map(|row| {
-                        logits.clear();
-                        logits.extend(row.iter().copied().map(from_bf16));
-                        cpu::softcap(&mut logits, s.logit_cap);
-                        sample(&logits)
-                    });
-                    crate::speculation::match_picks(draft, picks)
+                    if let Some(picks) = device.compute.sample_device_rows(
+                        &self.head, w.input.ptr(), s.unpadded_vocab, rows, &sample, s.logit_cap,
+                    )? {
+                        let result = crate::speculation::match_picks(draft, picks);
+                        for _ in 0..=result.0 {
+                            sample.rng.next_f32();
+                        }
+                        result
+                    } else {
+                        let scores = device.compute.read_device_scores(
+                            &self.head, w.input.ptr(), s.unpadded_vocab, rows,
+                        )?;
+                        let mut logits = Vec::with_capacity(s.unpadded_vocab);
+                        let picks = scores.chunks_exact(s.unpadded_vocab).map(|row| {
+                            logits.clear();
+                            logits.extend(row.iter().copied().map(from_bf16));
+                            cpu::softcap(&mut logits, s.logit_cap);
+                            super::super::generate::draw(&logits, sample.params, sample.rng)
+                        });
+                        crate::speculation::match_picks(draft, picks)
+                    }
                 } else {
                     let picks = device.compute.read_device_picks(
                         &self.head, w.input.ptr(), s.unpadded_vocab, rows,
@@ -914,7 +910,7 @@ impl Model {
                 consumed = kept + 1;
                 result = Some(Prediction::Verified(kept, next));
             }
-            Readout::Greedy | Readout::Scores => {
+            Readout::Greedy | Readout::Sample(_) => {
                 let last = Chunk { rows: 1, ..chunk };
                 last.normalize(
                     stream,
@@ -923,24 +919,22 @@ impl Model {
                     null_mut(),
                     w.input.ptr(),
                 )?;
-                result = Some(if matches!(readout, Readout::Greedy) {
-                    let picks = device.compute.read_device_picks(
-                        &self.head,
-                        w.input.ptr(),
-                        s.unpadded_vocab,
-                        1,
-                    )?;
-                    Prediction::Token(picks[0])
+                let id = if let Readout::Sample(sample) = readout {
+                    if let Some(picks) = device.compute.sample_device_rows(
+                        &self.head, w.input.ptr(), s.unpadded_vocab, 1, &sample, s.logit_cap,
+                    )? {
+                        sample.rng.next_f32();
+                        picks[0]
+                    } else {
+                        let scores = device.compute.read_device_scores(&self.head, w.input.ptr(), s.unpadded_vocab, 1)?;
+                        let mut logits: Vec<_> = scores.into_iter().map(from_bf16).collect();
+                        cpu::softcap(&mut logits, s.logit_cap);
+                        super::super::generate::draw(&logits, sample.params, sample.rng)
+                    }
                 } else {
-                    let mut logits = device
-                        .compute
-                        .read_device_scores(&self.head, w.input.ptr(), s.unpadded_vocab, 1)?
-                        .into_iter()
-                        .map(from_bf16)
-                        .collect::<Vec<_>>();
-                    cpu::softcap(&mut logits, s.logit_cap);
-                    Prediction::Scores(logits)
-                });
+                    device.compute.read_device_picks(&self.head, w.input.ptr(), s.unpadded_vocab, 1)?[0]
+                };
+                result = Some(Prediction::Token(id));
             }
         }
         match features {
@@ -990,14 +984,16 @@ mod tests {
         assert_eq!(committed.download::<u16>(3)?, [10, 11, 12]);
         let keep = 3;
         let consumed = 2;
-        copy_device(
-            &stream,
-            committed.ptr(),
-            pending.at::<u16>(3 + consumed - keep),
-            keep,
-        )?;
+        let wider = DevBuf::new(keep * 2 * size_of::<u16>())?;
+        let wider_pending = DevBuf::from_slice(&[0u16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])?;
+        let copies = DevBuf::from_slice(&[
+            sys::blz_row_copy { dst: committed.ptr(), src: pending.ptr(), width: 1 },
+            sys::blz_row_copy { dst: wider.ptr(), src: wider_pending.ptr(), width: 2 },
+        ])?;
+        check(unsafe { sys::blz_copy_row_windows(copies.ptr(), 2, consumed, keep as i32, stream.0) }, "copy history")?;
         stream.sync()?;
         assert_eq!(committed.download::<u16>(3)?, [12, 20, 21]);
+        assert_eq!(wider.download::<u16>(6)?, [4, 5, 6, 7, 8, 9]);
         Ok(())
     }
 

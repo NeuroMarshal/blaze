@@ -60,6 +60,8 @@ typedef struct {
 size_t blz_sampling_workspace_bytes(int rows, int vocab);
 cudaError_t blz_sampling_pack(const uint16_t* local, int local_vocab, int vocab, int rank,
                              int rows, float* full, cudaStream_t stream);
+cudaError_t blz_sampling_pack_softcap(const uint16_t* logits, int vocab, int rows, float cap, float* out,
+                                     cudaStream_t stream);
 /// Full logits stay on the device. Results are 64 alternatives, their LSE, and (canonical chosen logit, id).
 /// Alternatives and LSE are canonical when logprobs is true; otherwise alternatives are sampling diagnostics.
 /// execution: slot bits 0..7 active, 8..15 need ranking, 16..23 edit logits. Bit 24 permits top-64 selection

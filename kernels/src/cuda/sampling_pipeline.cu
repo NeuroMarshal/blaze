@@ -66,10 +66,12 @@ __device__ int reduce_min(int x) {
 }
 __device__ int op(const blz_sampling_row* p, int slot) { return slot < p->len ? p->stages[slot] : 0; }
 
-__global__ void pack(const uint16_t* x, int local, int vocab, int rank, int rows, float* full) {
+template <bool Softcap>
+__global__ void pack(const uint16_t* x, int local, int vocab, int rank, int rows, float cap, float* full) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= rows * local) return;
-  full[size_t(i / local) * vocab + rank * local + i % local] = __uint_as_float(uint32_t(x[i]) << 16);
+  const float logit = __uint_as_float(uint32_t(x[i]) << 16);
+  full[size_t(i / local) * vocab + rank * local + i % local] = Softcap ? cap * tanhf(logit / cap) : logit;
 }
 __global__ void initialize(const float* raw, int vocab, int true_vocab, const uint32_t* valid_ids, const int* ids, const float* edits,
                            const int* off, const uint32_t* masks, const int* mask_rows, int words, Work w) {
@@ -290,7 +292,14 @@ extern "C" size_t blz_sampling_workspace_bytes(int rows, int vocab) {
   return 5 * aligned(size_t(rows) * vocab * 4) + 2 * aligned(size_t(rows) * 4) + bytes;
 }
 extern "C" cudaError_t blz_sampling_pack(const uint16_t* local, int local_vocab, int vocab, int rank, int rows, float* full, cudaStream_t stream) {
-  pack<<<(rows * local_vocab + 255) / 256, 256, 0, stream>>>(local, local_vocab, vocab, rank, rows, full);
+  pack<false><<<(rows * local_vocab + 255) / 256, 256, 0, stream>>>(local, local_vocab, vocab, rank, rows, 0.0f, full);
+  return cudaGetLastError();
+}
+extern "C" cudaError_t blz_sampling_pack_softcap(const uint16_t* logits, int vocab, int rows, float cap, float* out,
+                                                  cudaStream_t stream) {
+  if (vocab < 1 || rows < 1) return cudaErrorInvalidValue;
+  if (!(cap > 0.0f)) return blz_sampling_pack(logits, vocab, vocab, 0, rows, out, stream);
+  pack<true><<<(rows * vocab + 255) / 256, 256, 0, stream>>>(logits, vocab, vocab, 0, rows, cap, out);
   return cudaGetLastError();
 }
 extern "C" cudaError_t blz_sampling_run(const float* raw, int rows, int vocab, int true_vocab, const uint32_t* valid_ids,

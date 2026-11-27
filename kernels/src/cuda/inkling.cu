@@ -187,9 +187,11 @@ __global__ void embed_rows(const __nv_bfloat16* input, const uint8_t* image, con
 }
 
 __global__ void mix_normalized(const float* bank, const float* current, const float* query, float* output,
-                               int depth, int rows, int width) {
+                               int depth, int bank_rows, int width, int query_stride) {
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    const size_t row = size_t(blockIdx.x) * width, plane = size_t(rows) * width;
+    const size_t row = size_t(blockIdx.x) * width, plane = size_t(bank_rows) * width;
+    query += size_t(blockIdx.y) * query_stride;
+    output += (size_t(blockIdx.x) * gridDim.y + blockIdx.y) * width;
     const int count = depth + (current != nullptr);
     const float factor = __frcp_rn(__fsqrt_rn(float(width)));
     __shared__ float probabilities[32];
@@ -219,7 +221,7 @@ __global__ void mix_normalized(const float* bank, const float* current, const fl
             const float* src = (source < depth ? bank + size_t(source) * plane : current) + row;
             value = __fadd_rn(value, __fmul_rn(src[i], probabilities[source]));
         }
-        output[row + i] = value;
+        output[i] = value;
     }
 }
 
@@ -263,10 +265,19 @@ extern "C" cudaError_t blz_mix_normalized_rows(const float* bank, const float* c
         float* output, int depth, int rows, int width, cudaStream_t stream) {
     if (depth < 0 || depth + (current != nullptr) < 1 || depth + (current != nullptr) > 32 || rows < 1 ||
         width < 32 || width % 32) return cudaErrorInvalidValue;
-    mix_normalized<<<rows, 128, 0, stream>>>(bank, current, query, output, depth, rows, width);
+    mix_normalized<<<rows, 128, 0, stream>>>(bank, current, query, output, depth, rows, width, 0);
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t blz_mix_normalized_batch(const float* bank, const float* current, const float* queries,
+        float* output, int depth, int bank_rows, int rows, int width, int groups, int query_stride, cudaStream_t stream) {
+    if (depth < 0 || depth + (current != nullptr) < 1 || depth + (current != nullptr) > 32 || rows < 1 ||
+        bank_rows < rows || width < 32 || width % 32 || groups < 1 || groups > 4 || query_stride < 0)
+        return cudaErrorInvalidValue;
+    mix_normalized<<<dim3(rows, groups), 128, 0, stream>>>(bank, current, queries, output, depth, bank_rows,
+        width, query_stride);
+    return cudaGetLastError();
+}
 extern "C" cudaError_t blz_inkling_kv_slots(int* slots, int start, int capacity, int rows, cudaStream_t stream) {
     kv_slots<<<(rows + 127) / 128, 128, 0, stream>>>(slots, start, capacity, rows);
     return cudaGetLastError();
@@ -570,15 +581,11 @@ extern "C" cudaError_t blz_inkling_prefill_attention(
     if (tensor && rows >= blaze::fa::kPromptQueries && valid >= 128) {
         const int span = max(128, ((valid + 256 * blaze::fa::kPromptKeys - 1) / (256 * blaze::fa::kPromptKeys)) * blaze::fa::kPromptKeys);
         const int splits = (valid + span - 1) / span;
-        const dim3 tensor_grid(heads, splits, (rows + blaze::fa::kPromptQueries - 1) / blaze::fa::kPromptQueries);
-        if (ks) {
-            blaze::fa::window_prefill<HEAD_DIM, true><<<tensor_grid, HEAD_DIM, 0, stream>>>(query, keys, values, ks, vs,
-                biases, scratch, kv_heads, capacity, window, start, extent, span, rows, scale);
-        } else {
-            blaze::fa::window_prefill<HEAD_DIM, false><<<tensor_grid, HEAD_DIM, 0, stream>>>(query, keys, values, nullptr,
-                nullptr, biases, scratch, kv_heads, capacity, window, start, extent, span, rows, scale);
-        }
-        const auto err = cudaGetLastError();
+        const auto err = ks
+            ? blaze::fa::launch_window_prefill<HEAD_DIM, true>(query, keys, values, ks, vs, biases, scratch,
+                heads, kv_heads, capacity, window, start, extent, span, splits, rows, scale, stream)
+            : blaze::fa::launch_window_prefill<HEAD_DIM, false>(query, keys, values, nullptr, nullptr, biases, scratch,
+                heads, kv_heads, capacity, window, start, extent, span, splits, rows, scale, stream);
         if (err != cudaSuccess) return err;
         attention_merge<false, true><<<dim3(heads, 1, rows), HEAD_DIM, 0, stream>>>(scratch, sink, gated, result, splits);
         return cudaGetLastError();

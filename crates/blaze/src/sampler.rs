@@ -1,6 +1,8 @@
 //! Ordered sampling over the current eligible vocabulary. Hard masks survive every stage.
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
+use crate::gpu::{DevBuf, HostMapped, Stream, check};
+use blaze_sys as sys;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +215,76 @@ impl Rng {
     }
 }
 
+pub(crate) struct DeviceSampler {
+    vocab: usize,
+    capacity: usize,
+    logits: DevBuf,
+    programs: DevBuf,
+    offsets: DevBuf,
+    masks: DevBuf,
+    workspace: DevBuf,
+    results: DevBuf,
+    readback: HostMapped,
+}
+
+impl DeviceSampler {
+    pub(crate) fn new(vocab: usize, capacity: usize) -> Result<Self> {
+        let bytes = unsafe { sys::blz_sampling_workspace_bytes(capacity as i32, vocab as i32) };
+        let result_bytes = capacity * (sys::BLZ_TOPK_MAX + 2) * 8;
+        Ok(Self {
+            vocab,
+            capacity,
+            logits: DevBuf::new(capacity * vocab * 4)?,
+            programs: DevBuf::new(capacity * size_of::<SamplingRow>())?,
+            offsets: DevBuf::from_slice(&vec![0i32; capacity + 1])?,
+            masks: DevBuf::from_slice(&vec![-1i32; capacity])?,
+            workspace: DevBuf::new(bytes)?,
+            results: DevBuf::new(result_bytes)?,
+            readback: HostMapped::new(result_bytes)?,
+        })
+    }
+
+    pub(crate) fn fits(&self, vocab: usize, rows: usize) -> bool {
+        self.vocab == vocab && rows <= self.capacity
+    }
+
+    /// The input must hold all vocabulary rows on the device of the stream.
+    pub(crate) unsafe fn sample(
+        &self, input: *const u16, rows: usize, params: &SamplingParams, rng: &Rng, cap: f32, stream: &Stream,
+    ) -> Result<Vec<u32>> {
+        ensure!((1..=self.capacity).contains(&rows), "sampling rows exceed scratch");
+        let programs: Vec<_> = (0..rows).map(|i| params.row(rng.lookahead(i))).collect();
+        let bounded = programs[0].bounded();
+        let values = (sys::BLZ_TOPK_MAX + 2) * 2;
+        self.programs.upload_async(&programs, stream)?;
+        let queued = (|| {
+            check(unsafe {
+                sys::blz_sampling_pack_softcap(input, self.vocab as i32, rows as i32, cap,
+                    self.logits.ptr(), stream.0)
+            }, "pack sampling logits")?;
+            check(unsafe {
+                sys::blz_sampling_run(self.logits.ptr(), rows as i32, self.vocab as i32, self.vocab as i32,
+                    std::ptr::null(), self.programs.ptr(), std::ptr::null(), std::ptr::null(), self.offsets.ptr(),
+                    std::ptr::null(), self.masks.ptr(), 0, programs[0].execution() | (u32::from(bounded) << 24),
+                    false, self.workspace.ptr(), self.workspace.bytes(), self.results.ptr(), stream.0)
+            }, "device sampling")?;
+            check(unsafe {
+                sys::cudaMemcpyAsync(self.readback.host_ptr().cast_mut(), self.results.ptr(),
+                    rows * values * size_of::<f32>(), sys::MEMCPY_D2H, stream.0)
+            }, "sampling readback")
+        })();
+        let synced = stream.sync();
+        queued?;
+        synced?;
+        let results = unsafe { std::slice::from_raw_parts(self.readback.host_ptr().cast::<f32>(), rows * values) };
+        results.chunks_exact(values).map(|row| {
+            let token = row[values - 1];
+            ensure!(token >= 0.0 && token < self.vocab as f32, "GPU sampler selected an invalid token");
+            Ok(token as u32)
+        }).collect()
+    }
+}
+
 pub fn sample(cands: &crate::engine::Cands, _p: &SamplingParams, rng: &mut Rng) -> i32 {
     rng.next_f32();
     cands.selected
@@ -331,6 +403,36 @@ fn distribution(logits: &[f32], edits: &[(usize, [f32; 5])], p: &SamplingParams)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn bounded_device_sampling_matches_seeded_softcap_distribution() -> Result<()> {
+        crate::gpu::set_device(0)?;
+        let stream = Stream::new()?;
+        let params = SamplingParams { temperature: 0.9, top_k: 7, top_p: 0.9, min_p: 0.03, ..Default::default() };
+        let vocab = 128;
+        let rows = 5;
+        let cap = 4.0;
+        let values: Vec<u16> = (0..rows * vocab).map(|i| {
+            let logit = ((i * 17 % 131) as f32 - 65.0) / 17.0;
+            (logit.to_bits() >> 16) as u16
+        }).collect();
+        let dev = DevBuf::from_slice(&values)?;
+        let sampler = DeviceSampler::new(vocab, rows)?;
+        let rng = Rng::new(42);
+        let tokens = unsafe { sampler.sample(dev.ptr(), rows, &params, &rng, cap, &stream) }?;
+        for (i, (bits, &token)) in values.chunks_exact(vocab).zip(&tokens).enumerate() {
+            let logits: Vec<_> = bits.iter().map(|&b| cap * (f32::from_bits(u32::from(b) << 16) / cap).tanh()).collect();
+            let choices = distribution(&logits, &[], &params)?;
+            let mut draw = f64::from(rng.lookahead(i));
+            let expected = choices.iter().find_map(|&(id, p)| {
+                draw -= p;
+                (draw < 0.0).then_some(id)
+            }).unwrap_or(choices.last().unwrap().0);
+            assert_eq!(token as usize, expected);
+        }
+        Ok(())
+    }
     #[test]
     fn pipeline_validation_and_stage_order() {
         assert!("temperature,temperature".parse::<SamplingPipeline>().is_err());

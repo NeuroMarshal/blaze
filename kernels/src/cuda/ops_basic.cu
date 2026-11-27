@@ -11,6 +11,20 @@
 
 #include "blaze/ops.h"
 
+static __global__ void copy_row_windows(const blz_row_copy* copies, int start) {
+  const blz_row_copy copy = copies[blockIdx.x];
+  const auto* src = copy.src + int64_t(start + blockIdx.y) * copy.width;
+  auto* dst = copy.dst + int64_t(blockIdx.y) * copy.width;
+  for (int64_t i = threadIdx.x; i < copy.width; i += blockDim.x) dst[i] = src[i];
+}
+
+extern "C" cudaError_t blz_copy_row_windows(const blz_row_copy* copies, int count, int start, int rows,
+                                             cudaStream_t stream) {
+  if (count < 1 || start < 0 || rows < 1) return cudaErrorInvalidValue;
+  copy_row_windows<<<dim3(count, rows), 256, 0, stream>>>(copies, start);
+  return cudaGetLastError();
+}
+
 namespace blaze {
 namespace {
 

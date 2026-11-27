@@ -33,12 +33,16 @@ impl MoeEngine {
     pub(crate) fn packed(
         directory: &Path, layers: Range<usize>, device: i32, budget: usize, top_k: usize,
         threads: usize, chunk: usize, stream_gpu_only: bool, all_resident: bool, device_routes: bool, caps: (f32, f32),
+        tensor_prefill: bool,
     ) -> Result<Self> {
         let model_dir = CString::new(directory.as_os_str().as_encoded_bytes())?;
         let heat = directory.join(format!("heat-{}-{}.bin", layers.start, layers.end));
         let heat = CString::new(heat.as_os_str().as_encoded_bytes())?;
         let wide_min = if stream_gpu_only { 1 } else { chunk.clamp(32, 256) };
-        let wide_a8 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_A8").is_some_and(|v| v == "1"));
+        let wide_a8 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_A8").map_or_else(
+            || tensor_prefill && crate::gpu::compute_capability() == (8, 9),
+            |v| v == "1",
+        ));
         let wide_fp4 = i32::from(device_routes || std::env::var_os("BLAZE_MOE_WIDE_FP4").is_some_and(|v| v == "1"));
         let resident_fast = i32::from(all_resident);
         let device_routes = i32::from(device_routes);

@@ -121,18 +121,18 @@ pub fn generate(
     ensure!(!cancelled(), "request cancelled");
     let mut seq = model.sequence(capacity)?;
     let mut prediction = None;
-    let readout = || if sampling.greedy() { Readout::Greedy } else { Readout::Scores };
+    let mut rng = sampling.seed.map_or_else(Rng::from_time, Rng::new);
     let chunk_size = model.prefill_chunk();
-    let chunks = prompt.chunks(chunk_size);
-    let total_chunks = chunks.len();
-    for (i, chunk) in chunks.enumerate() {
+    let mut chunks = crate::sched::prefill_chunks(prompt, chunk_size, model.prefill_wide_min(),
+        super::cuda::PREFILL_ATTENTION_ROWS).peekable();
+    while let Some(chunk) = chunks.next() {
         ensure!(!cancelled(), "request cancelled");
-        if let Some(out) = model.prefill(&mut seq, chunk, prompt.len(), if i + 1 == total_chunks { readout() } else { Readout::None })? {
+        let readout = if chunks.peek().is_none() { Readout::next(sampling, &mut rng) } else { Readout::None };
+        if let Some(out) = model.prefill(&mut seq, chunk, prompt.len(), readout)? {
             prediction = Some(out);
         }
     }
     let prompt_elapsed = start.elapsed();
-    let mut rng = sampling.seed.map_or_else(Rng::from_time, Rng::new);
     let start = Instant::now();
     let mut ids = Vec::new();
     let mut stop = false;
@@ -143,8 +143,7 @@ pub fn generate(
     'decode: while ids.len() < max_tokens {
         let id = match prediction.as_ref().context("Inkling generated no prediction")? {
             Prediction::Token(id) => *id,
-            Prediction::Scores(logits) => draw(logits, sampling, &mut rng),
-            Prediction::Verified(_, _) => anyhow::bail!("unexpected DSpark verdict"),
+            Prediction::Verified(_, _) => anyhow::bail!("unexpected Inkling speculative verdict"),
         };
         ids.push(id);
         if text.eos.contains(&id) {
@@ -162,8 +161,7 @@ pub fn generate(
             let draft = model.draft_tokens(&seq, id, limit)?;
             draft_time += t.elapsed();
             let t = Instant::now();
-            let mut sample = |logits: &[f32]| draw(logits, sampling, &mut rng);
-            let sample = (!sampling.greedy()).then_some(&mut sample as super::forward::SampleRow<'_>);
+            let sample = (!sampling.greedy()).then_some(super::forward::SampleRow { params: sampling, rng: &mut rng });
             let (kept, next) = model.verify(&mut seq, id, &draft, sample)?;
             verify_time += t.elapsed();
             accepted += kept;
@@ -175,7 +173,7 @@ pub fn generate(
             }
             prediction = Some(Prediction::Token(next));
         } else {
-            prediction = model.forward(&mut seq, id, readout())?;
+            prediction = model.forward(&mut seq, id, Readout::next(sampling, &mut rng))?;
         }
     }
     if drafted > 0 {
@@ -190,7 +188,7 @@ pub fn generate(
     })
 }
 
-fn draw(logits: &[f32], p: &SamplingParams, rng: &mut Rng) -> u32 {
+pub(super) fn draw(logits: &[f32], p: &SamplingParams, rng: &mut Rng) -> u32 {
     let (best, &max) = logits
         .iter()
         .enumerate()

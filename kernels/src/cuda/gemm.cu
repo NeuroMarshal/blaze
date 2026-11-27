@@ -38,8 +38,8 @@ extern "C" void blz_gemm_destroy(blz_gemm* g) {
   delete g;
 }
 
-extern "C" cudaError_t blz_gemm_bf16(blz_gemm* g, const uint16_t* x, int64_t ldx, const uint16_t* w, uint16_t* out,
-                                     int64_t ldo, int m, int n, int k, cudaStream_t stream) {
+static cudaError_t gemm_bf16(blz_gemm* g, const uint16_t* x, int64_t ldx, const uint16_t* w, void* out,
+                             cudaDataType_t dtype, int64_t ldo, int m, int n, int k, cudaStream_t stream) {
   if (m == 0 || n == 0) return cudaSuccess;
   if (!g->bound || stream != g->stream) {
     // cublasSetStream resets the workspace to cuBLAS's own pool: bind ours again.
@@ -53,6 +53,16 @@ extern "C" cudaError_t blz_gemm_bf16(blz_gemm* g, const uint16_t* x, int64_t ldx
   // Column-major view: out^T [n, m] = w [n, k] (row-major, i.e. op T of a k x n matrix) * x^T [k, m].
   const cublasStatus_t st =
       cublasGemmEx(g->handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha, w, CUDA_R_16BF, k, x, CUDA_R_16BF, int(ldx),
-                   &beta, out, CUDA_R_16BF, int(ldo), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+                   &beta, out, dtype, int(ldo), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
   return st == CUBLAS_STATUS_SUCCESS ? cudaSuccess : cudaErrorUnknown;
+}
+
+extern "C" cudaError_t blz_gemm_bf16(blz_gemm* g, const uint16_t* x, int64_t ldx, const uint16_t* w, uint16_t* out,
+                                     int64_t ldo, int m, int n, int k, cudaStream_t stream) {
+  return gemm_bf16(g, x, ldx, w, out, CUDA_R_16BF, ldo, m, n, k, stream);
+}
+
+extern "C" cudaError_t blz_gemm_bf16_f32(blz_gemm* g, const uint16_t* x, int64_t ldx, const uint16_t* w, float* out,
+                                         int64_t ldo, int m, int n, int k, cudaStream_t stream) {
+  return gemm_bf16(g, x, ldx, w, out, CUDA_R_32F, ldo, m, n, k, stream);
 }

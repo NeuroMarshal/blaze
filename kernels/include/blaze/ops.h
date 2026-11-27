@@ -70,6 +70,14 @@ cudaError_t blz_router_topk(const uint16_t* logits, int64_t ld, int tokens, int 
 /// \brief out[i] = a[i] + b[i] (bf16).
 cudaError_t blz_add(const uint16_t* a, const uint16_t* b, int64_t n, uint16_t* out, cudaStream_t stream);
 
+struct blz_row_copy {
+  uint16_t* dst;
+  const uint16_t* src;
+  int64_t width;
+};
+cudaError_t blz_copy_row_windows(const struct blz_row_copy* copies, int count, int start, int rows,
+                                 cudaStream_t stream);
+
 // gated deltanet
 
 /// \brief beta = sigmoid(b), g = -exp(A_log) * softplus(a + dt_bias); a, b [tokens, v_heads] bf16.
@@ -144,6 +152,8 @@ void blz_gemm_destroy(blz_gemm* g);
 /// accumulation. x rows `ldx` apart, out rows `ldo` apart.
 cudaError_t blz_gemm_bf16(blz_gemm* g, const uint16_t* x, int64_t ldx, const uint16_t* w, uint16_t* out, int64_t ldo,
                           int m, int n, int k, cudaStream_t stream);
+cudaError_t blz_gemm_bf16_f32(blz_gemm* g, const uint16_t* x, int64_t ldx, const uint16_t* w, float* out, int64_t ldo,
+                             int m, int n, int k, cudaStream_t stream);
 
 #ifdef __cplusplus
 }
