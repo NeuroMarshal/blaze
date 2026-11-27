@@ -783,6 +783,7 @@ struct Work {
     sampling_logits: DevBuf,
     sampling_work: DevBuf,
     cand_pairs: DevBuf,
+    head_readback: Option<HostMapped>,
     // QSA: index queries [t, heads, 128], block scores [score rows, max blocks], selected KV slots [t, table stride] with
     // their counts, the identity row list of the selection table
     qsa_q: Option<DevBuf>,
@@ -1967,6 +1968,8 @@ impl Model {
             sampling_logits: b((head_rows * d.vocab * world * 4).next_multiple_of(16))?,
             sampling_work: b(unsafe { sys::blz_sampling_workspace_bytes(head_rows as c_int, (d.vocab * world) as c_int) })?,
             cand_pairs: b((head_rows * (sys::BLZ_TOPK_MAX + 2) * 8).next_multiple_of(16))?,
+            head_readback: std::env::var_os("BLAZE_PINNED_HEAD_READBACK").is_some_and(|v| v == "1")
+                .then(|| HostMapped::new(head_rows * (sys::BLZ_TOPK_MAX + 2) * 8)).transpose()?,
             qsa_q: cfg.qsa.as_ref().map(|q| b(t.max(head_rows) * q.heads * q.head_dim * 2)).transpose()?,
             qsa_scores: cfg.qsa.as_ref().map(|q| b(QSA_SCORE_ROWS * (ctx / q.compress_ratio + 1) * 4)).transpose()?,
             qsa_table: cfg.qsa.as_ref().map(|_| b(t.max(head_rows) * QSA_TABLE_STRIDE * 4)).transpose()?,
@@ -2690,9 +2693,23 @@ impl Model {
     }
 
     pub fn candidates(&self, rows: usize) -> Result<Vec<f32>> {
+        self.read_head(&self.work.cand_pairs, rows * (sys::BLZ_TOPK_MAX + 2) * 2)
+    }
+
+    fn read_head<T: Copy + Default>(&self, source: &DevBuf, count: usize) -> Result<Vec<T>> {
+        let Some(staging) = &self.work.head_readback else {
+            self.stream.sync()?;
+            self.prefill_report();
+            return source.download(count);
+        };
+        let bytes = count * size_of::<T>();
+        ensure!(bytes <= source.bytes().min(staging.bytes()), "head readback exceeds workspace");
+        check(unsafe {
+            sys::cudaMemcpyAsync(staging.host_ptr().cast_mut(), source.ptr(), bytes, sys::MEMCPY_D2H, self.stream.0)
+        }, "head readback")?;
         self.stream.sync()?;
         self.prefill_report();
-        self.work.cand_pairs.download::<f32>(rows * (sys::BLZ_TOPK_MAX + 2) * 2)
+        Ok(unsafe { std::slice::from_raw_parts(staging.host_ptr().cast::<T>(), count) }.to_vec())
     }
 
     /// Copy the recurrent state (GDN conv and recurrent, PLE conv and n-gram history) of row `src` to row `dst`.
@@ -2733,9 +2750,7 @@ impl Model {
 
     /// Greedy picks of the last forward (one per span), after a stream synchronization.
     pub fn next_tokens(&self, n: usize) -> Result<Vec<i32>> {
-        self.stream.sync()?;
-        self.prefill_report();
-        self.work.next.download::<i32>(n)
+        self.read_head(&self.work.next, n)
     }
 
     /// Logits of every position of one sequence (scoring): the head over all rows of the last forward.

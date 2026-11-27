@@ -164,7 +164,7 @@ const MAX_VERIFY_GRAPHS: usize = 128;
 struct Runner {
     model: Model,
     draft: Option<crate::drafter::Drafter>,
-    staging: [HostMapped; 2],
+    staging: Vec<HostMapped>,
     staging_slot: usize,
     /// the hang report's view of this rank: (the engine's watch, this rank)
     watch: Option<(Arc<Watch>, usize)>,
@@ -298,7 +298,7 @@ impl Runner {
             return Err(err);
         }
         self.meta_copied[slot] = Some(copied);
-        self.staging_slot ^= 1;
+        self.staging_slot ^= usize::from(self.staging.len() == 2);
         if allow_graph && self.use_graphs && graphable {
             self.run_graph(key, n, &meta.spans)?;
         } else {
@@ -738,7 +738,8 @@ fn worker_main(
         }
         let draft_dir = opts.draft.clone();
         let model = Model::load(&dir, opts, Tp { rank: tp_rank, world: tp_world, ar, ar_bytes }, embed)?;
-        let staging = [HostMapped::new(model.meta.bytes)?, HostMapped::new(model.meta.bytes)?];
+        let slots = 1 + usize::from(model.opts.pp_stages > 1 && model.opts.pp_chunk > 0);
+        let staging = (0..slots).map(|_| HostMapped::new(model.meta.bytes)).collect::<Result<Vec<_>>>()?;
         let stage = |what: String| if rank == 0 { crate::logging::stage(what) } else { crate::logging::Stage::none() };
         let draft = match draft_dir {
             Some(d) => {
