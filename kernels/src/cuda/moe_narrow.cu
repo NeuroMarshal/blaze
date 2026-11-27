@@ -305,6 +305,7 @@ __global__ void plan_kernel(blz_moe_layer layer, int layer_id, const uint16_t* _
   }
   plan_block_done(ws, gridDim.x);
 }
+template <bool Capped>
 __global__ void finalize_kernel(blz_moe_layer layer, blz_moe_workspace ws) {
   const blz_moe_plan* plan = ws.plan;
   const int item_idx = blockIdx.x;
@@ -325,7 +326,8 @@ __global__ void finalize_kernel(blz_moe_layer layer, blz_moe_workspace ws) {
       if (xe >= 0) {
         const uint16_t gv = canon::a16_row_output(sums[2 * p], xe, mg);
         const uint16_t uv = canon::a16_row_output(sums[2 * p + 1], xe, mu);
-        v = canon::swiglu_bf16(gv, uv);
+        if constexpr (Capped) v = canon::capped_swiglu_bf16(gv, uv, layer.gate_cap, layer.up_cap);
+        else v = canon::swiglu_bf16(gv, uv);
       }
       h[p] = v;
       nonfinite |= canon::bf16_nonfinite(v);
@@ -719,7 +721,8 @@ static cudaError_t route_impl(const blz_moe_layer* layer, int layer_id, const ui
   const int max_items = tokens * layer->topk;
   launch_rows<false>(geo.gu_groups(), max_items, tokens, *layer, *ws, stream);
   mark(2);
-  finalize_kernel<<<max_items, 256, 0, stream>>>(*layer, *ws);
+  if (layer->gate_cap > 0) finalize_kernel<true><<<max_items, 256, 0, stream>>>(*layer, *ws);
+  else finalize_kernel<false><<<max_items, 256, 0, stream>>>(*layer, *ws);
   mark(3);
   launch_rows<true>(geo.d_groups(), max_items, tokens, *layer, *ws, stream);
   mark(4);
@@ -756,7 +759,8 @@ extern "C" cudaError_t blz_moe_gpu1_route(const blz_moe_layer* layer, const blz_
   const int max_items = tokens * layer->topk;
   gpu1_import_kernel<<<1, 256, 0, stream>>>(layer->hidden, layer->num_experts, *ws, mail);
   launch_rows<false>(geo.gu_groups(), max_items, tokens, *layer, *ws, stream);
-  finalize_kernel<<<max_items, 256, 0, stream>>>(*layer, *ws);
+  if (layer->gate_cap > 0) finalize_kernel<true><<<max_items, 256, 0, stream>>>(*layer, *ws);
+  else finalize_kernel<false><<<max_items, 256, 0, stream>>>(*layer, *ws);
   launch_rows<true>(geo.d_groups(), max_items, tokens, *layer, *ws, stream);
   gpu1_export_kernel<<<16, 256, 0, stream>>>(layer->hidden, *ws, mail);
   return cudaGetLastError();

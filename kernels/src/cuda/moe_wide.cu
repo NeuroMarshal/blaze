@@ -122,6 +122,7 @@ __device__ __forceinline__ void group_sums(const uint8_t* __restrict__ group, in
 }
 
 // grid (gu_groups / kWarps, n_tiles); warp = one 16-row group of the gate/up matrix (rows 2p gate, 2p + 1 up).
+template <bool Capped>
 __global__ void __launch_bounds__(32 * kWarps) gate_up_kernel(blz_wide_batch bt) {
   const int2 tile = bt.tiles[blockIdx.y];
   const blz_wide_item it = bt.items[tile.x];
@@ -162,7 +163,8 @@ __global__ void __launch_bounds__(32 * kWarps) gate_up_kernel(blz_wide_batch bt)
       if (x_e >= 0) {
         const uint16_t gv = canon::a16_row_output(acc[nt][j], x_e, mg);
         const uint16_t uv = canon::a16_row_output(partner, x_e, mu);
-        v = canon::swiglu_bf16(gv, uv);
+        if constexpr (Capped) v = canon::capped_swiglu_bf16(gv, uv, bt.gate_cap, bt.up_cap);
+        else v = canon::swiglu_bf16(gv, uv);
       }
       bt.h[size_t(route - bt.route0) * I + row / 2] = v;
     }
@@ -381,7 +383,8 @@ extern "C" cudaError_t blz_wide_gate_up(const blz_wide_batch* bt, cudaStream_t s
   if (bt->n_tiles <= 0) return cudaSuccess;
   const blaze::expert::Geometry geo{bt->hidden, bt->inter};
   const dim3 grid((geo.gu_groups() + kWarps - 1) / kWarps, bt->n_tiles);
-  gate_up_kernel<<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  if (bt->gate_cap > 0) gate_up_kernel<true><<<grid, 32 * kWarps, 0, stream>>>(*bt);
+  else gate_up_kernel<false><<<grid, 32 * kWarps, 0, stream>>>(*bt);
   return cudaGetLastError();
 }
 

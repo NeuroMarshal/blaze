@@ -41,6 +41,7 @@ struct EngineConfig {
   // Choose how many of the workers take part, by measurement while serving (the time per task of windows of jobs at a
   // few counts, the best kept, its neighbours probed now and then); false: all of them, always.
   bool tune_threads = false;
+  float gate_cap = 0, up_cap = 0;
 };
 
 /// \brief Parse a CPU list such as "0-23,48-55" (ranges and single CPUs, comma separated).
@@ -82,6 +83,7 @@ class Engine {
   bool poll_request(Job& job);
   void run_tasks(Job& job, int index);
   void finalize_item(Job& job, int item);
+  template <bool Capped> void finalize_item_impl(Job& job, int item);
   void tune_note(double ns, int tasks);
 
   // The worker count tuner (tune_threads): candidate counts, the decayed ns per task measured at each (0: not yet),

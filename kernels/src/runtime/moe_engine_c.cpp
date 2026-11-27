@@ -1,9 +1,11 @@
 #include "blaze/moe_engine.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <stdexcept>
 
 #include "blaze/hybrid.h"
 #include "blaze/moe.h"
@@ -28,6 +30,11 @@ extern "C" int blz_moe_engine_create(const blz_moe_engine_config* c, blz_moe_eng
     cfg.load_threads = 16;
     cfg.group_routes = c->group_routes;
     cfg.rank_experts = c->rank_experts;
+    if (!(c->gate_cap == 0 && c->up_cap == 0) &&
+        !(std::isfinite(c->gate_cap) && std::isfinite(c->up_cap) && c->gate_cap > 0 && c->up_cap > 0))
+      throw std::invalid_argument("MoE activation caps must both be finite and positive, or both zero");
+    cfg.gate_cap = c->gate_cap;
+    cfg.up_cap = c->up_cap;
     cfg.swap = blaze::parse_swap_options(c->swap_options ? c->swap_options : "");
     if (c->heat_path) cfg.swap.heat_path = c->heat_path;
     blaze::apply_hybrid_options(c->options ? c->options : "", cfg);

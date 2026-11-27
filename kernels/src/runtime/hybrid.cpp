@@ -159,10 +159,14 @@ HybridMoe::HybridMoe(const HybridConfig& cfg) : cfg_(cfg) {
   ec.ssd_io_threads = cfg_.ssd_io_threads;
   ec.tune_threads = cfg_.cpu_tune;
   ec.ssd_direct = cfg_.ssd_direct;
+  ec.gate_cap = cfg_.gate_cap;
+  ec.up_cap = cfg_.up_cap;
   cpu_ = std::make_unique<cpu::Engine>(ec, mail_, host_records_.data(), mult_host_.data());
   if (cfg_.gpu1 >= 0) {
-    const blz_moe_layer helper{geo.hidden, geo.inter, E, cfg_.topk, nullptr, nullptr, pool1_, int64_t(stride_), mult1_,
-                               nullptr};
+    blz_moe_layer helper{geo.hidden, geo.inter, E, cfg_.topk, nullptr, nullptr, pool1_, int64_t(stride_), mult1_,
+                         nullptr};
+    helper.gate_cap = cfg_.gate_cap;
+    helper.up_cap = cfg_.up_cap;
     gpu1_ = std::make_unique<Gpu1Service>(cfg_.gpu1, helper, mail_);
   }
   check(cudaSetDevice(cfg_.gpu0), "set gpu0");
@@ -297,7 +301,9 @@ cudaError_t HybridMoe::forward(int layer, const uint16_t* x, int tokens, const i
                         cfg_.defer_min_rank,
                         w,
                         cfg_.imm_heat,
-                        cfg_.defer_ssd_rank >= 0 ? cfg_.defer_ssd_rank : cfg_.defer_min_rank};
+                        cfg_.defer_ssd_rank >= 0 ? cfg_.defer_ssd_rank : cfg_.defer_min_rank,
+                        cfg_.gate_cap,
+                        cfg_.up_cap};
   const bool deferral = cfg_.defer_last >= 0;
   cudaError_t err = deferral ? blz_moe_defer_collect(geo.hidden, tokens, &ws_, stream) : cudaSuccess;
   if (err != cudaSuccess) return err;

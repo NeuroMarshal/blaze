@@ -137,6 +137,21 @@ BLZ_HD uint16_t swiglu_bf16(uint16_t g, uint16_t u) {
   return bf16_rn(BLZ_MUL(silu_c(bf16_to_f32(g)), bf16_to_f32(u)));
 }
 
+BLZ_HD float tanh_c(float x) {
+  const float a = x < 0.0f ? -x : x;
+  if (a < 0.015625f) return BLZ_FMA(BLZ_MUL(x, x), BLZ_MUL(x, -1.0f / 3.0f), x);
+  const float e = exp_c(BLZ_MUL(-2.0f, a));
+  const float y = BLZ_DIV(BLZ_ADD(1.0f, -e), BLZ_ADD(1.0f, e));
+  return x < 0.0f ? -y : y;
+}
+
+BLZ_HD uint16_t capped_swiglu_bf16(uint16_t gate, uint16_t up, float gate_cap, float up_cap) {
+  const float g = bf16_to_f32(gate), u = bf16_to_f32(up);
+  const float numerator = BLZ_MUL(BLZ_MUL(gate_cap, tanh_c(BLZ_DIV(g, gate_cap))),
+                                 BLZ_MUL(up_cap, tanh_c(BLZ_DIV(u, up_cap))));
+  return bf16_rn(BLZ_DIV(numerator, BLZ_ADD(1.0f, exp_c(-g))));
+}
+
 /// \brief Exponent field used by the A16 encoding: max(E, 1).
 BLZ_HD int a16_exp(uint16_t b) {
   const int e = (b >> 7) & 0xFF;

@@ -58,12 +58,14 @@ class ExpertStore {
   void read_chunk(int layer, int expert, int c, void* dst, bool direct) const;
 
  private:
+  void init_geometry(size_t chunk_bytes);
   struct Mat {
     const SafetensorsDir* dir;
     const SafetensorsDir::Tensor* codes;
     const SafetensorsDir::Tensor* scales;
   };
   std::unique_ptr<SafetensorsDir> st_, extra_;
+  const SafetensorsDir::Tensor* packed_ = nullptr;
   expert::Geometry geo_{};
   int layers_ = 0, experts_ = 0, main_layers_ = 0;
   std::string prefix_;

@@ -273,6 +273,12 @@ bool Engine::poll_request(Job& job) {
 }
 
 void Engine::finalize_item(Job& job, int item) {
+  if (cfg_.gate_cap > 0) return finalize_item_impl<true>(job, item);
+  finalize_item_impl<false>(job, item);
+}
+
+template <bool Capped>
+void Engine::finalize_item_impl(Job& job, int item) {
   const blz_moe_item& it = job.items[item];
   const int I = cfg_.geo.inter;
   const float* m = &mult_[(size_t(job.layer) * cfg_.num_experts + it.expert) * 3];
@@ -287,7 +293,8 @@ void Engine::finalize_item(Job& job, int item) {
       }
       const uint16_t gv = canon::a16_row_output(sums[size_t(2 * i) * it.ncols + c], emax, m[0]);
       const uint16_t uv = canon::a16_row_output(sums[size_t(2 * i + 1) * it.ncols + c], emax, m[1]);
-      h[i] = canon::swiglu_bf16(gv, uv);
+      if constexpr (Capped) h[i] = canon::capped_swiglu_bf16(gv, uv, cfg_.gate_cap, cfg_.up_cap);
+      else h[i] = canon::swiglu_bf16(gv, uv);
     }
     encode_column(h, I, job.h_bufs[item * kMaxCols + c]);
     if (cfg_.fast_min_cols > 0 && it.ncols >= cfg_.fast_min_cols) {

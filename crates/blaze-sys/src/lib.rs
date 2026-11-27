@@ -521,6 +521,8 @@ pub struct blz_moe_engine_config {
     pub options: *const c_char,
     pub group_routes: Option<unsafe extern "C" fn(*const i32, usize, usize, *mut i32, *mut i32, *mut i32) -> c_int>,
     pub rank_experts: Option<unsafe extern "C" fn(*mut usize, usize, *const f64, usize, usize, c_int) -> usize>,
+    pub gate_cap: f32,
+    pub up_cap: f32,
 }
 
 unsafe extern "C" {

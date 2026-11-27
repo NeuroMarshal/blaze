@@ -3,11 +3,12 @@ use super::cpu::Routed;
 use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
 use crate::expert_cache::{ExpertResidency, ExpertVisit, rank_experts};
 use crate::expert_routes::{RouteGroups, TokenRoute};
+use crate::expert_runtime::MoeEngine;
 use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check};
 use crate::matmul::{Bf16Kernel, Matmul, Mxfp8Rows, Nvfp4Rows};
 use crate::weights::{Checkpoint, Dtype};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use blaze_sys as sys;
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -610,6 +611,7 @@ pub(super) struct Compute {
     cpu_routes: u64,
     prompt_stage: Option<PromptStage>,
     wide_experts: Option<WideExperts>,
+    hybrid: Option<(MoeEngine, DevBuf)>,
     recurrent_batch: Option<RecurrentBatch>,
     projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
     grouped_experts: bool,
@@ -671,6 +673,7 @@ impl Compute {
             cpu_routes: 0,
             prompt_stage,
             wide_experts,
+            hybrid: None,
             recurrent_batch,
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
@@ -685,6 +688,47 @@ impl Compute {
         let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) };
         self.transfer.host_slice_mut()[..bytes.len()].copy_from_slice(bytes);
         self.copy_staged_input(bytes.len())
+    }
+
+    pub fn attach_expert_engine(&mut self, engine: MoeEngine, hidden: usize, chunk: usize) -> Result<()> {
+        self.hybrid = Some((engine, DevBuf::new(hidden * chunk * 2)?));
+        Ok(())
+    }
+
+    pub fn hybrid_moe(
+        &mut self, layer: usize, activations: Option<&[Vec<f32>]>, routes: &[Vec<(usize, f32)>], hidden: usize,
+        top_k: usize, verify: bool,
+    ) -> Result<MoeOutput> {
+        let tokens = routes.len();
+        let values = tokens * hidden;
+        ensure!(tokens > 0 && top_k > 0 && routes.iter().all(|r| r.len() == top_k) &&
+            2 * values <= self.input.bytes().min(self.result.bytes()).min(self.transfer.bytes()),
+            "Inkling HybridMoe shape exceeds scratch");
+        let (ids, weights): (Vec<_>, Vec<_>) = routes.iter().flatten()
+            .map(|&(id, probability)| (id as i32, probability)).unzip();
+        let work = (|| -> Result<()> {
+            if let Some(activations) = activations {
+                ensure!(activations.len() == tokens && activations.iter().all(|x| x.len() == hidden),
+                    "Inkling HybridMoe activation shape mismatch");
+                let values: Vec<_> = activations.iter().flatten().copied().map(to_bf16).collect();
+                self.stage_input(&values)?;
+            }
+            let (engine, retained) = self.hybrid.as_ref().context("missing Inkling HybridMoe")?;
+            let input: *const u16 = if activations.is_some() { self.input.ptr() } else { retained.ptr() };
+            self.scatter_ids.upload_async(&ids, &self.stream)?;
+            self.scatter_weights.upload_async(&weights, &self.stream)?;
+            let stride = if verify { 1 } else { tokens };
+            for offset in (0..tokens).step_by(stride) {
+                unsafe { engine.forward(layer, input.add(offset * hidden), stride,
+                    self.scatter_ids.at(offset * top_k), self.scatter_weights.at(offset * top_k),
+                    self.result.at(offset * hidden), &self.stream) }?;
+            }
+            self.queue_result::<u16>(self.result.ptr(), values)
+        })();
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        Ok(MoeOutput::Routed(self.read_result::<u16>(values).into_iter().map(from_bf16).collect()))
     }
 
     fn copy_staged_input(&self, bytes: usize) -> Result<()> {
@@ -958,8 +1002,9 @@ impl Compute {
     }
 
     pub fn retain_prefill_activations(&self) -> bool {
-        self.prompt_stage.is_none() && self.cpu.is_some()
+        self.hybrid.is_some() || (self.prompt_stage.is_none() && self.cpu.is_some()
             && self.wide_experts.as_ref().is_some_and(|wide| wide.activation_input.is_some())
+        )
     }
 
     pub fn recurrent_qkv_fits(&self, width: usize) -> bool {
@@ -1230,7 +1275,8 @@ impl Compute {
             && norm.bytes() == width * 4 && bytes.max(output_bytes) <= self.input.bytes()
             && width * 8 <= self.result.bytes() && self.gate.bytes() >= 128, "Inkling gated router exceeds scratch");
         let activation = if let Some(first) = retain_at {
-            let buffer = self.wide_experts.as_ref().and_then(|wide| wide.activation_input.as_ref())
+            let buffer = self.hybrid.as_ref().map(|(_, buffer)| buffer)
+                .or_else(|| self.wide_experts.as_ref().and_then(|wide| wide.activation_input.as_ref()))
                 .ok_or_else(|| anyhow::anyhow!("Inkling routed activations are unavailable"))?;
             ensure!((first * width + size) * 2 <= buffer.bytes(), "Inkling retained activations exceed scratch");
             buffer.at(first * width)

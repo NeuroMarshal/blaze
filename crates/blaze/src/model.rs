@@ -1847,6 +1847,8 @@ impl Model {
             options: options.as_ptr(),
             group_routes: None,
             rank_experts: None,
+            gate_cap: 0.0,
+            up_cap: 0.0,
         };
         let free_before = free;
         let stage = logging::stage(format!("routed experts → GPU{gpu0}{} slots, pinned RAM{} ({threads} CPU expert workers)",

@@ -32,6 +32,7 @@ typedef struct {
   const char* options;        // "key=value,..." runtime options (blaze/hybrid.h); NULL: defaults
   blz_group_expert_routes group_routes;
   blz_rank_experts rank_experts;
+  float gate_cap, up_cap;
 } blz_moe_engine_config;
 
 /// \brief Build the engine (loads every expert into its tier). On failure returns nonzero and writes a message.

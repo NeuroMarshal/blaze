@@ -69,6 +69,7 @@ typedef struct {
   // With deferral: CPU items of the SSD tier (slot_of == -2) are waited for only when some route ranks below this
   // instead of defer_min_rank (their reads are the slow part, so they can be deferred more readily).
   int32_t defer_ssd_rank;
+  float gate_cap, up_cap;
 } blz_moe_layer;
 
 /// \brief Expert-deferral state (KTransformers' Expert Deferral, applied to the CPU tier): a layer call whose CPU

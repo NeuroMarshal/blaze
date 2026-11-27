@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 
@@ -28,6 +29,33 @@ constexpr Format kFormats[] = {{"weight_packed", "weight_scale", "weight_global_
 ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix_hint, size_t chunk_bytes,
                          const std::string& extra_dir)
     : st_(std::make_unique<SafetensorsDir>(model_dir)) {
+  if ((packed_ = st_->find("blaze.rg16_v1.records"))) {
+    const auto& dims = packed_->shape;
+    const auto& scales = st_->at("blaze.rg16_v1.multipliers");
+    const auto& geometry = st_->at("blaze.rg16_v1.geometry");
+    if (!extra_dir.empty() || packed_->dtype != "U8" || dims.size() != 3 ||
+        dims[0] <= 0 || dims[0] > std::numeric_limits<int>::max() ||
+        dims[1] <= 0 || dims[1] > std::numeric_limits<int>::max() ||
+        scales.dtype != "F32" || scales.shape != std::vector<int64_t>{dims[0], dims[1], 3} ||
+        geometry.dtype != "I32" || geometry.shape != std::vector<int64_t>{2})
+      throw std::runtime_error("blaze: invalid rg16 expert store");
+    int32_t dimensions[2];
+    st_->read(geometry, dimensions, sizeof(dimensions));
+    geo_ = {dimensions[0], dimensions[1]};
+    if (!geo_.valid() || geo_.inter > std::numeric_limits<int>::max() / 2)
+      throw std::runtime_error("blaze: invalid rg16 expert geometry");
+    layers_ = main_layers_ = int(dims[0]);
+    experts_ = int(dims[1]);
+    prefix_ = "rg16";
+    init_geometry(chunk_bytes);
+    const size_t n = size_t(layers_) * experts_;
+    if (dims[2] != int64_t(stride_) || packed_->bytes() % stride_ != 0 || packed_->bytes() / stride_ != n ||
+        scales.bytes() % (3 * sizeof(float)) != 0 || scales.bytes() / (3 * sizeof(float)) != n)
+      throw std::runtime_error("blaze: invalid rg16 expert record length");
+    mult_.resize(n * 3);
+    st_->read(scales, mult_.data(), scales.bytes());
+    return;
+  }
   // Find "<prefix>0.mlp.experts.0.gate_proj.<codes>" with U8 codes: the prefix of the decoder layers (the MTP block's
   // "mtp." layers are not served) and the exporter's naming.
   std::string prefix;
@@ -80,12 +108,7 @@ ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix
     layers_ += extra_layers;
   }
   prefix_ = prefix;
-  stride_ = (geo_.record_bytes() + 255) / 256 * 256;
-  // Chunks of ~chunk_bytes of checkpoint bytes (codes and scales of 16 rows per group).
-  gu_chunk_groups_ = std::max<int>(1, int(chunk_bytes / (16 * size_t(H / 2 + H / 16))));
-  down_chunk_groups_ = std::max<int>(1, int(chunk_bytes / (16 * size_t(I / 2 + I / 16))));
-  gu_chunks_ = (geo_.gu_groups() + gu_chunk_groups_ - 1) / gu_chunk_groups_;
-  down_chunks_ = (geo_.d_groups() + down_chunk_groups_ - 1) / down_chunk_groups_;
+  init_geometry(chunk_bytes);
   const size_t n = size_t(layers_) * experts_;
   mats_.resize(n * 3);
   mult_.resize(n * 3);
@@ -113,8 +136,22 @@ ExpertStore::ExpertStore(const std::string& model_dir, const std::string& prefix
       }
 }
 
+void ExpertStore::init_geometry(size_t chunk_bytes) {
+  stride_ = (geo_.record_bytes() + 255) / 256 * 256;
+  gu_chunk_groups_ = std::max<int>(1, int(chunk_bytes / (144 * size_t(geo_.gu_blocks()))));
+  down_chunk_groups_ = std::max<int>(1, int(chunk_bytes / (144 * size_t(geo_.d_blocks()))));
+  gu_chunks_ = (geo_.gu_groups() + gu_chunk_groups_ - 1) / gu_chunk_groups_;
+  down_chunks_ = (geo_.d_groups() + down_chunk_groups_ - 1) / down_chunk_groups_;
+}
+
 void ExpertStore::read(int layer, int expert, void* dst, bool direct) const {
   auto* out = static_cast<uint8_t*>(dst);
+  if (packed_) {
+    thread_local SafetensorsDir::Bounce packed_bounce;
+    const size_t at = (size_t(layer) * experts_ + expert) * stride_;
+    std::memcpy(out, st_->read_range(*packed_, at, stride_, packed_bounce, direct), stride_);
+    return;
+  }
   std::memset(out + geo_.record_bytes(), 0, stride_ - geo_.record_bytes());
   for (int c = 0; c < num_chunks(); ++c) read_chunk(layer, expert, c, out, direct);
 }
@@ -127,6 +164,16 @@ ExpertStore::Chunk ExpertStore::chunk(int c) const {
 
 void ExpertStore::read_chunk(int layer, int expert, int c, void* dst, bool direct) const {
   const Chunk ch = chunk(c);
+  if (packed_) {
+    const size_t group = size_t(ch.down ? geo_.d_blocks() : geo_.gu_blocks()) * expert::kUnitBytes;
+    const size_t start = (ch.down ? geo_.gu_bytes() : 0) + ch.g0 * group;
+    const size_t bytes = (ch.g1 - ch.g0) * group;
+    const size_t at = (size_t(layer) * experts_ + expert) * stride_;
+    thread_local SafetensorsDir::Bounce packed_bounce;
+    std::memcpy(static_cast<uint8_t*>(dst) + start,
+                st_->read_range(*packed_, at + start, bytes, packed_bounce, direct), bytes);
+    return;
+  }
   const Mat* m = &mats_[(size_t(layer) * experts_ + expert) * 3];
   const int H = geo_.hidden, I = geo_.inter;
   thread_local SafetensorsDir::Bounce bounce[4];

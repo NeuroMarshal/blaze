@@ -120,6 +120,19 @@ impl Experts {
         let down = PackedMatrix::load(ckpt, format!("{prefix}.w2_weight"), experts, cfg.hidden, intermediate)?;
         Ok(Self { gate_up, down })
     }
+
+    pub fn to_rg16(&self, ckpt: &Checkpoint, id: usize, record: &mut [u8]) -> Result<[f32; 3]> {
+        let pack = |matrix: &PackedMatrix, output: &mut [u8]| {
+            let src = matrix.expert(ckpt, id)?;
+            crate::expert_rg16::convert_matrix(src.codes, src.scales, src.alpha, matrix.rows, matrix.cols, output)
+        };
+        let split = crate::expert_rg16::matrix_bytes(self.gate_up.rows, self.gate_up.cols);
+        let (gate_up, down) = record.split_at_mut(split);
+        let down_bytes = crate::expert_rg16::matrix_bytes(self.down.rows, self.down.cols);
+        let gate_up = pack(&self.gate_up, gate_up)?;
+        let down = pack(&self.down, &mut down[..down_bytes])?;
+        Ok([gate_up, gate_up, down])
+    }
 }
 
 pub(crate) fn read_float(ckpt: &Checkpoint, name: &str, shape: &[usize]) -> Result<Vec<f32>> {

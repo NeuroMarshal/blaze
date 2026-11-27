@@ -428,6 +428,8 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
         bt.hidden = H, bt.inter = I;
         bt.h = d.h, bt.h_planes = d.h_planes, bt.h_emax = d.h_emax;
         bt.a8 = cfg_.wide_a8;
+        bt.gate_cap = cfg_.gate_cap;
+        bt.up_cap = cfg_.up_cap;
         if (g == 0) {
           bt.y = d.y + size_t(b.route0) * H;
         } else {
