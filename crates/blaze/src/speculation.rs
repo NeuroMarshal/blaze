@@ -54,13 +54,25 @@ pub(crate) fn match_picks<T: Eq + Copy>(
     picks: impl IntoIterator<Item = T>,
 ) -> (usize, T) {
     let mut picks = picks.into_iter();
-    for kept in 0..=draft.len() {
+    let mut last = None;
+    let emitted = visit_verified_chain(draft, || {
         let pick = picks.next().expect("one target prediction per row");
-        if draft.get(kept) != Some(&pick) {
-            return (kept, pick);
+        last = Some(pick);
+        Some((pick, false))
+    });
+    (emitted - 1, last.expect("verification always reads the anchor prediction"))
+}
+
+pub(crate) fn visit_verified_chain<T: Eq>(draft: &[T], mut read: impl FnMut() -> Option<(T, bool)>) -> usize {
+    let mut emitted = 0;
+    while let Some((token, finished)) = read() {
+        let matched = draft.get(emitted) == Some(&token);
+        emitted += 1;
+        if finished || !matched {
+            break;
         }
     }
-    unreachable!("the bonus token always ends verification")
+    emitted
 }
 
 #[cfg(test)]
@@ -79,5 +91,15 @@ mod tests {
             assert_eq!(match_picks(draft, picks), expected);
             assert_eq!(sampled, expected.0 + 1);
         }
+    }
+
+    #[test]
+    fn finished_request_does_not_read_the_rest_of_the_verified_chain() {
+        let mut reads = 0;
+        let emitted = visit_verified_chain(&[2, 3], || {
+            reads += 1;
+            Some((2, true))
+        });
+        assert_eq!((emitted, reads), (1, 1));
     }
 }

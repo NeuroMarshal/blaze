@@ -1688,19 +1688,14 @@ impl Loop {
         let mut finished = Vec::new();
         for (&i, (p, lps)) in order.iter().zip(picks) {
             let draft = &drafts[i];
-            let mut emitted = 0;
             let mut finish = None;
-            for (j, (&x, lp)) in p.iter().zip(lps).enumerate() {
-                let (tok, f) = self.emit(i, x, lp);
-                emitted += 1;
-                if f.is_some() {
-                    finish = f;
-                    break;
-                }
-                if j >= draft.len() || tok as i64 != draft[j] {
-                    break;
-                }
-            }
+            let mut predictions = p.into_iter().zip(lps);
+            let emitted = crate::speculation::visit_verified_chain(draft, || {
+                let (token, logprob) = predictions.next()?;
+                let (token, stop) = self.emit(i, token, logprob);
+                finish = stop;
+                Some((i64::from(token), finish.is_some()))
+            });
             let a = &mut self.active[i];
             if !draft.is_empty() {
                 // matched drafts out of the compared ones (a finish cuts the round short)
