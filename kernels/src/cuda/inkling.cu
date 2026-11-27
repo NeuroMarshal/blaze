@@ -84,13 +84,14 @@ __device__ float controller_tanh(float value) {
 }
 
 __global__ void controller_norm(const float* gates, const float* x, const float* msg,
-                                const float* norm, __nv_bfloat16* output, int width, float eps) {
+                                const float* norm, __nv_bfloat16* output, int width, float eps, bool per_row) {
     extern __shared__ float mixed[];
     const int offset = blockIdx.x * width;
     gates += 2 * offset;
     x += offset;
     msg += offset;
     output += offset;
+    if (per_row) norm += offset;
     __shared__ float scale;
     for (int i = threadIdx.x; i < width; i += blockDim.x) {
         const float keep = __fmul_rn(x[i], 1.0f - controller_tanh(gates[i]));
@@ -118,7 +119,15 @@ extern "C" cudaError_t blz_inkling_controller_norm(const float* gates, const flo
         const float* norm, uint16_t* out, int width, float eps, int tokens, cudaStream_t stream) {
     if (width <= 0 || width > 4096 || width % 32) return cudaErrorInvalidValue;
     controller_norm<<<tokens, 256, width * sizeof(float), stream>>>(gates, x, msg, norm,
-        reinterpret_cast<__nv_bfloat16*>(out), width, eps);
+        reinterpret_cast<__nv_bfloat16*>(out), width, eps, false);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_controller_qkv(const float* gates, const float* x, const float* msg,
+        const float* norms, uint16_t* out, int width, float eps, cudaStream_t stream) {
+    if (width <= 0 || width > 4096 || width % 32) return cudaErrorInvalidValue;
+    controller_norm<<<3, 256, width * sizeof(float), stream>>>(gates, x, msg, norms,
+        reinterpret_cast<__nv_bfloat16*>(out), width, eps, true);
     return cudaGetLastError();
 }
 

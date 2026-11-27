@@ -443,7 +443,7 @@ impl WideExperts {
         let mut gather = Vec::with_capacity(permutation.len());
         let mut tables: [_; 5] = std::array::from_fn(|_| Vec::new());
         for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
-            let cached = &pool.entries[&(layer, id)];
+            let Some(cached) = pool.entries.get(&(layer, id)) else { continue };
             for rows in rows.chunks(EXPERT_BATCH) {
                 let begin = gather.len();
                 let class = WIDE_ROW_CLASSES.iter().position(|&max| rows.len() <= max).unwrap();
@@ -458,6 +458,7 @@ impl WideExperts {
                 }
             }
         }
+        if gather.is_empty() { return sum.zero(stream); }
         let tile_count: usize = tables.iter().map(Vec::len).sum();
         let tile_size = std::mem::size_of::<sys::blz_moe_matrix_tile>();
         let tile_bytes = 2 * tile_count * tile_size;
@@ -522,6 +523,7 @@ enum ProjectionKey {
     Controller([usize; 3], [usize; 3], usize),
     Router(usize),
     GatedRouter { weights: [usize; 4], eps: u32, tokens: usize },
+    RecurrentQkv { down: [usize; 3], up: [usize; 3], proj: [usize; 5], norm: usize, eps: u32 },
     Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
@@ -881,6 +883,75 @@ impl Compute {
             .min(self.gate.bytes() / 128).min(65535)
     }
 
+    pub fn recurrent_qkv_fits(&self, width: usize) -> bool {
+        self.input.bytes() >= width * 36 && self.transfer.bytes() >= width * 36
+            && self.result.bytes() >= width * 24 && self.gate.bytes() >= 3 * 128
+    }
+
+    pub fn project_recurrent<const N: usize>(
+        &mut self, projections: [&Dense; N], down: [&Dense; 3], up: [&Dense; 3],
+        x: [&[f32]; 3], messages: [&[f32]; 3], normalized: [&[f32]; 3], norms: &DevBuf,
+        eps: f32,
+    ) -> Result<[Vec<u16>; N]> {
+        let width = x[0].len();
+        let lanes = 3 * width;
+        let bytes = lanes * 12;
+        let values: usize = projections.iter().map(|p| p.rows).sum();
+        ensure!(matches!(N, 3 | 5) && self.recurrent_qkv_fits(width) && norms.bytes() == lanes * 4
+            && values * 2 <= self.result.bytes() && values * 2 <= self.transfer.bytes()
+            && down.iter().all(|w| w.rows == 64 && w.cols == 2 * width)
+            && up.iter().all(|w| w.rows == 2 * width && w.cols == 64)
+            && x.iter().chain(&messages).all(|row| row.len() == width)
+            && normalized.iter().all(|row| row.len() == 2 * width),
+            "Inkling recurrent QKV exceeds scratch");
+        let staging = &mut self.transfer.host_slice_mut()[..bytes];
+        let (inputs, rest) = staging.split_at_mut(lanes * 4);
+        for (dst, &value) in inputs.chunks_exact_mut(2).zip(normalized.into_iter().flatten()) {
+            dst.copy_from_slice(&to_bf16(value).to_ne_bytes());
+        }
+        for (dst, src) in rest.chunks_exact_mut(width * 4).zip(x.into_iter().chain(messages)) {
+            let source = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), dst.len()) };
+            dst.copy_from_slice(source);
+        }
+        let address = |w: &Dense| w.weight.ptr::<u8>() as usize;
+        let key = ProjectionKey::RecurrentQkv {
+            down: down.map(address), up: up.map(address),
+            proj: std::array::from_fn(|i| projections.get(i).map_or(0, |w| address(w))),
+            norm: norms.ptr::<u8>() as usize, eps: eps.to_bits(),
+        };
+        let work = self.run_projection(key, |gpu| {
+            gpu.copy_staged_input(bytes)?;
+            for (i, w) in down.iter().enumerate() {
+                w.run(gpu, gpu.input.at(i * 2 * width), gpu.gate.at(i * 64), 1)?;
+            }
+            check(unsafe {
+                sys::blz_inkling_controller_up(gpu.gate.ptr(), up[0].weight.ptr(), up[1].weight.ptr(), up[2].weight.ptr(),
+                    gpu.result.ptr(), (2 * width) as i32, 3, 1, gpu.stream.0)
+            }, "Inkling attention controller projection")?;
+            check(unsafe {
+                sys::blz_inkling_controller_qkv(gpu.result.ptr(), gpu.input.at(lanes), gpu.input.at(2 * lanes),
+                    norms.ptr(), gpu.input.ptr(), width as i32, eps, gpu.stream.0)
+            }, "Inkling attention controller normalization")?;
+            let offsets = [0, width, 2 * width, width, 2 * width];
+            let mut first = 0;
+            for (w, offset) in projections.iter().zip(offsets) {
+                w.run(gpu, gpu.input.at(offset), gpu.result.at(first), 1)?;
+                first += w.rows;
+            }
+            gpu.queue_result::<u16>(gpu.result.ptr(), values)
+        });
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        let data = self.read_result::<u16>(values);
+        let mut first = 0;
+        Ok(projections.map(|w| {
+            let row = data[first..first + w.rows].to_vec();
+            first += w.rows;
+            row
+        }))
+    }
+
     pub fn gated_router(
         &mut self, down: &Dense, up: &Dense, norm: &DevBuf, router: &Dense,
         input: &[f32], x: &[f32], message: &[f32], eps: f32,
@@ -1167,25 +1238,43 @@ impl Compute {
         self.cache.visits += activations.len();
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
+        let all_resident = || by_expert.iter().enumerate()
+            .all(|(id, rows)| rows.is_empty() || pool.entries.contains_key(&(layer, id)));
         if self.wide_experts.is_some()
             && routes.iter().all(|route| route.len() == routes[0].len())
-            && by_expert.iter().enumerate().all(|(id, rows)| rows.is_empty() || pool.entries.contains_key(&(layer, id)))
+            && (all_resident() || (self.cpu.is_some() && self.prompt_stage.is_none()))
         {
+            for (id, _) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                if let Some(hit) = pool.entries.get_mut(&(layer, id)) { hit.last_used = tick; }
+            }
             for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
                 pool.use_gpu(ckpt, weights, (layer, id), tick, epoch,
-                    self.cpu.is_some().then_some(rows.len()), false, None)?;
+                    self.cpu.is_some().then_some(rows.len()), true, None)?;
             }
-            let work = (|| -> Result<()> {
+            let workers = self.cpu.clone();
+            let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
+            let mut cold_count = 0;
+            let work = prefill_cpu_scope(workers.as_deref(), |scope| -> Result<()> {
+                let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
+                for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                    if !pool.entries.contains_key(&(layer, id)) {
+                        cold_count += rows.len();
+                        dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
+                    }
+                }
                 self.stage_input(&activations_bf16)?;
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
                 self.wide_experts.as_mut().unwrap().run(&self.stream, weights, pool, layer, &by_expert,
                     routes, caps, &self.input, &self.sum, &self.scatter_ids, &self.scatter_weights)?;
                 self.queue_result::<f32>(self.sum.ptr(), activations.len() * hidden)
-            })();
+            });
             let synced = self.stream.sync();
             work?;
             synced?;
-            return Ok(self.read_result(activations.len() * hidden));
+            self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
+            let mut output = self.read_result(activations.len() * hidden);
+            merge_cold(&mut output, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
+            return Ok(output);
         }
         let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
         let mut cold_count = 0usize;
@@ -1221,16 +1310,8 @@ impl Compute {
                     temporary = slot.load(&stage.copy, &self.stream, ckpt, weights, id)?;
                     (&prompt_slot.insert(slot).device, &temporary.0, &temporary.1)
                 } else {
-                    let expert = Routed::read(ckpt, weights, id)?;
-                    let result = &cold[id];
                     cold_count += rows.len();
-                    scope.expect("cold expert without CPU pool").spawn(move |_| {
-                        let output = rows.par_iter().map(|&(row, prob)| {
-                            let row = row as usize;
-                            (row, prob, expert.run(weights, &activations[row], caps))
-                        }).collect::<Vec<_>>();
-                        let _ = result.set(output);
-                    });
+                    dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
                     continue;
                 };
                 for (index, batch) in rows.chunks(EXPERT_BATCH).enumerate() {
@@ -1291,6 +1372,24 @@ impl Compute {
 }
 
 type ColdRoute<'a> = (Routed<'a>, &'a [f32], usize, f32);
+
+type ColdOutput = (usize, f32, Vec<f32>);
+
+fn dispatch_cold<'scope>(
+    ckpt: &'scope Checkpoint, weights: &'scope Experts, id: usize, rows: &'scope [(i32, f32)],
+    activations: &'scope [Vec<f32>], caps: (f32, f32), result: &'scope OnceLock<Vec<ColdOutput>>,
+    scope: Option<&rayon::Scope<'scope>>,
+) -> Result<()> {
+    let expert = Routed::read(ckpt, weights, id)?;
+    scope.expect("cold expert without CPU pool").spawn(move |_| {
+        let output = rows.par_iter().map(|&(row, prob)| {
+            let row = row as usize;
+            (row, prob, expert.run(weights, &activations[row], caps))
+        }).collect();
+        let _ = result.set(output);
+    });
+    Ok(())
+}
 
 fn prefill_cpu_scope<'scope, T>(cpu: Option<&rayon::ThreadPool>, dispatch: impl FnOnce(Option<&rayon::Scope<'scope>>) -> T) -> T {
     match cpu {
@@ -2000,6 +2099,65 @@ mod tests {
             assert_eq!(gpu.project_group([&matrix; 3], [&[x.as_slice()]; 3]).unwrap(), expected);
         }
         assert!(gpu.projection_graphs.as_ref().unwrap().values().any(Option::is_some));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn grouped_packed_projection_matches_separate_products() {
+        crate::gpu::set_device(0).unwrap();
+        let n = 128usize;
+        let k = 128usize;
+        let stream = Stream::new().unwrap();
+        let tiles = [3, 12, 30, 47, 63];
+        let rows: usize = tiles.iter().sum();
+        let x: Vec<_> = (0..rows * k).map(|i| to_bf16(((i * 19 % 97) as f32 - 48.0) / 32.0)).collect();
+        let input = DevBuf::from_slice(&x).unwrap();
+        let expected = DevBuf::new(rows * n * 2).unwrap();
+        let actual = DevBuf::new(rows * n * 2).unwrap();
+        for packing in [Packing::Nvfp4, Packing::Mxfp8] {
+            let (width, block, bias) = match packing {
+                Packing::Nvfp4 => (k / 2, 16, 56u8),
+                Packing::Mxfp8 => (k, 32, 124u8),
+            };
+            let codes: Vec<_> = (0..n * width * tiles.len()).map(|i| (i * 7 % 113) as u8).collect();
+            let scales: Vec<_> = (0..n * (k / block) * tiles.len()).map(|i| bias + (i % 3) as u8).collect();
+            let alpha = DevBuf::from_slice(&vec![0.75f32; n]).unwrap();
+            let codes = DevBuf::from_slice(&codes).unwrap();
+            let scales = DevBuf::from_slice(&scales).unwrap();
+            let mut begin = 0;
+            let pairs = tiles.iter().enumerate().map(|(i, &rows)| {
+                let tile = sys::blz_moe_matrix_tile {
+                    codes: codes.at(i * n * width),
+                    scales: scales.at(i * n * (k / block)),
+                    alpha: alpha.ptr(),
+                    begin: begin as i32,
+                    rows: rows as i32,
+                };
+                let product = Matmul {
+                    input: input.at(begin * k), output: expected.at(begin * n), rows,
+                    columns: n, inner: k, input_stride: k, output_stride: n,
+                };
+                unsafe {
+                    match packing {
+                        Packing::Nvfp4 => product.nvfp4(tile.codes, tile.scales, tile.alpha, 0, 0, &stream),
+                        Packing::Mxfp8 => product.mxfp8(tile.codes, tile.scales, 0, 0, &stream),
+                    }
+                }.unwrap();
+                begin += rows;
+                tile
+            }).collect::<Vec<_>>();
+            let descriptors = DevBuf::from_slice(&pairs).unwrap();
+            let launch = match packing {
+                Packing::Nvfp4 => sys::blz_moe_grouped_nvfp4,
+                Packing::Mxfp8 => sys::blz_moe_grouped_mxfp8,
+            };
+            for (i, class) in WIDE_ROW_CLASSES.into_iter().enumerate() {
+                check(unsafe { launch(input.ptr(), descriptors.at(i), actual.ptr(), 1,
+                    class as i32, n as i32, k as i32, stream.0) }, "grouped packed projection test").unwrap();
+            }
+            stream.sync().unwrap();
+            assert_eq!(actual.download::<u16>(rows * n).unwrap(), expected.download::<u16>(rows * n).unwrap(), "{packing:?}");
+        }
     }
 
     #[test]

@@ -383,6 +383,7 @@ struct Layer {
     norm_q: Vec<f32>,
     norm_k: Vec<f32>,
     norm_v: Vec<f32>,
+    device_qkv_norms: Option<gpu::DevBuf>,
     norm_mlp: Vec<f32>,
     gated_norm: Option<gpu::DevBuf>,
     q_clip: Vec<f32>,
@@ -472,6 +473,17 @@ impl Layer {
                 let weights: Vec<_> = q_clip.iter().chain(&rel_clip).copied().collect();
                 gpu::DevBuf::from_slice(&weights)
             }).transpose()?;
+        let norm_q = read(if local { "attn_norm.weight" } else { "q_input_norm.weight" }, &[s.hidden])?;
+        let norm_k = if local { Vec::new() } else { read("k_input_norm.weight", &[s.hidden])? };
+        let norm_v = if local { Vec::new() } else { read("v_input_norm.weight", &[s.hidden])? };
+        let device_qkv_norms = (avx_controller && s.hidden <= 4096 && s.hidden.is_multiple_of(32)
+            && std::env::var_os("BLAZE_INKLING_RECURRENT_QKV").is_some_and(|value| value == "1")
+            && loop_inputs.as_ref().is_some_and(|c| c.controllers[..3].iter().all(|c| matches!(c.up, GateWeights::Device(_)))))
+            .then(|| {
+                let norms: Vec<_> = if local { norm_q.repeat(3) }
+                    else { norm_q.iter().chain(&norm_k).chain(&norm_v).copied().collect() };
+                gpu::DevBuf::from_slice(&norms)
+            }).transpose()?;
 
         Ok(Self {
             local,
@@ -489,17 +501,10 @@ impl Layer {
             value: dense("attn.wv_dv.weight", kv, s.hidden)?,
             output: dense("attn.wo_ud.weight", s.hidden, q)?,
             bias: Dense::from_bf16(&rel_transposed, s.extent, s.relative)?,
-            norm_q: read(if local { "attn_norm.weight" } else { "q_input_norm.weight" }, &[s.hidden])?,
-            norm_k: if local {
-                Vec::new()
-            } else {
-                read("k_input_norm.weight", &[s.hidden])?
-            },
-            norm_v: if local {
-                Vec::new()
-            } else {
-                read("v_input_norm.weight", &[s.hidden])?
-            },
+            norm_q,
+            norm_k,
+            norm_v,
+            device_qkv_norms,
             norm_mlp,
             gated_norm,
             q_clip,
@@ -990,6 +995,8 @@ impl Model {
             let mut k_inputs = Vec::with_capacity(rows.len());
             let mut v_inputs = Vec::with_capacity(rows.len());
             let controller = (visit.pass > 0).then(|| layer.loop_inputs.as_ref().unwrap());
+            let recurrent = controller.zip(layer.device_qkv_norms.as_ref())
+                .filter(|_| rows.len() == 1 && compute.recurrent_qkv_fits(s.hidden));
             let mut qkv_rows = Vec::with_capacity(rows.len());
             for row in &mut rows {
                 let ForwardRow {
@@ -1022,10 +1029,10 @@ impl Model {
                 }
                 qkv_rows.push(qkv);
             }
-            if let Some(c) = controller {
+            if recurrent.is_none() && let Some(c) = controller {
                 c.mix_attention_rows(compute, &mut qkv_rows, &rows, s.eps)?;
             }
-            for qkv in qkv_rows {
+            for qkv in qkv_rows.iter().filter(|_| recurrent.is_none()) {
                 let norm = |x: &[f32], weight: &[f32]| normalized(x, Some(weight), s.eps);
                 let q_in = norm(&qkv[0], &layer.norm_q);
                 let k_in = qkv
@@ -1085,7 +1092,30 @@ impl Model {
                 state.value.remember_bf16(start, s.kv_width(), &value);
                 output
             } else {
-                let (qkv, conv) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
+                let (qkv, conv) = if let Some((controller, norms)) = recurrent {
+                    let x = std::array::from_fn(|i| qkv_rows[0][i].as_slice());
+                    let messages: [_; 3] = std::array::from_fn(|i| mix_normalized(&rows[0].messages, &controller.queries[i]));
+                    let inputs: [_; 3] = std::array::from_fn(|i| Controller::input(x[i], &messages[i], s.eps));
+                    let controllers = controller.controllers.first_chunk::<3>().unwrap();
+                    let down = controllers.each_ref().map(|c| &c.down);
+                    let up = controllers.each_ref().map(|c| {
+                        let GateWeights::Device(w) = &c.up else { unreachable!() };
+                        w
+                    });
+                    let messages = messages.each_ref().map(Vec::as_slice);
+                    let inputs = inputs.each_ref().map(Vec::as_slice);
+                    if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
+                        let [q, key, value, k_taps, v_taps] = compute.project_recurrent(
+                            [&layer.query, &layer.key, &layer.value, k, v], down, up, x, messages, inputs, norms, s.eps,
+                        )?;
+                        ([q, key, value], Some([k_taps, v_taps]))
+                    } else {
+                        let qkv = compute.project_recurrent(
+                            [&layer.query, &layer.key, &layer.value], down, up, x, messages, inputs, norms, s.eps,
+                        )?;
+                        (qkv, None)
+                    }
+                } else if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
                     let [q, key, value, k_taps, v_taps] = compute.project_rows(
                         [&layer.query, &layer.key, &layer.value, k, v],
                         [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)),
