@@ -456,6 +456,7 @@ pub struct Options {
     pub kv_dtype: KvDtype,
     pub max_image_tokens: usize,
     pub prefill_chunk: usize,
+    pub prefill_attention: super::PrefillAttention,
 }
 
 struct Device {
@@ -506,6 +507,7 @@ impl Model {
             kv_dtype,
             max_image_tokens,
             prefill_chunk,
+            prefill_attention,
         } = opts;
         ensure!(
             (1..=2).contains(&gpus) && device >= 0 && device <= i32::MAX - 1,
@@ -615,7 +617,8 @@ impl Model {
         for rank in 0..gpus {
             let id = device + rank as i32;
             gpu::set_device(id)?;
-            let scratch = AttentionScratch::new(s.heads, s.kv_heads, s.extent, s.relative, prefill_chunk, s.conv)?;
+            let mut scratch = AttentionScratch::new(s.heads, s.kv_heads, s.extent, s.relative, prefill_chunk, s.conv)?;
+            scratch.set_prefill_attention(prefill_attention);
             let mut kv_bytes = 0usize;
             let expert_layer_count = placement.iter().filter(|&&assigned| assigned == rank).count();
             let all_experts = expert_rg16::record_bytes(s.hidden, s.intermediate) * s.experts * expert_layer_count;

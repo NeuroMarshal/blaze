@@ -851,8 +851,17 @@ impl Compute {
 
     fn enqueue_device_scores(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize) -> Result<()> {
         ensure!(rows * vocab * 2 <= self.result.bytes(), "Inkling verification head exceeds workspace");
-        for row in 0..rows {
-            head.run_prefix(self, input.wrapping_add(row * head.cols), self.result.at(row * vocab), 1, vocab, true)?;
+        let width = head.cols;
+        let max_rows = if vocab > 4096 && (input as usize).is_multiple_of(16)
+            && crate::tune::wide_fits(1, width, width)
+        {
+            sys::BLZ_GEMV_WIDE_MAX_ROWS.min(sys::BLZ_GEMV_WIDE_MAX_SMEM / (width * 2))
+        } else {
+            1
+        };
+        for row in (0..rows).step_by(max_rows) {
+            let batch = (rows - row).min(max_rows);
+            head.run_prefix(self, input.wrapping_add(row * width), self.result.at(row * vocab), batch, vocab, true)?;
         }
         Ok(())
     }
@@ -1119,6 +1128,10 @@ impl AttentionScratch {
             heads,
             kv_heads,
         })
+    }
+
+    pub fn set_prefill_attention(&mut self, mode: super::PrefillAttention) {
+        self.tensor_prefill = mode == super::PrefillAttention::Tensor;
     }
 
     pub fn project_attention_device<const N: usize>(
@@ -1456,6 +1469,73 @@ pub(super) fn save_history(stream: &Stream, committed: &DevBuf, pending: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn tensor_prefill_matches_scalar_for_multiple_query_tiles_and_tail() -> Result<()> {
+        crate::gpu::set_device(0)?;
+        let stream = Stream::new()?;
+        let (heads, rows, window, extent, start) = (3usize, 47usize, 192usize, 64usize, 250usize);
+        let capacity = window + rows - 1;
+        let kv = Kv::new(capacity, window, 1, false, KvDtype::Nvfp4FourOverSix)?;
+        let values = |count: usize, salt: usize| -> Result<DevBuf> {
+            let data: Vec<u16> = (0..count)
+                .map(|i| to_bf16(((i.wrapping_mul(7919).wrapping_add(i / 31 * salt) % 509) as f32 - 254.0) / 512.0))
+                .collect();
+            DevBuf::from_slice(&data)
+        };
+        let slots: Vec<i32> = (start + 1 - window..start + rows)
+            .map(|pos| (pos % capacity) as i32)
+            .collect();
+        let slots = DevBuf::from_slice(&slots)?;
+        let scale = DevBuf::from_slice(&[KV_GLOBAL_SCALE])?;
+        let keys = values(capacity * HEAD_DIM, 19)?;
+        let vals = values(capacity * HEAD_DIM, 23)?;
+        kv.store_rows(0, keys.ptr(), vals.ptr(), slots.ptr(), capacity, &scale, &stream)?;
+        let count = rows * heads * HEAD_DIM;
+        let query = values(count, 29)?;
+        let gate = values(count, 31)?;
+        let sink = values(rows * heads, 37)?;
+        let relative = values(rows * heads * extent, 41)?;
+        let partial = DevBuf::new(rows * heads * MAX_TILES * (HEAD_DIM + 2) * 4)?;
+        let output = DevBuf::new(count * 2)?;
+        let [k, v, ks, vs] = kv.pointers(0);
+        let run = |tensor| -> Result<Vec<u16>> {
+            check(unsafe {
+                sys::blz_inkling_prefill_attention(query.ptr(), k, v, ks, vs, relative.ptr(), sink.ptr(),
+                    gate.ptr(), output.ptr(), partial.ptr(), heads as i32, 1, capacity as i32, window as i32,
+                    start as i32, extent as i32, rows as i32, KV_GLOBAL_SCALE, tensor, stream.0)
+            }, "test tiled Inkling attention")?;
+            stream.sync()?;
+            output.download(count)
+        };
+        let scalar = run(0)?;
+        let tensor = run(1)?;
+        for (index, (&expected, &actual)) in scalar.iter().zip(&tensor).enumerate() {
+            assert!((from_bf16(expected) - from_bf16(actual)).abs() < 0.002, "score at {index}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn batched_vocabulary_head_matches_single_rows() -> Result<()> {
+        crate::gpu::set_device(0)?;
+        let (rows, width, vocab) = (7usize, 2304usize, 4099usize);
+        let make_values = |count: usize, salt: usize| {
+            (0..count)
+                .map(|i| to_bf16(((i * 37 + i / 19 * salt) % 509) as f32 / 1024.0 - 0.25))
+                .collect::<Vec<_>>()
+        };
+        let matrix = Dense::from_bf16(&make_values(vocab * width, 13), vocab, width)?;
+        let input = DevBuf::from_slice(&make_values(rows * width, 7))?;
+        let compute = Compute::new(width, rows * vocab, width, rows)?;
+        let batched = compute.read_device_scores(&matrix, input.ptr(), vocab, rows)?;
+        for (row, got) in batched.chunks_exact(vocab).enumerate() {
+            assert_eq!(got, compute.read_device_scores(&matrix, input.at(row * width), vocab, 1)?);
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires a CUDA GPU"]

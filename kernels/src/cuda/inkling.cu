@@ -524,17 +524,24 @@ constexpr int kPromptKeys = 32;
 template<bool Packed>
 __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* keys, const uint8_t* values,
         const uint8_t* ks, const uint8_t* vs, const __nv_bfloat16* relative, float* scratch, int kv_heads,
-        int capacity, int window, int start, int extent, int span, float scale) {
+        int capacity, int window, int start, int extent, int span, int rows, float scale) {
     namespace wmma = nvcuda::wmma;
     const int head = blockIdx.x;
     const int kv_head = head / (gridDim.x / kv_heads);
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
+    const int query_base = blockIdx.z * kPromptQueries;
+    const int active = min(kPromptQueries, rows - query_base);
+    const int leading = HEAD_DIM + 8;
+    q += size_t(query_base) * gridDim.x * HEAD_DIM;
+    relative += size_t(query_base) * gridDim.x * extent;
+    scratch += size_t(query_base) * gridDim.x * gridDim.y * (HEAD_DIM + 2);
+    start += query_base;
     const int first = max(0, start + 1 - window) + blockIdx.y * span;
-    const int end = min(first + span, start + kPromptQueries);
+    const int end = min(first + span, start + active);
     __align__(32) __shared__ __half q_tile[kPromptQueries][HEAD_DIM];
-    __align__(32) __shared__ __half k_tile[kPromptKeys][HEAD_DIM];
-    __align__(32) __shared__ __half v_tile[kPromptKeys][HEAD_DIM];
+    __align__(32) __shared__ __half k_tile[kPromptKeys][leading];
+    __align__(32) __shared__ __half v_tile[kPromptKeys][leading];
     __align__(32) __shared__ float score[kPromptQueries][kPromptKeys];
     __align__(32) __shared__ __half probability[kPromptQueries][kPromptKeys];
     __align__(32) __shared__ float numerator[kPromptQueries][HEAD_DIM];
@@ -544,7 +551,7 @@ __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* 
     for (int i = threadIdx.x; i < kPromptQueries * HEAD_DIM; i += blockDim.x) {
         const int row = i / HEAD_DIM;
         const int col = i % HEAD_DIM;
-        q_tile[row][col] = __float2half(__bfloat162float(q[(size_t(row) * gridDim.x + head) * HEAD_DIM + col]));
+        q_tile[row][col] = row < active ? __float2half(__bfloat162float(q[(size_t(row) * gridDim.x + head) * HEAD_DIM + col])) : __float2half(0.0f);
         numerator[row][col] = 0.0f;
     }
     if (threadIdx.x < kPromptQueries) {
@@ -553,12 +560,33 @@ __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* 
     }
     __syncthreads();
     for (int base = first; base < end; base += kPromptKeys) {
-        for (int i = threadIdx.x; i < kPromptKeys * HEAD_DIM; i += blockDim.x) {
-            const int pos = base + i / HEAD_DIM;
-            const int col = i % HEAD_DIM;
-            const size_t kv_row = size_t(pos % capacity) * kv_heads + kv_head;
-            k_tile[i / HEAD_DIM][col] = __float2half(pos < end ? prefill_kv_element<Packed>(keys, ks, kv_row, col, scale) : 0.0f);
-            v_tile[i / HEAD_DIM][col] = __float2half(pos < end ? prefill_kv_element<Packed>(values, vs, kv_row, col, scale) : 0.0f);
+        if constexpr (Packed) {
+            constexpr int groups = HEAD_DIM / blaze::kNvfp4Block;
+            for (int i = threadIdx.x; i < kPromptKeys * groups; i += blockDim.x) {
+                const int key = i / groups;
+                const int group = i % groups;
+                const int pos = base + key;
+                const int col = group * blaze::kNvfp4Block;
+                if (pos < end) {
+                    const size_t kv_row = size_t(pos % capacity) * kv_heads + kv_head;
+                    const size_t bytes = kv_row * (HEAD_DIM / 2) + col / 2;
+                    blaze::fa::dequant_block(keys + bytes, ks[kv_row * groups + group], &k_tile[key][col], scale);
+                    blaze::fa::dequant_block(values + bytes, vs[kv_row * groups + group], &v_tile[key][col], scale);
+                } else {
+                    const uint4 zero = {};
+                    auto* k = reinterpret_cast<uint4*>(&k_tile[key][col]);
+                    auto* v = reinterpret_cast<uint4*>(&v_tile[key][col]);
+                    k[0] = k[1] = v[0] = v[1] = zero;
+                }
+            }
+        } else {
+            for (int i = threadIdx.x; i < kPromptKeys * HEAD_DIM; i += blockDim.x) {
+                const int pos = base + i / HEAD_DIM;
+                const int col = i % HEAD_DIM;
+                const size_t kv_row = size_t(pos % capacity) * kv_heads + kv_head;
+                k_tile[i / HEAD_DIM][col] = __float2half(pos < end ? prefill_kv_element<false>(keys, ks, kv_row, col, scale) : 0.0f);
+                v_tile[i / HEAD_DIM][col] = __float2half(pos < end ? prefill_kv_element<false>(values, vs, kv_row, col, scale) : 0.0f);
+            }
         }
         __syncthreads();
         if (warp < kPromptKeys / 16) {
@@ -568,7 +596,7 @@ __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* 
             wmma::fill_fragment(dot, 0.0f);
             for (int k = 0; k < HEAD_DIM; k += 16) {
                 wmma::load_matrix_sync(q_fragment, &q_tile[0][k], HEAD_DIM);
-                wmma::load_matrix_sync(k_fragment, &k_tile[warp * 16][k], HEAD_DIM);
+                wmma::load_matrix_sync(k_fragment, &k_tile[warp * 16][k], leading);
                 wmma::mma_sync(dot, q_fragment, k_fragment, dot);
             }
             wmma::store_matrix_sync(&score[0][warp * 16], dot, kPromptKeys, wmma::mem_row_major);
@@ -576,7 +604,7 @@ __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* 
         __syncthreads();
         for (int row = warp; row < kPromptQueries; row += WARPS) {
             const int distance = start + row - (base + lane);
-            const bool visible = base + lane < end && distance >= 0 && distance < window;
+            const bool visible = row < active && base + lane < end && distance >= 0 && distance < window;
             const float bias = visible && distance < extent
                 ? __bfloat162float(relative[(size_t(row) * gridDim.x + head) * extent + distance]) : 0.0f;
             const float logit = visible ? score[row][lane] * rsqrtf(float(HEAD_DIM)) + bias : -CUDART_INF_F;
@@ -601,7 +629,7 @@ __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* 
             wmma::fill_fragment(accum, 0.0f);
             for (int k = 0; k < kPromptKeys; k += 16) {
                 wmma::load_matrix_sync(p_fragment, &probability[0][k], kPromptKeys);
-                wmma::load_matrix_sync(v_fragment, &v_tile[k][col], HEAD_DIM);
+                wmma::load_matrix_sync(v_fragment, &v_tile[k][col], leading);
                 wmma::mma_sync(accum, p_fragment, v_fragment, accum);
             }
             wmma::store_matrix_sync(&product[0][col], accum, HEAD_DIM, wmma::mem_row_major);
@@ -614,7 +642,7 @@ __global__ void inkling_tensor_attention(const __nv_bfloat16* q, const uint8_t* 
         }
         __syncthreads();
     }
-    for (int row = 0; row < kPromptQueries; ++row) {
+    for (int row = 0; row < active; ++row) {
         auto* part = scratch + ((size_t(row) * gridDim.x + head) * gridDim.y + blockIdx.y) * (HEAD_DIM + 2);
         part[threadIdx.x] = numerator[row][threadIdx.x];
         if (threadIdx.x == 0) {
@@ -689,16 +717,16 @@ extern "C" cudaError_t blz_inkling_prefill_attention(
     const auto* gated = reinterpret_cast<const __nv_bfloat16*>(gate);
     auto* result = reinterpret_cast<__nv_bfloat16*>(out);
     const int valid = start + rows - max(0, start + 1 - window);
-    if (tensor && rows == kPromptQueries && valid >= 128) {
+    if (tensor && rows >= kPromptQueries && valid >= 128) {
         const int span = max(128, ((valid + 256 * kPromptKeys - 1) / (256 * kPromptKeys)) * kPromptKeys);
         const int splits = (valid + span - 1) / span;
-        const dim3 tensor_grid(heads, splits);
+        const dim3 tensor_grid(heads, splits, (rows + kPromptQueries - 1) / kPromptQueries);
         if (ks) {
             inkling_tensor_attention<true><<<tensor_grid, HEAD_DIM, 0, stream>>>(query, keys, values, ks, vs,
-                biases, scratch, kv_heads, capacity, window, start, extent, span, scale);
+                biases, scratch, kv_heads, capacity, window, start, extent, span, rows, scale);
         } else {
             inkling_tensor_attention<false><<<tensor_grid, HEAD_DIM, 0, stream>>>(query, keys, values, nullptr,
-                nullptr, biases, scratch, kv_heads, capacity, window, start, extent, span, scale);
+                nullptr, biases, scratch, kv_heads, capacity, window, start, extent, span, rows, scale);
         }
         const auto err = cudaGetLastError();
         if (err != cudaSuccess) return err;

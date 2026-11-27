@@ -21,3 +21,11 @@ pub enum KvDtype {
     #[value(name = "nvfp4_4over6", alias = "nvfp4-4over6")]
     Nvfp4FourOverSix,
 }
+
+/// Attention implementation used for multi-token Inkling prefill.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PrefillAttention {
+    #[default]
+    Scalar,
+    Tensor,
+}
