@@ -1,7 +1,8 @@
 use super::KvDtype;
 use super::cpu::Routed;
 use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
-use crate::expert_cache::{ExpertResidency, ExpertVisit};
+use crate::expert_cache::{ExpertResidency, ExpertVisit, rank_experts};
+use crate::expert_routes::{RouteGroups, TokenRoute};
 use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, Event, HostMapped, Stream, check};
 use crate::matmul::{Bf16Kernel, Matmul, Mxfp8Rows, Nvfp4Rows};
@@ -423,7 +424,7 @@ impl WideExperts {
 
     fn run(
         &mut self, stream: &Stream, weights: &Experts, pool: &ExpertPool, layer: usize,
-        by_expert: &[Vec<(i32, f32)>], routes: &[Vec<(usize, f32)>], caps: (f32, f32),
+        by_expert: &RouteGroups, routes: &[Vec<(usize, f32)>], caps: (f32, f32),
         input: Option<&DevBuf>, sum: &DevBuf, ids: &DevBuf, probabilities: &DevBuf,
     ) -> Result<()> {
         let tokens = routes.len();
@@ -436,7 +437,7 @@ impl WideExperts {
         let mut gather = Vec::with_capacity(permutation.len());
         let mut tables: [_; 6] = std::array::from_fn(|_| Vec::new());
         let native = self.native_input.as_ref();
-        for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+        for (id, rows) in by_expert.iter() {
             let Some(cached) = pool.residency.get((layer, id)) else { continue };
             for rows in rows.chunks(EXPERT_BATCH) {
                 let begin = gather.len();
@@ -449,9 +450,8 @@ impl WideExperts {
                     cached.gate_up.tile(&pool.buffer, begin, rows.len()),
                     cached.down.tile(&pool.buffer, begin, rows.len()),
                 ]);
-                for &(row, _) in rows {
-                    let slot = routes[row as usize].iter().position(|&(expert, _)| expert == id).unwrap();
-                    permutation[row as usize * top_k + slot] = gather.len() as i32;
+                for &TokenRoute { row, slot, .. } in rows {
+                    permutation[row as usize * top_k + slot as usize] = gather.len() as i32;
                     gather.push(row);
                 }
             }
@@ -1367,8 +1367,8 @@ impl Compute {
         let mut candidates: Vec<_> = pool.residency.cold_scores(next, epoch)
             .filter(|&(_, score)| score >= PROMPT_STAGE_MIN_ROUTES)
             .map(|(id, score)| (std::cmp::Reverse(score), id)).collect();
-        candidates.sort_unstable();
-        let ids: Vec<_> = candidates.into_iter().take(PREFETCH_BANK_EXPERTS).map(|(_, id)| id).collect();
+        let ids: Vec<_> = rank_experts(&mut candidates, PREFETCH_BANK_EXPERTS, Ord::cmp)
+            .iter().map(|&(_, id)| id).collect();
         if ids.is_empty() {
             return Ok(());
         }
@@ -1656,14 +1656,8 @@ impl Compute {
         }
         let hidden = weights.gate_up.cols;
         let intermediate = weights.down.cols;
-        let mut by_expert = vec![Vec::new(); experts];
-        for (row, route) in routes.iter().enumerate() {
-            for &(id, w) in route {
-                by_expert[id].push((row as i32, w));
-            }
-        }
+        let by_expert = RouteGroups::new(routes, experts)?;
         let activations_bf16 = activations.map(|rows| rows.iter().flatten().copied().map(to_bf16).collect::<Vec<_>>());
-        let (ids, probs): (Vec<_>, Vec<_>) = by_expert.iter().flatten().copied().unzip();
         let gather_offset = tokens * hidden;
         let output_bytes = gather_offset * std::mem::size_of::<f32>();
         ensure!(output_bytes <= self.transfer.bytes(), "Inkling expert readback exceeds scratch");
@@ -1674,16 +1668,15 @@ impl Compute {
         self.cache.visits += tokens;
         let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
         let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
-        let all_resident = || by_expert.iter().enumerate()
-            .all(|(id, rows)| rows.is_empty() || pool.residency.get((layer, id)).is_some());
+        let all_resident = || by_expert.iter().all(|(id, _)| pool.residency.get((layer, id)).is_some());
         if self.wide_experts.is_some()
             && routes.iter().all(|route| route.len() == routes[0].len())
             && (all_resident() || (self.cpu.is_some() && self.prompt_stage.is_none()))
         {
-            for (id, _) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            for (id, _) in by_expert.iter() {
                 pool.residency.touch((layer, id), tick);
             }
-            for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            for (id, rows) in by_expert.iter() {
                 pool.use_gpu(ckpt, weights, (layer, id), tick, epoch,
                     self.cpu.is_some().then_some(rows.len()), true, None)?;
             }
@@ -1691,22 +1684,22 @@ impl Compute {
             let activations = if let Some(host) = activations {
                 host
             } else {
-                let mut indices: Vec<_> = by_expert.iter().enumerate()
-                    .filter(|(id, rows)| !rows.is_empty() && pool.residency.get((layer, *id)).is_none())
-                    .flat_map(|(_, rows)| rows.iter().map(|&(row, _)| row)).collect();
+                let mut indices: Vec<_> = by_expert.iter()
+                    .filter(|(id, _)| pool.residency.get((layer, *id)).is_none())
+                    .flat_map(|(_, rows)| rows.iter().map(|route| route.row)).collect();
                 indices.sort_unstable();
                 indices.dedup();
                 fetched = self.read_cold_activations(&indices, tokens, hidden)?;
                 &fetched
             };
             let workers = self.cpu.clone();
-            let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
+            let cold: Vec<_> = (0..experts).map(|_| OnceLock::new()).collect();
             let mut cold_count = 0;
             let mut residual_enqueued = false;
             let mut merge_queued = false;
             let work = prefill_cpu_scope(workers.as_deref(), |scope| -> Result<()> {
                 let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-                for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+                for (id, rows) in by_expert.iter() {
                     if pool.residency.get((layer, id)).is_none() {
                         cold_count += rows.len();
                         dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
@@ -1758,7 +1751,9 @@ impl Compute {
         }
         let activations = activations.ok_or_else(|| anyhow::anyhow!("Inkling retained activations require grouped MoE"))?;
         let activations_bf16 = activations_bf16.unwrap();
-        let cold: Vec<_> = by_expert.iter().map(|_| OnceLock::new()).collect();
+        let (ids, probs): (Vec<_>, Vec<_>) = by_expert.grouped().iter()
+            .map(|route| (route.row, route.probability)).unzip();
+        let cold: Vec<_> = (0..experts).map(|_| OnceLock::new()).collect();
         let mut cold_count = 0usize;
         let work = prefill_cpu_scope(self.cpu.as_deref(), |scope| -> Result<()> {
             self.input.upload_async(&activations_bf16, &self.stream)?;
@@ -1766,7 +1761,7 @@ impl Compute {
             self.scatter_weights.upload_async(&probs, &self.stream)?;
             self.sum.zero(&self.stream)?;
             let mut offset = 0;
-            for (id, rows) in by_expert.iter().enumerate().filter(|(_, rows)| !rows.is_empty()) {
+            for (id, rows) in by_expert.iter() {
                 let start = offset;
                 offset += rows.len();
                 let resident = pool.use_gpu(
@@ -1869,15 +1864,15 @@ type ColdRoute<'a> = (Routed<'a>, &'a [f32], usize, f32);
 type ColdOutput = (usize, f32, Vec<f32>);
 
 fn dispatch_cold<'scope>(
-    ckpt: &'scope Checkpoint, weights: &'scope Experts, id: usize, rows: &'scope [(i32, f32)],
+    ckpt: &'scope Checkpoint, weights: &'scope Experts, id: usize, rows: &'scope [TokenRoute],
     activations: &'scope [Vec<f32>], caps: (f32, f32), result: &'scope OnceLock<Vec<ColdOutput>>,
     scope: Option<&rayon::Scope<'scope>>,
 ) -> Result<()> {
     let expert = Routed::read(ckpt, weights, id)?;
     scope.expect("cold expert without CPU pool").spawn(move |_| {
-        let output = rows.par_iter().map(|&(row, prob)| {
+        let output = rows.par_iter().map(|&TokenRoute { row, probability, .. }| {
             let row = row as usize;
-            (row, prob, expert.run(weights, &activations[row], caps))
+            (row, probability, expert.run(weights, &activations[row], caps))
         }).collect();
         let _ = result.set(output);
     });

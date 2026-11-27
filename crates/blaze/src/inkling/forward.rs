@@ -6,6 +6,7 @@ use super::vision::Vision;
 use super::weights::{Experts, read_float};
 use crate::config::{InklingLoop, MlpConfig, ModelConfig};
 use crate::gpu;
+use crate::layer_walk::LoopResiduals;
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, ensure};
 use rayon::prelude::*;
@@ -334,14 +335,14 @@ impl LoopInputs {
                 controllers.each_ref().map(|c| &c.up)
         {
             if let Some(norms) = norms && gpu.recurrent_batch_limit(width) > 1 {
-                if self.device_messages && (*bank_ready || rows.iter().all(|r| r.messages.len() == 2))
+                if self.device_messages && (*bank_ready || rows.iter().all(|r| r.recurrent.messages().len() == 2))
                 {
                     let bank: Vec<_> = if *bank_ready { Vec::new() } else {
-                        rows.iter().map(|row| row.messages.as_slice()).collect()
+                        rows.iter().map(|row| row.recurrent.messages()).collect()
                     };
                     let scale = (width as f32).sqrt().recip();
                     let prepare = |row: &ForwardRow| std::array::from_fn(|group| {
-                        let logits = [0, 1].map(|i| dot(&row.messages[i], &self.queries[group]) * scale);
+                        let logits = [0, 1].map(|i| dot(&row.recurrent.messages()[i], &self.queries[group]) * scale);
                         let peak = logits[0].max(logits[1]);
                         let exp = logits.map(|v| (v - peak).exp());
                         let sum = (exp[0] + exp[1]).recip();
@@ -364,7 +365,7 @@ impl LoopInputs {
                     }
                 }
                 let prepare = |row: &ForwardRow| {
-                    std::array::from_fn(|i| mix_normalized(&row.messages, &self.queries[i]))
+                    std::array::from_fn(|i| mix_normalized(row.recurrent.messages(), &self.queries[i]))
                 };
                 let messages: Vec<[Vec<f32>; 3]> = if let Some(pool) = workers {
                     pool.install(|| rows.par_iter().map(prepare).collect())
@@ -380,7 +381,7 @@ impl LoopInputs {
             let limit = gpu.controller_batch_limit::<3>(width).max(1);
             for (queries, rows) in qkv.chunks_mut(limit).zip(rows.chunks(limit)) {
                 let messages: Vec<[Vec<f32>; 3]> = rows.iter().map(|row| {
-                    std::array::from_fn(|i| mix_normalized(&row.messages, &self.queries[i]))
+                    std::array::from_fn(|i| mix_normalized(row.recurrent.messages(), &self.queries[i]))
                 }).collect();
                 let inputs: Vec<[Vec<f32>; 3]> = queries.iter().zip(&messages).map(|(qkv, msg)| {
                     std::array::from_fn(|i| Controller::input(&qkv[i], &msg[i], eps))
@@ -394,7 +395,7 @@ impl LoopInputs {
             }
         } else {
             for (qkv, row) in qkv.iter_mut().zip(rows) {
-                self.mix_attention(gpu, qkv, &row.messages, eps)?;
+                self.mix_attention(gpu, qkv, row.recurrent.messages(), eps)?;
             }
         }
         Ok(false)
@@ -1114,25 +1115,12 @@ impl Model {
             let restart = id == self.loops.core.start;
             let end = id == self.loops.core.end;
             let prepare_qkv = |row: &mut ForwardRow| {
-                let ForwardRow {
-                    x,
-                    blocks,
-                    prelude,
-                    messages,
-                } = row;
+                let ForwardRow { x, blocks, recurrent } = row;
                 if restart {
-                    if visit.pass == 0 {
-                        *prelude = Some((x.clone(), blocks.len()));
-                    } else {
-                        let (start, depth) = prelude.as_ref().unwrap();
-                        *messages = blocks[*depth + 1..].to_vec();
-                        messages.push(normalized(x, None, s.eps));
-                        blocks.truncate(*depth);
-                        x.clone_from(start);
-                    }
+                    recurrent.enter(visit.pass, x, blocks, |hidden| normalized(hidden, None, s.eps));
                 }
                 if end {
-                    messages.clear();
+                    recurrent.leave();
                 }
                 let mut qkv = if id == 0 {
                     vec![x.clone()]
@@ -1238,7 +1226,7 @@ impl Model {
             } else {
                 let (qkv, conv) = if let Some((controller, norms)) = recurrent {
                     let x = std::array::from_fn(|i| qkv_rows[0][i].as_slice());
-                    let messages: [_; 3] = std::array::from_fn(|i| mix_normalized(&rows[0].messages, &controller.queries[i]));
+                    let messages: [_; 3] = std::array::from_fn(|i| mix_normalized(rows[0].recurrent.messages(), &controller.queries[i]));
                     let inputs: [_; 3] = std::array::from_fn(|i| Controller::input(x[i], &messages[i], s.eps));
                     let controllers = controller.controllers.first_chunk::<3>().unwrap();
                     let down = controllers.each_ref().map(|c| &c.down);
@@ -1358,7 +1346,7 @@ impl Model {
                     residual.iter_mut().zip(&row.x).for_each(|(v, &x)| *v += x);
                 }
                 let mixed = mix(&row.blocks, &residual, &layer.res_mlp, s.eps).remove(0);
-                let message = controller.map(|c| mix_normalized(&row.messages, &c.queries[3]));
+                let message = controller.map(|c| mix_normalized(row.recurrent.messages(), &c.queries[3]));
                 let activation = if message.is_none() {
                     normalized(&mixed, Some(&layer.norm_mlp), s.eps).into_iter().map(round).collect()
                 } else {
@@ -1526,8 +1514,7 @@ impl Model {
 struct ForwardRow {
     x: Vec<f32>,
     blocks: Vec<Vec<f32>>,
-    prelude: Option<(Vec<f32>, usize)>,
-    messages: Vec<Vec<f32>>,
+    recurrent: LoopResiduals<Vec<f32>>,
 }
 
 impl ForwardRow {
@@ -1535,8 +1522,7 @@ impl ForwardRow {
         Self {
             x,
             blocks: Vec::new(),
-            prelude: None,
-            messages: Vec::new(),
+            recurrent: LoopResiduals::new(),
         }
     }
 }

@@ -25,6 +25,7 @@
 #include "blaze/cpu_engine.h"
 #include "blaze/gpu1_service.h"
 #include "blaze/moe.h"
+#include "blaze/moe_engine.h"
 #include "blaze/store.h"
 
 namespace blaze {
@@ -81,6 +82,8 @@ struct HybridConfig {
   int wide_tokens = 4096;
   int wide_min_tokens = 256;
   int wide_slots = 8;             // streamed records per batch (double-buffered per GPU)
+  blz_group_expert_routes group_routes = nullptr;
+  blz_rank_experts rank_experts = nullptr;
   bool wide_a8 = false;           // wide (prefill) route on 8-bit block-floating inputs: 1 MMA per unit instead of 3
   int cpu_fast_cols = 0;          // CPU items with >= this many columns use the approximate Q8 kernels (0: off)
   // Expert deferral of the CPU tier (decode): layers < defer_last may defer when every CPU route ranks >=

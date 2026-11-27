@@ -79,6 +79,7 @@ struct HybridMoe::Wide {
   int2* tiles_host[2] = {};
   int32_t* route_token_host = nullptr;
   int32_t* route_of_host = nullptr;
+  std::vector<int32_t> route_offsets, route_cursors, grouped_routes;
   // SSD-tier read-ahead: pinned slots and, per GPU, an event per slot recorded after its record left for the device.
   std::vector<uint8_t*> ahead;
   std::vector<cudaEvent_t> ahead_copied[2];
@@ -100,6 +101,9 @@ void HybridMoe::init_wide() {
   w->routes_cap = cfg_.wide_tokens * cfg_.topk;
   w->items_cap = E;
   w->tiles_cap = w->routes_cap / BLZ_WIDE_TILE_COLS + E;
+  w->route_offsets.resize(E + 1);
+  w->route_cursors.resize(E);
+  w->grouped_routes.resize(w->routes_cap);
   const int slots = std::max(1, cfg_.wide_slots);
   for (int g = 0; g < 2; ++g) {
     Wide::Gpu& d = w->gpu[g];
@@ -213,20 +217,24 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
     if (cfg_.wide_a8) check(blz_wide_to_a8(W.gpu[0].x_planes, T, H, stream), "x to a8");
     check(cudaEventSynchronize(W.ids_ready), "ids ready");
 
-    // Routes by expert, in token order.
-    std::vector<int> count(E, 0);
-    for (int r = 0; r < R; ++r) {
-      const int e = W.ids[r];
-      if (e < 0 || e >= E) throw std::runtime_error("expert id out of range");
-      ++count[e];
-    }
-    std::vector<int> start(E + 1, 0);
-    for (int e = 0; e < E; ++e) start[e + 1] = start[e] + count[e];
-    std::vector<int> by_expert(R);
-    {
-      std::vector<int> fill(start.begin(), start.end() - 1);
+    auto& start = W.route_offsets;
+    auto& fill = W.route_cursors;
+    auto& by_expert = W.grouped_routes;
+    if (cfg_.group_routes) {
+      if (cfg_.group_routes(W.ids, R, E, start.data(), fill.data(), by_expert.data()) != 0)
+        throw std::runtime_error("expert id out of range");
+    } else {
+      std::fill(start.begin(), start.end(), 0);
+      for (int r = 0; r < R; ++r) {
+        const int e = W.ids[r];
+        if (e < 0 || e >= E) throw std::runtime_error("expert id out of range");
+        ++start[e + 1];
+      }
+      for (int e = 0; e < E; ++e) start[e + 1] += start[e];
+      std::copy_n(start.begin(), E, fill.begin());
       for (int r = 0; r < R; ++r) by_expert[fill[W.ids[r]]++] = r;
     }
+    const auto count = [&](int e) { return start[e + 1] - start[e]; };
 
     std::unique_lock<std::mutex> lock(swap_mu_);
     // Experts per GPU: resident ones first, then the streamed RAM experts.
@@ -237,40 +245,40 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
     };
     std::vector<Item> res[2], ram;
     for (int e = 0; e < E; ++e) {
-      if (count[e] == 0) continue;
+      if (count(e) == 0) continue;
       const size_t i = size_t(layer) * E + e;
       const Tier t = placement_.tier[i];
       const int slot = placement_.slot[i];
       if (t == Tier::kGpu0) res[0].push_back({e, false, gpu_slot(Tier::kGpu0, slot)});
       else if (t == Tier::kGpu1) res[1].push_back({e, false, gpu_slot(Tier::kGpu1, slot)});
       else ram.push_back({e, true, host_records_[i]});
-      prefill_routes_[i] += uint32_t(count[e]);
+      prefill_routes_[i] += uint32_t(count(e));
     }
     // Split the RAM experts. Each GPU's time ~ max(its link's host -> device bytes, its compute); GPU1's y comes back
     // over GPU0's host -> device direction (the same one GPU0 streams on), x goes to GPU1 over GPU1's.
     const double rec_us = double(stride_) / kLinkBytesPerUs, y_us = double(H) * 2 / kLinkBytesPerUs;
     double link[2] = {0, 0}, comp[2] = {0, 0};
     for (int g = 0; g < 2; ++g)
-      for (const Item& it : res[g]) comp[g] += kUsPerRoute * count[it.e];
+      for (const Item& it : res[g]) comp[g] += kUsPerRoute * count(it.e);
     if (has_gpu1) {
       link[1] += double(T) * H * 2 / kLinkBytesPerUs;
-      for (const Item& it : res[1]) link[0] += y_us * count[it.e];
+      for (const Item& it : res[1]) link[0] += y_us * count(it.e);
     }
-    std::sort(ram.begin(), ram.end(), [&](const Item& a, const Item& b) { return count[a.e] > count[b.e]; });
+    std::sort(ram.begin(), ram.end(), [&](const Item& a, const Item& b) { return count(a.e) > count(b.e); });
     std::vector<Item> streamed[2];
     for (const Item& it : ram) {
-      const double c = kUsPerRoute * count[it.e];
+      const double c = kUsPerRoute * count(it.e);
       int best = 0;
       if (has_gpu1) {
         const double t0 = std::max(link[0] + rec_us, comp[0] + c);
         const double t1 = std::max(link[1] + rec_us, comp[1] + c);
-        const double t0_if1 = std::max(link[0] + y_us * count[it.e], comp[0]);  // GPU0 also imports GPU1's y
+        const double t0_if1 = std::max(link[0] + y_us * count(it.e), comp[0]);  // GPU0 also imports GPU1's y
         best = std::max(t1, t0_if1) < std::max(t0, std::max(link[1], comp[1])) ? 1 : 0;
       }
       if (best == 0) {
         link[0] += rec_us, comp[0] += c;
       } else {
-        link[1] += rec_us, comp[1] += c, link[0] += y_us * count[it.e];
+        link[1] += rec_us, comp[1] += c, link[0] += y_us * count(it.e);
       }
       streamed[best].push_back(it);
     }
@@ -290,7 +298,7 @@ cudaError_t HybridMoe::wide_pass(int layer, const uint16_t* x, int T, const int3
         const bool is_streamed = pass == 1;
         Batch* b = nullptr;
         for (const Item& it : list) {
-          const int c = count[it.e];
+          const int c = count(it.e);
           if (!b || b->routes + c > kBatchRoutes || (is_streamed && b->items == slots)) {
             batches[g].push_back({n_items, 0, n_tiles, 0, next_route, 0, is_streamed, is_streamed ? half : 0});
             if (is_streamed) half ^= 1;

@@ -8,10 +8,12 @@ pub struct MoeEngine(*mut sys::blz_moe_engine);
 unsafe impl Send for MoeEngine {}
 
 impl MoeEngine {
-    pub(crate) unsafe fn create(config: &sys::blz_moe_engine_config) -> Result<Self> {
+    pub(crate) unsafe fn create(mut config: sys::blz_moe_engine_config) -> Result<Self> {
+        config.group_routes = Some(crate::expert_routes::group_route_ids);
+        config.rank_experts = Some(crate::expert_cache::rank_expert_ids);
         let mut engine = null_mut();
         let mut error = [0 as std::ffi::c_char; 1024];
-        if unsafe { sys::blz_moe_engine_create(config, &mut engine, error.as_mut_ptr(), error.len()) } != 0 {
+        if unsafe { sys::blz_moe_engine_create(&config, &mut engine, error.as_mut_ptr(), error.len()) } != 0 {
             let message = unsafe { std::ffi::CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
             bail!("MoE engine: {message}");
         }

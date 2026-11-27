@@ -26,13 +26,15 @@ extern "C" int blz_moe_engine_create(const blz_moe_engine_config* c, blz_moe_eng
     cfg.cpu_threads = c->cpu_threads;
     if (c->cpu_cores && *c->cpu_cores) cfg.cpu_cores = blaze::cpu::parse_cpu_list(c->cpu_cores);
     cfg.load_threads = 16;
+    cfg.group_routes = c->group_routes;
+    cfg.rank_experts = c->rank_experts;
     cfg.swap = blaze::parse_swap_options(c->swap_options ? c->swap_options : "");
     if (c->heat_path) cfg.swap.heat_path = c->heat_path;
     blaze::apply_hybrid_options(c->options ? c->options : "", cfg);
-    auto* e = new blz_moe_engine;
+    auto e = std::make_unique<blz_moe_engine>();
     e->moe = std::make_unique<blaze::HybridMoe>(cfg);
     e->topk = cfg.topk;
-    *out = e;
+    *out = e.release();
     return 0;
   } catch (const std::exception& ex) {
     if (err && err_len) std::snprintf(err, err_len, "%s", ex.what());

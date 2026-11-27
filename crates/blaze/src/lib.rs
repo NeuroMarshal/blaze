@@ -12,6 +12,7 @@ pub mod drafter;
 pub mod eagle;
 pub mod engine;
 mod expert_cache;
+mod expert_routes;
 mod expert_runtime;
 pub mod gpu;
 mod graph;

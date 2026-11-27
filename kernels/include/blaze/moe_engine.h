@@ -12,6 +12,11 @@ extern "C" {
 
 typedef struct blz_moe_engine blz_moe_engine;
 
+typedef int (*blz_group_expert_routes)(const int32_t* ids, size_t routes, size_t experts, int32_t* offsets,
+                                      int32_t* cursors, int32_t* grouped);
+typedef size_t (*blz_rank_experts)(size_t* ids, size_t count, const double* scores, size_t experts,
+                                  size_t limit, int hottest);
+
 typedef struct {
   const char* model_dir;      // checkpoint directory (NVFP4 experts read as stored)
   int topk;                   // routed experts per token
@@ -25,6 +30,8 @@ typedef struct {
   const char* heat_path;      // routing profile file (initial placement, saved periodically); NULL: none
   const char* swap_options;   // "key=value,..." of the swap engine (blaze/hybrid.h); NULL: defaults
   const char* options;        // "key=value,..." runtime options (blaze/hybrid.h); NULL: defaults
+  blz_group_expert_routes group_routes;
+  blz_rank_experts rank_experts;
 } blz_moe_engine_config;
 
 /// \brief Build the engine (loads every expert into its tier). On failure returns nonzero and writes a message.

@@ -1845,12 +1845,14 @@ impl Model {
             heat_path: heat.as_ref().map_or(null(), |h| h.as_ptr()),
             swap_options: null(),
             options: options.as_ptr(),
+            group_routes: None,
+            rank_experts: None,
         };
         let free_before = free;
         let stage = logging::stage(format!("routed experts → GPU{gpu0}{} slots, pinned RAM{} ({threads} CPU expert workers)",
                                            if gpu1 >= 0 { format!(" + GPU{gpu1}") } else { String::new() },
                                            if self.opts.moe_ram_gib >= 0.0 { ", SSD" } else { "" }));
-        let engine = unsafe { MoeEngine::create(&cfg) }?;
+        let engine = unsafe { MoeEngine::create(cfg) }?;
         let free_after = crate::gpu::mem_info()?.0;
         let gib_of = |b: usize| b as f64 / (1u64 << 30) as f64;
         stage.done(format!(

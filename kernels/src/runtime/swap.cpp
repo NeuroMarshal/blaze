@@ -28,7 +28,12 @@ void check(cudaError_t e, const char* what) {
 }
 
 // The `count` indices of `idx` with the highest (hot) or lowest (cold) score, best first.
-void select(std::vector<size_t>& idx, const std::vector<double>& score, size_t count, bool hot) {
+void select(std::vector<size_t>& idx, const std::vector<double>& score, size_t count, bool hot,
+            blz_rank_experts rank) {
+  if (rank) {
+    idx.resize(rank(idx.data(), idx.size(), score.data(), score.size(), count, hot));
+    return;
+  }
   count = std::min(count, idx.size());
   auto better = [&](size_t a, size_t b) { return hot ? score[a] > score[b] : score[a] < score[b]; };
   std::partial_sort(idx.begin(), idx.begin() + ptrdiff_t(count), idx.end(), better);
@@ -259,8 +264,8 @@ void HybridMoe::swap_gpu_ram(int max_moves) {
     if (t == Tier::kRam) hot.push_back(i);
     else if (t == Tier::kGpu0 || t == Tier::kGpu1) cold.push_back(i);
   }
-  select(hot, score_, size_t(max_moves), true);
-  select(cold, score_, size_t(max_moves), false);
+  select(hot, score_, size_t(max_moves), true, cfg_.rank_experts);
+  select(cold, score_, size_t(max_moves), false, cfg_.rank_experts);
   struct Move {
     size_t a, b;
     Tier gt;
@@ -353,8 +358,8 @@ void HybridMoe::swap_ram_ssd(int max_moves) {
     if (t == Tier::kSsd && !loading_[i]) hot.push_back(i);
     else if (t == Tier::kRam) cold.push_back(i);
   }
-  select(hot, score_long_, size_t(max_moves), true);
-  select(cold, score_long_, size_t(max_moves), false);
+  select(hot, score_long_, size_t(max_moves), true, cfg_.rank_experts);
+  select(cold, score_long_, size_t(max_moves), false, cfg_.rank_experts);
   std::vector<SsdLoad*> queued;
   std::vector<std::pair<int32_t*, int32_t>> writes;
   for (size_t k = 0; k < std::min(hot.size(), cold.size()); ++k) {
