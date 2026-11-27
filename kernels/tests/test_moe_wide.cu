@@ -91,10 +91,10 @@ struct Layer {
   std::vector<float> w;
 };
 
-Layer make_layer(int T, int K, int E, double zipf, std::mt19937& rng) {
+Layer make_layer(int T, int K, int E, int hidden, double zipf, std::mt19937& rng) {
   Layer l{T, K};
   std::normal_distribution<float> nd(0, 1);
-  l.x.resize(size_t(T) * 2560);
+  l.x.resize(size_t(T) * hidden);
   for (auto& v : l.x) v = canon::bf16_rn(nd(rng));
   std::vector<double> p(E);
   for (int e = 0; e < E; ++e) p[e] = 1.0 / std::pow(e + 1.0, zipf);
@@ -234,7 +234,7 @@ int main() {
   {
     Bank bank = make_bank(expert::kFlashNext, 24, rng);
     for (int T : {1, 5, 37, 70}) {
-      Layer l = make_layer(T, 10, bank.n, 0.8, rng);
+      Layer l = make_layer(T, 10, bank.n, bank.geo.hidden, 0.8, rng);
       const std::vector<uint16_t> ref = reference(bank, T, 10, l.x, l.ids, l.w);
       for (int batches : {1, 3}) {
         double ms;
@@ -272,7 +272,7 @@ int main() {
     // Throughput: 128 resident experts, prefill-sized token counts.
     Bank bank = make_bank(expert::kFlashNext, 128, rng);
     for (int T : {512, 2048, 4096}) {
-      Layer l = make_layer(T, 10, bank.n, 0.5, rng);
+      Layer l = make_layer(T, 10, bank.n, bank.geo.hidden, 0.5, rng);
       double ms;
       const double flops = 2.0 * T * 10 * (2.0 * 640 * 2560 + 2560.0 * 640);
       for (bool a8 : {false, true}) {
@@ -281,6 +281,18 @@ int main() {
                     a8 ? "a8   " : "exact", ms, T / (ms / 1000.0), flops / (ms / 1000.0) / 1e12);
       }
     }
+    cudaFree(bank.dev), cudaFree(bank.dmult);
+  }
+  {
+    constexpr int tokens = 5, top_k = 8;
+    Bank bank = make_bank({7168, 2048}, top_k, rng);
+    Layer layer = make_layer(tokens, top_k, bank.n, bank.geo.hidden, 0.8, rng);
+    const auto expected = reference(bank, tokens, top_k, layer.x, layer.ids, layer.w);
+    double ms;
+    const auto actual = run_wide(bank, layer, plan_layer(bank, layer, 3), 0, &ms);
+    const bool matches = actual == expected;
+    std::printf("7168x2048, top-k 8: %s\n", matches ? "matches the reference" : "differs from the reference");
+    fail += !matches;
     cudaFree(bank.dev), cudaFree(bank.dmult);
   }
   std::printf(fail ? "FAILED\n" : "PASSED\n");
