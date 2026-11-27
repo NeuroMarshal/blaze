@@ -51,6 +51,7 @@ enum Reply {
     },
     Done {
         content: String,
+        calls: Vec<Value>,
         reasoning: String,
         prompt: usize,
         tokens: usize,
@@ -179,8 +180,6 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
         return Err(bad_param("messages", "messages must be a nonempty array"));
     }
     if let Some(param) = [
-        "tools",
-        "tool_choice",
         "stop",
         "response_format",
         "logit_bias",
@@ -196,6 +195,18 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
     }
     if body.get("n").is_some_and(|v| !v.is_null() && v.as_u64() != Some(1)) {
         return Err(bad_param("n", "the Inkling runner generates one choice"));
+    }
+    if !body["tools"].is_null() && !body["tools"].is_array() {
+        return Err(bad_param("tools", "tools must be an array"));
+    }
+    let choice = &body["tool_choice"];
+    if !choice.is_null() && !matches!(choice.as_str(), Some("auto" | "none")) {
+        return Err(bad_param("tool_choice", "Inkling supports auto and none"));
+    }
+    let hide_tools = choice == "none";
+    let mut body = body;
+    if hide_tools {
+        body["tools"] = Value::Null;
     }
     let urls = media::image_parts(&body)?;
     if !st.vision && !urls.is_empty() {
@@ -258,7 +269,14 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
                         let delta = if reasoning { json!({"reasoning_content":text}) } else { json!({"content":text}) };
                         yield Ok(chunk(delta, None));
                     }
-                    Reply::Done { reason, .. } => { yield Ok(chunk(json!({}), Some(reason))); break; }
+                    Reply::Done { reason, calls, .. } => {
+                        for (index, mut call) in calls.into_iter().enumerate() {
+                            call["index"] = index.into();
+                            yield Ok(chunk(json!({"tool_calls":[call]}), None));
+                        }
+                        yield Ok(chunk(json!({}), Some(reason)));
+                        break;
+                    }
                     Reply::Error(message) => { yield Ok(Event::default().data(json!({"error":{"message":message}}).to_string())); break; }
                 }
             }
@@ -269,12 +287,19 @@ async fn chat(State(st): State<Arc<StateData>>, Json(body): Json<Value>) -> Chec
     match rx.recv().await {
         Some(Reply::Done {
             content,
+            calls,
             reasoning,
             prompt,
             tokens,
             reason,
         }) => {
             let mut message = json!({"role":"assistant","content":content});
+            if !calls.is_empty() {
+                if message["content"] == "" {
+                    message["content"] = Value::Null;
+                }
+                message["tool_calls"] = calls.into();
+            }
             if !reasoning.is_empty() {
                 message["reasoning_content"] = reasoning.into();
             }
@@ -309,7 +334,10 @@ fn run_job(model: &mut Model, text: &Text, path: &std::path::Path, media: &media
         .collect::<Result<Vec<_>>>()?;
     let input = tokenize_prompt(model, text, &prompt, &images)?;
     let max_tokens = job.max_tokens.min(model.context().saturating_sub(input.len()));
-    let mut decoder = Output::new(text)?;
+    let names = job.body["tools"].as_array().into_iter().flatten()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    let mut decoder = Output::new(text, names)?;
     let cpu_before = model.cpu_expert_routes();
     let result = generate(
         model,
@@ -343,17 +371,25 @@ fn run_job(model: &mut Model, text: &Text, path: &std::path::Path, media: &media
         result.decode_elapsed.as_secs_f64(),
         model.cpu_expert_routes() - cpu_before
     );
+    let reason = if !decoder.calls.is_empty() { "tool_calls" }
+        else if result.stop { "stop" } else { "length" };
     Ok(Reply::Done {
         content: decoder.content,
+        calls: decoder.calls,
         reasoning: decoder.thinking,
         prompt: input.len(),
         tokens: result.ids.len(),
-        reason: if result.stop { "stop" } else { "length" },
+        reason,
     })
 }
 
 struct Output<'a> {
     text: &'a Text,
+    invoke: u32,
+    names: Vec<&'a str>,
+    calls: Vec<Value>,
+    header: bool,
+    invocation: bool,
     begin_reason: u32,
     begin_text: u32,
     end: u32,
@@ -365,13 +401,18 @@ struct Output<'a> {
 }
 
 impl<'a> Output<'a> {
-    fn new(text: &'a Text) -> Result<Self> {
+    fn new(text: &'a Text, names: Vec<&'a str>) -> Result<Self> {
         let id = |token| {
             text.token_id(token)
                 .with_context(|| format!("Inkling tokenizer is missing {token}"))
         };
         Ok(Self {
             text,
+            invoke: id("<|content_invoke_tool_json|>")?,
+            names,
+            calls: Vec::new(),
+            header: false,
+            invocation: false,
             begin_reason: id("<|content_thinking|>")?,
             begin_text: id("<|content_text|>")?,
             end: id("<|end_message|>")?,
@@ -384,15 +425,38 @@ impl<'a> Output<'a> {
     }
 
     fn push(&mut self, id: u32) -> Option<(String, bool)> {
-        if id == self.model {
+        if id == self.invoke {
+            self.pending.clear();
+            self.header = false;
+            self.invocation = true;
             return None;
         }
+        if self.invocation {
+            if id == self.end {
+                self.finish_call();
+            } else {
+                self.pending.extend(self.text.token_bytes(id));
+            }
+            return None;
+        }
+        if id == self.model {
+            let last = self.flush();
+            self.header = !self.names.is_empty();
+            return last;
+        }
         if id == self.begin_reason || id == self.begin_text || id == self.end {
+            if self.header {
+                self.pending.clear();
+                self.header = false;
+            }
             let last = self.flush();
             self.reasoning = id == self.begin_reason;
             return last;
         }
         self.pending.extend(self.text.token_bytes(id));
+        if self.header {
+            return None;
+        }
         match std::str::from_utf8(&self.pending) {
             Ok(_) => self.flush(),
             Err(e) if e.error_len().is_some() => self.flush(),
@@ -400,8 +464,25 @@ impl<'a> Output<'a> {
         }
     }
 
+    fn finish_call(&mut self) {
+        if let Ok(call) = serde_json::from_slice::<Value>(&self.pending)
+            && let Some(name) = call["name"].as_str()
+            && self.names.contains(&name)
+            && call["args"].is_object()
+        {
+            self.calls.push(json!({
+                "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
+                "type": "function",
+                "function": {"name": name, "arguments": call["args"].to_string()},
+            }));
+        }
+        self.pending.clear();
+        self.invocation = false;
+        self.reasoning = false;
+    }
+
     fn flush(&mut self) -> Option<(String, bool)> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() || self.invocation || self.header {
             return None;
         }
         let text = String::from_utf8_lossy(&self.pending).into_owned();

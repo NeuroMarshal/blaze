@@ -48,6 +48,14 @@ pub fn render_chat(model: &Path, body: &Value) -> Result<String> {
     let markers = regex::Regex::new(r"\{%(-?)\s*(?:end)?generation\s*(-?)%\}")?;
     let source = markers.replace_all(&source, "{%$1 set _unused = none $2%}");
     let mut env = minijinja::Environment::new();
+    env.add_filter("tojson", |value: minijinja::Value, options: minijinja::value::Kwargs| -> Result<String, minijinja::Error> {
+        let _: Option<bool> = options.get("sort_keys")?;
+        let _: Option<minijinja::Value> = options.get("separators")?;
+        options.assert_all_used()?;
+        serde_json::to_string(&value).map_err(|err| {
+            minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, err.to_string())
+        })
+    });
     env.add_function("raise_exception", |message: String| -> Result<(), minijinja::Error> {
         Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message))
     });
