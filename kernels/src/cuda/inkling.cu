@@ -8,26 +8,6 @@
 
 namespace {
 
-__global__ void softcapped_swiglu(const __nv_bfloat162* gate_up, __nv_bfloat16* out,
-                                  int n, float gate_cap, float up_cap) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float2 x = __bfloat1622float2(gate_up[i]);
-    const float gate = gate_cap * tanhf(x.x / gate_cap);
-    const float up = up_cap * tanhf(x.y / up_cap);
-    out[i] = __float2bfloat16(gate * up / (1.0f + expf(-x.x)));
-}
-
-__global__ void reduce_experts(const __nv_bfloat16* rows, const float* weights, float* out, int width, int experts) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (col >= width) return;
-    float sum = 0.0f;
-    for (int expert = 0; expert < experts; ++expert) {
-        sum = fmaf(__bfloat162float(rows[size_t(expert) * width + col]), weights[expert], sum);
-    }
-    out[col] = sum;
-}
-
 __global__ void controller_up(const __nv_bfloat16* hidden, const __nv_bfloat16* w0,
                               const __nv_bfloat16* w1, const __nv_bfloat16* w2, float* out, int rows) {
     const int group = blockIdx.y;
@@ -191,20 +171,6 @@ extern "C" cudaError_t blz_inkling_controller_up(const uint16_t* hidden, const u
     controller_up<<<dim3((rows + 15) / 16, groups, tokens), 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(hidden), reinterpret_cast<const __nv_bfloat16*>(w0),
         reinterpret_cast<const __nv_bfloat16*>(w1), reinterpret_cast<const __nv_bfloat16*>(w2), out, rows);
-    return cudaGetLastError();
-}
-
-extern "C" cudaError_t blz_inkling_swiglu(const uint16_t* gate_up, uint16_t* out, int n,
-                                          float gate_cap, float up_cap, cudaStream_t stream) {
-    softcapped_swiglu<<<(n + 127) / 128, 128, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat162*>(gate_up), reinterpret_cast<__nv_bfloat16*>(out), n, gate_cap, up_cap);
-    return cudaGetLastError();
-}
-
-extern "C" cudaError_t blz_inkling_reduce_experts(const uint16_t* rows, const float* weights, float* out,
-                                                int width, int experts, cudaStream_t stream) {
-    reduce_experts<<<(width + 127) / 128, 128, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(rows), weights, out, width, experts);
     return cudaGetLastError();
 }
 
@@ -728,19 +694,19 @@ __global__ void residual_conv(const __nv_bfloat16* raw, const __nv_bfloat16* pre
     out[index] = previous ? value + __bfloat162float(previous[index]) : value;
 }
 
-__global__ void mlp_residual_conv(const float* routed, const float* residual, const __nv_bfloat16* history,
+__global__ void mlp_residual_conv(const __nv_bfloat16* routed, const float* residual, const __nv_bfloat16* history,
         const float* weights, __nv_bfloat16* output, __nv_bfloat16* tail, int width, int taps,
         int history_rows, int tail_rows, float scale) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y;
     if (col >= width) return;
     const size_t index = size_t(row) * width + col;
-    const auto current = __float2bfloat16(routed[index]);
+    const auto current = routed[index];
     const int lag_count = min(taps, history_rows + row + 1);
     float value = __bfloat162float(current);
     for (int lag = 0; lag < lag_count; ++lag) {
         const int source = row - lag;
-        const auto raw = source >= 0 ? __float2bfloat16(routed[size_t(source) * width + col])
+        const auto raw = source >= 0 ? routed[size_t(source) * width + col]
                                      : history[size_t(history_rows + source) * width + col];
         value = __fadd_rn(value, __fmul_rn(__bfloat162float(raw), weights[lag * width + col]));
     }
@@ -751,12 +717,13 @@ __global__ void mlp_residual_conv(const float* routed, const float* residual, co
 
 } // namespace
 
-extern "C" cudaError_t blz_inkling_mlp_residual_conv(const float* routed, const float* residual,
+extern "C" cudaError_t blz_inkling_mlp_residual_conv(const uint16_t* routed, const float* residual,
         const uint16_t* history, const float* weights, uint16_t* output, uint16_t* tail,
         int width, int taps, int history_rows, int rows, int tail_rows, float scale, cudaStream_t stream) {
     if (width < 1 || taps < 1 || history_rows < 0 || history_rows >= taps || rows < 1 || rows > 65535
         || tail_rows < 0 || tail_rows > rows) return cudaErrorInvalidValue;
-    mlp_residual_conv<<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(routed, residual,
+    mlp_residual_conv<<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(routed), residual,
         reinterpret_cast<const __nv_bfloat16*>(history), weights, reinterpret_cast<__nv_bfloat16*>(output),
         reinterpret_cast<__nv_bfloat16*>(tail), width, taps, history_rows, tail_rows, scale);
     return cudaGetLastError();
@@ -903,45 +870,5 @@ extern "C" cudaError_t blz_inkling_vision_residual(uint16_t* state, const uint16
     vision_residual<<<(n + 255) / 256, 256, 0, stream>>>(reinterpret_cast<__nv_bfloat162*>(state),
         reinterpret_cast<const __nv_bfloat162*>(x), reinterpret_cast<const __nv_bfloat162*>(bias),
         reinterpret_cast<const __nv_bfloat162*>(scale), n, hidden / 2);
-    return cudaGetLastError();
-}
-
-namespace {
-__global__ void scatter_expert(const __nv_bfloat16* input, float* output, const int32_t* ids,
-                               const float* weights, int hidden) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row = blockIdx.y;
-    if (col < hidden) {
-        float& dst = output[ids[row] * hidden + col];
-        dst = fmaf(__bfloat162float(input[row * hidden + col]), weights[row], dst);
-    }
-}
-
-__global__ void merge_cold_experts(const float* input, float* output, const int* tokens,
-        const int* offsets, const float* weights, int width) {
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int index = blockIdx.y;
-    if (col >= width) return;
-    auto& sum = output[size_t(tokens[index]) * width + col];
-    float value = sum;
-    for (int i = offsets[index]; i < offsets[index + 1]; ++i) {
-        value = __fadd_rn(value, __fmul_rn(input[size_t(i) * width + col], weights[i]));
-    }
-    sum = value;
-}
-} // namespace
-
-extern "C" cudaError_t blz_inkling_merge_cold(const float* input, float* output, const int32_t* tokens,
-    const int32_t* offsets, const float* weights, int rows, int width, cudaStream_t stream) {
-    if (rows < 1 || rows > 65535 || width < 1) return cudaErrorInvalidValue;
-    merge_cold_experts<<<dim3((width + 255) / 256, rows), 256, 0, stream>>>(
-        input, output, tokens, offsets, weights, width);
-    return cudaGetLastError();
-}
-
-extern "C" cudaError_t blz_inkling_expert_scatter(const uint16_t* input, float* output, const int32_t* ids,
-                                                 const float* weights, int rows, int hidden, cudaStream_t stream) {
-    scatter_expert<<<dim3((hidden + 255) / 256, rows), 256, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(input), output, ids, weights, hidden);
     return cudaGetLastError();
 }

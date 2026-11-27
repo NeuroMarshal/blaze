@@ -33,44 +33,6 @@ pub(crate) fn group_by_expert<T: Copy>(
     true
 }
 
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TokenRoute {
-    pub row: i32,
-    pub slot: u32,
-    pub probability: f32,
-}
-
-pub(crate) struct RouteGroups {
-    offsets: Vec<i32>,
-    grouped: Vec<TokenRoute>,
-}
-
-impl RouteGroups {
-    pub fn new(routes: &[Vec<(usize, f32)>], experts: usize) -> anyhow::Result<Self> {
-        let mut offsets = vec![0; experts + 1];
-        let mut cursors = vec![0; experts];
-        let mut grouped = vec![TokenRoute::default(); routes.iter().map(Vec::len).sum()];
-        let routes = routes.iter().enumerate().flat_map(|(row, routes)| {
-            routes.iter().enumerate().map(move |(slot, &(expert, probability))| {
-                (expert, TokenRoute { row: row as i32, slot: slot as u32, probability })
-            })
-        });
-        anyhow::ensure!(group_by_expert(routes, &mut offsets, &mut cursors, &mut grouped), "invalid expert route");
-        Ok(Self { offsets, grouped })
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &[TokenRoute])> {
-        self.offsets.windows(2).enumerate().filter_map(|(expert, bounds)| {
-            let (start, end) = (bounds[0] as usize, bounds[1] as usize);
-            (start != end).then_some((expert, &self.grouped[start..end]))
-        })
-    }
-
-    pub fn grouped(&self) -> &[TokenRoute] {
-        &self.grouped
-    }
-}
-
 pub(crate) unsafe extern "C" fn group_route_ids(
     ids: *const i32, routes: usize, experts: usize, offsets: *mut i32, cursors: *mut i32,
     grouped: *mut i32,

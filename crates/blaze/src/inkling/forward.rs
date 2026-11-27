@@ -1,6 +1,6 @@
 use super::{KvDtype, cpu};
 use super::dspark::{Cache as DraftCache, Draft, Features};
-use super::cuda::{AttentionClip, AttentionConv, AttentionResidual, AttentionRow, AttentionScratch, Compute, Dense, Kv, MlpResidual, MoeOutput, ProjectionInputs, RecurrentMessages, expert_size, from_bf16, prefill_attention_rows, prompt_stage_bytes, to_bf16};
+use super::cuda::{AttentionClip, AttentionConv, AttentionResidual, AttentionRow, AttentionScratch, Compute, Dense, Kv, MlpResidual, MoeOutput, ProjectionInputs, RecurrentMessages, from_bf16, prefill_attention_rows, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
 use super::weights::{Experts, read_float};
@@ -712,7 +712,7 @@ pub struct Model {
     query_final: Vec<f32>,
     devices: Vec<Device>,
     placement: Vec<usize>,
-    expert_layers: Option<Vec<usize>>,
+    expert_layers: Vec<usize>,
     context: usize,
     global_kv_host: bool,
     kv_dtype: KvDtype,
@@ -795,21 +795,18 @@ impl Model {
         };
         loaded.sort_unstable_by_key(|(id, _)| *id);
         let layers: Vec<_> = loaded.into_iter().map(|(_, layer)| layer).collect();
-        let packed = std::env::var_os("BLAZE_INKLING_HYBRID_MOE").is_some_and(|value| value == "1");
         let mut layer_map = vec![0; layers.len()];
         let mut expert_layout: Vec<_> = (0..layers.len()).collect();
         expert_layout.sort_by_key(|&layer| placement[layer]);
         for (index, &layer) in expert_layout.iter().enumerate() {
             layer_map[layer] = index;
         }
-        let store = packed.then(|| {
-            ensure!(s.hidden.is_multiple_of(16) && s.intermediate.is_multiple_of(16)
-                && s.top_k <= 16, "Inkling does not support this HybridMoe geometry");
-            let threads = std::thread::available_parallelism().map_or(1, usize::from)
-                .min(if gpus == 1 { 4 } else { 12 });
-            expert_rg16::cached_store(&ckpt, &expert_layout, s.experts, s.hidden, s.intermediate, threads,
-                |layer, expert, out| layers[layer].experts.to_rg16(&ckpt, expert, out))
-        }).transpose()?;
+        ensure!(s.hidden.is_multiple_of(16) && s.intermediate.is_multiple_of(16)
+            && s.top_k <= 16, "Inkling does not support this HybridMoe geometry");
+        let threads = std::thread::available_parallelism().map_or(1, usize::from)
+            .min(if gpus == 1 { 4 } else { 12 });
+        let store = expert_rg16::cached_store(&ckpt, &expert_layout, s.experts, s.hidden, s.intermediate, threads,
+            |layer, expert, out| layers[layer].experts.to_rg16(&ckpt, expert, out))?;
         let last_device = *placement.last().unwrap();
         gpu::set_device(device + last_device as i32)?;
         let head = Dense::load(&ckpt, "model.llm.unembed.weight", s.vocab, s.hidden)?;
@@ -843,28 +840,14 @@ impl Model {
             let id = device + rank as i32;
             gpu::set_device(id)?;
             let scratch = AttentionScratch::new(s.heads, s.kv_heads, s.extent, s.relative, prefill_chunk, s.conv)?;
-            let mut sizes = [0; 2];
-            let mut visits = [0; 2];
             let mut kv_bytes = 0usize;
-            let mut all_experts = 0usize;
-            let mut expert_layer_count = 0;
-            for (layer, &assigned) in layers.iter().zip(&placement) {
-                if assigned == rank {
-                    expert_layer_count += 1;
-                    if !packed {
-                        all_experts += expert_size(&layer.experts) * s.experts;
-                    }
-                }
-            }
-            if packed {
-                all_experts = expert_rg16::record_bytes(s.hidden, s.intermediate) * s.experts * expert_layer_count;
-            }
+            let expert_layer_count = placement.iter().filter(|&&assigned| assigned == rank).count();
+            let all_experts = expert_rg16::record_bytes(s.hidden, s.intermediate) * s.experts * expert_layer_count;
             for visit in &loops.visits {
                 if placement[visit.layer] != rank {
                     continue;
                 }
                 let layer = &layers[visit.layer];
-                let packing = layer.experts.gate_up.packing as usize;
                 let slots = if layer.local {
                     (loops.window + prefill_attention_rows(prefill_chunk).saturating_sub(1).max(dspark_tokens)).min(context)
                 } else if host_kv {
@@ -873,8 +856,6 @@ impl Model {
                     context
                 };
                 kv_bytes += slots * Kv::row_bytes(s.kv_heads, kv_dtype) * 2;
-                sizes[packing] = sizes[packing].max(expert_size(&layer.experts));
-                visits[packing] += 1;
             }
             let vision_reserve = if rank == last_device && vision.is_some() {
                 max_image_tokens * 4 * 32768
@@ -883,7 +864,7 @@ impl Model {
             };
             let (free, _) = gpu::mem_info()?;
             let draft_reserve = if draft.is_some() && rank == last_device { DraftCache::bytes(context, kv_dtype) } else { 0 };
-            let reserve = (512 << 20) + vision_reserve + draft_reserve + prompt_stage_bytes(sizes, prefill_chunk, cpu.is_some());
+            let reserve = (512 << 20) + vision_reserve + draft_reserve;
             let max_experts = free.saturating_sub(kv_bytes).saturating_sub(reserve).min(all_experts);
             let expert_bytes = if expert_cache_mib == 0 {
                 max_experts
@@ -903,22 +884,17 @@ impl Model {
                 s.vocab.max((layers[0].query.rows + 2 * (s.kv_width() + s.kv_heads * s.conv)) * prefill_chunk
                     + 2 * s.kv_width() * (s.conv - 1)),
                 s.hidden,
-                s.intermediate,
-                if packed { 0 } else { expert_bytes },
-                if packed { [0; 2] } else { sizes },
-                if packed { [0; 2] } else { visits },
-                s.top_k,
                 prefill_chunk,
                 cpu.clone(),
             )?;
-            if let Some(store) = &store {
-                let end = expert_layer_start + expert_layer_count;
-                let threads = cpu.as_ref().map_or(1, |pool| pool.current_num_threads().div_ceil(gpus));
-                let engine = MoeEngine::packed(store, expert_layer_start..end, id, expert_bytes, s.top_k,
-                    threads, prefill_chunk, expert_threads.is_none() && expert_bytes < all_experts, (s.gate_cap, s.up_cap))?;
-                compute.attach_expert_engine(engine, s.hidden, prefill_chunk)?;
-                expert_layer_start = end;
-            }
+            let end = expert_layer_start + expert_layer_count;
+            let threads = cpu.as_ref().map_or(1, |pool| pool.current_num_threads().div_ceil(gpus));
+            let all_resident = expert_bytes >= all_experts;
+            let stream_gpu_only = expert_threads.is_none() && !all_resident;
+            let engine = MoeEngine::packed(&store, expert_layer_start..end, id, expert_bytes, s.top_k,
+                threads, prefill_chunk, stream_gpu_only, all_resident, (s.gate_cap, s.up_cap))?;
+            compute.attach_expert_engine(engine, s.hidden, prefill_chunk, !stream_gpu_only)?;
+            expert_layer_start = end;
             devices.push(Device { id, compute, scratch });
         }
         let norm_embed = read_float(&ckpt, "model.llm.embed_norm.weight", &[s.hidden])?;
@@ -937,7 +913,7 @@ impl Model {
             query_final,
             devices,
             placement,
-            expert_layers: packed.then_some(layer_map),
+            expert_layers: layer_map,
             context,
             global_kv_host: host_kv,
             kv_dtype,
@@ -1133,12 +1109,6 @@ impl Model {
             let layer = &self.layers[id];
             let workers = if self.parallel_prefill && rows.len() >= 128
                 && !matches!(readout, Readout::Verify(_)) { compute.host_workers() } else { None };
-            if !matches!(readout, Readout::Verify(_))
-                && let Some(next) = self.loops.visits.get(index + 1)
-                && self.placement[next.layer] == rank
-            {
-                compute.prefetch_experts(&self.ckpt, &self.layers[next.layer].experts, id, next.layer, rows.len())?;
-            }
             let mut residuals = Vec::with_capacity(rows.len());
             let mut activations = Vec::with_capacity(rows.len());
             let mut q_inputs = Vec::with_capacity(rows.len());
@@ -1460,31 +1430,22 @@ impl Model {
                 weights, history, residuals: &residuals, taps: s.conv,
                 tail: state.mlp.rows.len().min(count), scale: layer.mlp_conv.scale,
             });
-            let moe = if let Some(layers) = &self.expert_layers {
-                compute.hybrid_moe(layers[id], (!retain_activations).then_some(activations.as_slice()),
-                    &routes, s.hidden, s.top_k, matches!(readout, Readout::Verify(_)))?
-            } else if matches!(readout, Readout::Verify(_)) {
-                let mut output = Vec::with_capacity(rows.len()*s.hidden);
-                for (x, route) in activations.iter().zip(&routes) {
-                    output.extend(compute.moe(&self.ckpt,&layer.experts,id,x,route,s.gate_cap,s.up_cap)?);
-                }
-                MoeOutput::Routed(output)
-            } else { compute.moe_batch(
-                &self.ckpt,
-                &layer.experts,
-                id,
+            let verify = matches!(readout, Readout::Verify(_));
+            let moe = compute.moe(
+                self.expert_layers[id],
                 (!retain_activations).then_some(activations.as_slice()),
                 &routes,
-                (s.gate_cap, s.up_cap),
-                s.experts,
-                finish,
-            )? };
+                s.hidden,
+                s.top_k,
+                verify,
+                finish.filter(|_| !verify),
+            )?;
             phase(3);
             match moe {
-                MoeOutput::Routed(mut moe) => {
-                    for (offset, ((row, residual), moe)) in rows.iter_mut().zip(residuals).zip(moe.chunks_exact_mut(s.hidden)).enumerate() {
-                        moe.iter_mut().for_each(|v| *v = round(*v));
-                        let mlp = layer.mlp_conv.run(&mut state.mlp, moe, None, seq.position + offset, s.dim);
+                MoeOutput::Routed(moe) => {
+                    for (offset, ((row, residual), moe)) in rows.iter_mut().zip(residuals).zip(moe.chunks_exact(s.hidden)).enumerate() {
+                        let moe: Vec<_> = moe.iter().copied().map(from_bf16).collect();
+                        let mlp = layer.mlp_conv.run(&mut state.mlp, &moe, None, seq.position + offset, s.dim);
                         row.x = residual.into_iter().zip(mlp).map(|(a, b)| round(a + b)).collect();
                     }
                 }
@@ -1698,7 +1659,8 @@ mod tests {
             let residual: Vec<_> = previous[start * width..(start + count) * width].iter().copied()
                 .map(|v| from_bf16(v) - 0.029).collect();
             let history_rows = mlp.bf16_history(start, taps);
-            let input = DevBuf::from_slice(&routed).unwrap();
+            let rounded = routed.iter().copied().map(to_bf16).collect::<Vec<_>>();
+            let input = DevBuf::from_slice(&rounded).unwrap();
             let skip = DevBuf::from_slice(&residual).unwrap();
             let history = DevBuf::from_slice(&history_rows).unwrap();
             let output = DevBuf::new(count * width * 2).unwrap();
@@ -1709,7 +1671,6 @@ mod tests {
                     count as i32, count as i32, conv.scale, stream.0)
             }, "prefill MLP residual parity").unwrap();
             stream.sync().unwrap();
-            let rounded = routed.iter().copied().map(to_bf16).collect::<Vec<_>>();
             let expected: Vec<_> = rounded.chunks_exact(width).zip(residual.chunks_exact(width))
                 .enumerate().flat_map(|(i, (row, skip))| {
                     let input = row.iter().copied().map(from_bf16).collect::<Vec<_>>();

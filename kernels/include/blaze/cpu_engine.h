@@ -68,6 +68,7 @@ class Engine {
   /// \brief Telemetry: summed request time (pickup to done) in ns, and items served.
   uint64_t busy_ns() const { return busy_ns_.load(std::memory_order_relaxed); }
   uint64_t items() const { return items_.load(std::memory_order_relaxed); }
+  uint64_t routes() const { return routes_.load(std::memory_order_relaxed); }
   /// \brief Workers taking part in requests now (all of them unless tune_threads).
   int active_workers() const { return active_.load(std::memory_order_relaxed); }
 
@@ -115,6 +116,7 @@ class Engine {
   std::atomic<uint64_t> served_{0};
   std::atomic<uint64_t> busy_ns_{0};
   std::atomic<uint64_t> items_{0};
+  std::atomic<uint64_t> routes_{0};
 };
 
 }  // namespace blaze::cpu

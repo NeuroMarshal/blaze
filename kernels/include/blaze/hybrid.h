@@ -147,6 +147,7 @@ class HybridMoe {
 
   /// \brief Current placement (changes while the swap engine runs; read it with the engine stopped or for logs).
   const Placement& placement() const { return placement_; }
+  uint64_t cpu_routes() const { return cpu_->routes(); }
   const ExpertStore& store() const { return *store_; }
   int num_layers() const { return store_->num_layers(); }
   int num_experts() const { return store_->num_experts(); }

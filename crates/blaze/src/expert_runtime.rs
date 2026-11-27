@@ -26,15 +26,20 @@ impl MoeEngine {
         unsafe { sys::blz_moe_engine_layers(self.0) }
     }
 
+    pub(crate) fn cpu_routes(&self) -> u64 {
+        unsafe { sys::blz_moe_engine_cpu_routes(self.0) }
+    }
+
     pub(crate) fn packed(
         directory: &Path, layers: Range<usize>, device: i32, budget: usize, top_k: usize,
-        threads: usize, chunk: usize, stream_gpu_only: bool, caps: (f32, f32),
+        threads: usize, chunk: usize, stream_gpu_only: bool, all_resident: bool, caps: (f32, f32),
     ) -> Result<Self> {
         let model_dir = CString::new(directory.as_os_str().as_encoded_bytes())?;
         let heat = directory.join(format!("heat-{}-{}.bin", layers.start, layers.end));
         let heat = CString::new(heat.as_os_str().as_encoded_bytes())?;
         let wide_min = if stream_gpu_only { 1 } else { chunk.clamp(32, 256) };
-        let options = CString::new(format!("layers={}-{},wide_tokens={chunk},wide_min_tokens={wide_min}",
+        let wide_a8 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_A8").is_some_and(|v| v == "1"));
+        let options = CString::new(format!("layers={}-{},wide_tokens={chunk},wide_min_tokens={wide_min},wide_a8={wide_a8}",
             layers.start, layers.end))?;
         unsafe {
             Self::create(sys::blz_moe_engine_config {
@@ -48,7 +53,7 @@ impl MoeEngine {
                 cpu_threads: threads as i32,
                 cpu_cores: std::ptr::null(),
                 heat_path: heat.as_ptr(),
-                swap_options: std::ptr::null(),
+                swap_options: if all_resident { c"enabled=0".as_ptr() } else { std::ptr::null() },
                 options: options.as_ptr(),
                 group_routes: None,
                 rank_experts: None,

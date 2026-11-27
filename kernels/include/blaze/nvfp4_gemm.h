@@ -10,8 +10,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
-struct blz_moe_matrix_tile;
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -20,9 +18,6 @@ extern "C" {
 /// [m]. k a multiple of 16.
 cudaError_t blz_nvfp4_quant_rows(const uint16_t* x, int64_t ldx, int m, int k, uint8_t* codes, uint8_t* scales,
                                  float* row_scale, cudaStream_t stream);
-cudaError_t blz_nvfp4_quant_residual(const uint16_t* x, int64_t ldx, int m, int k,
-    const uint8_t* first_codes, const uint8_t* first_scales, const float* first_row_scale,
-    uint8_t* codes, uint8_t* scales, float* row_scale, cudaStream_t stream);
 
 /// \brief 1 when the W4A4 GEMM runs on the current GPU (built for its architecture-specific variant, SM120a).
 int blz_nvfp4_gemm_w4a4_supported(void);
@@ -32,9 +27,6 @@ int blz_nvfp4_gemm_w4a4_supported(void);
 cudaError_t blz_nvfp4_gemm_w4a4(const uint8_t* x_codes, const uint8_t* x_scales, const float* x_row_scale,
                                 const uint8_t* w_codes, const uint8_t* w_scales, const float* w_alpha, uint16_t* y,
                                 int64_t ldy, int m, int n, int k, cudaStream_t stream);
-cudaError_t blz_nvfp4_grouped_w4a4(const uint8_t* xc, const uint8_t* xs, const float* xr,
-    const uint8_t* xc2, const uint8_t* xs2, const float* xr2, const struct blz_moe_matrix_tile* items,
-    uint16_t* y, int count, int n, int k, cudaStream_t stream);
 
 /// \brief W4A16 on the FP16 tensor cores (SM80+): x16 [m, k] FP16 rows times 2^-shift (blz_nvfp4_f16_rows), the
 /// weight's block scales taken times 2^-wshift (its largest to <= 1); FP16 accumulation within 128 values of K, FP32

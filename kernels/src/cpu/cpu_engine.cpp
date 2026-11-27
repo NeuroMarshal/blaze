@@ -217,6 +217,11 @@ bool Engine::poll_request(Job& job) {
     job.item_record[i] = static_cast<const uint8_t*>(staging_[n_ssd++]);
     for (int c = 0; c < job.n_chunks; ++c) job.chunk_ready[size_t(i) * job.n_chunks + c].store(0, std::memory_order_relaxed);
   }
+  if (cfg_.gate_cap > 0) {
+    uint64_t routes = 0;
+    for (int i = 0; i < int(n); ++i) routes += job.items[i].ncols;
+    routes_.fetch_add(routes, std::memory_order_relaxed);
+  }
   // Processing order: immediate items (plan numbers them first) before deferred ones; RAM before SSD within each.
   job.n_imm = std::min(std::max(int(hdr->n_imm), 0), int(n));
   {

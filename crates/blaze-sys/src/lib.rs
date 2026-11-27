@@ -447,16 +447,6 @@ unsafe extern "C" {
     pub fn blz_nvfp4_quant_rows(x: *const u16, ldx: i64, m: c_int, k: c_int, codes: *mut u8, scales: *mut u8, row_scale: *mut f32,
                                 s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_w4a4_supported() -> c_int;
-    pub fn blz_nvfp4_quant_residual(x: *const u16, ldx: i64, m: c_int, k: c_int,
-        first_codes: *const u8, first_scales: *const u8, first_row_scale: *const f32,
-        codes: *mut u8, scales: *mut u8, row_scale: *mut f32, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_nvfp4_grouped_w4a4(xc: *const u8, xs: *const u8, xr: *const f32,
-        xc2: *const u8, xs2: *const u8, xr2: *const f32, items: *const blz_moe_matrix_tile,
-        y: *mut u16, count: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_mxfp8_quant_rows(input: *const u16, codes: *mut u8, scales: *mut u8,
-        rows: c_int, inner: c_int, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_mxfp8_grouped_native(input: *const u8, scales: *const u8, tiles: *const blz_moe_matrix_tile,
-        output: *mut u16, count: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_f16(x16: *const u16, shift: *const i32, w_codes: *const u8, w_scales: *const u8, w_alpha: *const f32,
                               wshift: c_int, y: *mut u16, ldy: i64, m: c_int, n: c_int, k: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn blz_nvfp4_gemm_w4a4(x_codes: *const u8, x_scales: *const u8, x_row_scale: *const f32, w_codes: *const u8, w_scales: *const u8,
@@ -530,6 +520,7 @@ unsafe extern "C" {
                                  err_len: usize) -> c_int;
     pub fn blz_moe_engine_destroy(e: *mut blz_moe_engine);
     pub fn blz_moe_engine_layers(e: *const blz_moe_engine) -> c_int;
+    pub fn blz_moe_engine_cpu_routes(e: *const blz_moe_engine) -> u64;
     pub fn blz_moe_engine_forward(e: *mut blz_moe_engine, layer: c_int, x: *const bf16, tokens: c_int, ids: *const i32,
                                   w: *const f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
 }
@@ -608,10 +599,6 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn blz_inkling_swiglu(gate_up: *const u16, out: *mut u16, n: c_int, gate_cap: f32, up_cap: f32,
-                             stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_inkling_reduce_experts(rows: *const u16, weights: *const f32, out: *mut f32,
-                                      width: c_int, experts: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_qkv(gates: *const f32, x: *const f32, msg: *const f32, norms: *const f32,
                                       out: *mut u16, width: c_int, tokens: c_int, projection_stride: c_int, eps: f32,
                                       stream: cudaStream_t) -> cudaError_t;
@@ -625,37 +612,9 @@ unsafe extern "C" {
                                      cols: c_int, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_up(hidden: *const u16, w0: *const u16, w1: *const u16, w2: *const u16,
                                      out: *mut f32, rows: c_int, groups: c_int, tokens: c_int, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_inkling_grouped_nvfp4(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,
-                                     y: *mut u16, experts: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_inkling_grouped_mxfp8(x: *const u16, x_step: i64, pool: *const u8, matrices: *const blz_inkling_matrix,
-                                     y: *mut u16, experts: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct blz_inkling_matrix {
-    pub codes: u64,
-    pub scales: u64,
-    pub alpha: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct blz_moe_matrix_tile {
-    pub codes: *const u8,
-    pub scales: *const u8,
-    pub alpha: *const f32,
-    pub begin: i32,
-    pub rows: i32,
 }
 
 unsafe extern "C" {
-    pub fn blz_moe_grouped_nvfp4(x: *const u16, tiles: *const blz_moe_matrix_tile, out: *mut u16,
-        count: c_int, row_class: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_moe_grouped_mxfp8(x: *const u16, tiles: *const blz_moe_matrix_tile, out: *mut u16,
-        count: c_int, row_class: c_int, n: c_int, k: c_int, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_wide_combine_f32(route_of: *const i32, weights: *const f32, results: *const u16,
-        tokens: c_int, topk: c_int, hidden: c_int, out: *mut f32, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_attention(q: *const u16, keys: *const u8, values: *const u8, key_scales: *const u8,
                                  value_scales: *const u8, relative: *const u16, sinks: *const u16,
                                  gate: *const u16, out: *mut u16, scratch: *mut f32, heads: c_int,
@@ -676,11 +635,9 @@ unsafe extern "C" {
         stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_residual_conv(raw: *const u16, previous: *const u16, weights: *const f32, out: *mut f32,
         width: c_int, taps: c_int, history: c_int, rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_inkling_mlp_residual_conv(routed: *const f32, residual: *const f32, history: *const u16,
+    pub fn blz_inkling_mlp_residual_conv(routed: *const u16, residual: *const f32, history: *const u16,
         weights: *const f32, output: *mut u16, tail: *mut u16, width: c_int, taps: c_int,
         history_rows: c_int, rows: c_int, tail_rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
-    pub fn blz_inkling_merge_cold(input: *const f32, output: *mut f32, tokens: *const i32, offsets: *const i32,
-        weights: *const f32, rows: c_int, width: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_dspark_attention(q: *const u16, stride: c_int, rows: c_int, keys: *const u8, values: *const u8,
                                 ks: *const u8, vs: *const u8, sinks: *const u16, gate: *const u16,
                                 out: *mut u16, scratch: *mut f32, heads: c_int, kv_heads: c_int, capacity: c_int,
@@ -697,9 +654,4 @@ unsafe extern "C" {
                                   w: c_int, merge: c_int, heads: c_int, rows: c_int, dim: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_vision_residual(state: *mut u16, x: *const u16, bias: *const u16, scale: *const u16,
                                        rows: c_int, hidden: c_int, stream: cudaStream_t) -> cudaError_t;
-}
-
-unsafe extern "C" {
-    pub fn blz_inkling_expert_scatter(input: *const u16, output: *mut f32, ids: *const i32, weights: *const f32,
-                                     rows: c_int, hidden: c_int, stream: cudaStream_t) -> cudaError_t;
 }

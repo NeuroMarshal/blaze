@@ -1,20 +1,15 @@
 use super::KvDtype;
-use super::cpu::Routed;
-use super::weights::{ExpertSlice, Experts, PackedMatrix, Packing};
-use crate::expert_cache::{ExpertResidency, ExpertVisit, rank_experts};
-use crate::expert_routes::{RouteGroups, TokenRoute};
 use crate::expert_runtime::MoeEngine;
 use crate::graph::{Capture, CudaGraph};
-use crate::gpu::{DevBuf, Event, HostMapped, Stream, check};
-use crate::matmul::{Bf16Kernel, Matmul, Mxfp8Rows, Nvfp4Rows};
+use crate::gpu::{DevBuf, HostMapped, Stream, check};
+use crate::matmul::{Bf16Kernel, Matmul};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, ensure};
 use blaze_sys as sys;
-use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 pub(super) struct Dense {
     weight: DevBuf,
@@ -104,442 +99,6 @@ impl Dense {
     }
 }
 
-struct OnDevice {
-    offset: usize,
-    scale_offset: usize,
-    alpha_offset: usize,
-    packing: Packing,
-    rows: usize,
-    cols: usize,
-}
-
-impl OnDevice {
-    fn layout(offset: usize, matrix: &PackedMatrix, data: &ExpertSlice<'_>) -> Result<Self> {
-        let scale_offset = offset + data.codes.len();
-        let alpha_offset = scale_offset + data.scales.len();
-        ensure!(data.alpha.is_none() || alpha_offset.is_multiple_of(4), "Inkling NVFP4 expert scale alignment");
-        Ok(Self { offset, scale_offset, alpha_offset, packing: matrix.packing, rows: matrix.rows, cols: matrix.cols })
-    }
-
-    fn stage(host: &mut [u8], offset: usize, matrix: &PackedMatrix, data: ExpertSlice<'_>) -> Result<Self> {
-        let layout = Self::layout(offset, matrix, &data)?;
-        host[offset..layout.scale_offset].copy_from_slice(data.codes);
-        host[layout.scale_offset..layout.alpha_offset].copy_from_slice(data.scales);
-        if let Some(alpha) = data.alpha {
-            for dst in host[layout.alpha_offset..layout.alpha_offset + 4 * matrix.rows].chunks_exact_mut(4) {
-                dst.copy_from_slice(&alpha.to_ne_bytes());
-            }
-        }
-        Ok(layout)
-    }
-
-    fn store(buffer: &DevBuf, offset: usize, matrix: &PackedMatrix, data: ExpertSlice<'_>) -> Result<Self> {
-        let layout = Self::layout(offset, matrix, &data)?;
-        buffer.upload_at(offset, data.codes)?;
-        buffer.upload_at(layout.scale_offset, data.scales)?;
-        if let Some(alpha) = data.alpha {
-            buffer.upload_at(layout.alpha_offset, &vec![alpha; matrix.rows])?;
-        }
-        Ok(layout)
-    }
-
-    fn run(&self, buffer: &DevBuf, x: *const u16, out: *mut u16, m: usize, stream: &Stream) -> Result<()> {
-        let codes = buffer.at(self.offset);
-        let scales = buffer.at(self.scale_offset);
-        let product = Matmul {
-            input: x, output: out, rows: m, columns: self.rows, inner: self.cols,
-            input_stride: self.cols, output_stride: self.rows,
-        };
-        unsafe {
-            match self.packing {
-                Packing::Nvfp4 => product.nvfp4(codes, scales, buffer.at(self.alpha_offset / 4), 0, 0, stream),
-                Packing::Mxfp8 => product.mxfp8(codes, scales, 0, 0, stream),
-            }
-        }
-    }
-
-    fn offsets(&self) -> sys::blz_inkling_matrix {
-        sys::blz_inkling_matrix {
-            codes: self.offset as u64,
-            scales: self.scale_offset as u64,
-            alpha: self.alpha_offset as u64,
-        }
-    }
-
-    fn tile(&self, buffer: &DevBuf, begin: usize, rows: usize) -> sys::blz_moe_matrix_tile {
-        sys::blz_moe_matrix_tile {
-            codes: buffer.at(self.offset),
-            scales: buffer.at(self.scale_offset),
-            alpha: match self.packing {
-                Packing::Nvfp4 => buffer.at(self.alpha_offset / 4),
-                Packing::Mxfp8 => std::ptr::null(),
-            },
-            begin: begin as i32,
-            rows: rows as i32,
-        }
-    }
-}
-
-const PROMPT_STAGE_SLOTS: usize = 2;
-const PROMPT_STAGE_MIN_ROUTES: usize = 8;
-const PREFETCH_MIN_ROWS: usize = 512;
-const PREFETCH_BANK_EXPERTS: usize = 8;
-
-fn prompt_prefetch_enabled(prefill_chunk: usize) -> bool {
-    prefill_chunk >= PREFETCH_MIN_ROWS
-        && std::env::var_os("BLAZE_INKLING_PREFETCH_EXPERTS").is_some_and(|value| value == "1")
-}
-
-pub(super) fn prompt_stage_bytes(expert_sizes: [usize; 2], prefill_chunk: usize, cpu: bool) -> usize {
-    if cpu && prefill_chunk >= 64
-        && std::env::var_os("BLAZE_INKLING_STAGE_PREFILL_EXPERTS").is_some_and(|value| value == "1")
-    {
-        let banks = usize::from(prompt_prefetch_enabled(prefill_chunk)) * 2 * PREFETCH_BANK_EXPERTS;
-        (PROMPT_STAGE_SLOTS + banks) * expert_sizes.into_iter().max().unwrap()
-    } else { 0 }
-}
-
-struct PromptSlot {
-    host: HostMapped,
-    device: DevBuf,
-    uploaded: Event,
-    consumed: Event,
-    copied: bool,
-    consumed_in_flight: bool,
-}
-
-impl PromptSlot {
-    fn new(bytes: usize) -> Result<Self> {
-        Ok(Self {
-            host: HostMapped::new(bytes)?,
-            device: DevBuf::new(bytes)?,
-            uploaded: Event::new()?,
-            consumed: Event::new()?,
-            copied: false,
-            consumed_in_flight: false,
-        })
-    }
-
-    fn load(&mut self, copy: &Stream, compute: &Stream, ckpt: &Checkpoint, weights: &Experts,
-            id: usize) -> Result<(OnDevice, OnDevice)> {
-        let mut records = self.upload(copy, ckpt, weights, &[id])?;
-        self.wait(compute)?;
-        Ok(records.pop().unwrap())
-    }
-
-    fn upload(&mut self, copy: &Stream, ckpt: &Checkpoint, weights: &Experts,
-              ids: &[usize]) -> Result<Vec<(OnDevice, OnDevice)>> {
-        if self.copied {
-            check(unsafe { sys::cudaEventSynchronize(self.uploaded.0) }, "Inkling staging host reuse")?;
-        }
-        if self.consumed_in_flight {
-            check(unsafe { sys::cudaStreamWaitEvent(copy.0, self.consumed.0, 0) }, "Inkling staging device reuse")?;
-        }
-        let stride = expert_size(weights);
-        let bytes = stride * ids.len();
-        ensure!(bytes > 0 && bytes <= self.device.bytes(), "Inkling expert bank exceeds scratch");
-        let host = self.host.host_slice_mut();
-        let down_at = weights.gate_up.gpu_bytes().next_multiple_of(64);
-        let records = ids.iter().enumerate().map(|(i, &id)| {
-            let start = i * stride;
-            let gate = OnDevice::stage(host, start, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
-            let down = OnDevice::stage(host, start + down_at, &weights.down, weights.down.expert(ckpt, id)?)?;
-            Ok((gate, down))
-        }).collect::<Result<_>>()?;
-        check(unsafe {
-            sys::cudaMemcpyAsync(self.device.ptr(), self.host.host_ptr(), bytes, sys::MEMCPY_H2D, copy.0)
-        }, "Inkling prompt expert upload")?;
-        if let Err(error) = check(unsafe { sys::cudaEventRecord(self.uploaded.0, copy.0) }, "Inkling prompt expert ready") {
-            let _ = copy.sync();
-            return Err(error);
-        }
-        self.copied = true;
-        Ok(records)
-    }
-
-    fn wait(&self, compute: &Stream) -> Result<()> {
-        check(unsafe { sys::cudaStreamWaitEvent(compute.0, self.uploaded.0, 0) }, "Inkling prompt expert wait")
-    }
-
-    fn release(&mut self, stream: &Stream) -> Result<()> {
-        check(unsafe { sys::cudaEventRecord(self.consumed.0, stream.0) }, "Inkling prompt expert consumed")?;
-        self.consumed_in_flight = true;
-        Ok(())
-    }
-}
-
-struct PromptStage {
-    copy: Stream,
-    prefetch: Option<Stream>,
-    slots: [PromptSlot; PROMPT_STAGE_SLOTS],
-    next: usize,
-    banks: Vec<PromptBank>,
-}
-
-struct PromptBank {
-    layer: Option<usize>,
-    slot: PromptSlot,
-    experts: HashMap<usize, (OnDevice, OnDevice)>,
-}
-
-impl PromptStage {
-    fn new(bytes: usize, prefetch: bool) -> Result<Self> {
-        let banks = (0..2).filter(|_| prefetch).map(|_| {
-            Ok(PromptBank { layer: None, slot: PromptSlot::new(bytes * PREFETCH_BANK_EXPERTS)?, experts: HashMap::new() })
-        }).collect::<Result<_>>()?;
-        Ok(Self {
-            copy: Stream::new()?,
-            prefetch: prefetch.then(Stream::new).transpose()?,
-            slots: [PromptSlot::new(bytes)?, PromptSlot::new(bytes)?],
-            next: 0,
-            banks,
-        })
-    }
-}
-
-type GroupedExpertGemv = unsafe extern "C" fn(
-    *const u16, i64, *const u8, *const sys::blz_inkling_matrix, *mut u16, i32, i32, i32, sys::cudaStream_t,
-) -> sys::cudaError_t;
-
-struct DeviceExpert {
-    gate_up: OnDevice,
-    down: OnDevice,
-}
-
-struct ExpertPool {
-    buffer: DevBuf,
-    stride: usize,
-    residency: ExpertResidency<DeviceExpert>,
-}
-
-impl ExpertPool {
-    fn new(bytes: usize, stride: usize) -> Result<Self> {
-        let slots = bytes / stride;
-        Ok(Self {
-            buffer: DevBuf::new(slots * stride)?,
-            stride,
-            residency: ExpertResidency::new(slots),
-        })
-    }
-
-    fn use_gpu(
-        &mut self,
-        ckpt: &Checkpoint,
-        weights: &Experts,
-        key: (usize, usize),
-        tick: usize,
-        epoch: usize,
-        observations: Option<usize>,
-        preserve_group: bool,
-        pending: Option<&Stream>,
-    ) -> Result<bool> {
-        let visit = ExpertVisit { tick, epoch, observations, preserve_group };
-        self.residency.admit(key, visit, || pending.map_or(Ok(()), Stream::sync), |slot| {
-            let id = key.1;
-            let offset = slot * self.stride;
-            let gate_up = OnDevice::store(&self.buffer, offset, &weights.gate_up, weights.gate_up.expert(ckpt, id)?)?;
-            let down_offset = offset + weights.gate_up.gpu_bytes().next_multiple_of(64);
-            let down = OnDevice::store(&self.buffer, down_offset, &weights.down, weights.down.expert(ckpt, id)?)?;
-            Ok(DeviceExpert { gate_up, down })
-        })
-    }
-}
-
-pub(super) fn expert_size(weights: &Experts) -> usize {
-    weights.gate_up.gpu_bytes().next_multiple_of(64) + weights.down.gpu_bytes().next_multiple_of(64)
-}
-
-struct ExpertCache {
-    pools: [Option<ExpertPool>; 2],
-    generation: usize,
-    visits: usize,
-}
-
-impl ExpertCache {
-    fn new(byte_limit: usize, sizes: [usize; 2], layers: [usize; 2], top_k: usize) -> Result<Self> {
-        let minimum = (sizes[0] + sizes[1]) * top_k;
-        ensure!(
-            byte_limit >= minimum,
-            "Inkling expert cache needs at least {} MiB for one route per format",
-            minimum.div_ceil(1 << 20)
-        );
-        let mut pools = [None, None];
-        let total = layers[0] * sizes[0] + layers[1] * sizes[1];
-        for i in 0..2 {
-            if sizes[i] > 0 {
-                let budget = sizes[i] * top_k + (byte_limit - minimum) * (layers[i] * sizes[i]) / total;
-                pools[i] = Some(ExpertPool::new(budget, sizes[i])?);
-            }
-        }
-        Ok(Self {
-            pools,
-            generation: 0,
-            visits: 0,
-        })
-    }
-}
-
-const EXPERT_BATCH: usize = 64;
-const MAX_DEVICE_COLD_ROUTES: usize = 64;
-const WIDE_ROW_CLASSES: [usize; 5] = [8, 16, 32, 48, EXPERT_BATCH];
-
-struct WideExperts {
-    input: DevBuf,
-    gate: DevBuf,
-    activation: DevBuf,
-    output: DevBuf,
-    route_of: DevBuf,
-    tiles: DevBuf,
-    staging: HostMapped,
-    mlp_staging: Option<HostMapped>,
-    cold_staging: Option<HostMapped>,
-    activation_input: Option<DevBuf>,
-    native_input: Option<DevBuf>,
-}
-
-impl WideExperts {
-    fn new(tokens: usize, top_k: usize, hidden: usize, inter: usize) -> Result<Self> {
-        let routes = tokens * top_k;
-        let tile_bytes = 2 * routes * std::mem::size_of::<sys::blz_moe_matrix_tile>();
-        let device_residual = std::env::var_os("BLAZE_INKLING_DEVICE_MLP_RESIDUAL").is_some_and(|value| value == "1");
-        Ok(Self {
-            input: DevBuf::new(routes * hidden * 2)?,
-            gate: DevBuf::new(routes * inter * 4)?,
-            activation: DevBuf::new(routes * inter * 2)?,
-            output: DevBuf::new(routes * hidden * 2)?,
-            route_of: DevBuf::new(routes * 4)?,
-            tiles: DevBuf::new(tile_bytes)?,
-            staging: HostMapped::new(tile_bytes.next_multiple_of(16) + routes * 12)?,
-            mlp_staging: device_residual.then(|| HostMapped::new(tokens * hidden * 6)).transpose()?,
-            cold_staging: device_residual
-                .then(|| HostMapped::new((MAX_DEVICE_COLD_ROUTES * (hidden + 3) + 1) * 4)).transpose()?,
-            activation_input: std::env::var_os("BLAZE_INKLING_PARALLEL_PREFILL")
-                .is_some_and(|value| value == "1")
-                .then(|| DevBuf::new(tokens * hidden * 2)).transpose()?,
-            native_input: (std::env::var_os("BLAZE_INKLING_NATIVE_MOE").is_some_and(|value| value == "1")
-                && Nvfp4Rows::supported())
-                .then(|| DevBuf::new(2 * Nvfp4Rows::bytes(routes, hidden.max(inter)).next_multiple_of(64)))
-                .transpose()?,
-        })
-    }
-
-    fn run(
-        &mut self, stream: &Stream, weights: &Experts, pool: &ExpertPool, layer: usize,
-        by_expert: &RouteGroups, routes: &[Vec<(usize, f32)>], caps: (f32, f32),
-        input: Option<&DevBuf>, sum: &DevBuf, ids: &DevBuf, probabilities: &DevBuf,
-    ) -> Result<()> {
-        let tokens = routes.len();
-        let top_k = routes[0].len();
-        let hidden = weights.down.rows;
-        let inter = weights.down.cols;
-        let input = input.or(self.activation_input.as_ref())
-            .ok_or_else(|| anyhow::anyhow!("Inkling grouped activations are unavailable"))?;
-        let mut permutation = vec![-1i32; tokens * top_k];
-        let mut gather = Vec::with_capacity(permutation.len());
-        let mut tables: [_; 6] = std::array::from_fn(|_| Vec::new());
-        let native = self.native_input.as_ref();
-        for (id, rows) in by_expert.iter() {
-            let Some(cached) = pool.residency.get((layer, id)) else { continue };
-            for rows in rows.chunks(EXPERT_BATCH) {
-                let begin = gather.len();
-                let class = if native.is_some() && rows.len() >= 32 {
-                    WIDE_ROW_CLASSES.len()
-                } else {
-                    WIDE_ROW_CLASSES.iter().position(|&max| rows.len() <= max).unwrap()
-                };
-                tables[class].push([
-                    cached.gate_up.tile(&pool.buffer, begin, rows.len()),
-                    cached.down.tile(&pool.buffer, begin, rows.len()),
-                ]);
-                for &TokenRoute { row, slot, .. } in rows {
-                    permutation[row as usize * top_k + slot as usize] = gather.len() as i32;
-                    gather.push(row);
-                }
-            }
-        }
-        if gather.is_empty() { return sum.zero(stream); }
-        let tile_count: usize = tables.iter().map(Vec::len).sum();
-        let tile_size = std::mem::size_of::<sys::blz_moe_matrix_tile>();
-        let tile_bytes = 2 * tile_count * tile_size;
-        let route_at = tile_bytes.next_multiple_of(16);
-        let ids_at = route_at + permutation.len() * 4;
-        let weights_at = ids_at + gather.len() * 4;
-        let host = self.staging.host_ptr().cast_mut().cast::<u8>();
-        // All regions are disjoint, aligned, and retained until the caller synchronizes the stream.
-        unsafe {
-            let matrices = host.cast::<sys::blz_moe_matrix_tile>();
-            for (i, pair) in tables.iter().flatten().enumerate() {
-                matrices.add(i).write(pair[0]);
-                matrices.add(i + tile_count).write(pair[1]);
-            }
-            host.add(route_at).cast::<i32>().copy_from_nonoverlapping(permutation.as_ptr(), permutation.len());
-            host.add(ids_at).cast::<i32>().copy_from_nonoverlapping(gather.as_ptr(), gather.len());
-            let w = host.add(weights_at).cast::<f32>();
-            for (i, (_, probability)) in routes.iter().flatten().enumerate() {
-                w.add(i).write(*probability);
-            }
-            for (dst, offset, bytes) in [
-                (self.tiles.ptr(), 0, tile_bytes),
-                (self.route_of.ptr(), route_at, permutation.len() * 4),
-                (ids.ptr(), ids_at, gather.len() * 4),
-                (probabilities.ptr(), weights_at, permutation.len() * 4),
-            ] {
-                check(sys::cudaMemcpyAsync(dst, host.add(offset).cast(), bytes, sys::MEMCPY_H2D, stream.0),
-                      "Inkling grouped route tables")?;
-            }
-            check(sys::blz_gather_rows(input.ptr(), hidden as i64, ids.ptr(), gather.len() as i32,
-                hidden as i32, self.input.ptr(), stream.0), "Inkling grouped route gather")?;
-        }
-        let launch = match weights.gate_up.packing {
-            Packing::Nvfp4 => sys::blz_moe_grouped_nvfp4,
-            Packing::Mxfp8 => sys::blz_moe_grouped_mxfp8,
-        };
-        let project = |input, output, offset, columns: usize, inner: usize| -> Result<()> {
-            let mut first = offset;
-            for (&class, table) in WIDE_ROW_CLASSES.iter().zip(&tables) {
-                if table.is_empty() { continue; }
-                check(unsafe { launch(input, self.tiles.at(first), output, table.len() as i32,
-                    class as i32, columns as i32, inner as i32, stream.0) }, "Inkling grouped expert projection")?;
-                first += table.len();
-            }
-            let native_count = tables[WIDE_ROW_CLASSES.len()].len();
-            if native_count > 0 {
-                let quant = native.unwrap();
-                let rows = gather.len();
-                let tiles = self.tiles.at(first);
-                match weights.gate_up.packing {
-                    Packing::Nvfp4 => {
-                        let stride = Nvfp4Rows::bytes(rows, inner).next_multiple_of(64);
-                        ensure!(2 * stride <= quant.bytes(), "Inkling grouped NVFP4 scratch exceeds capacity");
-                        unsafe {
-                            let primary = Nvfp4Rows::from_scratch(quant.ptr(), rows, inner);
-                            let residual = Nvfp4Rows::from_scratch(quant.at(stride), rows, inner);
-                            primary.quantize(input, inner, rows, inner, stream)?;
-                            residual.quantize_residual(primary, input, rows, inner, stream)?;
-                            primary.grouped(residual, tiles, output, native_count, columns, inner, stream)?;
-                        }
-                    }
-                    Packing::Mxfp8 => {
-                        ensure!(Mxfp8Rows::bytes(rows, inner) <= quant.bytes(), "Inkling grouped MXFP8 scratch exceeds capacity");
-                        unsafe {
-                            let primary = Mxfp8Rows::from_scratch(quant.ptr(), rows, inner);
-                            primary.quantize(input, rows, inner, stream)?;
-                            primary.grouped(tiles, output, native_count, columns, inner, stream)?;
-                        }
-                    }
-                }
-            }
-            Ok(())
-        };
-        project(self.input.ptr(), self.gate.ptr(), 0, 2 * inter, hidden)?;
-        check(unsafe { sys::blz_inkling_swiglu(self.gate.ptr(), self.activation.ptr(),
-            (gather.len() * inter) as i32, caps.0, caps.1, stream.0) }, "Inkling grouped SwiGLU")?;
-        project(self.activation.ptr(), self.output.ptr(), tile_count, hidden, inter)?;
-        check(unsafe { sys::blz_wide_combine_f32(self.route_of.ptr(), probabilities.ptr(), self.output.ptr(),
-            tokens as i32, top_k as i32, hidden as i32, sum.ptr(), stream.0) }, "Inkling grouped expert reduction")
-    }
-}
-
 pub(super) struct MlpResidual<'a> {
     pub weights: &'a DevBuf,
     pub history: &'a [u16],
@@ -550,8 +109,16 @@ pub(super) struct MlpResidual<'a> {
 }
 
 pub(super) enum MoeOutput {
-    Routed(Vec<f32>),
+    Routed(Vec<u16>),
     Residual { hidden: Vec<u16>, history: Vec<u16> },
+}
+
+struct ExpertBuffers {
+    engine: MoeEngine,
+    retained: DevBuf,
+    routed: DevBuf,
+    mlp_staging: HostMapped,
+    captures_decode: bool,
 }
 
 struct RecurrentBatch {
@@ -580,9 +147,6 @@ pub(super) enum RecurrentMessages<'a> {
     },
 }
 
-// Count token visits, so a prefill chunk advances the heat clock by its length.
-const HEAT_EPOCH_VISITS: usize = 48 * 512;
-
 #[derive(Hash, Eq, PartialEq)]
 enum ProjectionKey {
     Dense([usize; 5], [usize; 5]),
@@ -590,7 +154,7 @@ enum ProjectionKey {
     Router(usize),
     GatedRouter { weights: [usize; 4], eps: u32, tokens: usize },
     RecurrentQkv { down: [usize; 3], up: [usize; 3], proj: [usize; 5], norm: usize, eps: u32 },
-    Experts { pool: usize, hidden: usize, intermediate: usize, count: usize, caps: [u32; 2] },
+    Experts { layer: usize, hidden: usize, top_k: usize },
 }
 const MAX_PROJECTION_GRAPHS: usize = 256;
 
@@ -600,21 +164,12 @@ pub(super) struct Compute {
     input: DevBuf,
     result: DevBuf,
     gate: DevBuf,
-    glu: DevBuf,
-    sum: DevBuf,
-    scatter_ids: DevBuf,
-    scatter_weights: DevBuf,
     transfer: HostMapped,
     next_id: DevBuf,
-    cache: ExpertCache,
     cpu: Option<Arc<rayon::ThreadPool>>,
-    cpu_routes: u64,
-    prompt_stage: Option<PromptStage>,
-    wide_experts: Option<WideExperts>,
-    hybrid: Option<(MoeEngine, DevBuf)>,
+    experts: Option<ExpertBuffers>,
     recurrent_batch: Option<RecurrentBatch>,
     projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
-    grouped_experts: bool,
     tiled_skinny: bool,
 }
 
@@ -623,34 +178,15 @@ impl Compute {
         max_in: usize,
         max_out: usize,
         hidden: usize,
-        intermediate: usize,
-        expert_bytes: usize,
-        expert_sizes: [usize; 2],
-        layer_visits: [usize; 2],
-        top_k: usize,
         prefill_chunk: usize,
         cpu: Option<Arc<rayon::ThreadPool>>,
     ) -> Result<Self> {
         let stream = Stream::new()?;
-        let batch = prefill_chunk.min(EXPERT_BATCH);
         let input = DevBuf::new((max_in * 3).max(hidden * prefill_chunk * 3) * 2)?;
-        let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk).max(hidden * top_k) * 2)?;
-        let expert_rows = batch.max(top_k);
-        let gate = DevBuf::new((intermediate * 2 * expert_rows).max(max_in) * 2)?;
-        let glu = DevBuf::new(intermediate * expert_rows * 2)?;
-        let sum = DevBuf::new(prefill_chunk * hidden * 4)?;
-        let scatter_ids = DevBuf::new(prefill_chunk * top_k * 4)?;
-        let scatter_weights = DevBuf::new(prefill_chunk * top_k * 4)?;
+        let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk) * 2)?;
+        let gate = DevBuf::new((prefill_chunk * 3 * 128).max(hidden * 2).max(max_in * 2))?;
         let transfer = HostMapped::new(input.bytes().max(result.bytes()))?;
         let next_id = DevBuf::new(4)?;
-        let cache = ExpertCache::new(expert_bytes, expert_sizes, layer_visits, top_k)?;
-        let stage_bytes = prompt_stage_bytes(expert_sizes, prefill_chunk, cpu.is_some());
-        let prompt_stage = (stage_bytes > 0).then(|| {
-            PromptStage::new(expert_sizes.into_iter().max().unwrap(), prompt_prefetch_enabled(prefill_chunk))
-        }).transpose()?;
-        let wide_experts = (hidden.is_multiple_of(128) && intermediate.is_multiple_of(128) && top_k <= 16
-            && std::env::var_os("BLAZE_INKLING_GROUPED_PREFILL").is_some_and(|value| value == "1"))
-            .then(|| WideExperts::new(prefill_chunk, top_k, hidden, intermediate)).transpose()?;
         let recurrent_batch = (prefill_chunk >= 12
             && std::env::var_os("BLAZE_INKLING_BATCH_QKV").is_some_and(|value| value == "1"))
             .then(|| RecurrentBatch::new(prefill_chunk, hidden)).transpose()?;
@@ -662,23 +198,14 @@ impl Compute {
             input,
             result,
             gate,
-            glu,
-            sum,
-            scatter_ids,
-            scatter_weights,
             transfer,
             next_id,
-            cache,
             cpu,
-            cpu_routes: 0,
-            prompt_stage,
-            wide_experts,
-            hybrid: None,
+            experts: None,
             recurrent_batch,
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
-            grouped_experts: std::env::var_os("BLAZE_INKLING_GROUPED_MOE").is_some_and(|value| value == "1"),
             tiled_skinny: std::env::var_os("BLAZE_INKLING_TILED_SKINNY").is_some_and(|value| value == "1"),
         })
     }
@@ -690,45 +217,84 @@ impl Compute {
         self.copy_staged_input(bytes.len())
     }
 
-    pub fn attach_expert_engine(&mut self, engine: MoeEngine, hidden: usize, chunk: usize) -> Result<()> {
-        self.hybrid = Some((engine, DevBuf::new(hidden * chunk * 2)?));
+    pub fn attach_expert_engine(&mut self, engine: MoeEngine, hidden: usize, chunk: usize, captures_decode: bool) -> Result<()> {
+        let values = hidden * chunk;
+        self.experts = Some(ExpertBuffers {
+            engine,
+            retained: DevBuf::new(values * 2)?,
+            routed: DevBuf::new(values * 2)?,
+            mlp_staging: HostMapped::new(values * 6)?,
+            captures_decode,
+        });
         Ok(())
     }
 
-    pub fn hybrid_moe(
+    pub fn moe(
         &mut self, layer: usize, activations: Option<&[Vec<f32>]>, routes: &[Vec<(usize, f32)>], hidden: usize,
-        top_k: usize, verify: bool,
+        top_k: usize, verify: bool, residual: Option<MlpResidual<'_>>,
     ) -> Result<MoeOutput> {
         let tokens = routes.len();
         let values = tokens * hidden;
-        ensure!(tokens > 0 && top_k > 0 && routes.iter().all(|r| r.len() == top_k) &&
-            2 * values <= self.input.bytes().min(self.result.bytes()).min(self.transfer.bytes()),
+        let experts = self.experts.as_ref().context("missing Inkling HybridMoe")?;
+        let id_at = (usize::from(activations.is_some()) * values * 2).next_multiple_of(4);
+        let weight_at = id_at + 4 * tokens * top_k;
+        let end = weight_at + 4 * tokens * top_k;
+        ensure!(tokens > 0 && top_k > 0 && routes.iter().all(|r| r.len() == top_k)
+            && end <= self.input.bytes().min(self.transfer.bytes()) && values * 2 <= experts.routed.bytes(),
             "Inkling HybridMoe shape exceeds scratch");
-        let (ids, weights): (Vec<_>, Vec<_>) = routes.iter().flatten()
-            .map(|&(id, probability)| (id as i32, probability)).unzip();
-        let work = (|| -> Result<()> {
-            if let Some(activations) = activations {
-                ensure!(activations.len() == tokens && activations.iter().all(|x| x.len() == hidden),
-                    "Inkling HybridMoe activation shape mismatch");
-                let values: Vec<_> = activations.iter().flatten().copied().map(to_bf16).collect();
-                self.stage_input(&values)?;
+        let capture = tokens == 1 && experts.captures_decode && residual.is_none();
+        let staging = self.transfer.host_slice_mut();
+        let (input, metadata) = staging[..end].split_at_mut(id_at);
+        if let Some(activations) = activations {
+            ensure!(activations.len() == tokens && activations.iter().all(|x| x.len() == hidden),
+                "Inkling HybridMoe activation shape mismatch");
+            for (dst, &src) in input.chunks_exact_mut(2).zip(activations.iter().flatten()) {
+                dst.copy_from_slice(&to_bf16(src).to_ne_bytes());
             }
-            let (engine, retained) = self.hybrid.as_ref().context("missing Inkling HybridMoe")?;
-            let input: *const u16 = if activations.is_some() { self.input.ptr() } else { retained.ptr() };
-            self.scatter_ids.upload_async(&ids, &self.stream)?;
-            self.scatter_weights.upload_async(&weights, &self.stream)?;
+        }
+        let (ids, weights) = metadata.split_at_mut(weight_at - id_at);
+        for ((id, weight), &(expert, probability)) in ids.chunks_exact_mut(4).zip(weights.chunks_exact_mut(4))
+            .zip(routes.iter().flatten())
+        {
+            id.copy_from_slice(&(expert as i32).to_ne_bytes());
+            weight.copy_from_slice(&probability.to_ne_bytes());
+        }
+        let enqueue = |gpu: &Self| -> Result<()> {
+            let experts = gpu.experts.as_ref().unwrap();
+            gpu.copy_staged_input(end)?;
+            let input: *const u16 = if activations.is_some() { gpu.input.ptr() } else { experts.retained.ptr() };
             let stride = if verify { 1 } else { tokens };
             for offset in (0..tokens).step_by(stride) {
-                unsafe { engine.forward(layer, input.add(offset * hidden), stride,
-                    self.scatter_ids.at(offset * top_k), self.scatter_weights.at(offset * top_k),
-                    self.result.at(offset * hidden), &self.stream) }?;
+                unsafe { experts.engine.forward(layer, input.add(offset * hidden), stride,
+                    gpu.input.at(id_at / 4 + offset * top_k), gpu.input.at(weight_at / 4 + offset * top_k),
+                    experts.routed.at(offset * hidden), &gpu.stream) }?;
             }
-            self.queue_result::<u16>(self.result.ptr(), values)
-        })();
+            Ok(())
+        };
+        let work = if capture {
+            self.run_projection(ProjectionKey::Experts { layer, hidden, top_k }, |gpu| {
+                enqueue(gpu)?;
+                gpu.queue_result::<u16>(gpu.experts.as_ref().unwrap().routed.ptr(), values)
+            }).map(|()| false)
+        } else {
+            enqueue(self).and_then(|()| {
+                if let Some(params) = &residual && self.enqueue_mlp_residual(params, hidden, tokens)? {
+                    return Ok(true);
+                }
+                self.queue_result::<u16>(self.experts.as_ref().unwrap().routed.ptr(), values)?;
+                Ok(false)
+            })
+        };
         let synced = self.stream.sync();
-        work?;
+        let merged = work?;
         synced?;
-        Ok(MoeOutput::Routed(self.read_result::<u16>(values).into_iter().map(from_bf16).collect()))
+        if merged {
+            let mut hidden = self.read_result(values + residual.unwrap().tail * hidden);
+            let history = hidden.split_off(values);
+            Ok(MoeOutput::Residual { hidden, history })
+        } else {
+            Ok(MoeOutput::Routed(self.read_result(values)))
+        }
     }
 
     fn copy_staged_input(&self, bytes: usize) -> Result<()> {
@@ -1002,9 +568,7 @@ impl Compute {
     }
 
     pub fn retain_prefill_activations(&self) -> bool {
-        self.hybrid.is_some() || (self.prompt_stage.is_none() && self.cpu.is_some()
-            && self.wide_experts.as_ref().is_some_and(|wide| wide.activation_input.is_some())
-        )
+        self.experts.is_some()
     }
 
     pub fn recurrent_qkv_fits(&self, width: usize) -> bool {
@@ -1275,8 +839,7 @@ impl Compute {
             && norm.bytes() == width * 4 && bytes.max(output_bytes) <= self.input.bytes()
             && width * 8 <= self.result.bytes() && self.gate.bytes() >= 128, "Inkling gated router exceeds scratch");
         let activation = if let Some(first) = retain_at {
-            let buffer = self.hybrid.as_ref().map(|(_, buffer)| buffer)
-                .or_else(|| self.wide_experts.as_ref().and_then(|wide| wide.activation_input.as_ref()))
+            let buffer = self.experts.as_ref().map(|experts| &experts.retained)
                 .ok_or_else(|| anyhow::anyhow!("Inkling routed activations are unavailable"))?;
             ensure!((first * width + size) * 2 <= buffer.bytes(), "Inkling retained activations exceed scratch");
             buffer.at(first * width)
@@ -1391,205 +954,16 @@ impl Compute {
     }
 
     pub fn cpu_routes(&self) -> u64 {
-        self.cpu_routes
+        self.experts.as_ref().map_or(0, |experts| experts.engine.cpu_routes())
     }
 
     pub fn host_workers(&self) -> Option<Arc<rayon::ThreadPool>> {
         self.cpu.clone()
     }
 
-    pub fn prefetch_experts(&mut self, ckpt: &Checkpoint, weights: &Experts,
-                            current: usize, next: usize, rows: usize) -> Result<()> {
-        let Some(stage) = &mut self.prompt_stage else { return Ok(()) };
-        let Some(copy) = &stage.prefetch else { return Ok(()) };
-        if rows < PREFETCH_MIN_ROWS || stage.banks.iter().any(|bank| bank.layer == Some(next)) {
-            return Ok(());
-        }
-        let Some(bank) = stage.banks.iter_mut().find(|bank| bank.layer != Some(current)) else {
-            return Ok(());
-        };
-        let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-        let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
-        let mut candidates: Vec<_> = pool.residency.cold_scores(next, epoch)
-            .filter(|&(_, score)| score >= PROMPT_STAGE_MIN_ROUTES)
-            .map(|(id, score)| (std::cmp::Reverse(score), id)).collect();
-        let ids: Vec<_> = rank_experts(&mut candidates, PREFETCH_BANK_EXPERTS, Ord::cmp)
-            .iter().map(|&(_, id)| id).collect();
-        if ids.is_empty() {
-            return Ok(());
-        }
-        bank.layer = None;
-        bank.experts.clear();
-        let staged = bank.slot.upload(copy, ckpt, weights, &ids)?;
-        bank.experts.extend(ids.into_iter().zip(staged));
-        bank.layer = Some(next);
-        Ok(())
-    }
-
-    pub(super) fn moe(
-        &mut self,
-        ckpt: &Checkpoint,
-        weights: &Experts,
-        layer: usize,
-        x: &[f32],
-        routes: &[(usize, f32)],
-        gate_cap: f32,
-        up_cap: f32,
-    ) -> Result<Vec<f32>> {
-        let x_bf16: Vec<_> = x.iter().map(|&x| to_bf16(x)).collect();
-        self.cache.generation += 1;
-        let tick = self.cache.generation;
-        self.cache.visits += 1;
-        let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
-        let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
-        // Touch hits first. Cache misses then evict only experts outside this route group.
-        for &(id, _) in routes {
-            pool.residency.touch((layer, id), tick);
-        }
-        let mut cold = Vec::new();
-        let mut resident = Vec::new();
-        for &(id, weight) in routes {
-            if pool.use_gpu(ckpt, weights, (layer, id), tick, epoch, self.cpu.is_some().then_some(1), true, None)? {
-                resident.push((id, weight));
-            } else {
-                cold.push((Routed::read(ckpt, weights, id)?, x, 0, weight));
-            }
-        }
-        if resident.is_empty() {
-            let mut total = vec![0.0; x.len()];
-            let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, (gate_cap, up_cap), &mut self.cpu_routes);
-            merge_cold(&mut total, x.len(), out_cpu);
-            return Ok(total);
-        }
-
-        let work = (|| -> Result<()> {
-            let activation_bytes = std::mem::size_of_val(x_bf16.as_slice());
-            let offset = activation_bytes.next_multiple_of(std::mem::align_of::<f32>());
-            let weights_end = offset + resident.len() * std::mem::size_of::<f32>();
-            let grouped = self.grouped_experts && (2..=65535).contains(&resident.len());
-            let matrix_bytes = std::mem::size_of::<sys::blz_inkling_matrix>();
-            let gate_meta = weights_end.next_multiple_of(std::mem::align_of::<sys::blz_inkling_matrix>());
-            let down_meta = gate_meta + resident.len() * matrix_bytes;
-            let end = if grouped { down_meta + resident.len() * matrix_bytes } else { weights_end };
-            ensure!(end <= self.input.bytes() && end <= self.transfer.bytes(), "Inkling MoE input exceeds staging");
-            let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-            let staging = self.transfer.host_slice_mut();
-            // SAFETY: these initialized activation values are copied as native-endian bytes.
-            let activations = unsafe { std::slice::from_raw_parts(x_bf16.as_ptr().cast::<u8>(), activation_bytes) };
-            staging[..activation_bytes].copy_from_slice(activations);
-            for (dst, (_, weight)) in staging[offset..weights_end].chunks_exact_mut(4).zip(&resident) {
-                dst.copy_from_slice(&weight.to_ne_bytes());
-            }
-            if grouped {
-                // SAFETY: the pinned buffer is page-aligned, the descriptor offsets are aligned,
-                // and the capacity was checked above.
-                unsafe {
-                    let ptr = staging.as_mut_ptr();
-                    let gate = ptr.add(gate_meta).cast::<sys::blz_inkling_matrix>();
-                    let down = ptr.add(down_meta).cast::<sys::blz_inkling_matrix>();
-                    for (row, &(id, _)) in resident.iter().enumerate() {
-                        let expert = pool.residency.get((layer, id)).unwrap();
-                        gate.add(row).write(expert.gate_up.offsets());
-                        down.add(row).write(expert.down.offsets());
-                    }
-                }
-            }
-            let enqueue = |gpu: &Self| -> Result<()> {
-                let pool = gpu.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-                gpu.copy_staged_input(end)?;
-                if grouped {
-                    let run: GroupedExpertGemv = match weights.gate_up.packing {
-                        Packing::Nvfp4 => sys::blz_inkling_grouped_nvfp4,
-                        Packing::Mxfp8 => sys::blz_inkling_grouped_mxfp8,
-                    };
-                    let group_count = resident.len() as i32;
-                    let launch = |matrix: &PackedMatrix, meta, x, x_step, y| {
-                        check(
-                            unsafe {
-                                run(
-                                    x, x_step, pool.buffer.ptr(), gpu.input.at::<u8>(meta).cast(), y,
-                                    group_count, matrix.rows as i32, matrix.cols as i32, gpu.stream.0,
-                                )
-                            },
-                            "Inkling grouped expert GEMV",
-                        )
-                    };
-                    launch(&weights.gate_up, gate_meta, gpu.input.ptr(), 0, gpu.gate.ptr())?;
-                    check(
-                        unsafe {
-                            sys::blz_inkling_swiglu(
-                                gpu.gate.ptr(),
-                                gpu.glu.ptr(),
-                                group_count * weights.down.cols as i32,
-                                gate_cap,
-                                up_cap,
-                                gpu.stream.0,
-                            )
-                        },
-                        "Inkling expert activation",
-                    )?;
-                    launch(&weights.down, down_meta, gpu.glu.ptr(), weights.down.cols as i64, gpu.result.ptr())?;
-                } else {
-                    for (row, &(id, _)) in resident.iter().enumerate() {
-                        let expert = pool.residency.get((layer, id)).unwrap();
-                        expert.gate_up.run(&pool.buffer, gpu.input.ptr(), gpu.gate.ptr(), 1, &gpu.stream)?;
-                        check(
-                            unsafe {
-                                sys::blz_inkling_swiglu(
-                                    gpu.gate.ptr(),
-                                    gpu.glu.ptr(),
-                                    weights.down.cols as i32,
-                                    gate_cap,
-                                    up_cap,
-                                    gpu.stream.0,
-                                )
-                            },
-                            "Inkling expert activation",
-                        )?;
-                        expert.down.run(&pool.buffer, gpu.glu.ptr(), gpu.result.at(row * x.len()), 1, &gpu.stream)?;
-                    }
-                }
-                check(
-                    unsafe {
-                        sys::blz_inkling_reduce_experts(
-                            gpu.result.ptr(),
-                            gpu.input.at(offset / std::mem::size_of::<f32>()),
-                            gpu.sum.ptr(),
-                            x.len() as i32,
-                            resident.len() as i32,
-                            gpu.stream.0,
-                        )
-                    },
-                    "Inkling expert reduction",
-                )?;
-                gpu.queue_result::<f32>(gpu.sum.ptr(), x.len())
-            };
-            if grouped {
-                let key = ProjectionKey::Experts {
-                    pool: pool.buffer.ptr::<u8>() as usize,
-                    hidden: x.len(),
-                    intermediate: weights.down.cols,
-                    count: resident.len(),
-                    caps: [gate_cap.to_bits(), up_cap.to_bits()],
-                };
-                self.run_projection(key, enqueue)
-            } else {
-                enqueue(self)
-            }
-        })();
-        let out_cpu = run_cold(self.cpu.as_deref(), cold, weights, (gate_cap, up_cap), &mut self.cpu_routes);
-        let synced = self.stream.sync();
-        work?;
-        synced?;
-        let mut total = self.read_result(x.len());
-        merge_cold(&mut total, x.len(), out_cpu);
-        Ok(total)
-    }
-
     fn enqueue_mlp_residual(&mut self, params: &MlpResidual<'_>, hidden: usize, tokens: usize) -> Result<bool> {
-        let Some(staging) = self.wide_experts.as_mut().and_then(|wide| wide.mlp_staging.as_mut()) else {
-            return Ok(false);
-        };
+        let experts = self.experts.as_mut().context("missing Inkling HybridMoe")?;
+        let staging = &mut experts.mlp_staging;
         let values = tokens * hidden;
         let history_bytes = std::mem::size_of_val(params.history);
         let bytes = values * 4 + history_bytes;
@@ -1615,7 +989,7 @@ impl Compute {
         let history = input.wrapping_add(values).cast::<u16>();
         let output = self.result.ptr::<u16>();
         check(unsafe {
-            sys::blz_inkling_mlp_residual_conv(self.sum.ptr(), input, history, params.weights.ptr(), output,
+            sys::blz_inkling_mlp_residual_conv(experts.routed.ptr(), input, history, params.weights.ptr(), output,
                 output.wrapping_add(values), hidden as i32, params.taps as i32, (params.history.len() / hidden) as i32,
                 tokens as i32, params.tail as i32, params.scale, self.stream.0)
         }, "Inkling MLP residual convolution")?;
@@ -1623,339 +997,6 @@ impl Compute {
         Ok(true)
     }
 
-    fn queue_cold_merge(&mut self, cold: &[OnceLock<Vec<ColdOutput>>], hidden: usize) -> Result<()> {
-        let mut corrections: Vec<_> = cold.iter().filter_map(OnceLock::get).flatten().collect();
-        corrections.sort_by_key(|(row, _, _)| *row);
-        let count = corrections.len();
-        let weight_at = count * hidden;
-        let token_at = weight_at + count;
-        let offset_at = token_at + count;
-        let max_bytes = (offset_at + count + 1) * 4;
-        let staging = self.wide_experts.as_mut().and_then(|wide| wide.cold_staging.as_mut()).unwrap();
-        ensure!((1..=MAX_DEVICE_COLD_ROUTES).contains(&count) && max_bytes <= self.result.bytes().min(staging.bytes()),
-            "Inkling cold expert merge exceeds scratch");
-        let dst = staging.host_slice_mut();
-        let mut last = None;
-        let mut rows = 0;
-        for (index, (row, weight, values)) in corrections.into_iter().enumerate() {
-            if last != Some(*row) {
-                dst[(token_at + rows) * 4..(token_at + rows + 1) * 4].copy_from_slice(&(*row as i32).to_ne_bytes());
-                dst[(offset_at + rows) * 4..(offset_at + rows + 1) * 4].copy_from_slice(&(index as i32).to_ne_bytes());
-                rows += 1;
-                last = Some(*row);
-            }
-            dst[(weight_at + index) * 4..(weight_at + index + 1) * 4].copy_from_slice(&weight.to_ne_bytes());
-            let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), hidden * 4) };
-            dst[index * hidden * 4..(index + 1) * hidden * 4].copy_from_slice(bytes);
-        }
-        dst[(offset_at + rows) * 4..(offset_at + rows + 1) * 4].copy_from_slice(&(count as i32).to_ne_bytes());
-        check(unsafe {
-            sys::cudaMemcpyAsync(self.result.ptr(), staging.host_ptr(), (offset_at + rows + 1) * 4,
-                sys::MEMCPY_H2D, self.stream.0)
-        }, "Inkling sparse cold expert upload")?;
-        check(unsafe {
-            sys::blz_inkling_merge_cold(self.result.ptr(), self.sum.ptr(), self.result.at(token_at),
-                self.result.at(offset_at), self.result.at(weight_at), rows as i32, hidden as i32, self.stream.0)
-        }, "Inkling sparse cold expert merge")
-    }
-
-    fn read_cold_activations(&mut self, indices: &[i32], tokens: usize, hidden: usize) -> Result<Vec<Vec<f32>>> {
-        let mut rows = vec![Vec::new(); tokens];
-        if indices.is_empty() {
-            return Ok(rows);
-        }
-        let wide = self.wide_experts.as_ref().unwrap();
-        let activation = wide.activation_input.as_ref().unwrap();
-        ensure!(indices.len() * 4 <= self.scatter_ids.bytes()
-            && indices.len() * hidden * 2 <= wide.input.bytes(), "Inkling cold activations exceed scratch");
-        let work = (|| -> Result<()> {
-            self.scatter_ids.upload_async(indices, &self.stream)?;
-            check(unsafe {
-                sys::blz_gather_rows(activation.ptr(), hidden as i64, self.scatter_ids.ptr(), indices.len() as i32,
-                    hidden as i32, wide.input.ptr(), self.stream.0)
-            }, "Inkling gather cold activations")?;
-            self.queue_result::<u16>(wide.input.ptr(), indices.len() * hidden)
-        })();
-        let synced = self.stream.sync();
-        work?;
-        synced?;
-        for (&index, act) in indices.iter().zip(self.read_result::<u16>(indices.len() * hidden).chunks_exact(hidden)) {
-            rows[index as usize] = act.iter().copied().map(from_bf16).collect();
-        }
-        Ok(rows)
-    }
-
-    pub fn moe_batch(
-        &mut self,
-        ckpt: &Checkpoint,
-        weights: &Experts,
-        layer: usize,
-        activations: Option<&[Vec<f32>]>,
-        routes: &[Vec<(usize, f32)>],
-        caps: (f32, f32),
-        experts: usize,
-        residual: Option<MlpResidual<'_>>,
-    ) -> Result<MoeOutput> {
-        let tokens = routes.len();
-        if tokens == 1 {
-            return self.moe(ckpt, weights, layer, &activations.unwrap()[0], &routes[0], caps.0, caps.1).map(MoeOutput::Routed);
-        }
-        let hidden = weights.gate_up.cols;
-        let intermediate = weights.down.cols;
-        let by_expert = RouteGroups::new(routes, experts)?;
-        let activations_bf16 = activations.map(|rows| rows.iter().flatten().copied().map(to_bf16).collect::<Vec<_>>());
-        let gather_offset = tokens * hidden;
-        let output_bytes = gather_offset * std::mem::size_of::<f32>();
-        ensure!(output_bytes <= self.transfer.bytes(), "Inkling expert readback exceeds scratch");
-        ensure!((gather_offset + tokens.min(EXPERT_BATCH) * hidden) * 2 <= self.input.bytes(),
-            "Inkling expert gather exceeds scratch");
-        self.cache.generation += 1;
-        let tick = self.cache.generation;
-        self.cache.visits += tokens;
-        let epoch = self.cache.visits / HEAT_EPOCH_VISITS;
-        let pool = self.cache.pools[weights.gate_up.packing as usize].as_mut().unwrap();
-        let all_resident = || by_expert.iter().all(|(id, _)| pool.residency.get((layer, id)).is_some());
-        if self.wide_experts.is_some()
-            && routes.iter().all(|route| route.len() == routes[0].len())
-            && (all_resident() || (self.cpu.is_some() && self.prompt_stage.is_none()))
-        {
-            for (id, _) in by_expert.iter() {
-                pool.residency.touch((layer, id), tick);
-            }
-            for (id, rows) in by_expert.iter() {
-                pool.use_gpu(ckpt, weights, (layer, id), tick, epoch,
-                    self.cpu.is_some().then_some(rows.len()), true, None)?;
-            }
-            let fetched;
-            let activations = if let Some(host) = activations {
-                host
-            } else {
-                let mut indices: Vec<_> = by_expert.iter()
-                    .filter(|(id, _)| pool.residency.get((layer, *id)).is_none())
-                    .flat_map(|(_, rows)| rows.iter().map(|route| route.row)).collect();
-                indices.sort_unstable();
-                indices.dedup();
-                fetched = self.read_cold_activations(&indices, tokens, hidden)?;
-                &fetched
-            };
-            let workers = self.cpu.clone();
-            let cold: Vec<_> = (0..experts).map(|_| OnceLock::new()).collect();
-            let mut cold_count = 0;
-            let mut residual_enqueued = false;
-            let mut merge_queued = false;
-            let work = prefill_cpu_scope(workers.as_deref(), |scope| -> Result<()> {
-                let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-                for (id, rows) in by_expert.iter() {
-                    if pool.residency.get((layer, id)).is_none() {
-                        cold_count += rows.len();
-                        dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
-                    }
-                }
-                if let Some(input) = &activations_bf16 {
-                    self.stage_input(input)?;
-                }
-                let pool = self.cache.pools[weights.gate_up.packing as usize].as_ref().unwrap();
-                self.wide_experts.as_mut().unwrap().run(&self.stream, weights, pool, layer, &by_expert,
-                    routes, caps, activations_bf16.as_ref().map(|_| &self.input), &self.sum,
-                    &self.scatter_ids, &self.scatter_weights)?;
-                if cold_count == 0 && let Some(params) = &residual {
-                    residual_enqueued = self.enqueue_mlp_residual(params, hidden, tokens)?;
-                    if residual_enqueued { return Ok(()); }
-                }
-                if (1..=MAX_DEVICE_COLD_ROUTES).contains(&cold_count) && residual.is_some()
-                    && self.wide_experts.as_ref().is_some_and(|wide| wide.cold_staging.is_some())
-                    && (cold_count * (hidden + 3) + 1) * 4 <= self.result.bytes()
-                {
-                    merge_queued = true;
-                    return Ok(());
-                }
-                self.queue_result::<f32>(self.sum.ptr(), tokens * hidden)
-            });
-            let work = work.and_then(|()| {
-                if !merge_queued { return Ok(()); }
-                self.queue_cold_merge(&cold, hidden)?;
-                residual_enqueued = self.enqueue_mlp_residual(residual.as_ref().unwrap(), hidden, tokens)?;
-                if residual_enqueued { return Ok(()); }
-                self.queue_result::<f32>(self.sum.ptr(), tokens * hidden)
-            });
-            let synced = self.stream.sync();
-            work?;
-            synced?;
-            self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
-            if residual_enqueued {
-                let values = tokens * hidden;
-                let tail = residual.unwrap().tail * hidden;
-                let mut output = self.read_result::<u16>(values + tail);
-                let history = output.split_off(values);
-                return Ok(MoeOutput::Residual { hidden: output, history });
-            }
-            let mut output = self.read_result(tokens * hidden);
-            if !merge_queued {
-                merge_cold(&mut output, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
-            }
-            return Ok(MoeOutput::Routed(output));
-        }
-        let activations = activations.ok_or_else(|| anyhow::anyhow!("Inkling retained activations require grouped MoE"))?;
-        let activations_bf16 = activations_bf16.unwrap();
-        let (ids, probs): (Vec<_>, Vec<_>) = by_expert.grouped().iter()
-            .map(|route| (route.row, route.probability)).unzip();
-        let cold: Vec<_> = (0..experts).map(|_| OnceLock::new()).collect();
-        let mut cold_count = 0usize;
-        let work = prefill_cpu_scope(self.cpu.as_deref(), |scope| -> Result<()> {
-            self.input.upload_async(&activations_bf16, &self.stream)?;
-            self.scatter_ids.upload_async(&ids, &self.stream)?;
-            self.scatter_weights.upload_async(&probs, &self.stream)?;
-            self.sum.zero(&self.stream)?;
-            let mut offset = 0;
-            for (id, rows) in by_expert.iter() {
-                let start = offset;
-                offset += rows.len();
-                let resident = pool.use_gpu(
-                    ckpt,
-                    weights,
-                    (layer, id),
-                    tick,
-                    epoch,
-                    self.cpu.is_some().then_some(rows.len()),
-                    false,
-                    Some(&self.stream),
-                )?;
-                let mut prompt_slot = None;
-                let temporary;
-                let (buffer, gate_up, down) = if resident {
-                    let expert = pool.residency.get((layer, id)).unwrap();
-                    (&pool.buffer, &expert.gate_up, &expert.down)
-                } else if tokens >= 64 && rows.len() >= PROMPT_STAGE_MIN_ROUTES
-                    && let Some(stage) = &mut self.prompt_stage
-                {
-                    if let Some(bank) = stage.banks.iter_mut().find(|bank| {
-                        bank.layer == Some(layer) && bank.experts.contains_key(&id)
-                    }) {
-                        bank.slot.wait(&self.stream)?;
-                        let (gate, down) = &bank.experts[&id];
-                        (&prompt_slot.insert(&mut bank.slot).device, gate, down)
-                    } else {
-                        let slot = &mut stage.slots[stage.next];
-                        stage.next = (stage.next + 1) % PROMPT_STAGE_SLOTS;
-                        temporary = slot.load(&stage.copy, &self.stream, ckpt, weights, id)?;
-                        (&prompt_slot.insert(slot).device, &temporary.0, &temporary.1)
-                    }
-                } else {
-                    cold_count += rows.len();
-                    dispatch_cold(ckpt, weights, id, rows, activations, caps, &cold[id], scope)?;
-                    continue;
-                };
-                for (index, batch) in rows.chunks(EXPERT_BATCH).enumerate() {
-                    let at = start + index * EXPERT_BATCH;
-                    let n = batch.len();
-                    let input = self.input.at(gather_offset);
-                    check(unsafe {
-                        sys::blz_gather_rows(self.input.ptr(), hidden as i64, self.scatter_ids.at(at),
-                            n as i32, hidden as i32, input, self.stream.0)
-                    }, "Inkling gather expert activations")?;
-                    gate_up.run(buffer, input, self.gate.ptr(), n, &self.stream)?;
-                    check(
-                        unsafe {
-                            sys::blz_inkling_swiglu(
-                                self.gate.ptr(),
-                                self.glu.ptr(),
-                                (intermediate * n) as i32,
-                                caps.0,
-                                caps.1,
-                                self.stream.0,
-                            )
-                        },
-                        "Inkling batched activation",
-                    )?;
-                    down.run(buffer, self.glu.ptr(), self.result.ptr(), n, &self.stream)?;
-                    check(
-                        unsafe {
-                            sys::blz_inkling_expert_scatter(
-                                self.result.ptr(),
-                                self.sum.ptr(),
-                                self.scatter_ids.at(at),
-                                self.scatter_weights.at(at),
-                                n as i32,
-                                hidden as i32,
-                                self.stream.0,
-                            )
-                        },
-                        "Inkling batched expert reduction",
-                    )?;
-                }
-                if let Some(slot) = prompt_slot {
-                    slot.release(&self.stream)?;
-                }
-            }
-            check(unsafe {
-                sys::cudaMemcpyAsync(self.transfer.host_ptr().cast_mut(), self.sum.ptr(), output_bytes,
-                    sys::MEMCPY_D2H, self.stream.0)
-            }, "Inkling expert readback")
-        });
-        let synced = self.stream.sync();
-        if (work.is_err() || synced.is_err()) && let Some(stage) = &self.prompt_stage {
-            let _ = stage.copy.sync();
-        }
-        work?;
-        synced?;
-        self.cpu_routes = self.cpu_routes.saturating_add(cold_count as u64);
-        let mut total = self.read_result(tokens * hidden);
-        merge_cold(&mut total, hidden, cold.into_iter().filter_map(OnceLock::into_inner).flatten());
-        Ok(MoeOutput::Routed(total))
-    }
-}
-
-type ColdRoute<'a> = (Routed<'a>, &'a [f32], usize, f32);
-
-type ColdOutput = (usize, f32, Vec<f32>);
-
-fn dispatch_cold<'scope>(
-    ckpt: &'scope Checkpoint, weights: &'scope Experts, id: usize, rows: &'scope [TokenRoute],
-    activations: &'scope [Vec<f32>], caps: (f32, f32), result: &'scope OnceLock<Vec<ColdOutput>>,
-    scope: Option<&rayon::Scope<'scope>>,
-) -> Result<()> {
-    let expert = Routed::read(ckpt, weights, id)?;
-    scope.expect("cold expert without CPU pool").spawn(move |_| {
-        let output = rows.par_iter().map(|&TokenRoute { row, probability, .. }| {
-            let row = row as usize;
-            (row, probability, expert.run(weights, &activations[row], caps))
-        }).collect();
-        let _ = result.set(output);
-    });
-    Ok(())
-}
-
-fn prefill_cpu_scope<'scope, T>(cpu: Option<&rayon::ThreadPool>, dispatch: impl FnOnce(Option<&rayon::Scope<'scope>>) -> T) -> T {
-    match cpu {
-        Some(cpu) => cpu.in_place_scope(|scope| dispatch(Some(scope))),
-        None => dispatch(None),
-    }
-}
-
-fn run_cold(
-    cpu: Option<&rayon::ThreadPool>,
-    cold: Vec<ColdRoute<'_>>,
-    weights: &Experts,
-    caps: (f32, f32),
-    count: &mut u64,
-) -> Vec<(usize, f32, Vec<f32>)> {
-    if cold.is_empty() {
-        return Vec::new();
-    }
-    *count = count.saturating_add(cold.len() as u64);
-    cpu.unwrap().install(|| {
-        cold.into_par_iter()
-            .map(|(expert, x, row, weight)| (row, weight, expert.run(weights, x, caps)))
-            .collect()
-    })
-}
-
-fn merge_cold(output: &mut [f32], hidden: usize, cold: impl IntoIterator<Item = (usize, f32, Vec<f32>)>) {
-    for (row, weight, values) in cold {
-        for (dst, src) in output[row * hidden..][..hidden].iter_mut().zip(values) {
-            *dst += src * weight;
-        }
-    }
 }
 
 impl Drop for Compute {
@@ -2562,7 +1603,7 @@ mod tests {
         let capacity = window + PREFILL_ATTENTION_ROWS - 1;
         let end = 225;
         let mut scratch = AttentionScratch::new(1, 1, window, 8, end, 4).unwrap();
-        let mut gpu = Compute::new(128, 2048, 128, 64, 0, [0; 2], [0; 2], 8, end, None).unwrap();
+        let mut gpu = Compute::new(128, 2048, 128, end, None).unwrap();
         let bias: Vec<_> = (0..window * 8).map(|i| to_bf16((i % 11) as f32 / 32.0)).collect();
         let bias = Dense::from_bf16(&bias, window, 8).unwrap();
         let weights: Vec<_> = (0..128 * 128).map(|i| to_bf16((i % 13) as f32 / 256.0)).collect();
@@ -2604,7 +1645,7 @@ mod tests {
         crate::gpu::set_device(0).unwrap();
         let width = 2304;
         let count = 131;
-        let mut gpu = Compute::new(2 * width, 12 * width, width, 1152, 0, [0; 2], [0; 2], 8, 512, None).unwrap();
+        let mut gpu = Compute::new(2 * width, 12 * width, width, 512, None).unwrap();
         let values = |count, seed: usize| {
             (0..count).map(move |i| ((i * 641 + (i % 113) * seed) % 719) as f32 / 431.0 - 0.83)
         };
@@ -2681,7 +1722,7 @@ mod tests {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
         crate::gpu::set_device(0).unwrap();
         let width = 2304;
-        let mut gpu = Compute::new(2 * width, 4 * width, width, 64, 0, [0; 2], [0; 2], 8, 8, None).unwrap();
+        let mut gpu = Compute::new(2 * width, 4 * width, width, 8, None).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let values = |len, scale: f32| (0..len).map(|i: usize| {
             (((i * 47 % 179) as f32 - 89.0) / (9 + i % 31) as f32) * scale
@@ -2735,7 +1776,7 @@ mod tests {
     fn router_logits_match_host_for_prefill_and_decode() {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
         crate::gpu::set_device(0).unwrap();
-        let mut gpu = Compute::new(96, 128, 96, 32, 0, [0; 2], [0; 2], 8, 3, None).unwrap();
+        let mut gpu = Compute::new(96, 128, 96, 3, None).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let values = |i: usize| to_bf16(((i * 31 % 113) as f32 - 50.0) / (3 + i % 19) as f32);
         let weights: Vec<_> = (0..11 * 96).map(values).collect();
@@ -2786,7 +1827,7 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn convolution_taps_share_key_value_inputs() {
         crate::gpu::set_device(0).unwrap();
-        let mut gpu = Compute::new(32, 512, 32, 32, 0, [0; 2], [0; 2], 8, 3, None).unwrap();
+        let mut gpu = Compute::new(32, 512, 32, 3, None).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let weights: Vec<_> = (0..32 * 32).map(|i| to_bf16((i % 37) as f32 * 0.031 - 0.5)).collect();
         let projection = Dense::from_bf16(&weights, 32, 32).unwrap();
@@ -2813,7 +1854,7 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn grouped_projection_graph_replays_with_new_input() {
         crate::gpu::set_device(0).unwrap();
-        let mut gpu = Compute::new(32, 32, 32, 32, 0, [0; 2], [0; 2], 8, 1, None).unwrap();
+        let mut gpu = Compute::new(32, 32, 32, 1, None).unwrap();
         let matrix: Vec<_> = (0..32 * 32).map(|i| to_bf16(if i % 33 == 0 { 1.0 } else { 0.0 })).collect();
         let matrix = Dense::from_bf16(&matrix, 32, 32).unwrap();
         let expected: Vec<_> = [1.0, 2.0].into_iter().map(|value| {
@@ -2826,95 +1867,6 @@ mod tests {
             assert_eq!(gpu.project_group([&matrix; 3], [&[x.as_slice()]; 3]).unwrap(), expected);
         }
         assert!(gpu.projection_graphs.as_ref().unwrap().values().any(Option::is_some));
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn grouped_packed_projection_matches_separate_products() {
-        crate::gpu::set_device(0).unwrap();
-        let n = 128usize;
-        let k = 128usize;
-        let stream = Stream::new().unwrap();
-        let tiles = [3, 12, 30, 47, 63];
-        let rows: usize = tiles.iter().sum();
-        let x: Vec<_> = (0..rows * k).map(|i| to_bf16(((i * 19 % 97) as f32 - 48.0) / 32.0)).collect();
-        let input = DevBuf::from_slice(&x).unwrap();
-        let expected = DevBuf::new(rows * n * 2).unwrap();
-        let actual = DevBuf::new(rows * n * 2).unwrap();
-        for packing in [Packing::Nvfp4, Packing::Mxfp8] {
-            let (width, block, bias) = match packing {
-                Packing::Nvfp4 => (k / 2, 16, 56u8),
-                Packing::Mxfp8 => (k, 32, 124u8),
-            };
-            let codes: Vec<_> = (0..n * width * tiles.len()).map(|i| (i * 7 % 113) as u8).collect();
-            let scales: Vec<_> = (0..n * (k / block) * tiles.len()).map(|i| bias + (i % 3) as u8).collect();
-            let alpha = DevBuf::from_slice(&vec![0.75f32; n]).unwrap();
-            let codes = DevBuf::from_slice(&codes).unwrap();
-            let scales = DevBuf::from_slice(&scales).unwrap();
-            let mut begin = 0;
-            let pairs = tiles.iter().enumerate().map(|(i, &rows)| {
-                let tile = sys::blz_moe_matrix_tile {
-                    codes: codes.at(i * n * width),
-                    scales: scales.at(i * n * (k / block)),
-                    alpha: alpha.ptr(),
-                    begin: begin as i32,
-                    rows: rows as i32,
-                };
-                let product = Matmul {
-                    input: input.at(begin * k), output: expected.at(begin * n), rows,
-                    columns: n, inner: k, input_stride: k, output_stride: n,
-                };
-                unsafe {
-                    match packing {
-                        Packing::Nvfp4 => product.nvfp4(tile.codes, tile.scales, tile.alpha, 0, 0, &stream),
-                        Packing::Mxfp8 => product.mxfp8(tile.codes, tile.scales, 0, 0, &stream),
-                    }
-                }.unwrap();
-                begin += rows;
-                tile
-            }).collect::<Vec<_>>();
-            let descriptors = DevBuf::from_slice(&pairs).unwrap();
-            let launch = match packing {
-                Packing::Nvfp4 => sys::blz_moe_grouped_nvfp4,
-                Packing::Mxfp8 => sys::blz_moe_grouped_mxfp8,
-            };
-            for (i, class) in WIDE_ROW_CLASSES.into_iter().enumerate() {
-                check(unsafe { launch(input.ptr(), descriptors.at(i), actual.ptr(), 1,
-                    class as i32, n as i32, k as i32, stream.0) }, "grouped packed projection test").unwrap();
-            }
-            stream.sync().unwrap();
-            assert_eq!(actual.download::<u16>(rows * n).unwrap(), expected.download::<u16>(rows * n).unwrap(), "{packing:?}");
-            if Nvfp4Rows::supported() {
-                let bytes = Nvfp4Rows::bytes(rows, k).next_multiple_of(64);
-                let scratch = DevBuf::new(2 * bytes).unwrap();
-                unsafe {
-                    match packing {
-                        Packing::Nvfp4 => {
-                            let primary = Nvfp4Rows::from_scratch(scratch.ptr(), rows, k);
-                            let residual = Nvfp4Rows::from_scratch(scratch.at(bytes), rows, k);
-                            primary.quantize(input.ptr(), k, rows, k, &stream).unwrap();
-                            residual.quantize_residual(primary, input.ptr(), rows, k, &stream).unwrap();
-                            primary.grouped(residual, descriptors.ptr(), actual.ptr(), tiles.len(), n, k, &stream).unwrap();
-                        }
-                        Packing::Mxfp8 => {
-                            let primary = Mxfp8Rows::from_scratch(scratch.ptr(), rows, k);
-                            primary.quantize(input.ptr(), rows, k, &stream).unwrap();
-                            primary.grouped(descriptors.ptr(), actual.ptr(), tiles.len(), n, k, &stream).unwrap();
-                        }
-                    }
-                }
-                stream.sync().unwrap();
-                let got = actual.download::<u16>(rows * n).unwrap();
-                let want = expected.download::<u16>(rows * n).unwrap();
-                let (error, power) = got.into_iter().zip(want).fold((0.0f64, 0.0f64), |(error, power), (got, want)| {
-                    let got = f64::from(from_bf16(got));
-                    let want = f64::from(from_bf16(want));
-                    (error + (got - want).powi(2), power + want.powi(2))
-                });
-                let relative_rms = (error / power).sqrt();
-                assert!(relative_rms < 0.06, "{packing:?} relative RMS error {relative_rms}");
-            }
-        }
     }
 
     #[test]
@@ -2943,62 +1895,6 @@ mod tests {
         }, "tiled skinny projection").unwrap();
         stream.sync().unwrap();
         assert_eq!(eager.download::<u16>(rows * output_stride).unwrap(), tiled.download::<u16>(rows * output_stride).unwrap());
-    }
-
-    #[test]
-    #[ignore = "requires CUDA"]
-    fn sparse_expert_merge_preserves_cpu_sum_and_untouched_rows() {
-        crate::gpu::set_device(0).unwrap();
-        let width = 257;
-        let stream = Stream::new().unwrap();
-        let starting: Vec<_> = (0..width * 4).map(|i| (i as f32 - 500.0) / 419.0).collect();
-        let values: Vec<_> = (0..width * 3).map(|i| ((i * 17 % 511) as f32 - 300.0) / 89.0).collect();
-        let weights = [0.71, -0.121, 0.045];
-        let initial = DevBuf::from_slice(&starting).unwrap();
-        let payload = DevBuf::from_slice(&values).unwrap();
-        let tokens = DevBuf::from_slice(&[1i32, 3]).unwrap();
-        let offsets = DevBuf::from_slice(&[0i32, 2, 3]).unwrap();
-        let probs = DevBuf::from_slice(&weights).unwrap();
-        check(unsafe {
-            sys::blz_inkling_merge_cold(payload.ptr(), initial.ptr(), tokens.ptr(), offsets.ptr(), probs.ptr(),
-                2, width as i32, stream.0)
-        }, "sparse cold expert merge").unwrap();
-        stream.sync().unwrap();
-        let mut expected = starting;
-        merge_cold(&mut expected, width, [1, 1, 3].into_iter().zip(weights).zip(values.chunks_exact(width))
-            .map(|((token, weight), row)| (token, weight, row.to_vec())));
-        assert_eq!(initial.download::<f32>(width * 4).unwrap(), expected);
-    }
-
-    #[test]
-    #[ignore = "requires a CUDA GPU"]
-    fn expert_reduction_preserves_accumulation_order() {
-        crate::gpu::set_device(0).unwrap();
-        let stream = Stream::new().unwrap();
-        let width = 131;
-        let weights = [0.73, -0.14, 0.067, 0.88, -0.861, 0.11, 0.37, 0.15];
-        let rows: Vec<_> = (0..width * weights.len())
-            .map(|i| to_bf16(((i * 19 % 251) as f32 - 117.0) * 0.013))
-            .collect();
-        let expected: Vec<_> = (0..width)
-            .map(|col| weights.iter().enumerate().fold(0.0, |sum, (i, &weight)| {
-                from_bf16(rows[i * width + col]).mul_add(weight, sum)
-            }))
-            .collect();
-        let input = DevBuf::from_slice(&rows).unwrap();
-        let weights_dev = DevBuf::from_slice(&weights).unwrap();
-        let output = DevBuf::new(width * 4).unwrap();
-        check(
-            unsafe {
-                sys::blz_inkling_reduce_experts(
-                    input.ptr(), weights_dev.ptr(), output.ptr(), width as i32, weights.len() as i32, stream.0,
-                )
-            },
-            "test Inkling expert reduction",
-        )
-        .unwrap();
-        stream.sync().unwrap();
-        assert_eq!(output.download::<f32>(width).unwrap(), expected);
     }
 
     #[test]

@@ -89,14 +89,6 @@ impl PackedMatrix {
             alpha: self.alpha.get(id).copied(),
         })
     }
-
-    pub fn gpu_bytes(&self) -> usize {
-        let (divisor, block) = match self.packing {
-            Packing::Nvfp4 => (2, 16),
-            Packing::Mxfp8 => (1, 32),
-        };
-        self.rows * (self.cols / divisor + self.cols / block) + usize::from(self.packing == Packing::Nvfp4) * self.rows * 4
-    }
 }
 
 pub(crate) struct Experts {

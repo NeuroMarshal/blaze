@@ -54,6 +54,7 @@ extern "C" void blz_moe_engine_destroy(blz_moe_engine* e) { delete e; }
 extern "C" int blz_moe_engine_layers(const blz_moe_engine* e) { return e->moe->num_layers(); }
 
 extern "C" int blz_moe_engine_hidden(const blz_moe_engine* e) { return e->moe->geometry().hidden; }
+extern "C" uint64_t blz_moe_engine_cpu_routes(const blz_moe_engine* e) { return e->moe->cpu_routes(); }
 
 extern "C" cudaError_t blz_moe_engine_forward(blz_moe_engine* e, int layer, const uint16_t* x, int tokens,
                                               const int32_t* ids, const float* w, uint16_t* out, cudaStream_t stream) {
