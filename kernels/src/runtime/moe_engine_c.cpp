@@ -62,7 +62,7 @@ extern "C" cudaError_t blz_moe_engine_forward(blz_moe_engine* e, int layer, cons
   cudaError_t err = cudaStreamIsCapturing(stream, &capture);
   if (err != cudaSuccess) return err;
   if (tokens >= e->moe->wide_min_tokens() && capture == cudaStreamCaptureStatusNone) {
-    // Prefill: every tier on tensor cores (same bits as the narrow route), host-synchronous.
+    // Prefill batches use tensor cores. The result is ordered on the caller's stream.
     return e->moe->forward_wide(layer, x, tokens, ids, w, out, stream);
   }
   const int hidden = e->moe->geometry().hidden, k = e->topk;

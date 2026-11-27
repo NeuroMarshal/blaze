@@ -2,6 +2,9 @@
 
 use crate::gpu::{Stream, check};
 use anyhow::{Result, ensure};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::Hash;
 use blaze_sys as sys;
 use std::ptr::null_mut;
 
@@ -56,5 +59,30 @@ impl Drop for CudaGraph {
         if !self.0.is_null() {
             unsafe { sys::cudaGraphExecDestroy(self.0) };
         }
+    }
+}
+
+pub(crate) struct GraphCache<K> {
+    graphs: RefCell<HashMap<K, Option<CudaGraph>>>,
+    limit: usize,
+}
+
+impl<K: Eq + Hash> GraphCache<K> {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { graphs: RefCell::new(HashMap::new()), limit }
+    }
+
+    pub(crate) fn launch(&self, key: K, stream: &Stream, enqueue: impl Fn() -> Result<()>) -> Result<()> {
+        let mut graphs = self.graphs.borrow_mut();
+        if let Some(graph) = graphs.get(&key) {
+            return graph.as_ref().map_or_else(enqueue, |graph| graph.launch(stream));
+        }
+        if graphs.len() >= self.limit {
+            return enqueue();
+        }
+        let graph = Capture::record(stream, &enqueue).and_then(Capture::instantiate).ok();
+        let result = graph.as_ref().map_or_else(enqueue, |graph| graph.launch(stream));
+        graphs.insert(key, graph);
+        result
     }
 }

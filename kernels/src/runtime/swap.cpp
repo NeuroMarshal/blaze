@@ -128,6 +128,7 @@ void apply_hybrid_options(const std::string& options, HybridConfig& cfg) {
     else if (key == "wide_a8") cfg.wide_a8 = std::stoi(val) != 0;
     else if (key == "wide_fp4") cfg.wide_fp4 = std::stoi(val) != 0;
     else if (key == "resident_fast") cfg.resident_fast = std::stoi(val) != 0;
+    else if (key == "device_routes") cfg.device_routes = std::stoi(val) != 0;
     else if (key == "host_reserve_gib") cfg.host_reserve_gib = std::stod(val);
     else if (key == "ssd_io") cfg.ssd_io_threads = std::stoi(val);
     else if (key == "cpu_tune") cfg.cpu_tune = std::stoi(val) != 0;

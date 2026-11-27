@@ -1,15 +1,18 @@
 use super::KvDtype;
 use crate::expert_runtime::MoeEngine;
+use crate::graph::GraphCache;
+#[cfg(test)]
 use crate::graph::{Capture, CudaGraph};
 use crate::gpu::{DevBuf, HostMapped, Stream, check};
 use crate::matmul::{Bf16Kernel, Matmul};
 use crate::weights::{Checkpoint, Dtype};
 use anyhow::{Context, Result, ensure};
 use blaze_sys as sys;
+#[cfg(test)]
 use std::borrow::Cow;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::Arc;
 
 pub(super) struct Dense {
     weight: DevBuf,
@@ -99,38 +102,20 @@ impl Dense {
     }
 }
 
-pub(super) struct MlpResidual<'a> {
-    pub weights: &'a DevBuf,
-    pub history: &'a [u16],
-    pub residuals: &'a [Vec<f32>],
-    pub taps: usize,
-    pub tail: usize,
-    pub scale: f32,
-}
-
-pub(super) enum MoeOutput {
-    Routed(Vec<u16>),
-    Residual { hidden: Vec<u16>, history: Vec<u16> },
-}
-
-struct ExpertBuffers {
-    engine: MoeEngine,
-    retained: DevBuf,
-    routed: DevBuf,
-    mlp_staging: HostMapped,
-    captures_decode: bool,
-}
-
+#[cfg(test)]
 struct RecurrentBatch {
+    #[cfg(test)]
     staging: HostMapped,
     projected_input: DevBuf,
     bank_staging: HostMapped,
     message_bank: DevBuf,
 }
 
+#[cfg(test)]
 impl RecurrentBatch {
     fn new(rows: usize, width: usize) -> Result<Self> {
         Ok(Self {
+            #[cfg(test)]
             staging: HostMapped::new(rows * 3 * width * 8)?,
             projected_input: DevBuf::new(rows * 3 * width * 2)?,
             bank_staging: HostMapped::new(rows * 2 * width * 4)?,
@@ -139,6 +124,7 @@ impl RecurrentBatch {
     }
 }
 
+#[cfg(test)]
 pub(super) enum RecurrentMessages<'a> {
     Mixed(&'a [[Vec<f32>; 3]]),
     Bank {
@@ -147,15 +133,15 @@ pub(super) enum RecurrentMessages<'a> {
     },
 }
 
+#[cfg(test)]
 #[derive(Hash, Eq, PartialEq)]
 enum ProjectionKey {
     Dense([usize; 5], [usize; 5]),
     Controller([usize; 3], [usize; 3], usize),
     Router(usize),
     GatedRouter { weights: [usize; 4], eps: u32, tokens: usize },
-    RecurrentQkv { down: [usize; 3], up: [usize; 3], proj: [usize; 5], norm: usize, eps: u32 },
-    Experts { layer: usize, hidden: usize, top_k: usize },
 }
+#[cfg(test)]
 const MAX_PROJECTION_GRAPHS: usize = 256;
 
 pub(super) struct Compute {
@@ -166,9 +152,11 @@ pub(super) struct Compute {
     gate: DevBuf,
     transfer: HostMapped,
     next_id: DevBuf,
-    cpu: Option<Arc<rayon::ThreadPool>>,
-    experts: Option<ExpertBuffers>,
+    controller_graphs: GraphCache<[usize; 8]>,
+    experts: Option<MoeEngine>,
+    #[cfg(test)]
     recurrent_batch: Option<RecurrentBatch>,
+    #[cfg(test)]
     projection_graphs: Option<HashMap<ProjectionKey, Option<CudaGraph>>>,
     tiled_skinny: bool,
 }
@@ -179,16 +167,15 @@ impl Compute {
         max_out: usize,
         hidden: usize,
         prefill_chunk: usize,
-        cpu: Option<Arc<rayon::ThreadPool>>,
     ) -> Result<Self> {
         let stream = Stream::new()?;
         let input = DevBuf::new((max_in * 3).max(hidden * prefill_chunk * 3) * 2)?;
         let result = DevBuf::new(max_out.max((hidden * 3 + max_in) * prefill_chunk) * 2)?;
         let gate = DevBuf::new((prefill_chunk * 3 * 128).max(hidden * 2).max(max_in * 2))?;
         let transfer = HostMapped::new(input.bytes().max(result.bytes()))?;
-        let next_id = DevBuf::new(4)?;
-        let recurrent_batch = (prefill_chunk >= 12
-            && std::env::var_os("BLAZE_INKLING_BATCH_QKV").is_some_and(|value| value == "1"))
+        let next_id = DevBuf::new(prefill_chunk * size_of::<i32>())?;
+        #[cfg(test)]
+        let recurrent_batch = (prefill_chunk >= 12)
             .then(|| RecurrentBatch::new(prefill_chunk, hidden)).transpose()?;
         let mut gemm = null_mut();
         check(unsafe { sys::blz_gemm_create(&mut gemm) }, "Inkling cuBLAS handle")?;
@@ -200,13 +187,15 @@ impl Compute {
             gate,
             transfer,
             next_id,
-            cpu,
+            controller_graphs: GraphCache::new(96),
             experts: None,
+            #[cfg(test)]
             recurrent_batch,
+            #[cfg(test)]
             projection_graphs: std::env::var_os("BLAZE_INKLING_GRAPHS")
                 .filter(|value| value == "1")
                 .map(|_| HashMap::new()),
-            tiled_skinny: std::env::var_os("BLAZE_INKLING_TILED_SKINNY").is_some_and(|value| value == "1"),
+            tiled_skinny: prefill_chunk >= 256,
         })
     }
 
@@ -217,84 +206,8 @@ impl Compute {
         self.copy_staged_input(bytes.len())
     }
 
-    pub fn attach_expert_engine(&mut self, engine: MoeEngine, hidden: usize, chunk: usize, captures_decode: bool) -> Result<()> {
-        let values = hidden * chunk;
-        self.experts = Some(ExpertBuffers {
-            engine,
-            retained: DevBuf::new(values * 2)?,
-            routed: DevBuf::new(values * 2)?,
-            mlp_staging: HostMapped::new(values * 6)?,
-            captures_decode,
-        });
-        Ok(())
-    }
-
-    pub fn moe(
-        &mut self, layer: usize, activations: Option<&[Vec<f32>]>, routes: &[Vec<(usize, f32)>], hidden: usize,
-        top_k: usize, verify: bool, residual: Option<MlpResidual<'_>>,
-    ) -> Result<MoeOutput> {
-        let tokens = routes.len();
-        let values = tokens * hidden;
-        let experts = self.experts.as_ref().context("missing Inkling HybridMoe")?;
-        let id_at = (usize::from(activations.is_some()) * values * 2).next_multiple_of(4);
-        let weight_at = id_at + 4 * tokens * top_k;
-        let end = weight_at + 4 * tokens * top_k;
-        ensure!(tokens > 0 && top_k > 0 && routes.iter().all(|r| r.len() == top_k)
-            && end <= self.input.bytes().min(self.transfer.bytes()) && values * 2 <= experts.routed.bytes(),
-            "Inkling HybridMoe shape exceeds scratch");
-        let capture = tokens == 1 && experts.captures_decode && residual.is_none();
-        let staging = self.transfer.host_slice_mut();
-        let (input, metadata) = staging[..end].split_at_mut(id_at);
-        if let Some(activations) = activations {
-            ensure!(activations.len() == tokens && activations.iter().all(|x| x.len() == hidden),
-                "Inkling HybridMoe activation shape mismatch");
-            for (dst, &src) in input.chunks_exact_mut(2).zip(activations.iter().flatten()) {
-                dst.copy_from_slice(&to_bf16(src).to_ne_bytes());
-            }
-        }
-        let (ids, weights) = metadata.split_at_mut(weight_at - id_at);
-        for ((id, weight), &(expert, probability)) in ids.chunks_exact_mut(4).zip(weights.chunks_exact_mut(4))
-            .zip(routes.iter().flatten())
-        {
-            id.copy_from_slice(&(expert as i32).to_ne_bytes());
-            weight.copy_from_slice(&probability.to_ne_bytes());
-        }
-        let enqueue = |gpu: &Self| -> Result<()> {
-            let experts = gpu.experts.as_ref().unwrap();
-            gpu.copy_staged_input(end)?;
-            let input: *const u16 = if activations.is_some() { gpu.input.ptr() } else { experts.retained.ptr() };
-            let stride = if verify { 1 } else { tokens };
-            for offset in (0..tokens).step_by(stride) {
-                unsafe { experts.engine.forward(layer, input.add(offset * hidden), stride,
-                    gpu.input.at(id_at / 4 + offset * top_k), gpu.input.at(weight_at / 4 + offset * top_k),
-                    experts.routed.at(offset * hidden), &gpu.stream) }?;
-            }
-            Ok(())
-        };
-        let work = if capture {
-            self.run_projection(ProjectionKey::Experts { layer, hidden, top_k }, |gpu| {
-                enqueue(gpu)?;
-                gpu.queue_result::<u16>(gpu.experts.as_ref().unwrap().routed.ptr(), values)
-            }).map(|()| false)
-        } else {
-            enqueue(self).and_then(|()| {
-                if let Some(params) = &residual && self.enqueue_mlp_residual(params, hidden, tokens)? {
-                    return Ok(true);
-                }
-                self.queue_result::<u16>(self.experts.as_ref().unwrap().routed.ptr(), values)?;
-                Ok(false)
-            })
-        };
-        let synced = self.stream.sync();
-        let merged = work?;
-        synced?;
-        if merged {
-            let mut hidden = self.read_result(values + residual.unwrap().tail * hidden);
-            let history = hidden.split_off(values);
-            Ok(MoeOutput::Residual { hidden, history })
-        } else {
-            Ok(MoeOutput::Routed(self.read_result(values)))
-        }
+    pub fn attach_expert_engine(&mut self, engine: MoeEngine) {
+        self.experts = Some(engine);
     }
 
     fn copy_staged_input(&self, bytes: usize) -> Result<()> {
@@ -334,6 +247,7 @@ impl Compute {
         unsafe { std::slice::from_raw_parts(self.transfer.host_ptr().cast::<T>(), count) }.to_vec()
     }
 
+    #[cfg(test)]
     pub fn linear_bf16(&mut self, matrix: &Dense, x: &[u16], m: usize) -> Result<Vec<u16>> {
         let rows = matrix.rows * m;
         ensure!(
@@ -351,10 +265,12 @@ impl Compute {
         Ok(self.read_result(rows))
     }
 
+    #[cfg(test)]
     pub fn project_group<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N]) -> Result<[Vec<u16>; N]> {
         self.project_rows(matrices, inputs, false)
     }
 
+    #[cfg(test)]
     pub fn project_rows<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N], verifying: bool) -> Result<[Vec<u16>; N]> {
         let (offsets, end) = self.stage_projections(matrices, inputs)?;
         let m = inputs[0].len();
@@ -384,6 +300,7 @@ impl Compute {
         }))
     }
 
+    #[cfg(test)]
     fn stage_projections<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N]) -> Result<([usize; 5], usize)> {
         let m = inputs[0].len();
         let cols = matrices[0].cols;
@@ -441,6 +358,7 @@ impl Compute {
         Ok(results)
     }
 
+    #[cfg(test)]
     fn run_projection(&mut self, key: ProjectionKey, enqueue: impl Fn(&Self) -> Result<()>) -> Result<()> {
         let Some(graphs) = &self.projection_graphs else { return enqueue(self) };
         if let Some(cached) = graphs.get(&key) {
@@ -456,12 +374,14 @@ impl Compute {
         result
     }
 
+    #[cfg(test)]
     pub fn controller_gates<const N: usize>(
         &mut self, down: [&Dense; N], up: [&Dense; N], inputs: [&[f32]; N],
     ) -> Result<Vec<f32>> {
         self.controller_gates_batch(down, up, &[inputs])
     }
 
+    #[cfg(test)]
     pub fn controller_batch_limit<const N: usize>(&self, width: usize) -> usize {
         (self.input.bytes() / (N * width * 4))
             .min(self.result.bytes() / (N * width * 8))
@@ -469,6 +389,7 @@ impl Compute {
             .min(65535)
     }
 
+    #[cfg(test)]
     pub fn controller_gates_batch<const N: usize>(
         &mut self, down: [&Dense; N], up: [&Dense; N], inputs: &[[&[f32]; N]],
     ) -> Result<Vec<f32>> {
@@ -531,6 +452,7 @@ impl Compute {
         Ok(self.read_result(num_outputs))
     }
 
+    #[cfg(test)]
     pub fn router_logits(&mut self, weights: &Dense, activations: &[Vec<f32>]) -> Result<Vec<f32>> {
         let tokens = activations.len();
         let inputs = tokens * weights.cols;
@@ -562,88 +484,18 @@ impl Compute {
         Ok(self.read_result(outputs))
     }
 
+    #[cfg(test)]
     pub fn gate_batch_limit(&self, width: usize) -> usize {
         (self.input.bytes() / (12 * width)).min(self.result.bytes() / (8 * width))
             .min(self.gate.bytes() / 128).min(65535)
     }
 
-    pub fn retain_prefill_activations(&self) -> bool {
-        self.experts.is_some()
-    }
-
-    pub fn recurrent_qkv_fits(&self, width: usize) -> bool {
-        self.input.bytes() >= width * 36 && self.transfer.bytes() >= width * 36
-            && self.result.bytes() >= width * 24 && self.gate.bytes() >= 3 * 128
-    }
-
-    pub fn project_recurrent<const N: usize>(
-        &mut self, projections: [&Dense; N], down: [&Dense; 3], up: [&Dense; 3],
-        x: [&[f32]; 3], messages: [&[f32]; 3], normalized: [&[f32]; 3], norms: &DevBuf,
-        eps: f32,
-    ) -> Result<[Vec<u16>; N]> {
-        let width = x[0].len();
-        let lanes = 3 * width;
-        let bytes = lanes * 12;
-        let values: usize = projections.iter().map(|p| p.rows).sum();
-        ensure!(matches!(N, 3 | 5) && self.recurrent_qkv_fits(width) && norms.bytes() == lanes * 4
-            && values * 2 <= self.result.bytes() && values * 2 <= self.transfer.bytes()
-            && down.iter().all(|w| w.rows == 64 && w.cols == 2 * width)
-            && up.iter().all(|w| w.rows == 2 * width && w.cols == 64)
-            && x.iter().chain(&messages).all(|row| row.len() == width)
-            && normalized.iter().all(|row| row.len() == 2 * width),
-            "Inkling recurrent QKV exceeds scratch");
-        let staging = &mut self.transfer.host_slice_mut()[..bytes];
-        let (inputs, rest) = staging.split_at_mut(lanes * 4);
-        for (dst, &value) in inputs.chunks_exact_mut(2).zip(normalized.into_iter().flatten()) {
-            dst.copy_from_slice(&to_bf16(value).to_ne_bytes());
-        }
-        for (dst, src) in rest.chunks_exact_mut(width * 4).zip(x.into_iter().chain(messages)) {
-            let source = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), dst.len()) };
-            dst.copy_from_slice(source);
-        }
-        let address = |w: &Dense| w.weight.ptr::<u8>() as usize;
-        let key = ProjectionKey::RecurrentQkv {
-            down: down.map(address), up: up.map(address),
-            proj: std::array::from_fn(|i| projections.get(i).map_or(0, |w| address(w))),
-            norm: norms.ptr::<u8>() as usize, eps: eps.to_bits(),
-        };
-        let work = self.run_projection(key, |gpu| {
-            gpu.copy_staged_input(bytes)?;
-            for (i, w) in down.iter().enumerate() {
-                w.run(gpu, gpu.input.at(i * 2 * width), gpu.gate.at(i * 64), 1)?;
-            }
-            check(unsafe {
-                sys::blz_inkling_controller_up(gpu.gate.ptr(), up[0].weight.ptr(), up[1].weight.ptr(), up[2].weight.ptr(),
-                    gpu.result.ptr(), (2 * width) as i32, 3, 1, gpu.stream.0)
-            }, "Inkling attention controller projection")?;
-            check(unsafe {
-                sys::blz_inkling_controller_qkv(gpu.result.ptr(), gpu.input.at(lanes), gpu.input.at(2 * lanes),
-                    norms.ptr(), gpu.input.ptr(), width as i32, 1, 0, eps, gpu.stream.0)
-            }, "Inkling attention controller normalization")?;
-            let offsets = [0, width, 2 * width, width, 2 * width];
-            let mut first = 0;
-            for (w, offset) in projections.iter().zip(offsets) {
-                w.run(gpu, gpu.input.at(offset), gpu.result.at(first), 1)?;
-                first += w.rows;
-            }
-            gpu.queue_result::<u16>(gpu.result.ptr(), values)
-        });
-        let synced = self.stream.sync();
-        work?;
-        synced?;
-        let data = self.read_result::<u16>(values);
-        let mut first = 0;
-        Ok(projections.map(|w| {
-            let row = data[first..first + w.rows].to_vec();
-            first += w.rows;
-            row
-        }))
-    }
-
-    pub fn recurrent_batch_limit(&self, width: usize) -> usize {
+    #[cfg(test)]
+    fn recurrent_batch_limit(&self, width: usize) -> usize {
         self.controller_batch_limit::<3>(width).min(self.input.bytes() / (36 * width))
     }
 
+    #[cfg(test)]
     fn enqueue_recurrent_attention(
         &self, down: [&Dense; 3], up: [&Dense; 3], norms: &DevBuf, width: usize, rows: usize,
         eps: f32, host: *const f32, bank: Option<*const f32>,
@@ -702,6 +554,7 @@ impl Compute {
         Ok(output)
     }
 
+    #[cfg(test)]
     fn pack_recurrent_attention(dst: &mut [f32], width: usize, x: &[Vec<Vec<f32>>], messages: &[[Vec<f32>; 3]]) {
         let (states, msg) = dst.split_at_mut(x.len() * 3 * width);
         for (out, src) in states.chunks_exact_mut(width).zip(x.iter().flatten()) {
@@ -712,6 +565,7 @@ impl Compute {
         }
     }
 
+    #[cfg(test)]
     fn validate_recurrent_attention(x: &[Vec<Vec<f32>>], norms: &DevBuf) -> Result<usize> {
         let width = x.first().and_then(|row| row.first()).map_or(0, Vec::len);
         ensure!((32..=4096).contains(&width) && width.is_multiple_of(32)
@@ -720,6 +574,7 @@ impl Compute {
         Ok(width)
     }
 
+    #[cfg(test)]
     #[cfg(test)]
     fn recurrent_attention_inputs(
         &mut self, down: [&Dense; 3], up: [&Dense; 3], x: &[Vec<Vec<f32>>],
@@ -739,6 +594,7 @@ impl Compute {
         Ok(self.read_result(values))
     }
 
+    #[cfg(test)]
     pub fn queue_recurrent_attention(
         &mut self, down: [&Dense; 3], up: [&Dense; 3], x: &[Vec<Vec<f32>>],
         messages: RecurrentMessages<'_>, norms: &DevBuf, eps: f32,
@@ -822,9 +678,10 @@ impl Compute {
         enqueue.map(|_| true)
     }
 
+    #[cfg(test)]
     pub fn gated_router(
         &mut self, down: &Dense, up: &Dense, norm: &DevBuf, router: &Dense,
-        input: Option<&[f32]>, x: &[f32], message: &[f32], eps: f32, retain_at: Option<usize>,
+        input: Option<&[f32]>, x: &[f32], message: &[f32], eps: f32,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let width = router.cols;
         let tokens = x.len() / width;
@@ -838,14 +695,7 @@ impl Compute {
             && down.cols == width * 2 && down.rows == 64 && up.rows == width * 2 && up.cols == 64
             && norm.bytes() == width * 4 && bytes.max(output_bytes) <= self.input.bytes()
             && width * 8 <= self.result.bytes() && self.gate.bytes() >= 128, "Inkling gated router exceeds scratch");
-        let activation = if let Some(first) = retain_at {
-            let buffer = self.experts.as_ref().map(|experts| &experts.retained)
-                .ok_or_else(|| anyhow::anyhow!("Inkling routed activations are unavailable"))?;
-            ensure!((first * width + size) * 2 <= buffer.bytes(), "Inkling retained activations exceed scratch");
-            buffer.at(first * width)
-        } else {
-            self.input.ptr::<u16>()
-        };
+        let activation = self.input.ptr::<u16>();
         let staging = self.transfer.host_slice_mut();
         let (normalized, rest) = staging[..bytes].split_at_mut(size * 4);
         if let Some(input) = input {
@@ -893,18 +743,14 @@ impl Compute {
                 sys::blz_inkling_controller_norm(gpu.result.ptr(), gpu.input.at(size), gpu.input.at(size * 2),
                     norm.ptr(), activation, width as i32, eps, tokens as i32, gpu.stream.0)
             }, "Inkling gated MLP normalization")?;
-            let scores_out = if retain_at.is_some() { gpu.input.ptr() } else { gpu.input.at(size / 2) };
+            let scores_out = gpu.input.at(size / 2);
             check(unsafe {
                 sys::blz_inkling_router_logits(router.weight.ptr(), activation, scores_out,
                     scores as i32, width as i32, tokens as i32, gpu.stream.0)
             }, "Inkling gated MoE router")?;
-            if retain_at.is_some() {
-                gpu.queue_result(scores_out, tokens * scores)
-            } else {
-                gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
-            }
+            gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
         };
-        let work = if tokens == 1 && input.is_some() && retain_at.is_none() {
+        let work = if tokens == 1 && input.is_some() {
             self.run_projection(key, enqueue)
         } else {
             enqueue(self)
@@ -912,18 +758,10 @@ impl Compute {
         let synced = self.stream.sync();
         work?;
         synced?;
-        if retain_at.is_some() {
-            return Ok((Vec::new(), self.read_result(tokens * scores)));
-        }
         let activation = self.read_result::<u16>(size).into_iter().map(from_bf16).collect();
         let host = self.transfer.host_ptr().cast::<u16>();
         let logits = unsafe { std::slice::from_raw_parts(host.add(size).cast::<f32>(), tokens*scores) }.to_vec();
         Ok((activation, logits))
-    }
-
-    pub fn linear(&mut self, matrix: &Dense, x: &[f32]) -> Result<Vec<f32>> {
-        let x: Vec<_> = x.iter().copied().map(to_bf16).collect();
-        Ok(self.linear_bf16(matrix, &x, 1)?.into_iter().map(from_bf16).collect())
     }
 
     pub fn argmax(&mut self, matrix: &Dense, x: &[f32], vocab: usize) -> Result<u32> {
@@ -954,53 +792,100 @@ impl Compute {
     }
 
     pub fn cpu_routes(&self) -> u64 {
-        self.experts.as_ref().map_or(0, |experts| experts.engine.cpu_routes())
+        self.experts.as_ref().map_or(0, MoeEngine::cpu_routes)
     }
 
-    pub fn host_workers(&self) -> Option<Arc<rayon::ThreadPool>> {
-        self.cpu.clone()
+    pub fn enqueue_controller(
+        &self, down: &Dense, up: &Dense, norm: *const f32, x: *const f32, message: *const f32,
+        output: *mut u16, width: usize, rows: usize, eps: f32,
+    ) -> Result<()> {
+        ensure!(rows * width * 4 <= self.input.bytes() && rows * width * 8 <= self.result.bytes()
+            && rows * 128 <= self.gate.bytes(), "Inkling device controller exceeds scratch");
+        let enqueue = || {
+        check(unsafe {
+            sys::blz_inkling_controller_inputs(x, message, self.input.ptr(), width as i32, rows as i32, eps, self.stream.0)
+        }, "Inkling controller input")?;
+        if rows > 16 {
+            down.run(self, self.input.ptr(), self.gate.ptr(), rows)?;
+        } else {
+            down.run_decode_rows(self, self.input.ptr(), self.gate.ptr(), rows)?;
+        }
+        check(unsafe {
+            sys::blz_inkling_controller_up(self.gate.ptr(), up.weight.ptr(), null_mut(), null_mut(),
+                self.result.ptr(), up.rows as i32, 1, rows as i32, self.stream.0)
+        }, "Inkling controller projection")?;
+        check(unsafe {
+            sys::blz_inkling_controller_norm(self.result.ptr(), x, message, norm, output,
+                width as i32, eps, rows as i32, self.stream.0)
+        }, "Inkling controller residual")
+        };
+        if rows == 1 {
+            let key = [
+                down.weight.ptr::<u16>() as usize, up.weight.ptr::<u16>() as usize, norm as usize,
+                x as usize, message as usize, output as usize, width, eps.to_bits() as usize,
+            ];
+            self.controller_graphs.launch(key, &self.stream, enqueue)
+        } else {
+            enqueue()
+        }
     }
 
-    fn enqueue_mlp_residual(&mut self, params: &MlpResidual<'_>, hidden: usize, tokens: usize) -> Result<bool> {
-        let experts = self.experts.as_mut().context("missing Inkling HybridMoe")?;
-        let staging = &mut experts.mlp_staging;
-        let values = tokens * hidden;
-        let history_bytes = std::mem::size_of_val(params.history);
-        let bytes = values * 4 + history_bytes;
-        let output_values = values + params.tail * hidden;
-        ensure!(params.residuals.len() == tokens && params.residuals.iter().all(|row| row.len() == hidden)
-            && params.history.len().is_multiple_of(hidden) && params.tail <= tokens
-            && params.weights.bytes() == params.taps * hidden * 4, "Inkling MLP residual shape mismatch");
-        if bytes > self.input.bytes().min(staging.bytes()) || output_values * 2 > self.result.bytes().min(self.transfer.bytes()) {
-            return Ok(false);
-        }
-        let dst = staging.host_slice_mut();
-        let (residuals, history) = dst[..bytes].split_at_mut(values * 4);
-        for (dst, src) in residuals.chunks_exact_mut(4).zip(params.residuals.iter().flatten()) {
-            dst.copy_from_slice(&src.to_ne_bytes());
-        }
-        for (dst, src) in history.chunks_exact_mut(2).zip(params.history) {
-            dst.copy_from_slice(&src.to_ne_bytes());
-        }
-        let input = self.input.ptr::<f32>();
+    pub fn enqueue_routes(&self, router: &Dense, x: *const u16, bias: &DevBuf, rows: usize,
+        top_k: usize, scale: f32, ids: *mut i32, weights: *mut f32) -> Result<()> {
+        ensure!(rows * router.rows * 4 <= self.result.bytes(), "Inkling router exceeds scratch");
         check(unsafe {
-            sys::cudaMemcpyAsync(input.cast(), staging.host_ptr(), bytes, sys::MEMCPY_H2D, self.stream.0)
-        }, "Inkling MLP residual inputs")?;
-        let history = input.wrapping_add(values).cast::<u16>();
-        let output = self.result.ptr::<u16>();
+            sys::blz_inkling_router_logits(router.weight.ptr(), x, self.result.ptr(),
+                router.rows as i32, router.cols as i32, rows as i32, self.stream.0)
+        }, "Inkling router logits")?;
         check(unsafe {
-            sys::blz_inkling_mlp_residual_conv(experts.routed.ptr(), input, history, params.weights.ptr(), output,
-                output.wrapping_add(values), hidden as i32, params.taps as i32, (params.history.len() / hidden) as i32,
-                tokens as i32, params.tail as i32, params.scale, self.stream.0)
-        }, "Inkling MLP residual convolution")?;
-        self.queue_result(output, output_values)?;
-        Ok(true)
+            sys::blz_router_sigmoid_topk(self.result.ptr(), bias.ptr(), rows as i32, router.rows as i32,
+                top_k as i32, scale, ids, weights, self.stream.0)
+        }, "Inkling device top-k")
+    }
+
+    pub fn enqueue_experts(&self, layer: usize, x: *const u16, rows: usize, ids: *const i32,
+        weights: *const f32, output: *mut u16) -> Result<()> {
+        let experts = self.experts.as_ref().context("missing Inkling HybridMoe")?;
+        unsafe { experts.forward(layer, x, rows, ids, weights, output, &self.stream) }
+    }
+
+    pub fn read_device_picks(&self, head: &Dense, input: *const u16, vocab: usize, rows: usize) -> Result<Vec<u32>> {
+        ensure!(rows * vocab * 2 <= self.result.bytes() && rows * 4 <= self.next_id.bytes(),
+            "Inkling verification head exceeds workspace");
+        for row in 0..rows {
+            head.run_prefix(self, input.wrapping_add(row * head.cols), self.result.at(row * vocab), 1, vocab, true)?;
+        }
+        check(unsafe {
+            sys::blz_argmax_bf16(self.result.ptr(), rows as i32, vocab as i32, vocab as i64, self.next_id.ptr(), self.stream.0)
+        }, "Inkling argmax")?;
+        self.queue_result::<u32>(self.next_id.ptr(), rows)?;
+        self.stream.sync()?;
+        Ok(self.read_result(rows))
+    }
+
+    pub fn read_device_scores(&self, head: &Dense, input: *const u16, vocab: usize) -> Result<Vec<u16>> {
+        head.run_prefix(self, input, self.result.ptr(), 1, vocab, true)?;
+        self.queue_result::<u16>(self.result.ptr(), vocab)?;
+        self.stream.sync()?;
+        Ok(self.read_result(vocab))
+    }
+
+    pub fn linear_context(&self, device: i32) -> crate::linear::LinCtx {
+        crate::linear::LinCtx {
+            gemm: self.gemm,
+            scratch: self.result.ptr(),
+            scratch_elems: self.result.bytes() / 2,
+            tune: std::sync::Arc::new(crate::tune::Tuning::open(device as usize)),
+            route: crate::linear::GemmRoute::Auto,
+            w4a4: crate::matmul::Nvfp4Rows::supported(),
+        }
     }
 
 }
 
 impl Drop for Compute {
     fn drop(&mut self) {
+        #[cfg(test)]
         self.projection_graphs.take();
         unsafe { sys::blz_gemm_destroy(self.gemm) };
     }
@@ -1091,8 +976,13 @@ impl Kv {
 
     fn store_rows(&self, base: usize, key: *const u16, value: *const u16, slots: *const i32,
                   count: usize, scale: &DevBuf, stream: &Stream) -> Result<()> {
+        self.store_strided(base, key, value, self.heads * HEAD_DIM, slots, count, scale, stream)
+    }
+
+    pub(super) fn store_strided(&self, base: usize, key: *const u16, value: *const u16, stride: usize,
+        slots: *const i32, count: usize, scale: &DevBuf, stream: &Stream) -> Result<()> {
         let [keys, values, key_scales, value_scales] = self.pointers(base);
-        let stride = (self.heads * HEAD_DIM) as i64;
+        let stride = stride as i64;
         if self.dtype == KvDtype::Bf16 {
             return check(
                 unsafe {
@@ -1136,11 +1026,10 @@ impl Kv {
 pub(super) const PREFILL_ATTENTION_ROWS: usize = 16;
 
 pub(super) fn prefill_attention_rows(chunk: usize) -> usize {
-    let wide = std::env::var_os("BLAZE_INKLING_WIDE_ATTENTION").is_some_and(|value| value == "1")
-        && std::env::var_os("BLAZE_INKLING_TENSOR_PREFILL").is_none_or(|value| value != "1");
-    chunk.min(if wide { 64 } else { PREFILL_ATTENTION_ROWS })
+    chunk.min(if chunk >= 256 { 64 } else { PREFILL_ATTENTION_ROWS })
 }
 
+#[cfg(test)]
 pub(super) struct AttentionRow<'a> {
     pub q: Vec<u16>,
     pub gate: &'a [u16],
@@ -1152,7 +1041,9 @@ pub(super) struct AttentionRow<'a> {
 
 pub(super) struct AttentionConv<'a> {
     pub weights: &'a DevBuf,
+    #[cfg(test)]
     pub history: [&'a [u16]; 2],
+    #[cfg(test)]
     pub dynamic: Option<[&'a [u16]; 2]>,
     pub taps: usize,
     pub scale: f32,
@@ -1169,18 +1060,7 @@ pub(super) struct AttentionClip<'a> {
     pub log_alpha: f32,
 }
 
-pub(super) struct AttentionResidual<'a> {
-    pub weights: &'a DevBuf,
-    pub history: &'a [u16],
-    pub previous: &'a [&'a [f32]],
-    pub scale: f32,
-}
-
-pub(super) enum ProjectionInputs<'a, const N: usize> {
-    Host([&'a [&'a [f32]]; N]),
-    Recurrent(usize),
-}
-
+#[cfg(test)]
 impl AttentionRow<'_> {
     fn fields(&self) -> [&[u16]; 6] {
         [&self.q, self.gate, self.sink, &self.relative, &self.key, &self.value]
@@ -1189,6 +1069,7 @@ impl AttentionRow<'_> {
 
 pub(super) struct AttentionScratch {
     input: DevBuf,
+    #[cfg(test)]
     staging: HostMapped,
     relative: DevBuf,
     zero: DevBuf,
@@ -1196,6 +1077,7 @@ pub(super) struct AttentionScratch {
     tiles: DevBuf,
     attended: DevBuf,
     filtered: DevBuf,
+    #[cfg(test)]
     block_bytes: usize,
     batch: usize,
     projection_batch: usize,
@@ -1210,11 +1092,11 @@ impl AttentionScratch {
         let values = heads * (HEAD_DIM * 2 + relative + 1) + kv_heads * HEAD_DIM * 2;
         let batch = chunk.min(PREFILL_ATTENTION_ROWS);
         let projection_batch = prefill_attention_rows(chunk);
-        let full_kv_projection = std::env::var_os("BLAZE_INKLING_WIDE_ATTENTION").is_some_and(|value| value == "1");
-        let filtered_rows = if full_kv_projection { chunk } else { batch };
+        let filtered_rows = if projection_batch > batch { chunk } else { batch };
         let bytes = (values * batch + 2 * taps * kv_heads * (HEAD_DIM + batch)) * 2 + 9 * 16 + batch * 4;
         Ok(Self {
             input: DevBuf::new(bytes.next_multiple_of(16) * chunk.div_ceil(batch))?,
+            #[cfg(test)]
             staging: HostMapped::new(bytes.next_multiple_of(16) * chunk.div_ceil(batch))?,
             relative: DevBuf::new(projection_batch * heads * extent * 2)?,
             zero: DevBuf::from_slice(&[0i32])?,
@@ -1222,172 +1104,137 @@ impl AttentionScratch {
             tiles: DevBuf::new(batch * heads * MAX_TILES * (HEAD_DIM + 2) * 4)?,
             attended: DevBuf::new(projection_batch * heads * HEAD_DIM * 2)?,
             filtered: DevBuf::new(filtered_rows * 2 * kv_heads * HEAD_DIM * 2)?,
+            #[cfg(test)]
             block_bytes: bytes.next_multiple_of(16),
             batch,
             projection_batch,
             filtered_rows,
-            tensor_prefill: std::env::var_os("BLAZE_INKLING_TENSOR_PREFILL").is_some_and(|value| value == "1"),
+            tensor_prefill: false,
             heads,
             kv_heads,
         })
     }
 
-    pub fn project_attention<const N: usize>(
-        &mut self, gpu: &mut Compute, kv: &Kv, matrices: [&Dense; N], inputs: ProjectionInputs<'_, N>,
-        bias: &Dense, output: &Dense, start: usize, conv: AttentionConv<'_>, clip: AttentionClip<'_>,
-        tail: usize, residual: Option<AttentionResidual<'_>>,
-    ) -> Result<(Vec<f32>, [Vec<u16>; 3])> {
-        let (rows, input, offsets, upload) = match inputs {
-            ProjectionInputs::Host(inputs) => {
-                let (offsets, size) = gpu.stage_projections(matrices, inputs)?;
-                (inputs[0].len(), &gpu.input, offsets, size)
-            }
-            ProjectionInputs::Recurrent(rows) => {
-                let buffer = &gpu.recurrent_batch.as_ref().unwrap().projected_input;
-                let size = rows * matrices[0].cols;
-                (rows, buffer, [0, size, 2 * size, size, 2 * size], 0)
-            }
-        };
+    pub fn project_attention_device<const N: usize>(
+        &self, gpu: &Compute, kv: &Kv, matrices: [&Dense; N], qkv: &DevBuf, offsets: [usize; 5],
+        bias: &Dense, output: &Dense, start: usize, rows: usize, conv: &AttentionConv<'_>, clip: &AttentionClip<'_>,
+        histories: &[DevBuf; 4], candidate: Option<&[DevBuf; 4]>, attn_weights: &DevBuf, attn_scale: f32,
+        previous: *const f32, verify: bool, residual: *mut f32,
+    ) -> Result<()> {
         let history = (conv.taps - 1).min(start);
         let width = self.kv_heads * HEAD_DIM;
-        let history_values = width * history;
+        let history_values = if rows == 1 { 0 } else { width * history };
         let mut prefix = [0; N];
         prefix[1] = history_values;
         prefix[2] = history_values;
+        let slot_offset = (rows * self.heads * (2 * HEAD_DIM + clip.relative + 1)).div_ceil(2);
+        let attention_history = if rows == 1 { 0 } else { history * output.rows };
+        ensure!((slot_offset + rows) * 4 <= self.input.bytes()
+            && (attention_history + rows * output.rows) * 2 <= gpu.input.bytes(),
+            "Inkling device attention exceeds scratch");
+        let projections = gpu.enqueue_projections(matrices, qkv, offsets, rows, verify, prefix)?;
+        let slots = self.input.at::<i32>(slot_offset);
+        let raw_attn = gpu.input.at::<u16>(attention_history);
+        if rows == 1 {
+            self.project_tiles(gpu, kv, &projections, slots, bias, output, start, rows, conv, clip,
+                raw_attn, Some(histories))?;
+            return check(unsafe {
+                sys::blz_inkling_decode_attention_residual(raw_attn, previous, attn_weights.ptr(), residual,
+                    histories[2].ptr(), output.rows as i32, conv.taps as i32, history as i32, attn_scale, gpu.stream.0)
+            }, "Inkling decode attention residual");
+        }
+        for (i, &raw) in projections[1..3].iter().enumerate() {
+            let full = raw.wrapping_sub(history_values);
+            copy_device(&gpu.stream, full, histories[i].ptr(), history_values)?;
+            save_history(&gpu.stream, &histories[i], candidate.map(|buffers| &buffers[i]),
+                full, history_values, rows * width, (conv.taps - 1) * width)?;
+        }
+        check(unsafe { sys::blz_inkling_kv_slots(slots, start as i32, kv.capacity as i32, rows as i32, gpu.stream.0) },
+            "Inkling device KV slots")?;
+        self.project_tiles(gpu, kv, &projections, slots, bias, output, start, rows, conv, clip, raw_attn, None)?;
+        copy_device(&gpu.stream, gpu.input.ptr::<u16>(), histories[2].ptr(), attention_history)?;
+        check(unsafe {
+            sys::blz_inkling_prefill_attention_residual(gpu.input.ptr(), previous, attn_weights.ptr(), residual,
+                output.rows as i32, conv.taps as i32, history as i32, rows as i32, attn_scale, gpu.stream.0)
+        }, "Inkling device attention residual")?;
+        save_history(&gpu.stream, &histories[2], candidate.map(|buffers| &buffers[2]),
+            gpu.input.ptr(), attention_history, rows * output.rows, (conv.taps - 1) * output.rows)
+    }
+
+    fn project_tiles(
+        &self, gpu: &Compute, kv: &Kv, projections: &[*mut u16], slots: *const i32,
+        bias: &Dense, output: &Dense, start: usize, rows: usize,
+        conv: &AttentionConv<'_>, clip: &AttentionClip<'_>, raw_attention: *mut u16, device_history: Option<&[DevBuf; 4]>,
+    ) -> Result<()> {
+        let width = self.kv_heads * HEAD_DIM;
+        let history = (conv.taps - 1).min(start);
         let q_values = rows * self.heads * HEAD_DIM;
         let rel_values = rows * self.heads * clip.relative;
-        let sink_values = rows * self.heads;
-        let slot_offset = (2 * q_values + rel_values + sink_values).next_multiple_of(2) / 2;
-        let attention_values = rows * output.rows;
-        let history_res = residual.as_ref().map_or(0, |r| r.history.len());
-        let [tail, attention_tail] = [tail * width, usize::from(residual.is_some()) * tail * output.rows];
-        let slots_end = 4 * (history_values + rows);
-        let res_at = slots_end + 2 * history_res;
-        let add_previous = residual.as_ref().is_some_and(|r| !r.previous.is_empty());
-        let stage_end = res_at + 2 * usize::from(add_previous) * attention_values;
-        let raw_end = history_res + attention_values;
-        let tail_values = 2 * tail + attention_tail;
-        ensure!((slot_offset + rows) * 4 <= self.input.bytes()
-            && stage_end.max(tail_values * 2) <= self.staging.bytes()
-            && (raw_end + usize::from(add_previous) * attention_values) * 2 <= gpu.input.bytes()
-            && attention_values * 4 <= gpu.result.bytes().min(gpu.transfer.bytes())
-            && residual.as_ref().is_none_or(|r| !add_previous || (r.previous.len() == rows
-                && r.previous.iter().all(|row| row.len() == output.rows))),
-            "Inkling device attention exceeds scratch");
-        let staging = self.staging.host_slice_mut();
-        for (dst, src) in staging[..4 * history_values].chunks_exact_mut(2).zip(conv.history.into_iter().flatten()) {
-            dst.copy_from_slice(&src.to_ne_bytes());
-        }
-        for (i, dst) in staging[4 * history_values..slots_end].chunks_exact_mut(4).enumerate() {
-            dst.copy_from_slice(&(((start + i) % kv.capacity) as i32).to_ne_bytes());
-        }
-        if let Some(residual) = &residual {
-            for (dst, src) in staging[slots_end..res_at].chunks_exact_mut(2).zip(residual.history) {
-                dst.copy_from_slice(&src.to_ne_bytes());
-            }
-            for (dst, &src) in staging[res_at..stage_end].chunks_exact_mut(2).zip(residual.previous.iter().copied().flatten()) {
-                dst.copy_from_slice(&to_bf16(src).to_ne_bytes());
-            }
-        }
-        let work = (|| -> Result<()> {
-            if upload > 0 {
-                gpu.copy_staged_input(upload * 2)?;
-            }
-            let projections = gpu.enqueue_projections(matrices, input, offsets, rows, false, prefix)?;
-            let slots = self.input.at::<i32>(slot_offset);
-            let host = self.staging.host_ptr().cast::<u16>();
-            for (i, &raw) in projections[1..3].iter().enumerate().filter(|_| history > 0) {
-                check(unsafe { sys::cudaMemcpyAsync(raw.sub(history_values).cast(), host.add(i * history_values).cast(),
-                    history_values * 2, sys::MEMCPY_H2D, gpu.stream.0) }, "Inkling KV convolution history")?;
-            }
-            check(unsafe { sys::cudaMemcpyAsync(slots.cast(), host.add(2 * history_values).cast(),
-                rows * 4, sys::MEMCPY_H2D, gpu.stream.0) }, "Inkling KV slots")?;
-            let q = self.input.ptr::<u16>();
-            let gate = self.input.at::<u16>(q_values);
-            let relative = self.input.at::<u16>(2 * q_values);
-            let sink = self.input.at::<u16>(2 * q_values + rel_values);
-            check(unsafe {
-                sys::blz_inkling_split_projection(projections[0], clip.weights.ptr(), q, gate, relative, sink,
-                    rows as i32, self.heads as i32, clip.relative as i32, start as i32,
-                    clip.threshold, clip.relative_threshold, clip.log_floor, clip.log_alpha, gpu.stream.0)
-            }, "Inkling Q and relative clipping")?;
+        let q = self.input.ptr::<u16>();
+        let gate = self.input.at::<u16>(q_values);
+        let relative = self.input.at::<u16>(2 * q_values);
+        let sink = self.input.at::<u16>(2 * q_values + rel_values);
+        check(unsafe {
+            sys::blz_inkling_split_projection(projections[0], clip.weights.ptr(), q, gate, relative, sink,
+                rows as i32, self.heads as i32, clip.relative as i32, start as i32,
+                clip.threshold, clip.relative_threshold, clip.log_floor, clip.log_alpha, gpu.stream.0)
+        }, "Inkling Q and relative clipping")?;
 
-            let grouped = self.filtered_rows > self.batch;
-            if grouped {
-                self.convolve_kv(gpu, &conv, &projections, history, 0, history, rows)?;
-            }
-            let mut first = 0;
-            while first < rows {
-                let pos = start + first;
-                let max_count = (rows - first).min(self.projection_batch);
-                let max_tiles = kv.window.min(pos + max_count).div_ceil(64).clamp(1, MAX_TILES);
-                let count = max_count.min(self.batch * MAX_TILES / max_tiles);
-                let oldest = (pos + 1).saturating_sub(kv.window);
-                ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
-                let filtered_at = if grouped { first * width } else {
-                    self.convolve_kv(gpu, &conv, &projections, history, first, (conv.taps - 1).min(pos), count)?;
-                    0
-                };
-                let keys = self.filtered.at(filtered_at);
-                let values = self.filtered.at(self.filtered_rows * width + filtered_at);
-                kv.store_rows(0, keys, values, slots.wrapping_add(first), count, &self.kv_scale, &gpu.stream)?;
-                let query_offset = first * self.heads * HEAD_DIM;
-                self.attend_tile(gpu, kv, [
-                    q.wrapping_add(query_offset), gate.wrapping_add(query_offset), sink.wrapping_add(first * self.heads),
-                    relative.wrapping_add(first * self.heads * clip.relative),
-                ], bias, pos, count, false)?;
-                let dst = gpu.input.at(history_res + first * output.rows);
-                if gpu.tiled_skinny && count >= 32 && output.cols.is_multiple_of(8) {
-                    check(unsafe {
-                        sys::blz_skinny_gemm_bf16_tiled(self.attended.ptr(), output.cols as i64, output.weight.ptr(),
-                            dst, output.rows as i64, count as i32,
-                            output.rows as i32, output.cols as i32, gpu.stream.0)
-                    }, "Inkling attention output row tiles")?;
-                } else {
-                    output.run_decode_rows(gpu, self.attended.ptr(), dst, count)?;
-                }
-                first += count;
-            }
-            let previous: *mut u16 = if add_previous { gpu.input.at(raw_end) } else { null_mut() };
-            for (dst, src, count) in [
-                (gpu.input.ptr(), slots_end, history_res),
-                (previous, res_at, usize::from(add_previous) * attention_values),
-            ].into_iter().filter(|&(_, _, count)| count > 0) {
-                check(unsafe { sys::cudaMemcpyAsync(dst.cast(), host.cast::<u8>().add(src).cast(),
-                    count * 2, sys::MEMCPY_H2D, gpu.stream.0) }, "Inkling residual convolution inputs")?;
-            }
-            for (i, &raw) in projections[1..3].iter().enumerate().filter(|_| tail > 0) {
-                check(unsafe { sys::cudaMemcpyAsync(host.cast_mut().add(i * tail).cast(),
-                    raw.add(rows * width - tail).cast(), tail * 2, sys::MEMCPY_D2H, gpu.stream.0) },
-                    "Inkling KV convolution tail")?;
-            }
-            if let Some(residual) = &residual {
+        if rows == 1 {
+            if let Some(state) = device_history {
+                let dynamic = |i| projections.get(i).map_or(std::ptr::null(), |p: &*mut u16| p.cast_const());
                 check(unsafe {
-                    sys::blz_inkling_residual_conv(gpu.input.ptr(), previous, residual.weights.ptr(), gpu.result.ptr(),
-                        output.rows as i32, conv.taps as i32, (history_res / output.rows) as i32, rows as i32,
-                        residual.scale, gpu.stream.0)
-                }, "Inkling prefill residual convolution")?;
-            }
-            if attention_tail > 0 {
-                check(unsafe { sys::cudaMemcpyAsync(host.cast_mut().add(2 * tail).cast(),
-                    gpu.input.at::<u16>(raw_end - attention_tail).cast(), attention_tail * 2,
-                    sys::MEMCPY_D2H, gpu.stream.0) }, "Inkling residual convolution tail")?;
-            }
-            if residual.is_some() {
-                gpu.queue_result::<f32>(gpu.result.ptr(), attention_values)
+                    sys::blz_inkling_decode_conv(projections[1], projections[2], dynamic(3), dynamic(4),
+                        conv.weights.ptr(), self.filtered.ptr(), self.filtered.at(self.filtered_rows * width),
+                        self.kv_heads as i32, conv.taps as i32, history as i32, state[0].ptr(), state[1].ptr(),
+                        conv.scale, conv.clip, conv.eps, gpu.stream.0)
+                }, "Inkling decode KV convolution")?;
             } else {
-                gpu.queue_result::<u16>(gpu.input.ptr(), attention_values)
+                self.convolve_kv(gpu, conv, projections, history, 0, history, 1)?;
             }
-        })();
-        let synced = gpu.stream.sync();
-        work?;
-        synced?;
-        let history = unsafe { std::slice::from_raw_parts(self.staging.host_ptr().cast::<u16>(), tail_values) };
-        let attention = if residual.is_some() { gpu.read_result(attention_values) }
-            else { gpu.read_result::<u16>(attention_values).into_iter().map(from_bf16).collect() };
-        Ok((attention, [
-            history[..tail].to_vec(), history[tail..2 * tail].to_vec(), history[2 * tail..].to_vec(),
-        ]))
+            kv.store(start, self.filtered.ptr(), self.filtered.at(self.filtered_rows * width),
+                &self.zero, &self.kv_scale, &gpu.stream)?;
+            self.attend_one(gpu, kv, [q, gate, sink, relative], bias, start)?;
+            return output.run(gpu, self.attended.ptr(), raw_attention, 1);
+        }
+
+        let grouped = self.filtered_rows > self.batch;
+        if grouped {
+            self.convolve_kv(gpu, conv, projections, history, 0, history, rows)?;
+        }
+        let mut first = 0;
+        while first < rows {
+            let pos = start + first;
+            let max_count = (rows - first).min(self.projection_batch);
+            let max_tiles = kv.window.min(pos + max_count).div_ceil(64).clamp(1, MAX_TILES);
+            let count = max_count.min(self.batch * MAX_TILES / max_tiles);
+            let oldest = (pos + 1).saturating_sub(kv.window);
+            ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
+            let filtered_at = if grouped { first * width } else {
+                self.convolve_kv(gpu, conv, projections, history, first, (conv.taps - 1).min(pos), count)?;
+                0
+            };
+            let keys = self.filtered.at(filtered_at);
+            let values = self.filtered.at(self.filtered_rows * width + filtered_at);
+            kv.store_rows(0, keys, values, slots.wrapping_add(first), count, &self.kv_scale, &gpu.stream)?;
+            let query_offset = first * self.heads * HEAD_DIM;
+            self.attend_tile(gpu, kv, [
+                q.wrapping_add(query_offset), gate.wrapping_add(query_offset), sink.wrapping_add(first * self.heads),
+                relative.wrapping_add(first * self.heads * clip.relative),
+            ], bias, pos, count, false)?;
+            let dst = raw_attention.wrapping_add(first * output.rows);
+            if gpu.tiled_skinny && count >= 32 && output.cols.is_multiple_of(8) {
+                check(unsafe {
+                    sys::blz_skinny_gemm_bf16_tiled(self.attended.ptr(), output.cols as i64, output.weight.ptr(),
+                        dst, output.rows as i64, count as i32,
+                        output.rows as i32, output.cols as i32, gpu.stream.0)
+                }, "Inkling attention output row tiles")?;
+            } else {
+                output.run_decode_rows(gpu, self.attended.ptr(), dst, count)?;
+            }
+            first += count;
+        }
+        Ok(())
     }
 
     fn convolve_kv(
@@ -1423,6 +1270,19 @@ impl AttentionScratch {
         }, "Inkling causal prefill attention")
     }
 
+    fn attend_one(&self, gpu: &Compute, kv: &Kv, [q, gate, sink, relative]: [*const u16; 4],
+        bias: &Dense, position: usize) -> Result<()> {
+        bias.run(gpu, relative, self.relative.ptr(), self.heads)?;
+        let tiles = kv.window.min(position + 1).div_ceil(64).clamp(1, MAX_TILES);
+        let [keys, values, key_scales, value_scales] = kv.pointers(0);
+        check(unsafe {
+            sys::blz_inkling_attention(q, keys, values, key_scales, value_scales, self.relative.ptr(), sink, gate,
+                self.attended.ptr(), self.tiles.ptr(), self.heads as i32, self.kv_heads as i32, kv.capacity as i32,
+                kv.window as i32, position as i32, bias.rows as i32, tiles as i32, KV_GLOBAL_SCALE, gpu.stream.0)
+        }, "Inkling relative attention")
+    }
+
+    #[cfg(test)]
     pub fn run_rows(&mut self, gpu: &mut Compute, kv: &Kv, rows: &[AttentionRow<'_>], bias: &Dense,
                     output: &Dense, start: usize, conv: Option<AttentionConv<'_>>, verify: bool) -> Result<Vec<f32>> {
         if let [row] = rows {
@@ -1513,6 +1373,7 @@ impl AttentionScratch {
         Ok(gpu.read_result::<u16>(result_count).into_iter().map(from_bf16).collect())
     }
 
+    #[cfg(test)]
     pub fn run(
         &mut self,
         gpu: &mut Compute,
@@ -1552,42 +1413,37 @@ impl AttentionScratch {
                 "Inkling attention inputs",
             )?;
             kv.store(position, key, value, &self.zero, &self.kv_scale, &gpu.stream)?;
-            bias.run(gpu, relative, self.relative.ptr(), self.heads)?;
-            let tiles = kv.window.min(position + 1).div_ceil(64).clamp(1, MAX_TILES);
-            let [keys, values, key_scales, value_scales] = kv.pointers(0);
-            check(
-                unsafe {
-                    sys::blz_inkling_attention(
-                        q,
-                        keys,
-                        values,
-                        key_scales,
-                        value_scales,
-                        self.relative.ptr(),
-                        sink,
-                        gate,
-                        gpu.gate.ptr(),
-                        self.tiles.ptr(),
-                        self.heads as i32,
-                        self.kv_heads as i32,
-                        kv.capacity as i32,
-                        kv.window as i32,
-                        position as i32,
-                        bias.rows as i32,
-                        tiles as i32,
-                        KV_GLOBAL_SCALE,
-                        gpu.stream.0,
-                    )
-                },
-                "Inkling relative attention",
-            )?;
-            output.run(gpu, gpu.gate.ptr(), gpu.result.ptr(), 1)?;
+            self.attend_one(gpu, kv, [q, gate, sink, relative], bias, position)?;
+            output.run(gpu, self.attended.ptr(), gpu.result.ptr(), 1)?;
+
             gpu.queue_result::<u16>(gpu.result.ptr(), output.rows)
         })();
         let synced = gpu.stream.sync();
         work?;
         synced?;
         Ok(gpu.read_result::<u16>(output.rows).into_iter().map(from_bf16).collect())
+    }
+}
+
+pub(super) fn copy_device<T>(stream: &Stream, destination: *mut T, source: *const T, count: usize) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    // Callers provide non-overlapping ranges on the stream's device.
+    check(unsafe {
+        sys::cudaMemcpyAsync(destination.cast(), source.cast(), count * size_of::<T>(), sys::MEMCPY_D2D, stream.0)
+    }, "Inkling device state copy")
+}
+
+pub(super) fn save_history(stream: &Stream, committed: &DevBuf, pending: Option<&DevBuf>,
+    source: *const u16, prefix: usize, count: usize, capacity: usize) -> Result<()> {
+    let total = prefix + count;
+    if let Some(pending) = pending {
+        ensure!(total * 2 <= pending.bytes(), "Inkling verification history exceeds workspace");
+        copy_device(stream, pending.ptr(), source, total)
+    } else {
+        let keep = total.min(capacity);
+        copy_device(stream, committed.ptr(), source.wrapping_add(total - keep), keep)
     }
 }
 
@@ -1603,7 +1459,7 @@ mod tests {
         let capacity = window + PREFILL_ATTENTION_ROWS - 1;
         let end = 225;
         let mut scratch = AttentionScratch::new(1, 1, window, 8, end, 4).unwrap();
-        let mut gpu = Compute::new(128, 2048, 128, end, None).unwrap();
+        let mut gpu = Compute::new(128, 2048, 128, end).unwrap();
         let bias: Vec<_> = (0..window * 8).map(|i| to_bf16((i % 11) as f32 / 32.0)).collect();
         let bias = Dense::from_bf16(&bias, window, 8).unwrap();
         let weights: Vec<_> = (0..128 * 128).map(|i| to_bf16((i % 13) as f32 / 256.0)).collect();
@@ -1645,7 +1501,7 @@ mod tests {
         crate::gpu::set_device(0).unwrap();
         let width = 2304;
         let count = 131;
-        let mut gpu = Compute::new(2 * width, 12 * width, width, 512, None).unwrap();
+        let mut gpu = Compute::new(2 * width, 12 * width, width, 512).unwrap();
         let values = |count, seed: usize| {
             (0..count).map(move |i| ((i * 641 + (i % 113) * seed) % 719) as f32 / 431.0 - 0.83)
         };
@@ -1722,7 +1578,7 @@ mod tests {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
         crate::gpu::set_device(0).unwrap();
         let width = 2304;
-        let mut gpu = Compute::new(2 * width, 4 * width, width, 8, None).unwrap();
+        let mut gpu = Compute::new(2 * width, 4 * width, width, 8).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let values = |len, scale: f32| (0..len).map(|i: usize| {
             (((i * 47 % 179) as f32 - 89.0) / (9 + i % 31) as f32) * scale
@@ -1750,7 +1606,7 @@ mod tests {
                 *v = from_bf16(to_bf16(*v * rms * weight));
             }
             let scores = gpu.router_logits(&router, std::slice::from_ref(&expected)).unwrap();
-            let (actual, logits) = gpu.gated_router(&down, &up, &norm, &router, Some(&input), &x, &msg, eps, None).unwrap();
+            let (actual, logits) = gpu.gated_router(&down, &up, &norm, &router, Some(&input), &x, &msg, eps).unwrap();
             assert_eq!(actual, expected);
             assert_eq!(logits, scores);
             inputs.extend(input);
@@ -1759,14 +1615,14 @@ mod tests {
             activations.extend(expected);
             routes.extend(scores);
         }
-        let batch = gpu.gated_router(&down, &up, &norm, &router, Some(&inputs), &xs, &messages, 1e-6, None).unwrap();
+        let batch = gpu.gated_router(&down, &up, &norm, &router, Some(&inputs), &xs, &messages, 1e-6).unwrap();
         assert_eq!(batch, (activations, routes));
         let normalized: Vec<_> = xs.chunks_exact(width).zip(messages.chunks_exact(width)).flat_map(|(x, m)| {
             super::super::forward::normalized(x, None, 1e-6).into_iter()
                 .chain(super::super::forward::normalized(m, None, 1e-6))
         }).collect();
-        let host = gpu.gated_router(&down, &up, &norm, &router, Some(&normalized), &xs, &messages, 1e-6, None).unwrap();
-        let device = gpu.gated_router(&down, &up, &norm, &router, None, &xs, &messages, 1e-6, None).unwrap();
+        let host = gpu.gated_router(&down, &up, &norm, &router, Some(&normalized), &xs, &messages, 1e-6).unwrap();
+        let device = gpu.gated_router(&down, &up, &norm, &router, None, &xs, &messages, 1e-6).unwrap();
         assert_eq!(device, host);
     }
 
@@ -1776,7 +1632,7 @@ mod tests {
     fn router_logits_match_host_for_prefill_and_decode() {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) { return; }
         crate::gpu::set_device(0).unwrap();
-        let mut gpu = Compute::new(96, 128, 96, 3, None).unwrap();
+        let mut gpu = Compute::new(96, 128, 96, 3).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let values = |i: usize| to_bf16(((i * 31 % 113) as f32 - 50.0) / (3 + i % 19) as f32);
         let weights: Vec<_> = (0..11 * 96).map(values).collect();
@@ -1827,7 +1683,7 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn convolution_taps_share_key_value_inputs() {
         crate::gpu::set_device(0).unwrap();
-        let mut gpu = Compute::new(32, 512, 32, 3, None).unwrap();
+        let mut gpu = Compute::new(32, 512, 32, 3).unwrap();
         gpu.projection_graphs = Some(HashMap::new());
         let weights: Vec<_> = (0..32 * 32).map(|i| to_bf16((i % 37) as f32 * 0.031 - 0.5)).collect();
         let projection = Dense::from_bf16(&weights, 32, 32).unwrap();
@@ -1840,7 +1696,7 @@ mod tests {
             let v = &refs[offset+2..offset+m+2];
             let expected_qkv = gpu.project_group([&projection; 3], [q, k, v]).unwrap();
             let expected_taps = [k, v].map(|inputs| inputs.iter().flat_map(|x| {
-                gpu.linear(&taps, x).unwrap().into_iter().map(to_bf16)
+                gpu.linear_bf16(&taps, &x.iter().copied().map(to_bf16).collect::<Vec<_>>(), 1).unwrap().into_iter()
             }).collect::<Vec<_>>());
             let [a, b, c, d, e] = gpu.project_group(
                 [&projection, &projection, &projection, &taps, &taps], [q, k, v, k, v],
@@ -1854,7 +1710,7 @@ mod tests {
     #[ignore = "requires a CUDA GPU"]
     fn grouped_projection_graph_replays_with_new_input() {
         crate::gpu::set_device(0).unwrap();
-        let mut gpu = Compute::new(32, 32, 32, 1, None).unwrap();
+        let mut gpu = Compute::new(32, 32, 32, 1).unwrap();
         let matrix: Vec<_> = (0..32 * 32).map(|i| to_bf16(if i % 33 == 0 { 1.0 } else { 0.0 })).collect();
         let matrix = Dense::from_bf16(&matrix, 32, 32).unwrap();
         let expected: Vec<_> = [1.0, 2.0].into_iter().map(|value| {

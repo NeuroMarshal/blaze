@@ -124,7 +124,139 @@ __global__ void controller_message_mix(const float* bank, const float* mix_weigh
     }
 }
 
+__global__ void norm_rows(const float* input, const float* weight, float* full, __nv_bfloat16* rounded,
+                          int width, float eps) {
+    input += size_t(blockIdx.x) * width;
+    __shared__ float rms;
+    if (threadIdx.x < 32) {
+        float dot = 0.0f;
+        for (int i = threadIdx.x; i < width; i += 32) dot = fmaf(input[i], input[i], dot);
+        dot = ordered_sum(dot);
+        if (threadIdx.x == 0) rms = __fdiv_rn(1.0f, __fsqrt_rn(__fdiv_rn(dot, float(width)) + eps));
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float value = input[i] * rms;
+        if (weight) value *= weight[i];
+        const size_t at = size_t(blockIdx.x) * width + i;
+        if (full) full[at] = value;
+        else rounded[at] = __float2bfloat16(value);
+    }
+}
+
+__global__ void expand_bf16(const __nv_bfloat16* input, float* output, size_t values) {
+    const size_t at = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (at < values) output[at] = __bfloat162float(input[at]);
+}
+
+__global__ void pack_features(const float* input, __nv_bfloat16* output, int rows, int width, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * width * 4) return;
+    const int row = i / (4 * width), tap = i / width % 4, col = i % width;
+    output[i] = __float2bfloat16(input[tap * stride + row * width + col]);
+}
+
+__global__ void embed_rows(const __nv_bfloat16* input, const uint8_t* image, const float* weight,
+                           float* output, int width, float eps) {
+    const size_t row = size_t(blockIdx.x) * width;
+    const bool text = image[blockIdx.x] == 0;
+    __shared__ float rms;
+    if (text) {
+        if (threadIdx.x < 32) {
+            float dot = 0.0f;
+            for (int i = threadIdx.x; i < width; i += 32) {
+                const float x = __bfloat162float(input[row + i]);
+                dot = fmaf(x, x, dot);
+            }
+            dot = ordered_sum(dot);
+            if (threadIdx.x == 0) rms = __fdiv_rn(1.0f, __fsqrt_rn(__fdiv_rn(dot, float(width)) + eps));
+        }
+        __syncthreads();
+    }
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        const float value = __bfloat162float(input[row + i]);
+        output[row + i] = text ? __bfloat162float(__float2bfloat16(value * rms * weight[i])) : value;
+    }
+}
+
+__global__ void mix_normalized(const float* bank, const float* current, const float* query, float* output,
+                               int depth, int rows, int width) {
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const size_t row = size_t(blockIdx.x) * width, plane = size_t(rows) * width;
+    const int count = depth + (current != nullptr);
+    const float factor = __frcp_rn(__fsqrt_rn(float(width)));
+    __shared__ float probabilities[32];
+    for (int source = warp; source < count; source += blockDim.x / 32) {
+        const float* src = (source < depth ? bank + size_t(source) * plane : current) + row;
+        float dot = 0.0f;
+        for (int i = lane; i < width; i += 32) dot = fmaf(src[i], query[i], dot);
+        dot = ordered_sum(dot);
+        if (lane == 0) probabilities[source] = dot * factor;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float max_logit = -CUDART_INF_F;
+        for (int i = 0; i < count; ++i) max_logit = fmaxf(max_logit, probabilities[i]);
+        float sum = 0.0f;
+        for (int i = 0; i < count; ++i) {
+            probabilities[i] = expf(probabilities[i] - max_logit);
+            sum += probabilities[i];
+        }
+        const float inv = __frcp_rn(sum);
+        for (int i = 0; i < count; ++i) probabilities[i] *= inv;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        float value = 0.0f;
+        for (int source = 0; source < count; ++source) {
+            const float* src = (source < depth ? bank + size_t(source) * plane : current) + row;
+            value = __fadd_rn(value, __fmul_rn(src[i], probabilities[source]));
+        }
+        output[row + i] = value;
+    }
+}
+
+__global__ void kv_slots(int* slots, int start, int capacity, int rows) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < rows) slots[row] = (start + row) % capacity;
+}
+
 } // namespace
+
+extern "C" cudaError_t blz_inkling_norm_rows(const float* input, const float* weight, float* full,
+        uint16_t* rounded, int rows, int width, float eps, cudaStream_t stream) {
+    norm_rows<<<rows, 128, 0, stream>>>(input, weight, full, reinterpret_cast<__nv_bfloat16*>(rounded), width, eps);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_expand_bf16(const uint16_t* input, float* output, size_t values, cudaStream_t stream) {
+    expand_bf16<<<(values + 255) / 256, 256, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(input), output, values);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_pack_spec_features(const float* input, uint16_t* output, int rows, int width, int stride, cudaStream_t stream) {
+    pack_features<<<(rows * width * 4 + 255) / 256, 256, 0, stream>>>(input, reinterpret_cast<__nv_bfloat16*>(output), rows, width, stride);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_embed_rows(const uint16_t* input, const uint8_t* image, const float* weight,
+        float* output, int rows, int width, float eps, cudaStream_t stream) {
+    embed_rows<<<rows, 128, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(input), image, weight, output, width, eps);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_mix_normalized_rows(const float* bank, const float* current, const float* query,
+        float* output, int depth, int rows, int width, cudaStream_t stream) {
+    if (depth < 0 || depth + (current != nullptr) < 1 || depth + (current != nullptr) > 32 || rows < 1 ||
+        width < 32 || width % 32) return cudaErrorInvalidValue;
+    mix_normalized<<<rows, 128, 0, stream>>>(bank, current, query, output, depth, rows, width);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_kv_slots(int* slots, int start, int capacity, int rows, cudaStream_t stream) {
+    kv_slots<<<(rows + 127) / 128, 128, 0, stream>>>(slots, start, capacity, rows);
+    return cudaGetLastError();
+}
 
 extern "C" cudaError_t blz_inkling_controller_norm(const float* gates, const float* x, const float* msg,
         const float* norm, uint16_t* out, int width, float eps, int tokens, cudaStream_t stream) {
@@ -550,16 +682,23 @@ extern "C" cudaError_t blz_inkling_prefill_attention(
 
 namespace {
 
-template<bool Key>
+__device__ void append_history(__nv_bfloat16* history, int rows, int taps, int width, int col, __nv_bfloat16 value) {
+    if (taps == 1) return;
+    const int first = rows == taps - 1;
+    for (int i = first; i < rows; ++i) history[(i - first) * width + col] = history[i * width + col];
+    history[(rows - first) * width + col] = value;
+}
+
+template<bool Key, bool Decode = false>
 __global__ void inkling_prefill_conv(const __nv_bfloat16* raw, const __nv_bfloat16* dynamic,
         const float* weights, __nv_bfloat16* out, int heads, int taps, int history,
-        float scale, float clip, float eps) {
+        float scale, float clip, float eps, __nv_bfloat16* past = nullptr) {
     const int lane = threadIdx.x;
     const int head = blockIdx.x;
     const int row = blockIdx.y;
     const int width = heads * HEAD_DIM;
     const int offset = head * HEAD_DIM;
-    const auto* current = raw + (history + row) * width + offset;
+    const auto* current = raw + (Decode ? 0 : (history + row) * width) + offset;
     float values[HEAD_DIM / 8];
     float partial[4] = {};
     for (int i = 0; i < HEAD_DIM / 8; ++i) {
@@ -569,7 +708,8 @@ __global__ void inkling_prefill_conv(const __nv_bfloat16* raw, const __nv_bfloat
         for (int lag = 0; lag < last; ++lag) {
             float w = weights[lag * width + offset + col];
             if (dynamic) w += __bfloat162float(dynamic[(row * heads + head) * taps + lag]);
-            v = __fadd_rn(v, __fmul_rn(__bfloat162float(current[col - lag * width]), w));
+            const auto x = Decode && lag > 0 ? past[(history - lag) * width + offset + col] : current[col - lag * width];
+            v = __fadd_rn(v, __fmul_rn(__bfloat162float(x), w));
         }
         v = __bfloat162float(__float2bfloat16(v * scale));
         values[i] = v;
@@ -583,7 +723,11 @@ __global__ void inkling_prefill_conv(const __nv_bfloat16* raw, const __nv_bfloat
     const float norm = Key ? fminf(1.0f, __fdiv_rn(clip, __fsqrt_rn(sum) + 1e-6f))
                            : __fdiv_rn(1.0f, __fsqrt_rn(sum / HEAD_DIM + eps));
     auto* dest = out + row * width + offset;
-    for (int i = 0; i < HEAD_DIM / 8; ++i) dest[i * 8 + lane] = __float2bfloat16(values[i] * norm);
+    for (int i = 0; i < HEAD_DIM / 8; ++i) {
+        const int col = i * 8 + lane;
+        dest[col] = __float2bfloat16(values[i] * norm);
+        if constexpr (Decode) append_history(past, history, taps, width, offset + col, current[col]);
+    }
 }
 
 } // namespace
@@ -676,24 +820,45 @@ extern "C" cudaError_t blz_inkling_prefill_conv(const uint16_t* key, const uint1
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t blz_inkling_decode_conv(const uint16_t* key, const uint16_t* value, const uint16_t* key_dynamic,
+        const uint16_t* value_dynamic, const float* weights, uint16_t* keys, uint16_t* values, int heads, int taps,
+        int history, uint16_t* past_keys, uint16_t* past_values, float scale, float clip, float eps, cudaStream_t stream) {
+    if (heads < 1 || taps < 1 || history < 0 || history >= taps) return cudaErrorInvalidValue;
+    inkling_prefill_conv<true, true><<<heads, 8, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(key),
+        reinterpret_cast<const __nv_bfloat16*>(key_dynamic), weights, reinterpret_cast<__nv_bfloat16*>(keys),
+        heads, taps, history, scale, clip, eps, reinterpret_cast<__nv_bfloat16*>(past_keys));
+    const auto err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    inkling_prefill_conv<false, true><<<heads, 8, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(value),
+        reinterpret_cast<const __nv_bfloat16*>(value_dynamic), weights + size_t(heads) * HEAD_DIM * taps,
+        reinterpret_cast<__nv_bfloat16*>(values), heads, taps, history, scale, clip, eps,
+        reinterpret_cast<__nv_bfloat16*>(past_values));
+    return cudaGetLastError();
+}
+
 namespace {
 
-__global__ void residual_conv(const __nv_bfloat16* raw, const __nv_bfloat16* previous,
-        const float* weights, float* out, int width, int taps, int history, float scale) {
+template<bool Decode = false, class Residual = __nv_bfloat16>
+__global__ void residual_conv(const __nv_bfloat16* raw, const Residual* previous,
+        const float* weights, float* out, int width, int taps, int history, float scale,
+        __nv_bfloat16* past = nullptr) {
     const int col = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y;
     if (col >= width) return;
-    const auto* current = raw + size_t(history + row) * width + col;
+    const auto* current = raw + (Decode ? 0 : size_t(history + row) * width) + col;
     float value = __bfloat162float(*current);
     const int count = min(taps, history + row + 1);
     for (int lag = 0; lag < count; ++lag) {
-        value = __fadd_rn(value, __fmul_rn(__bfloat162float(current[-lag * width]), weights[lag * width + col]));
+        const auto x = Decode && lag > 0 ? past[(history - lag) * width + col] : current[-lag * width];
+        value = __fadd_rn(value, __fmul_rn(__bfloat162float(x), weights[lag * width + col]));
     }
     value = __bfloat162float(__float2bfloat16(value * scale));
     const size_t index = size_t(row) * width + col;
-    out[index] = previous ? value + __bfloat162float(previous[index]) : value;
+    out[index] = previous ? value + float(previous[index]) : value;
+    if constexpr (Decode) append_history(past, history, taps, width, col, *current);
 }
 
+template<bool Decode = false>
 __global__ void mlp_residual_conv(const __nv_bfloat16* routed, const float* residual, const __nv_bfloat16* history,
         const float* weights, __nv_bfloat16* output, __nv_bfloat16* tail, int width, int taps,
         int history_rows, int tail_rows, float scale) {
@@ -711,8 +876,11 @@ __global__ void mlp_residual_conv(const __nv_bfloat16* routed, const float* resi
         value = __fadd_rn(value, __fmul_rn(__bfloat162float(raw), weights[lag * width + col]));
     }
     output[index] = __float2bfloat16(residual[index] + __bfloat162float(__float2bfloat16(value * scale)));
-    const int tail_row = row - (int(gridDim.y) - tail_rows);
-    if (tail_row >= 0) tail[size_t(tail_row) * width + col] = current;
+    if constexpr (Decode) append_history(tail, history_rows, taps, width, col, current);
+    else {
+        const int tail_row = row - (int(gridDim.y) - tail_rows);
+        if (tail_row >= 0) tail[size_t(tail_row) * width + col] = current;
+    }
 }
 
 } // namespace
@@ -722,7 +890,7 @@ extern "C" cudaError_t blz_inkling_mlp_residual_conv(const uint16_t* routed, con
         int width, int taps, int history_rows, int rows, int tail_rows, float scale, cudaStream_t stream) {
     if (width < 1 || taps < 1 || history_rows < 0 || history_rows >= taps || rows < 1 || rows > 65535
         || tail_rows < 0 || tail_rows > rows) return cudaErrorInvalidValue;
-    mlp_residual_conv<<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
+    mlp_residual_conv<><<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(routed), residual,
         reinterpret_cast<const __nv_bfloat16*>(history), weights, reinterpret_cast<__nv_bfloat16*>(output),
         reinterpret_cast<__nv_bfloat16*>(tail), width, taps, history_rows, tail_rows, scale);
@@ -734,9 +902,32 @@ extern "C" cudaError_t blz_inkling_residual_conv(const uint16_t* raw, const uint
         cudaStream_t stream) {
     if (width < 1 || taps < 1 || history < 0 || history >= taps || rows < 1 || rows > 65535)
         return cudaErrorInvalidValue;
-    residual_conv<<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
+    residual_conv<><<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(raw), reinterpret_cast<const __nv_bfloat16*>(previous),
         weights, out, width, taps, history, scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_decode_attention_residual(const uint16_t* raw, const float* previous,
+        const float* weights, float* out, uint16_t* history, int width, int taps, int past, float scale, cudaStream_t stream) {
+    residual_conv<true><<<(width + 127) / 128, 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(raw), previous, weights, out, width, taps, past, scale,
+        reinterpret_cast<__nv_bfloat16*>(history));
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_prefill_attention_residual(const uint16_t* raw, const float* previous,
+        const float* weights, float* out, int width, int taps, int past, int rows, float scale, cudaStream_t stream) {
+    residual_conv<false><<<dim3((width + 127) / 128, rows), 128, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(raw), previous, weights, out, width, taps, past, scale);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_inkling_decode_mlp_residual(const uint16_t* raw, const float* residual,
+        const float* weights, uint16_t* out, uint16_t* history, int width, int taps, int past, float scale, cudaStream_t stream) {
+    auto* state = reinterpret_cast<__nv_bfloat16*>(history);
+    mlp_residual_conv<true><<<(width + 127) / 128, 128, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(raw),
+        residual, state, weights, reinterpret_cast<__nv_bfloat16*>(out), state, width, taps, past, 0, scale);
     return cudaGetLastError();
 }
 

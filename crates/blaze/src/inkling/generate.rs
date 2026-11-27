@@ -153,8 +153,8 @@ pub fn generate(
         }
     }
     if drafted > 0 {
-        crate::eprintln!("DSpark proposed in {:.3}s, verified in {:.3}s; DSpark accepted {accepted} / {drafted} draft tokens",
-            draft_time.as_secs_f64(), verify_time.as_secs_f64());
+        crate::eprintln!("{} proposed in {:.3}s, verified in {:.3}s; accepted {accepted} / {drafted} draft tokens",
+            model.draft_name(), draft_time.as_secs_f64(), verify_time.as_secs_f64());
     }
     Ok(Generation {
         ids,

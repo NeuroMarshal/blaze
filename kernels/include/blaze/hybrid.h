@@ -87,6 +87,7 @@ struct HybridConfig {
   bool wide_a8 = false;           // wide (prefill) route on 8-bit block-floating inputs: 1 MMA per unit instead of 3
   bool wide_fp4 = false;
   bool resident_fast = false;
+  bool device_routes = false;
   float gate_cap = 0, up_cap = 0;
   int cpu_fast_cols = 0;          // CPU items with >= this many columns use the approximate Q8 kernels (0: off)
   // Expert deferral of the CPU tier (decode): layers < defer_last may defer when every CPU route ranks >=

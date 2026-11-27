@@ -62,7 +62,6 @@ pub(super) struct Draft {
 
 pub(super) struct Cache {
     kv: Vec<Kv>,
-    format: KvDtype,
     capacity: usize,
     conditioning: Vec<f32>,
 }
@@ -96,7 +95,6 @@ impl Cache {
             .collect::<Result<_>>()?;
         Ok(Self {
             kv,
-            format,
             capacity,
             conditioning: Vec::new(),
         })
@@ -281,52 +279,8 @@ impl Draft {
         offset: usize,
         stride: usize,
     ) -> Result<()> {
-        let [keys, values, ks, vs] = cache.kv[layer].pointers(0);
-        let key = self.output.at::<u16>(offset).cast();
-        let value = self.output.at::<u16>(offset + K).cast();
-        let err = unsafe {
-            if cache.format == KvDtype::Bf16 {
-                sys::blz_kv_store_dense(
-                    key,
-                    value,
-                    stride as i64,
-                    stride as i64,
-                    self.slots.ptr(),
-                    sys::BLZ_I32,
-                    rows as i64,
-                    KV_HEADS as i32,
-                    D as i32,
-                    sys::BLZ_KV_BF16,
-                    keys,
-                    values,
-                    self.scale.ptr(),
-                    self.scale.ptr(),
-                    gpu.stream.0,
-                )
-            } else {
-                sys::blz_nvfp4_kv_store(
-                    key,
-                    value,
-                    stride as i64,
-                    stride as i64,
-                    sys::BLZ_BF16,
-                    self.slots.ptr(),
-                    sys::BLZ_I32,
-                    rows as i64,
-                    KV_HEADS as i32,
-                    D as i32,
-                    keys,
-                    values,
-                    ks,
-                    vs,
-                    self.scale.ptr(),
-                    self.scale.ptr(),
-                    i32::from(cache.format == KvDtype::Nvfp4FourOverSix),
-                    gpu.stream.0,
-                )
-            }
-        };
-        check(err, "DSpark KV store")
+        cache.kv[layer].store_strided(0, self.output.at(offset), self.output.at(offset + K),
+            stride, self.slots.ptr(), rows, &self.scale, &gpu.stream)
     }
 
     pub fn append(

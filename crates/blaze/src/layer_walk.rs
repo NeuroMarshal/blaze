@@ -7,46 +7,88 @@ pub struct LayerVisit {
     pub pass: usize,
 }
 
-pub(crate) struct LoopResiduals<T> {
-    entry: Option<(T, usize)>,
-    messages: Vec<T>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoopEntry {
+    Save,
+    Rewind {
+        first_message: usize,
+        previous_blocks: usize,
+    },
 }
 
-impl<T: Clone> LoopResiduals<T> {
-    pub fn new() -> Self {
-        Self { entry: None, messages: Vec::new() }
-    }
-
-    pub fn enter(&mut self, pass: usize, hidden: &mut T, blocks: &mut Vec<T>, finish: impl FnOnce(&T) -> T) {
-        if pass == 0 {
-            self.entry = Some((hidden.clone(), blocks.len()));
-            return;
-        }
-        let (entry, depth) = self.entry.as_ref().expect("repeated layer visited before its first pass");
-        self.messages.clear();
-        self.messages.extend_from_slice(&blocks[*depth + 1..]);
-        self.messages.push(finish(hidden));
-        blocks.truncate(*depth);
-        hidden.clone_from(entry);
-    }
-
-    pub fn messages(&self) -> &[T] {
-        &self.messages
-    }
-
-    pub fn leave(&mut self) {
-        self.entry = None;
-        self.messages.clear();
-    }
+#[derive(Clone, Copy)]
+pub(crate) struct ResidualVisit {
+    pub depth: usize,
+    pub bank_slot: Option<usize>,
+    pub loop_entry: Option<LoopEntry>,
+    pub messages: usize,
 }
 
-pub(crate) fn repeated_layers(layers: usize, core: Range<usize>, passes: usize) -> Result<Vec<LayerVisit>> {
-    ensure!(core.start < core.end && core.end <= layers, "invalid repeated layer range {core:?}");
+/// Plan the residual bank independently of where the tensors live.
+pub(crate) fn residual_visits(
+    visits: &[LayerVisit],
+    core_start: usize,
+    layers_per_block: usize,
+) -> Result<Vec<ResidualVisit>> {
+    ensure!(layers_per_block > 0, "residual blocks must contain layers");
+    let mut depth = 0usize;
+    let mut entry_depth = None;
+    let mut messages = 0;
+    visits
+        .iter()
+        .map(|visit| {
+            let loop_entry = if visit.layer != core_start {
+                None
+            } else if visit.pass == 0 {
+                entry_depth = Some(depth);
+                Some(LoopEntry::Save)
+            } else {
+                let entry = entry_depth.context("loop pass has no entry state")?;
+                messages = depth
+                    .checked_sub(entry)
+                    .filter(|&n| n > 0)
+                    .context("loop pass has no residual blocks")?;
+                depth = entry;
+                Some(LoopEntry::Rewind {
+                    first_message: entry + 1,
+                    previous_blocks: messages - 1,
+                })
+            };
+            let bank_slot = visit
+                .layer
+                .is_multiple_of(layers_per_block)
+                .then_some(depth);
+            let state = ResidualVisit {
+                depth,
+                bank_slot,
+                loop_entry,
+                messages,
+            };
+            depth += usize::from(bank_slot.is_some());
+            Ok(state)
+        })
+        .collect()
+}
+
+pub(crate) fn repeated_layers(
+    layers: usize,
+    core: Range<usize>,
+    passes: usize,
+) -> Result<Vec<LayerVisit>> {
+    ensure!(
+        core.start < core.end && core.end <= layers,
+        "invalid repeated layer range {core:?}"
+    );
     ensure!(passes > 0, "layer walk requires at least one pass");
-    let count = core.len().checked_mul(passes).and_then(|n| n.checked_add(layers - core.len()))
+    let count = core
+        .len()
+        .checked_mul(passes)
+        .and_then(|n| n.checked_add(layers - core.len()))
         .context("layer visit count overflows")?;
     let mut visits = Vec::new();
-    visits.try_reserve_exact(count).context("allocating layer visits")?;
+    visits
+        .try_reserve_exact(count)
+        .context("allocating layer visits")?;
     let visit = |layer| LayerVisit { layer, pass: 0 };
     visits.extend((0..core.start).map(visit));
     for pass in 0..passes {
@@ -61,20 +103,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repeat_restores_entry_and_replaces_previous_pass_messages() {
-        let mut residuals = LoopResiduals::new();
-        let mut blocks = vec![1];
-        let mut hidden = 2;
-        residuals.enter(0, &mut hidden, &mut blocks, |_| unreachable!());
-        for pass in 1..3 {
-            blocks.extend([2, 2 + pass]);
-            hidden += pass;
-            residuals.enter(pass, &mut hidden, &mut blocks, |&x| x * 2);
-            assert_eq!(hidden, 2);
-            assert_eq!(&blocks, &[1]);
-            assert_eq!(residuals.messages(), &[2 + pass, (2 + pass) * 2]);
+    fn loop_rewinds_to_entry_and_addresses_only_previous_pass_messages() -> Result<()> {
+        let visits = repeated_layers(8, 2..6, 3)?;
+        let plan = residual_visits(&visits, 2, 2)?;
+        assert_eq!(plan[2].loop_entry, Some(LoopEntry::Save));
+        for i in [6, 10] {
+            assert_eq!(
+                plan[i].loop_entry,
+                Some(LoopEntry::Rewind {
+                    first_message: 2,
+                    previous_blocks: 1
+                })
+            );
+            assert_eq!(
+                (plan[i].depth, plan[i].messages, plan[i].bank_slot),
+                (1, 2, Some(1))
+            );
         }
-        residuals.leave();
-        assert!(residuals.messages().is_empty());
+        assert_eq!(plan.last().unwrap().depth, 4);
+        Ok(())
     }
 }

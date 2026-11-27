@@ -79,7 +79,7 @@ __device__ __forceinline__ uint32_t ld_nc_u32(const uint8_t* p) {
 // A thread handles chunks of 8 values (16-byte load, 8-byte limb stores); with a mailbox it also writes the planes,
 // the per-16 hi sums (chunk pairs, one shuffle) and the exponent there for the CPU engine.
 __device__ void encode_token(const blz_moe_layer& layer, const uint16_t* __restrict__ x, int t,
-                             const blz_moe_workspace& ws, int* s_emax) {
+                             const blz_moe_workspace& ws, int* s_emax, bool export_planes) {
   const int H = layer.hidden, tid = threadIdx.x, chunks = H / 8;
   const uint4* xv = reinterpret_cast<const uint4*>(x + size_t(t) * H);
   int e = 1;
@@ -103,9 +103,9 @@ __device__ void encode_token(const blz_moe_layer& layer, const uint16_t* __restr
   const int emax = s_emax[0];
   uint8_t* planes = ws.x_planes + size_t(t) * 3 * H;
   blz_mail_layout ml{};
-  if (ws.mail != nullptr) ml = blz_mail_layout_for(H);
-  uint8_t* mp = ws.mail != nullptr ? ws.mail + ml.planes + size_t(t) * 3 * H : nullptr;
-  int32_t* hsum_out = ws.mail != nullptr ? reinterpret_cast<int32_t*>(ws.mail + ml.hi_sum) + size_t(t) * (H / 16) : nullptr;
+  if (export_planes) ml = blz_mail_layout_for(H);
+  uint8_t* mp = export_planes ? ws.mail + ml.planes + size_t(t) * 3 * H : nullptr;
+  int32_t* hsum_out = export_planes ? reinterpret_cast<int32_t*>(ws.mail + ml.hi_sum) + size_t(t) * (H / 16) : nullptr;
   for (int c = tid; c < chunks; c += blockDim.x) {
     const uint4 v = xv[c];
     const uint32_t w[4] = {v.x, v.y, v.z, v.w};
@@ -137,7 +137,7 @@ __device__ void encode_token(const blz_moe_layer& layer, const uint16_t* __restr
   const int out_emax = emax == 0x7fffffff ? -1 : emax;
   if (tid == 0) {
     ws.x_emax[t] = out_emax;
-    if (ws.mail != nullptr) reinterpret_cast<blz_mail_header*>(ws.mail)->x_emax[t] = out_emax;
+    if (export_planes) reinterpret_cast<blz_mail_header*>(ws.mail)->x_emax[t] = out_emax;
   }
 }
 
@@ -186,7 +186,16 @@ __global__ void plan_kernel(blz_moe_layer layer, int layer_id, const uint16_t* _
   const int tid = threadIdx.x;
   // Blocks 1..T encode token columns (block t+1 -> token t) while block 0 builds the routing plan.
   if (blockIdx.x > 0) {
-    encode_token(layer, x, blockIdx.x - 1, ws, s_emax);
+    const int token = blockIdx.x - 1;
+    __shared__ bool export_planes;
+    if (ws.mail != nullptr && tid < 32) {
+      const int expert = tid < K ? topk_ids[token * K + tid] : -1;
+      const bool remote = unsigned(expert) < unsigned(layer.num_experts) && layer.slot_of[expert] < 0;
+      const bool any_remote = __any_sync(0xffffffffu, remote);
+      if (tid == 0) export_planes = any_remote;
+    }
+    if (ws.mail != nullptr) __syncthreads();
+    encode_token(layer, x, token, ws, s_emax, ws.mail != nullptr && export_planes);
     plan_block_done(ws, gridDim.x);
     return;
   }
@@ -333,7 +342,7 @@ __global__ void plan_resident_decode(blz_moe_layer layer, const uint16_t* x,
       plan->col[0][route] = 0;
     }
   }
-  encode_token(layer, x, 0, ws, emax);
+  encode_token(layer, x, 0, ws, emax, false);
 }
 
 template <bool Capped>

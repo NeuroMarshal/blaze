@@ -28,6 +28,9 @@ unsafe extern "C" {
     pub fn cudaGetDeviceCount(count: *mut c_int) -> cudaError_t;
     pub fn cudaGetDevice(device: *mut c_int) -> cudaError_t;
     pub fn cudaDeviceSynchronize() -> cudaError_t;
+    pub fn cudaDeviceCanAccessPeer(can_access: *mut c_int, device: c_int, peer: c_int) -> cudaError_t;
+    pub fn cudaDeviceEnablePeerAccess(peer: c_int, flags: u32) -> cudaError_t;
+    pub fn cudaGetLastError() -> cudaError_t;
     pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError_t;
     pub fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> cudaError_t;
     pub fn cudaFree(ptr: *mut c_void) -> cudaError_t;
@@ -36,6 +39,8 @@ unsafe extern "C" {
     pub fn cudaHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: u32) -> cudaError_t;
     pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int) -> cudaError_t;
     pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: c_int, s: cudaStream_t) -> cudaError_t;
+    pub fn cudaMemcpyPeerAsync(dst: *mut c_void, dst_device: c_int, src: *const c_void, src_device: c_int,
+        bytes: usize, s: cudaStream_t) -> cudaError_t;
     pub fn cudaMemcpy2DAsync(dst: *mut c_void, dpitch: usize, src: *const c_void, spitch: usize, width: usize,
                              height: usize, kind: c_int, s: cudaStream_t) -> cudaError_t;
     pub fn cudaMemsetAsync(dst: *mut c_void, value: c_int, bytes: usize, s: cudaStream_t) -> cudaError_t;
@@ -97,6 +102,8 @@ unsafe extern "C" {
                                   dim: c_int, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_router_topk(logits: *const bf16, ld: i64, tokens: c_int, experts: c_int, k: c_int, renorm: c_int,
                            ids: *mut i32, w: *mut f32, s: cudaStream_t) -> cudaError_t;
+    pub fn blz_router_sigmoid_topk(logits: *const f32, bias: *const f32, tokens: c_int, experts: c_int,
+        k: c_int, scale: f32, ids: *mut i32, weights: *mut f32, s: cudaStream_t) -> cudaError_t;
     pub fn blz_add(a: *const bf16, b: *const bf16, n: i64, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
     pub fn blz_gdn_gate(a: *const bf16, ld_a: i64, b: *const bf16, ld_b: i64, a_log: *const bf16, dt_bias: *const bf16,
                         tokens: c_int, v_heads: c_int, g: *mut f32, beta: *mut f32, s: cudaStream_t) -> cudaError_t;
@@ -599,6 +606,25 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn blz_inkling_norm_rows(input: *const f32, weight: *const f32, full: *mut f32, rounded: *mut u16,
+        rows: c_int, width: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_expand_bf16(input: *const u16, output: *mut f32, values: usize, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_pack_spec_features(input: *const f32, output: *mut u16, rows: c_int, width: c_int, stride: c_int,
+        stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_decode_conv(key: *const u16, value: *const u16, key_dynamic: *const u16, value_dynamic: *const u16,
+        weights: *const f32, keys: *mut u16, values: *mut u16, heads: c_int, taps: c_int, history: c_int,
+        past_keys: *mut u16, past_values: *mut u16, scale: f32, clip: f32, eps: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_decode_attention_residual(raw: *const u16, previous: *const f32, weights: *const f32,
+        output: *mut f32, history: *mut u16, width: c_int, taps: c_int, past: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_prefill_attention_residual(raw: *const u16, previous: *const f32, weights: *const f32, output: *mut f32,
+        width: c_int, taps: c_int, past: c_int, rows: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_decode_mlp_residual(raw: *const u16, residual: *const f32, weights: *const f32,
+        output: *mut u16, history: *mut u16, width: c_int, taps: c_int, past: c_int, scale: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_embed_rows(input: *const u16, image: *const u8, weight: *const f32, output: *mut f32,
+        rows: c_int, width: c_int, eps: f32, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_mix_normalized_rows(bank: *const f32, current: *const f32, query: *const f32,
+        output: *mut f32, depth: c_int, rows: c_int, width: c_int, stream: cudaStream_t) -> cudaError_t;
+    pub fn blz_inkling_kv_slots(slots: *mut i32, start: c_int, capacity: c_int, rows: c_int, stream: cudaStream_t) -> cudaError_t;
     pub fn blz_inkling_controller_qkv(gates: *const f32, x: *const f32, msg: *const f32, norms: *const f32,
                                       out: *mut u16, width: c_int, tokens: c_int, projection_stride: c_int, eps: f32,
                                       stream: cudaStream_t) -> cudaError_t;

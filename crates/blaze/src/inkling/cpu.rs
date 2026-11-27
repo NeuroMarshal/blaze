@@ -1,3 +1,4 @@
+#[cfg(test)]
 pub(super) fn controller_mix(x: &mut [f32], msg: &[f32], forget: &[f32], gain: &[f32]) {
     let mut start = 0;
     #[cfg(target_arch = "x86_64")]
@@ -61,7 +62,7 @@ fn tanh_avx(x: __m256) -> __m256 {
     _mm256_xor_ps(_mm256_div_ps(_mm256_sub_ps(one, exp), _mm256_add_ps(one, exp)), sign)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(test, target_arch = "x86_64"))]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn controller_mix_avx(x: &mut [f32], msg: &[f32], forget: &[f32], gain: &[f32]) {
     let one = _mm256_set1_ps(1.0);

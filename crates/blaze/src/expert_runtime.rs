@@ -32,16 +32,17 @@ impl MoeEngine {
 
     pub(crate) fn packed(
         directory: &Path, layers: Range<usize>, device: i32, budget: usize, top_k: usize,
-        threads: usize, chunk: usize, stream_gpu_only: bool, all_resident: bool, caps: (f32, f32),
+        threads: usize, chunk: usize, stream_gpu_only: bool, all_resident: bool, device_routes: bool, caps: (f32, f32),
     ) -> Result<Self> {
         let model_dir = CString::new(directory.as_os_str().as_encoded_bytes())?;
         let heat = directory.join(format!("heat-{}-{}.bin", layers.start, layers.end));
         let heat = CString::new(heat.as_os_str().as_encoded_bytes())?;
         let wide_min = if stream_gpu_only { 1 } else { chunk.clamp(32, 256) };
         let wide_a8 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_A8").is_some_and(|v| v == "1"));
-        let wide_fp4 = i32::from(std::env::var_os("BLAZE_MOE_WIDE_FP4").is_some_and(|v| v == "1"));
+        let wide_fp4 = i32::from(device_routes || std::env::var_os("BLAZE_MOE_WIDE_FP4").is_some_and(|v| v == "1"));
         let resident_fast = i32::from(all_resident);
-        let options = CString::new(format!("layers={}-{},wide_tokens={chunk},wide_min_tokens={wide_min},wide_a8={wide_a8},wide_fp4={wide_fp4},resident_fast={resident_fast}",
+        let device_routes = i32::from(device_routes);
+        let options = CString::new(format!("layers={}-{},wide_tokens={chunk},wide_min_tokens={wide_min},wide_a8={wide_a8},wide_fp4={wide_fp4},resident_fast={resident_fast},device_routes={device_routes}",
             layers.start, layers.end))?;
         unsafe {
             Self::create(sys::blz_moe_engine_config {

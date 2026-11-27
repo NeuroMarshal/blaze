@@ -3,7 +3,7 @@
 
 use crate::eagle::{DraftItem, DraftPlan};
 use crate::gpu::{DevBuf, HostMapped, Stream, check};
-use crate::linear::{Cut, Linear};
+use crate::linear::{Cut, LinCtx, Linear};
 use crate::model::Model;
 use crate::quant::QuantConfig;
 use crate::weights::{Checkpoint, Dtype};
@@ -36,6 +36,44 @@ pub struct DFlashConfig {
     pub target_layers: Vec<usize>,
     pub embed_scale: f32,
     pub vocab: usize,
+}
+
+pub(crate) struct Target<'a> {
+    pub hidden: usize,
+    pub vocab: usize,
+    pub local_vocab: usize,
+    pub valid_vocab: usize,
+    pub rank: usize,
+    pub world: usize,
+    pub sms: usize,
+    pub ar: *mut sys::blz_host_ar,
+    pub stream: &'a Stream,
+    pub linear: &'a LinCtx,
+    pub features: Option<&'a DevBuf>,
+    pub embedding: *const u16,
+    pub embedding_norm: Option<&'a DevBuf>,
+    pub head: &'a dyn Fn(*const u16, usize, *mut u16) -> Result<()>,
+}
+
+impl Model {
+    fn dflash_target<'a>(&'a self, head: &'a dyn Fn(*const u16, usize, *mut u16) -> Result<()>) -> Target<'a> {
+        Target {
+            hidden: self.cfg.hidden,
+            vocab: self.cfg.vocab,
+            local_vocab: self.dims.vocab,
+            valid_vocab: self.dims.vocab,
+            rank: self.tp.rank,
+            world: self.tp.world,
+            sms: self.sms(),
+            ar: self.tp.ar,
+            stream: &self.stream,
+            linear: self.lin_ctx(),
+            features: self.aux.as_ref(),
+            embedding: self.embed_table().dev_ptr(),
+            embedding_norm: None,
+            head,
+        }
+    }
 }
 
 impl DFlashConfig {
@@ -179,13 +217,13 @@ unsafe impl Send for DFlash {}
 impl DFlash {
     /// Window splits of the block attention: about four CTAs per SM over the call's query tiles and KV heads, within
     /// the partial workspace (one CTA per tile walked the whole 2048-position window).
-    fn attn_splits(&self, model: &Model, items: usize, q_len: usize) -> usize {
+    fn attn_splits(&self, sms: usize, items: usize, q_len: usize) -> usize {
         let (heads, kvh, hd) = (self.heads, self.kv_heads, self.cfg.head_dim);
         let group = heads / kvh;
         let mt = (q_len * group).div_ceil(16).min(3);
         let tiles = q_len.div_ceil((16 * mt / group).max(1));
         let cap = self.partial_o.bytes() / (heads * hd * 4);
-        let mut splits = (4 * model.sms() / (items * tiles * kvh)).clamp(1, 16);
+        let mut splits = (4 * sms / (items * tiles * kvh)).clamp(1, 16);
         while splits > 1
             && items * q_len * unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kvh as c_int, q_len as c_int, splits as c_int) } as usize > cap
         {
@@ -195,17 +233,21 @@ impl DFlash {
     }
 
     pub fn load(dir: &Path, model: &Model, max_items: usize, stride: usize) -> Result<Self> {
+        Self::load_target(dir, &model.dflash_target(&|_, _, _| unreachable!()), max_items, stride)
+    }
+
+    pub(crate) fn load_target(dir: &Path, target: &Target<'_>, max_items: usize, stride: usize) -> Result<Self> {
         let cfg = DFlashConfig::load(dir)?;
-        let s = &model.stream;
+        let s = target.stream;
         let ckpt = Checkpoint::open(dir)?;
         let root: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let hf_quant = std::fs::read_to_string(dir.join("hf_quant_config.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
         let quant = QuantConfig::from_model_config(&root, hf_quant.as_ref())?;
         let (h, hd) = (cfg.hidden, cfg.head_dim);
-        if hd != 128 || cfg.vocab != model.cfg.vocab || h != model.cfg.hidden {
-            bail!("DFlash: head dim {hd}, vocabulary {}, hidden {h} (128, the target's {} and {})", cfg.vocab, model.cfg.vocab, model.cfg.hidden);
+        if hd != 128 || cfg.vocab != target.vocab || h != target.hidden {
+            bail!("DFlash: head dim {hd}, vocabulary {}, hidden {h} (128, the target's {} and {})", cfg.vocab, target.vocab, target.hidden);
         }
-        let (rank, world) = (model.tp.rank, model.tp.world);
+        let (rank, world) = (target.rank, target.world);
         if cfg.heads % world != 0 || cfg.kv_heads % world != 0 || cfg.inter % world != 0 {
             bail!("DFlash: heads / KV heads / MLP rows do not split {world} ways");
         }
@@ -252,7 +294,7 @@ impl DFlash {
         let nq = max_items * cfg.block;
         let ns = max_items * cfg.steps();
         let groups = h / cfg.group;
-        let v_local = model.dims.vocab;
+        let v_local = target.local_vocab;
         // the block attention splits its window up to 16 ways (attn_splits)
         let parts = unsafe { sys::blz_nvfp4_mha_parts(heads as c_int, kv_heads as c_int, cfg.block as c_int, 16) } as usize;
         let k = cfg.top_k;
@@ -276,7 +318,7 @@ impl DFlash {
             heads,
             kv_heads,
             inter,
-            ar: if world > 1 { model.tp.ar } else { std::ptr::null_mut() },
+            ar: if world > 1 { target.ar } else { std::ptr::null_mut() },
             rank,
             world,
             ctx_h: b(ROWS * h * 2)?,
@@ -340,6 +382,22 @@ impl DFlash {
     /// Context K/V of the items' rows (the last step's hidden states) into every layer, then the drafts after each
     /// item (`steps()` tokens; `plan.k` is not used: a block is drafted whole).
     pub fn run(&mut self, model: &Model, plan: &DraftPlan) -> Result<Vec<Vec<i64>>> {
+        anyhow::ensure!(plan.items.is_empty() || model.aux.is_some(), "DFlash without captured hidden states");
+        let hidden = self.cfg.hidden;
+        let head = |input, rows, output| model.lm_head().run(model.lin_ctx(), input, hidden,
+            rows, output, model.dims.vocab, &model.stream);
+        self.run_target(&model.dflash_target(&head), plan)
+    }
+
+    pub(crate) fn append_target(&mut self, target: &Target<'_>, item: &DraftItem) -> Result<()> {
+        self.staged = 0;
+        let submit = self.context(target, item);
+        let waited = target.stream.sync();
+        submit?;
+        waited
+    }
+
+    pub(crate) fn run_target(&mut self, target: &Target<'_>, plan: &DraftPlan) -> Result<Vec<Vec<i64>>> {
         let n = plan.items.len();
         if n == 0 {
             return Ok(Vec::new());
@@ -349,31 +407,37 @@ impl DFlash {
         }
         // the previous call ended with a synchronization: its staging is free
         self.staged = 0;
-        for it in &plan.items {
-            self.context(model, it)?;
-        }
+        let enqueue = (|| -> Result<()> {
+            if target.features.is_some() {
+                for it in &plan.items {
+                    self.context(target, it)?;
+                }
+            }
+            if plan.k > 0 {
+                self.block(target, &plan.items)?;
+                self.candidates(target, n)?;
+            }
+            Ok(())
+        })();
+        let waited = target.stream.sync();
+        enqueue?;
+        waited?;
         if plan.k == 0 {
-            // the staging is reused by the next call: its copies must have run
-            model.stream.sync()?;
             return Ok(vec![Vec::new(); n]);
         }
-        self.block(model, &plan.items)?;
-        self.candidates(model, n)?;
-        let s = &model.stream;
-        s.sync()?;
         let steps = self.cfg.steps();
         let d: Vec<i64> = self.drafts.download(n * steps)?;
         Ok((0..n).map(|i| d[i * steps..(i + 1) * steps].to_vec()).collect())
     }
 
     /// K/V of one item's context rows (its last `window` ones: no query reads further back) into every layer's ring.
-    fn context(&mut self, model: &Model, it: &DraftItem) -> Result<()> {
+    fn context(&mut self, target: &Target<'_>, it: &DraftItem) -> Result<()> {
         let cfg = self.cfg.clone();
-        let (c, s, lin) = (&cfg, &model.stream, model.lin_ctx());
+        let (c, s, lin) = (&cfg, target.stream, target.linear);
         let (h, hd) = (c.hidden, c.head_dim);
         let kr = self.kv_heads * hd;
         let feats = c.target_layers.len() * h;
-        let aux = model.aux.as_ref().ok_or_else(|| anyhow!("DFlash without captured hidden states"))?;
+        let aux = target.features.ok_or_else(|| anyhow!("DFlash without captured hidden states"))?;
         let rows = it.tokens.len();
         let first = rows.saturating_sub(c.window);
         let w = c.window;
@@ -413,9 +477,9 @@ impl DFlash {
     }
 
     /// The query blocks: [anchor, mask...] per item through every layer; leaves the mask rows' final hidden in `hm`.
-    fn block(&mut self, model: &Model, items: &[DraftItem]) -> Result<()> {
+    fn block(&mut self, target: &Target<'_>, items: &[DraftItem]) -> Result<()> {
         let cfg = self.cfg.clone();
-        let (c, s, lin) = (&cfg, &model.stream, model.lin_ctx());
+        let (c, s, lin) = (&cfg, target.stream, target.linear);
         let (h, hd, bl) = (c.hidden, c.head_dim, c.block);
         let n = items.len();
         let nq = n * bl;
@@ -446,11 +510,14 @@ impl DFlash {
         let kvlp = self.stage(s, &kvl)?;
         let tokp = self.stage(s, &tok)?;
         self.anchors = self.stage(s, &anchors)?;
-        let table = model.embed_table();
         check(
-            unsafe { sys::blz_embed_gather(tokp, nq as i64, table.dev_ptr(), c.vocab as i64, (h * 2) as i64, self.h.ptr(), s.0) },
+            unsafe { sys::blz_embed_gather(tokp, nq as i64, target.embedding.cast(), c.vocab as i64, (h * 2) as i64, self.h.ptr(), s.0) },
             "DFlash embed",
         )?;
+        if let Some(norm) = target.embedding_norm {
+            check(unsafe { sys::blz_rmsnorm(self.h.ptr(), std::ptr::null_mut(), norm.ptr(), c.eps, nq as c_int, h as c_int, 0, self.x.ptr(), s.0) }, "DFlash target embedding norm")?;
+            check(unsafe { sys::cudaMemcpyAsync(self.h.ptr(), self.x.ptr(), nq * h * 2, sys::MEMCPY_D2D, s.0) }, "DFlash normalized embedding")?;
+        }
         if c.embed_scale != 1.0 {
             bail!("DFlash: input_embedding_scale {} is not supported yet", c.embed_scale);
         }
@@ -522,7 +589,7 @@ impl DFlash {
                         sys::blz_index_ptr { ptr: kvlp.cast(), kind: sys::BLZ_I32 },
                         n as c_int,
                         bl as c_int,
-                        self.attn_splits(model, n, bl) as c_int,
+                        self.attn_splits(target.sms, n, bl) as c_int,
                         1.0 / (hd as f32).sqrt(),
                         c.window as c_int,
                         c.causal as c_int,
@@ -568,15 +635,15 @@ impl DFlash {
     }
 
     /// Top-k of the target's LM head at every mask row (merged over the ranks), the selector's projection, the walk.
-    fn candidates(&self, model: &Model, n: usize) -> Result<()> {
-        let (c, s, lin) = (&self.cfg, &model.stream, model.lin_ctx());
+    fn candidates(&self, target: &Target<'_>, n: usize) -> Result<()> {
+        let (c, s, lin) = (&self.cfg, target.stream, target.linear);
         let (h, k) = (c.hidden, c.top_k);
         let ns = n * c.steps();
-        let v_local = model.dims.vocab;
-        model.lm_head().run(lin, self.hm.ptr(), h, ns, self.logits.ptr(), v_local, s)?;
+        let v_local = target.local_vocab;
+        (target.head)(self.hm.ptr(), ns, self.logits.ptr())?;
         check(
             unsafe {
-                sys::blz_topk(self.logits.ptr(), v_local as i64, ns as c_int, v_local as c_int, (self.rank * v_local) as c_int, k as c_int,
+                sys::blz_topk(self.logits.ptr(), v_local as i64, ns as c_int, target.valid_vocab as c_int, (self.rank * v_local) as c_int, k as c_int,
                               self.cand_vals.ptr(), self.cand_ids.ptr(), std::ptr::null_mut(), s.0)
             },
             "DFlash candidates",

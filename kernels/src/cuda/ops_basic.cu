@@ -3,6 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <math_constants.h>
 
 #include <cfloat>
 
@@ -193,6 +194,15 @@ __global__ void add_kernel(const uint16_t* __restrict__ a, const uint16_t* __res
 // One warp per token; experts <= 32 * kMaxPerLane, k <= 32.
 constexpr int kMaxPerLane = 16;
 
+__device__ void reduce_best_route(float& score, int& expert) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    const float other = __shfl_xor_sync(0xffffffffu, score, offset);
+    const int id = __shfl_xor_sync(0xffffffffu, expert, offset);
+    if (other > score || (other == score && id < expert)) score = other, expert = id;
+  }
+}
+
 __global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int64_t ld, int tokens, int experts, int k,
                                    int renorm, int32_t* __restrict__ ids, float* __restrict__ w) {
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -227,12 +237,7 @@ __global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int64_t 
       const int e = lane + 32 * j;
       if (p[j] > best || (p[j] == best && e < best_e)) best = p[j], best_e = e;
     }
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      const float ob = __shfl_xor_sync(0xffffffffu, best, o);
-      const int oe = __shfl_xor_sync(0xffffffffu, best_e, o);
-      if (ob > best || (ob == best && oe < best_e)) best = ob, best_e = oe;
-    }
+    reduce_best_route(best, best_e);
     const float prob = best / sum;
     picked_sum += prob;
     if (lane == r) my_w = prob, my_id = best_e;
@@ -241,6 +246,52 @@ __global__ void router_topk_kernel(const uint16_t* __restrict__ logits, int64_t 
   if (lane < k) {
     ids[t * k + lane] = my_id;
     w[t * k + lane] = renorm ? my_w / picked_sum : my_w;
+  }
+}
+
+__global__ void router_sigmoid_topk(const float* logits, const float* bias, int tokens, int experts, int k,
+                                    float scale, int32_t* ids, float* weights) {
+  const int lane = threadIdx.x % 32;
+  const int token = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+  if (token >= tokens) return;
+  logits += size_t(token) * experts;
+  ids += size_t(token) * k;
+  weights += size_t(token) * k;
+  float scores[kMaxPerLane];
+#pragma unroll
+  for (int j = 0; j < kMaxPerLane; ++j) {
+    const int expert = lane + j * 32;
+    scores[j] = expert < experts ? __frcp_rn(1.0f + expf(-logits[expert])) + bias[expert] : -CUDART_INF_F;
+  }
+  unsigned available = (1u << min(kMaxPerLane, (experts + 31 - lane) / 32)) - 1u;
+  int picked = 0;
+  for (int rank = 0; rank < k; ++rank) {
+    float best = -CUDART_INF_F;
+    int expert = 0x7fffffff;
+#pragma unroll
+    for (int j = 0; j < kMaxPerLane; ++j) {
+      const int id = lane + j * 32;
+      const float score = fmaxf(scores[j], -CUDART_INF_F);
+      if ((available & (1u << j)) && (score > best || (score == best && id < expert))) {
+        best = score;
+        expert = id;
+      }
+    }
+    reduce_best_route(best, expert);
+    if (lane == rank) picked = expert;
+    if (lane == (expert & 31)) available &= ~(1u << (expert / 32));
+  }
+  int index = 0;
+  for (int i = 0; i < k; ++i) index += __shfl_sync(0xffffffffu, picked, i) < picked;
+  float weight = lane < k ? __frcp_rn(1.0f + expf(-logits[picked])) : 0.0f;
+  float sum = 0.0f;
+  for (int i = 0; i < k; ++i) {
+    const unsigned int lanes = __ballot_sync(0xffffffffu, lane < k && index == i);
+    sum += __shfl_sync(0xffffffffu, weight, __ffs(lanes) - 1);
+  }
+  if (lane < k) {
+    ids[index] = picked;
+    weights[index] = weight * __fdiv_rn(scale, sum + 1e-20f);
   }
 }
 
@@ -488,6 +539,14 @@ extern "C" cudaError_t blz_router_topk(const uint16_t* logits, int64_t ld, int t
   if (tokens == 0) return cudaSuccess;
   if (experts > 32 * kMaxPerLane || k > 32 || k > experts) return cudaErrorInvalidValue;
   router_topk_kernel<<<(tokens + 3) / 4, 128, 0, stream>>>(logits, ld, tokens, experts, k, renorm, ids, w);
+  return cudaGetLastError();
+}
+
+extern "C" cudaError_t blz_router_sigmoid_topk(const float* logits, const float* bias, int tokens, int experts,
+                                               int k, float scale, int32_t* ids, float* weights, cudaStream_t stream) {
+  if (tokens < 1 || experts < 1 || experts > 32 * kMaxPerLane || k < 1 || k > 32 || k > experts)
+    return cudaErrorInvalidValue;
+  router_sigmoid_topk<<<(tokens + 3) / 4, 128, 0, stream>>>(logits, bias, tokens, experts, k, scale, ids, weights);
   return cudaGetLastError();
 }
 

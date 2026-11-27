@@ -368,3 +368,78 @@ impl Drop for HostMapped {
         unsafe { sys::cudaFreeHost(self.host) };
     }
 }
+
+pub(crate) struct DeviceTransfer {
+    source: i32,
+    destination: i32,
+    ready: Event,
+    staging: Option<(Stream, Event, HostMapped)>,
+}
+
+impl DeviceTransfer {
+    pub(crate) fn new(source: i32, destination: i32, bytes: usize) -> Result<Self> {
+        const PEER_ALREADY_ENABLED: i32 = 704;
+        let mut available = 0;
+        check(unsafe { sys::cudaDeviceCanAccessPeer(&mut available, destination, source) }, "query CUDA peer access")?;
+        let peer = if available != 0 {
+            set_device(destination)?;
+            let status = unsafe { sys::cudaDeviceEnablePeerAccess(source, 0) };
+            if status != sys::CUDA_SUCCESS {
+                unsafe { sys::cudaGetLastError() };
+            }
+            matches!(status, sys::CUDA_SUCCESS | PEER_ALREADY_ENABLED)
+        } else {
+            false
+        };
+        set_device(source)?;
+        let staging = if peer { None } else { Some((Stream::new()?, Event::new()?, HostMapped::new(bytes)?)) };
+        Ok(Self { source, destination, ready: Event::new()?, staging })
+    }
+
+    /// Enqueue a transfer. The source and destination buffers must remain live until the destination stream is done.
+    /// The caller orders the next use of the source and staging after that completion.
+    pub(crate) fn enqueue(&self, from: &Stream, to: &Stream, ranges: &[(&DevBuf, &DevBuf, usize)]) -> Result<()> {
+        anyhow::ensure!(ranges.iter().all(|(src, dst, bytes)| *bytes <= src.bytes().min(dst.bytes())),
+            "CUDA transfer exceeds a device buffer");
+        set_device(self.source)?;
+        if let Some((copy, begin, host)) = &self.staging {
+            let bytes = ranges.iter().map(|(_, _, bytes)| bytes).sum::<usize>();
+            anyhow::ensure!(bytes <= host.bytes(), "CUDA transfer exceeds staging");
+            stream_after(copy, from, begin)?;
+            let mut offset = 0;
+            for &(src, _, bytes) in ranges {
+                if bytes == 0 { continue; }
+                let slot = host.host_ptr().cast_mut().cast::<u8>().wrapping_add(offset).cast();
+                check(unsafe { sys::cudaMemcpyAsync(slot, src.ptr(), bytes, sys::MEMCPY_D2H, copy.0) }, "CUDA device export")?;
+                offset += bytes;
+            }
+            check(unsafe { sys::cudaEventRecord(self.ready.0, copy.0) }, "CUDA export event")?;
+            set_device(self.destination)?;
+            check(unsafe { sys::cudaStreamWaitEvent(to.0, self.ready.0, 0) }, "CUDA transfer wait")?;
+            let mut offset = 0;
+            for &(_, dst, bytes) in ranges {
+                if bytes == 0 { continue; }
+                let slot = host.host_ptr().cast::<u8>().wrapping_add(offset).cast();
+                check(unsafe { sys::cudaMemcpyAsync(dst.ptr(), slot, bytes, sys::MEMCPY_H2D, to.0) }, "CUDA device import")?;
+                offset += bytes;
+            }
+        } else {
+            check(unsafe { sys::cudaEventRecord(self.ready.0, from.0) }, "CUDA peer event")?;
+            set_device(self.destination)?;
+            check(unsafe { sys::cudaStreamWaitEvent(to.0, self.ready.0, 0) }, "CUDA peer wait")?;
+            for &(src, dst, bytes) in ranges {
+                if bytes == 0 { continue; }
+                check(unsafe { sys::cudaMemcpyPeerAsync(dst.ptr(), self.destination, src.ptr(), self.source, bytes, to.0) },
+                    "CUDA peer transfer")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn drain(&self) {
+        if let Some((copy, _, _)) = &self.staging
+            && set_device(self.source).is_ok() {
+            let _ = copy.sync();
+        }
+    }
+}
