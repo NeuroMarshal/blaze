@@ -543,10 +543,37 @@ impl Compute {
     }
 
     pub fn project_rows<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N], verifying: bool) -> Result<[Vec<u16>; N]> {
+        let (offsets, end) = self.stage_projections(matrices, inputs)?;
         let m = inputs[0].len();
-        let cols = matrices[0].cols;
         let rows = matrices.map(|w| w.rows * m);
         let output_values: usize = rows.iter().sum();
+        let enqueue = |gpu: &Self| -> Result<()> {
+            gpu.enqueue_projections(matrices, offsets, end, m, verifying, [0; N])?;
+            gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
+        };
+        let work = if m == 1 {
+            let weights = std::array::from_fn(|i| matrices.get(i).map_or(0, |w| w.weight.ptr::<u8>() as usize));
+            let key = ProjectionKey::Dense(weights, offsets);
+            self.run_projection(key, enqueue)
+        } else {
+            enqueue(self)
+        };
+        let synced = self.stream.sync();
+        work?;
+        synced?;
+        let mut offset = 0;
+        let host = self.transfer.host_ptr().cast::<u16>();
+        Ok(rows.map(|len| {
+            let dst = unsafe { std::slice::from_raw_parts(host.add(offset), len) }.to_vec();
+            offset += len;
+            dst
+        }))
+    }
+
+    fn stage_projections<const N: usize>(&mut self, matrices: [&Dense; N], inputs: [&[&[f32]]; N]) -> Result<([usize; 5], usize)> {
+        let m = inputs[0].len();
+        let cols = matrices[0].cols;
+        let output_values: usize = matrices.iter().map(|w| w.rows * m).sum();
         ensure!(
             matches!(N, 3 | 5) && m != 0
                 && inputs.iter().all(|x| x.len() == m && x.iter().all(|r| r.len() == cols))
@@ -575,37 +602,30 @@ impl Compute {
             }
             end += size;
         }
-        let enqueue = |gpu: &Self| -> Result<()> {
-            gpu.copy_staged_input(end * 2)?;
-            let mut out = 0;
-            for i in 0..N {
-                // Dynamic convolution taps use the decode GEMV for every prompt row.
-                if (verifying || i >= 3) && m > 1 {
-                    matrices[i].run_decode_rows(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
-                } else {
-                    matrices[i].run(gpu, gpu.input.at(offsets[i]), gpu.result.at(out), m)?;
-                }
-                out += rows[i];
+        Ok((offsets, end))
+    }
+
+    fn enqueue_projections<const N: usize>(
+        &self, matrices: [&Dense; N], offsets: [usize; 5], input_values: usize, rows: usize,
+        verifying: bool, prefix: [usize; N],
+    ) -> Result<[*mut u16; N]> {
+        let total: usize = matrices.iter().zip(prefix).map(|(w, p)| w.rows * rows + p).sum();
+        ensure!(total * 2 <= self.result.bytes(), "Inkling projection output exceeds scratch");
+        self.copy_staged_input(input_values * 2)?;
+        let mut out = 0;
+        let mut results = [null_mut(); N];
+        for i in 0..N {
+            out += prefix[i];
+            let result = self.result.at(out);
+            results[i] = result;
+            if (verifying || i >= 3) && rows > 1 {
+                matrices[i].run_decode_rows(self, self.input.at(offsets[i]), result, rows)?;
+            } else {
+                matrices[i].run(self, self.input.at(offsets[i]), result, rows)?;
             }
-            gpu.queue_result::<u16>(gpu.result.ptr(), output_values)
-        };
-        let work = if m == 1 {
-            let weights = std::array::from_fn(|i| matrices.get(i).map_or(0, |w| w.weight.ptr::<u8>() as usize));
-            let key = ProjectionKey::Dense(weights, offsets);
-            self.run_projection(key, enqueue)
-        } else {
-            enqueue(self)
-        };
-        let synced = self.stream.sync();
-        work?;
-        synced?;
-        let mut offset = 0;
-        Ok(rows.map(|len| {
-            // Read the requested range of the completed D2H copy.
-            let dst = unsafe { std::slice::from_raw_parts(host.add(offset), len) }.to_vec();
-            offset += len;
-            dst
-        }))
+            out += matrices[i].rows * rows;
+        }
+        Ok(results)
     }
 
     fn run_projection(&mut self, key: ProjectionKey, enqueue: impl Fn(&Self) -> Result<()>) -> Result<()> {
@@ -633,7 +653,7 @@ impl Compute {
         (self.input.bytes() / (N * width * 4))
             .min(self.result.bytes() / (N * width * 8))
             .min(self.gate.bytes() / (N * 64 * 2))
-            .min(PREFILL_ATTENTION_ROWS)
+            .min(65535)
     }
 
     pub fn controller_gates_batch<const N: usize>(
@@ -662,19 +682,23 @@ impl Compute {
             matrices.get(i).map_or(0, |w| w.weight.ptr::<u16>() as usize)
         });
         let key = ProjectionKey::Controller(pointers(down), pointers(up), count);
-        let work = self.run_projection(key, |gpu| {
+        let enqueue = |gpu: &Self| {
             gpu.copy_staged_input(num_inputs * 2)?;
-            for (i, w) in down.iter().enumerate() {
-                if count > 1 && crate::tune::skinny_fits(count, cols, N * cols) {
-                    check(unsafe {
-                        sys::blz_skinny_gemm_ex(gpu.input.at::<u16>(i * cols).cast(), (N * cols) as i64,
-                            w.weight.ptr(), gpu.gate.at::<u16>(i * 64).cast(), (N * 64) as i64, count as i32,
-                            64, cols as i32, sys::BLZ_BF16, gpu.stream.0)
-                    }, "Inkling batched loop projection")?;
-                } else {
-                    for r in 0..count {
-                        let index = r * N + i;
-                        w.run(gpu, gpu.input.at(index * cols), gpu.gate.at(index * 64), 1)?;
+            for first in (0..count).step_by(sys::BLZ_SKINNY_EX_MAX_ROWS) {
+                let batch = (count - first).min(sys::BLZ_SKINNY_EX_MAX_ROWS);
+                for (i, w) in down.iter().enumerate() {
+                    let index = first * N + i;
+                    if batch > 1 && crate::tune::skinny_fits(batch, cols, N * cols) {
+                        check(unsafe {
+                            sys::blz_skinny_gemm_ex(gpu.input.at::<u16>(index * cols).cast(), (N * cols) as i64,
+                                w.weight.ptr(), gpu.gate.at::<u16>(index * 64).cast(), (N * 64) as i64, batch as i32,
+                                64, cols as i32, sys::BLZ_BF16, gpu.stream.0)
+                        }, "Inkling batched loop projection")?;
+                    } else {
+                        for row in 0..batch {
+                            let index = index + row * N;
+                            w.run(gpu, gpu.input.at(index * cols), gpu.gate.at(index * 64), 1)?;
+                        }
                     }
                 }
             }
@@ -686,7 +710,8 @@ impl Compute {
                 )
             }, "Inkling controller gates")?;
             gpu.queue_result::<f32>(gpu.result.ptr(), num_outputs)
-        });
+        };
+        let work = if count == 1 { self.run_projection(key, enqueue) } else { enqueue(self) };
         let synced = self.stream.sync();
         work?;
         synced?;
@@ -725,7 +750,8 @@ impl Compute {
     }
 
     pub fn gate_batch_limit(&self, width: usize) -> usize {
-        (self.input.bytes() / (12 * width)).min(self.result.bytes() / (8 * width)).min(self.gate.bytes()/128).min(16)
+        (self.input.bytes() / (12 * width)).min(self.result.bytes() / (8 * width))
+            .min(self.gate.bytes() / 128).min(65535)
     }
 
     pub fn gated_router(
@@ -758,7 +784,7 @@ impl Compute {
                       norm.ptr::<u8>() as usize, router.weight.ptr::<u8>() as usize],
             eps: eps.to_bits(), tokens,
         };
-        let work = self.run_projection(key, |gpu| {
+        let enqueue = |gpu: &Self| {
             gpu.copy_staged_input(bytes)?;
             down.run_decode_rows(gpu, gpu.input.ptr(), gpu.gate.ptr(), tokens)?;
             check(unsafe {
@@ -774,7 +800,8 @@ impl Compute {
                     scores as i32, width as i32, tokens as i32, gpu.stream.0)
             }, "Inkling gated MoE router")?;
             gpu.queue_result::<u8>(gpu.input.ptr(), output_bytes)
-        });
+        };
+        let work = if tokens == 1 { self.run_projection(key, enqueue) } else { enqueue(self) };
         let synced = self.stream.sync();
         work?;
         synced?;
@@ -1306,6 +1333,15 @@ pub(super) struct AttentionConv<'a> {
     pub eps: f32,
 }
 
+pub(super) struct AttentionClip<'a> {
+    pub weights: &'a DevBuf,
+    pub relative: usize,
+    pub threshold: f32,
+    pub relative_threshold: f32,
+    pub log_floor: f32,
+    pub log_alpha: f32,
+}
+
 impl AttentionRow<'_> {
     fn fields(&self) -> [&[u16]; 6] {
         [&self.q, self.gate, self.sink, &self.relative, &self.key, &self.value]
@@ -1321,6 +1357,7 @@ pub(super) struct AttentionScratch {
     tiles: DevBuf,
     attended: DevBuf,
     filtered: DevBuf,
+    block_bytes: usize,
     batch: usize,
     tensor_prefill: bool,
     heads: usize,
@@ -1333,19 +1370,128 @@ impl AttentionScratch {
         let batch = chunk.min(PREFILL_ATTENTION_ROWS);
         let bytes = (values * batch + 2 * taps * kv_heads * (HEAD_DIM + batch)) * 2 + 9 * 16 + batch * 4;
         Ok(Self {
-            input: DevBuf::new(bytes)?,
-            staging: HostMapped::new(bytes)?,
+            input: DevBuf::new(bytes.next_multiple_of(16) * chunk.div_ceil(batch))?,
+            staging: HostMapped::new(bytes.next_multiple_of(16) * chunk.div_ceil(batch))?,
             relative: DevBuf::new(batch * heads * extent * 2)?,
             zero: DevBuf::from_slice(&[0i32])?,
             kv_scale: DevBuf::from_slice(&[KV_GLOBAL_SCALE])?,
             tiles: DevBuf::new(batch * heads * MAX_TILES * (HEAD_DIM + 2) * 4)?,
             attended: DevBuf::new(batch * heads * HEAD_DIM * 2)?,
             filtered: DevBuf::new(batch * 2 * kv_heads * HEAD_DIM * 2)?,
+            block_bytes: bytes.next_multiple_of(16),
             batch,
             tensor_prefill: std::env::var_os("BLAZE_INKLING_TENSOR_PREFILL").is_some_and(|value| value == "1"),
             heads,
             kv_heads,
         })
+    }
+
+    pub fn project_attention<const N: usize>(
+        &mut self, gpu: &mut Compute, kv: &Kv, matrices: [&Dense; N], inputs: [&[&[f32]]; N],
+        bias: &Dense, output: &Dense, start: usize, conv: AttentionConv<'_>, clip: AttentionClip<'_>,
+        tail: usize,
+    ) -> Result<(Vec<f32>, [Vec<u16>; 2])> {
+        let rows = inputs[0].len();
+        let history = (conv.taps - 1).min(start);
+        let width = self.kv_heads * HEAD_DIM;
+        let history_values = width * history;
+        let mut prefix = [0; N];
+        prefix[1] = history_values;
+        prefix[2] = history_values;
+        let (offsets, size) = gpu.stage_projections(matrices, inputs)?;
+        let q_values = rows * self.heads * HEAD_DIM;
+        let rel_values = rows * self.heads * clip.relative;
+        let sink_values = rows * self.heads;
+        let slot_offset = (2 * q_values + rel_values + sink_values).next_multiple_of(2) / 2;
+        let attention_values = rows * output.rows;
+        let tail = rows.min(tail) * width;
+        ensure!((slot_offset + rows) * 4 <= self.input.bytes()
+            && attention_values * 2 <= gpu.input.bytes()
+            && (attention_values + 2 * tail) * 2 <= gpu.transfer.bytes(),
+            "Inkling device attention exceeds scratch");
+        let staging = self.staging.host_slice_mut();
+        for (dst, src) in staging[..4 * history_values].chunks_exact_mut(2).zip(conv.history.into_iter().flatten()) {
+            dst.copy_from_slice(&src.to_ne_bytes());
+        }
+        for (i, dst) in staging[4 * history_values..4 * (history_values + rows)].chunks_exact_mut(4).enumerate() {
+            dst.copy_from_slice(&(((start + i) % kv.capacity) as i32).to_ne_bytes());
+        }
+        let work = (|| -> Result<()> {
+            let projections = gpu.enqueue_projections(matrices, offsets, size, rows, false, prefix)?;
+            let slots = self.input.at::<i32>(slot_offset);
+            let host = self.staging.host_ptr().cast::<u16>();
+            for (i, &raw) in projections[1..3].iter().enumerate().filter(|_| history > 0) {
+                check(unsafe { sys::cudaMemcpyAsync(raw.sub(history_values).cast(), host.add(i * history_values).cast(),
+                    history_values * 2, sys::MEMCPY_H2D, gpu.stream.0) }, "Inkling KV convolution history")?;
+            }
+            check(unsafe { sys::cudaMemcpyAsync(slots.cast(), host.add(2 * history_values).cast(),
+                rows * 4, sys::MEMCPY_H2D, gpu.stream.0) }, "Inkling KV slots")?;
+            let q = self.input.ptr::<u16>();
+            let gate = self.input.at::<u16>(q_values);
+            let relative = self.input.at::<u16>(2 * q_values);
+            let sink = self.input.at::<u16>(2 * q_values + rel_values);
+            check(unsafe {
+                sys::blz_inkling_split_projection(projections[0], clip.weights.ptr(), q, gate, relative, sink,
+                    rows as i32, self.heads as i32, clip.relative as i32, start as i32,
+                    clip.threshold, clip.relative_threshold, clip.log_floor, clip.log_alpha, gpu.stream.0)
+            }, "Inkling Q and relative clipping")?;
+
+            for first in (0..rows).step_by(self.batch) {
+                let count = (rows - first).min(self.batch);
+                let pos = start + first;
+                let oldest = (pos + 1).saturating_sub(kv.window);
+                ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
+                let prefix = (conv.taps - 1).min(pos);
+                let raw_offset = (history + first - prefix) * width;
+                let key = projections[1].wrapping_sub(history_values).wrapping_add(raw_offset);
+                let value = projections[2].wrapping_sub(history_values).wrapping_add(raw_offset);
+                let dynamic = |i: usize| projections.get(i).map_or(std::ptr::null(), |p| {
+                    p.wrapping_add(first * self.kv_heads * conv.taps) as *const u16
+                });
+                let keys = self.filtered.ptr();
+                let values = self.filtered.at(self.batch * width);
+                check(unsafe {
+                    sys::blz_inkling_prefill_conv(key, value, dynamic(3), dynamic(4), conv.weights.ptr(), keys, values,
+                        self.kv_heads as i32, conv.taps as i32, prefix as i32, count as i32,
+                        conv.scale, conv.clip, conv.eps, gpu.stream.0)
+                }, "Inkling prefill KV convolution")?;
+                kv.store_rows(0, keys, values, slots.wrapping_add(first), count, &self.kv_scale, &gpu.stream)?;
+                let query_offset = first * self.heads * HEAD_DIM;
+                self.attend_tile(gpu, kv, [
+                    q.wrapping_add(query_offset), gate.wrapping_add(query_offset), sink.wrapping_add(first * self.heads),
+                    relative.wrapping_add(first * self.heads * clip.relative),
+                ], bias, pos, count, false)?;
+                output.run_decode_rows(gpu, self.attended.ptr(), gpu.input.at(first * output.rows), count)?;
+            }
+            gpu.queue_result::<u16>(gpu.input.ptr(), attention_values)?;
+            for (i, &raw) in projections[1..3].iter().enumerate().filter(|_| tail > 0) {
+                let host = gpu.transfer.host_ptr().cast_mut().cast::<u16>();
+                check(unsafe { sys::cudaMemcpyAsync(host.add(attention_values + i * tail).cast(),
+                    raw.add(rows * width - tail).cast(), tail * 2, sys::MEMCPY_D2H, gpu.stream.0) },
+                    "Inkling KV convolution tail")?;
+            }
+            Ok(())
+        })();
+        let synced = gpu.stream.sync();
+        work?;
+        synced?;
+        let result = gpu.read_result::<u16>(attention_values + 2 * tail);
+        let (attention, history) = result.split_at(attention_values);
+        Ok((attention.iter().copied().map(from_bf16).collect(), [history[..tail].to_vec(), history[tail..].to_vec()]))
+    }
+
+    fn attend_tile(
+        &self, gpu: &Compute, kv: &Kv, [q, gate, sink, relative]: [*const u16; 4], bias: &Dense,
+        pos: usize, count: usize, verify: bool,
+    ) -> Result<()> {
+        bias.run(gpu, relative, self.relative.ptr(), count * self.heads)?;
+        let [keys, values, ks, vs] = kv.pointers(0);
+        check(unsafe {
+            sys::blz_inkling_prefill_attention(q, keys, values, ks, vs, self.relative.ptr(), sink, gate,
+                self.attended.ptr(), self.tiles.ptr(), self.heads as i32, self.kv_heads as i32,
+                kv.capacity as i32, kv.window as i32, pos as i32, bias.rows as i32, count as i32,
+                KV_GLOBAL_SCALE, i32::from(self.tensor_prefill && !verify && !kv.storage.is_host()), gpu.stream.0)
+        }, "Inkling causal prefill attention")
     }
 
     pub fn run_rows(&mut self, gpu: &mut Compute, kv: &Kv, rows: &[AttentionRow<'_>], bias: &Dense,
@@ -1355,59 +1501,64 @@ impl AttentionScratch {
             return self.run(gpu, kv, q, gate, sink, relative, key, value, bias, output, start);
         }
 
-        let mut result = Vec::with_capacity(rows.len() * output.rows);
-        for (block, chunk) in rows.chunks(self.batch).enumerate() {
-            let first = block * self.batch;
-            let pos = start + first;
-            let count = chunk.len();
-            let oldest = (pos + 1).saturating_sub(kv.window);
-            ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
-            let staging = self.staging.host_slice_mut();
-            let mut offset: usize = 0;
-            let history = conv.as_ref().map_or(0, |c| (c.taps - 1).min(pos));
-            let width = self.kv_heads * HEAD_DIM;
-            let mut stage = |src: &[u16], offset: &mut usize| {
-                // The staged copy reads initialized BF16 rows as bytes.
-                let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src)) };
-                staging[*offset..*offset + bytes.len()].copy_from_slice(bytes);
-                *offset += bytes.len();
-            };
-            let [q, gate, sink, relative, key, value] = std::array::from_fn(|field| {
-                offset = offset.next_multiple_of(16);
-                let ptr = self.input.at::<u16>(offset / 2);
-                if let Some(c) = &conv && field >= 4 {
-                    let from_state = history.saturating_sub(first) * width;
-                    let initial = c.history[field - 4];
-                    stage(&initial[initial.len() - from_state..], &mut offset);
-                    for row in &rows[first.saturating_sub(history)..first] {
+        let result_count = rows.len() * output.rows;
+        ensure!(result_count * 2 <= gpu.result.bytes()
+            && rows.len().div_ceil(self.batch) * self.block_bytes <= self.input.bytes(),
+            "Inkling attention rows exceed scratch");
+        let work = (|| -> Result<()> {
+            for (block, chunk) in rows.chunks(self.batch).enumerate() {
+                let first = block * self.batch;
+                let pos = start + first;
+                let count = chunk.len();
+                let oldest = (pos + 1).saturating_sub(kv.window);
+                ensure!(pos + count - oldest <= kv.capacity, "Inkling prefill would overwrite live KV");
+                let base = block * self.block_bytes;
+                let staging = &mut self.staging.host_slice_mut()[base..base + self.block_bytes];
+                let mut offset: usize = 0;
+                let history = conv.as_ref().map_or(0, |c| (c.taps - 1).min(pos));
+                let width = self.kv_heads * HEAD_DIM;
+                let mut stage = |src: &[u16], offset: &mut usize| {
+                    // The staged copy reads initialized BF16 rows as bytes.
+                    let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src)) };
+                    staging[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+                    *offset += bytes.len();
+                };
+                let [q, gate, sink, relative, key, value] = std::array::from_fn(|field| {
+                    offset = offset.next_multiple_of(16);
+                    let ptr = self.input.at::<u16>((base + offset) / 2);
+                    if let Some(c) = &conv && field >= 4 {
+                        let from_state = history.saturating_sub(first) * width;
+                        let initial = c.history[field - 4];
+                        stage(&initial[initial.len() - from_state..], &mut offset);
+                        for row in &rows[first.saturating_sub(history)..first] {
+                            stage(row.fields()[field], &mut offset);
+                        }
+                    }
+                    for row in chunk {
                         stage(row.fields()[field], &mut offset);
                     }
+                    ptr
+                });
+                let dynamic = if let Some(c) = &conv && let Some(dynamic) = c.dynamic {
+                    let width = self.kv_heads * c.taps;
+                    dynamic.map(|src| {
+                        offset = offset.next_multiple_of(16);
+                        let ptr = self.input.at::<u16>((base + offset) / 2);
+                        stage(&src[first * width..(first + count) * width], &mut offset);
+                        ptr as *const u16
+                    })
+                } else {
+                    [std::ptr::null(); 2]
+                };
+                let slots_at = offset.next_multiple_of(16);
+                let mut offset = slots_at;
+                for p in pos..pos + count {
+                    staging[offset..offset + 4].copy_from_slice(&((p % kv.capacity) as i32).to_ne_bytes());
+                    offset += 4;
                 }
-                for row in chunk {
-                    stage(row.fields()[field], &mut offset);
-                }
-                ptr
-            });
-            let dynamic = if let Some(c) = &conv && let Some(dynamic) = c.dynamic {
-                let width = self.kv_heads * c.taps;
-                dynamic.map(|src| {
-                    offset = offset.next_multiple_of(16);
-                    let ptr = self.input.at::<u16>(offset / 2);
-                    stage(&src[first * width..(first + count) * width], &mut offset);
-                    ptr as *const u16
-                })
-            } else {
-                [std::ptr::null(); 2]
-            };
-            let slots_at = offset.next_multiple_of(16);
-            let mut offset = slots_at;
-            for p in pos..pos + count {
-                staging[offset..offset + 4].copy_from_slice(&((p % kv.capacity) as i32).to_ne_bytes());
-                offset += 4;
-            }
-            let work = (|| -> Result<()> {
                 check(unsafe {
-                    sys::cudaMemcpyAsync(self.input.ptr(), self.staging.host_ptr(), offset, sys::MEMCPY_H2D, gpu.stream.0)
+                    sys::cudaMemcpyAsync(self.input.at::<u8>(base).cast(), self.staging.host_ptr().cast::<u8>().add(base).cast(),
+                        offset, sys::MEMCPY_H2D, gpu.stream.0)
                 }, "Inkling attention batch inputs")?;
                 let (key, value) = if let Some(c) = &conv {
                     let keys = self.filtered.ptr();
@@ -1421,24 +1572,16 @@ impl AttentionScratch {
                 } else {
                     (key, value)
                 };
-                kv.store_rows(0, key, value, self.input.at(slots_at / 4), count, &self.kv_scale, &gpu.stream)?;
-                bias.run(gpu, relative, self.relative.ptr(), count * self.heads)?;
-                let [keys, values, ks, vs] = kv.pointers(0);
-                check(unsafe {
-                    sys::blz_inkling_prefill_attention(q, keys, values, ks, vs, self.relative.ptr(), sink, gate,
-                        self.attended.ptr(), self.tiles.ptr(), self.heads as i32, self.kv_heads as i32,
-                        kv.capacity as i32, kv.window as i32, pos as i32, bias.rows as i32, count as i32,
-                        KV_GLOBAL_SCALE, i32::from(self.tensor_prefill && !verify && !kv.storage.is_host()), gpu.stream.0)
-                }, "Inkling causal prefill attention")?;
-                output.run_decode_rows(gpu, self.attended.ptr(), gpu.result.ptr(), count)?;
-                gpu.queue_result::<u16>(gpu.result.ptr(), count * output.rows)
-            })();
-            let synced = gpu.stream.sync();
-            work?;
-            synced?;
-            result.extend(gpu.read_result::<u16>(count * output.rows).into_iter().map(from_bf16));
-        }
-        Ok(result)
+                kv.store_rows(0, key, value, self.input.at((base + slots_at) / 4), count, &self.kv_scale, &gpu.stream)?;
+                self.attend_tile(gpu, kv, [q, gate, sink, relative], bias, pos, count, verify)?;
+                output.run_decode_rows(gpu, self.attended.ptr(), gpu.result.at(first * output.rows), count)?;
+            }
+            gpu.queue_result::<u16>(gpu.result.ptr(), result_count)
+        })();
+        let synced = gpu.stream.sync();
+        work?;
+        synced?;
+        Ok(gpu.read_result::<u16>(result_count).into_iter().map(from_bf16).collect())
     }
 
     pub fn run(
@@ -1530,8 +1673,8 @@ mod tests {
         let window = 160;
         let capacity = window + PREFILL_ATTENTION_ROWS - 1;
         let end = 225;
-        let mut scratch = AttentionScratch::new(1, 1, window, 8, PREFILL_ATTENTION_ROWS, 4).unwrap();
-        let mut gpu = Compute::new(128, 2048, 128, 64, 0, [0; 2], [0; 2], 8, 16, None).unwrap();
+        let mut scratch = AttentionScratch::new(1, 1, window, 8, end, 4).unwrap();
+        let mut gpu = Compute::new(128, 2048, 128, 64, 0, [0; 2], [0; 2], 8, end, None).unwrap();
         let bias: Vec<_> = (0..window * 8).map(|i| to_bf16((i % 11) as f32 / 32.0)).collect();
         let bias = Dense::from_bf16(&bias, window, 8).unwrap();
         let weights: Vec<_> = (0..128 * 128).map(|i| to_bf16((i % 13) as f32 / 256.0)).collect();

@@ -567,6 +567,78 @@ __global__ void inkling_prefill_conv(const __nv_bfloat16* raw, const __nv_bfloat
 
 } // namespace
 
+namespace {
+
+template<bool Relative>
+__global__ void split_clipped_projection(
+    const __nv_bfloat16* projected, const float* weights, __nv_bfloat16* clipped,
+    __nv_bfloat16* gates, __nv_bfloat16* sinks, int relative, int start,
+    float threshold, float log_floor, float log_alpha) {
+    const int heads = gridDim.x;
+    const int head = blockIdx.x, row = blockIdx.y, lane = threadIdx.x;
+    const int q_width = heads * HEAD_DIM;
+    const int stride = 2 * q_width + heads * (relative + 1);
+    const int width = Relative ? relative : HEAD_DIM;
+    const auto* src = projected + size_t(row) * stride;
+    const auto* values = src + (Relative ? 2 * q_width : 0) + head * width;
+    const auto* scale = weights + head * width;
+    auto* out = clipped + (size_t(row) * heads + head) * width;
+    const float log_scale = 1.0f + __fmul_rn(log_alpha,
+        logf(fmaxf(1.0f, __fdiv_rn(float(start + row + 1), log_floor))));
+    if constexpr (Relative) {
+        if (lane == 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < width; ++i) {
+                const float v = __bfloat162float(values[i]) * scale[i];
+                sum = __fadd_rn(sum, __fmul_rn(v, v));
+            }
+            const float norm = fminf(1.0f, __fdiv_rn(threshold, __fsqrt_rn(sum) + 1e-6f));
+            for (int i = 0; i < width; ++i) {
+                const float v = (__bfloat162float(values[i]) * scale[i]) * norm;
+                out[i] = __float2bfloat16(__bfloat162float(__float2bfloat16(v)) * log_scale);
+            }
+            sinks[size_t(row) * heads + head] = src[2 * q_width + heads * relative + head];
+        }
+    } else {
+        float partial[4] = {};
+        float channels[HEAD_DIM / 8];
+        for (int i = 0; i < HEAD_DIM / 8; ++i) {
+            const int col = i * 8 + lane;
+            const float v = __bfloat162float(values[col]) * scale[col];
+            channels[i] = v;
+            partial[i % 4] = fmaf(v, v, partial[i % 4]);
+            gates[size_t(row) * q_width + head * HEAD_DIM + col] = src[q_width + head * HEAD_DIM + col];
+        }
+        const float accum = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+        float sum = 0.0f;
+        const unsigned mask = __activemask();
+        for (int i = 0; i < 8; ++i) sum += __shfl_sync(mask, accum, i, 8);
+        const float norm = fminf(1.0f, __fdiv_rn(threshold, __fsqrt_rn(sum) + 1e-6f));
+        for (int i = 0; i < HEAD_DIM / 8; ++i)
+            out[i * 8 + lane] = __float2bfloat16(__bfloat162float(__float2bfloat16(channels[i] * norm)) * log_scale);
+    }
+}
+
+} // namespace
+
+extern "C" cudaError_t blz_inkling_split_projection(const uint16_t* projected, const float* weights,
+        uint16_t* query, uint16_t* gate, uint16_t* relative, uint16_t* sink, int rows, int heads,
+        int rel_width, int start, float clip, float rel_clip, float log_floor, float log_alpha, cudaStream_t stream) {
+    if (rows < 1 || rows > 65535 || heads < 1 || rel_width < 1 || rel_width >= 32) return cudaErrorInvalidValue;
+    const dim3 grid(heads, rows);
+    const auto* source = reinterpret_cast<const __nv_bfloat16*>(projected);
+    auto* sinks = reinterpret_cast<__nv_bfloat16*>(sink);
+    split_clipped_projection<false><<<grid, 8, 0, stream>>>(source, weights,
+        reinterpret_cast<__nv_bfloat16*>(query), reinterpret_cast<__nv_bfloat16*>(gate), sinks,
+        rel_width, start, clip, log_floor, log_alpha);
+    const auto status = cudaGetLastError();
+    if (status != cudaSuccess) return status;
+    split_clipped_projection<true><<<grid, 1, 0, stream>>>(source, weights + heads * HEAD_DIM,
+        reinterpret_cast<__nv_bfloat16*>(relative), nullptr, sinks,
+        rel_width, start, rel_clip, log_floor, log_alpha);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t blz_inkling_prefill_conv(const uint16_t* key, const uint16_t* value, const uint16_t* key_dynamic,
         const uint16_t* value_dynamic, const float* weights, uint16_t* keys, uint16_t* values, int heads, int taps,
         int history, int rows, float scale, float clip, float eps, cudaStream_t stream) {

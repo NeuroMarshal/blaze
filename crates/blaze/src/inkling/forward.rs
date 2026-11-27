@@ -1,6 +1,6 @@
 use super::{KvDtype, cpu};
 use super::dspark::{Cache as DraftCache, Draft, Features};
-use super::cuda::{AttentionConv, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, prompt_stage_bytes, to_bf16};
+use super::cuda::{AttentionClip, AttentionConv, AttentionRow, AttentionScratch, Compute, Dense, Kv, PREFILL_ATTENTION_ROWS, expert_size, from_bf16, prompt_stage_bytes, to_bf16};
 use super::generate::Input;
 use super::vision::Vision;
 use super::weights::{Experts, read_float};
@@ -387,6 +387,7 @@ struct Layer {
     gated_norm: Option<gpu::DevBuf>,
     q_clip: Vec<f32>,
     rel_clip: Vec<f32>,
+    device_clip: Option<gpu::DevBuf>,
     res_query: Vec<f32>,
     res_mlp: Vec<f32>,
     loop_inputs: Option<LoopInputs>,
@@ -463,6 +464,14 @@ impl Layer {
             let weights: Vec<_> = k_conv.taps.iter().chain(&v_conv.taps).flatten().copied().collect();
             gpu::DevBuf::from_slice(&weights)
         }).transpose()?;
+        let q_clip = read("attn.q_l2_clip.scale", &[s.heads, s.dim])?;
+        let rel_clip = read("attn.rel_l2_clip.scale", &[s.heads, s.relative])?;
+        let device_clip = (avx_controller && s.relative < 32 && s.heads.is_multiple_of(8)
+            && std::env::var_os("BLAZE_INKLING_DEVICE_ATTENTION").is_none_or(|value| value != "0"))
+            .then(|| {
+                let weights: Vec<_> = q_clip.iter().chain(&rel_clip).copied().collect();
+                gpu::DevBuf::from_slice(&weights)
+            }).transpose()?;
 
         Ok(Self {
             local,
@@ -493,8 +502,9 @@ impl Layer {
             },
             norm_mlp,
             gated_norm,
-            q_clip: read("attn.q_l2_clip.scale", &[s.heads, s.dim])?,
-            rel_clip: read("attn.rel_l2_clip.scale", &[s.heads, s.relative])?,
+            q_clip,
+            rel_clip,
+            device_clip,
             res_query,
             res_mlp: read_float(ckpt, &format!("{attn_res}.mlp_queries.{id}"), &[s.hidden])?,
             loop_inputs,
@@ -769,7 +779,8 @@ impl Model {
             );
             let compute = Compute::new(
                 (s.hidden * 2).max(s.q_width()),
-                s.vocab.max((layers[0].query.rows + 2 * (s.kv_width() + s.kv_heads * s.conv)) * prefill_chunk),
+                s.vocab.max((layers[0].query.rows + 2 * (s.kv_width() + s.kv_heads * s.conv)) * prefill_chunk
+                    + 2 * s.kv_width() * (s.conv - 1)),
                 s.hidden,
                 s.intermediate,
                 expert_bytes,
@@ -1038,88 +1049,125 @@ impl Model {
                 .zip(&q_refs)
                 .map(|(v, &q)| v.as_deref().unwrap_or(q))
                 .collect();
-            let (qkv, conv) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
-                let [q, key, value, k_taps, v_taps] = compute.project_rows(
-                    [&layer.query, &layer.key, &layer.value, k, v],
-                    [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)),
-                )?;
-                ([q, key, value], Some([k_taps, v_taps]))
-            } else {
-                (compute.project_rows([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)))?, None)
-            };
-            let [q_batch, k_batch, v_batch] = qkv;
             let count = rows.len();
+            let attention = if count > 1 && !matches!(readout, Readout::Verify(_))
+                && let (Some(clip), Some(weights)) = (&layer.device_clip, &layer.kv_taps)
+            {
+                let conv = AttentionConv {
+                    weights,
+                    history: [&state.key.bf16_history(seq.position, s.conv), &state.value.bf16_history(seq.position, s.conv)],
+                    dynamic: None,
+                    taps: s.conv,
+                    scale: layer.k_conv.scale,
+                    clip: s.qk_clip,
+                    eps: s.eps,
+                };
+                let clip = AttentionClip {
+                    weights: clip,
+                    relative: s.relative,
+                    threshold: s.qk_clip,
+                    relative_threshold: s.rel_clip,
+                    log_floor: s.log_floor,
+                    log_alpha: if layer.local { 0.0 } else { s.log_alpha },
+                };
+                let tail = state.key.rows.len().min(count);
+                let (output, [key, value]) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
+                    device.scratch.project_attention(compute, &state.kv,
+                        [&layer.query, &layer.key, &layer.value, k, v], [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs],
+                        &layer.bias, &layer.output, seq.position, conv, clip, tail)?
+                } else {
+                    device.scratch.project_attention(compute, &state.kv,
+                        [&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs],
+                        &layer.bias, &layer.output, seq.position, conv, clip, tail)?
+                };
+                let start = seq.position + count - tail;
+                state.key.remember_bf16(start, s.kv_width(), &key);
+                state.value.remember_bf16(start, s.kv_width(), &value);
+                output
+            } else {
+                let (qkv, conv) = if let (Some(k), Some(v)) = (&layer.k_conv.dynamic, &layer.v_conv.dynamic) {
+                    let [q, key, value, k_taps, v_taps] = compute.project_rows(
+                        [&layer.query, &layer.key, &layer.value, k, v],
+                        [&q_refs, &k_refs, &v_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)),
+                    )?;
+                    ([q, key, value], Some([k_taps, v_taps]))
+                } else {
+                    (compute.project_rows([&layer.query, &layer.key, &layer.value], [&q_refs, &k_refs, &v_refs], matches!(readout, Readout::Verify(_)))?, None)
+                };
+                let [q_batch, k_batch, v_batch] = qkv;
+                let kv_weights = layer.kv_taps.as_ref().filter(|_| count > 1);
+                let kv_history = kv_weights.map(|_| [
+                    state.key.bf16_history(seq.position, s.conv),
+                    state.value.bf16_history(seq.position, s.conv),
+                ]);
+                let mut queries = Vec::with_capacity(count);
+                for offset in 0..count {
+                    let position = seq.position + offset;
+                    let q_raw = &q_batch[offset * layer.query.rows..(offset + 1) * layer.query.rows];
+                    let (q_raw, rest) = q_raw.split_at(s.q_width());
+                    let (gate, rest) = rest.split_at(s.q_width());
+                    let (rel_raw, sink) = rest.split_at(s.rel_width());
+                    let log_scale = if layer.local {
+                        1.0
+                    } else {
+                        1.0 + s.log_alpha * (((position + 1) as f32 / s.log_floor).max(1.0)).ln()
+                    };
+                    let q = clipped(q_raw, &layer.q_clip, s.dim, s.qk_clip, log_scale);
+                    let rel = clipped(rel_raw, &layer.rel_clip, s.relative, s.rel_clip, log_scale);
+                    let kv_range = offset * s.kv_width()..(offset + 1) * s.kv_width();
+                    if kv_weights.is_some() {
+                        queries.push(AttentionRow { q, gate, sink, relative: rel,
+                            key: (&k_batch[kv_range.clone()]).into(), value: (&v_batch[kv_range]).into() });
+                        continue;
+                    }
+                    let key: Vec<_> = k_batch[kv_range.clone()].iter().copied().map(from_bf16).collect();
+                    let value: Vec<_> = v_batch[kv_range].iter().copied().map(from_bf16).collect();
+                    let taps = |i: usize| conv.as_ref().map(|w| {
+                        let width = s.kv_heads * s.conv;
+                        &w[i][offset * width..(offset + 1) * width]
+                    });
+                    let key = layer.k_conv.run(&mut state.key, &key, taps(0), position, s.dim);
+                    let value = layer.v_conv.run(&mut state.value, &value, taps(1), position, s.dim);
+                    let key: Vec<_> = key
+                        .chunks_exact(s.dim)
+                        .flat_map(|row| {
+                            let scale = clip_scale(row, s.qk_clip);
+                            row.iter().map(move |&v| to_bf16(v * scale))
+                        })
+                        .collect();
+                    let value: Vec<_> = value
+                        .chunks_exact(s.dim)
+                        .flat_map(|row| {
+                            let scale = inv_rms(row, s.eps);
+                            row.iter().map(move |&v| to_bf16(v * scale))
+                        })
+                        .collect();
+                    queries.push(AttentionRow { q, gate, sink, relative: rel, key: key.into(), value: value.into() });
+                }
+                let kv_conv = kv_weights.zip(kv_history.as_ref()).map(|(weights, history)| AttentionConv {
+                    weights,
+                    history: history.each_ref().map(Vec::as_slice),
+                    dynamic: conv.as_ref().map(|c| c.each_ref().map(Vec::as_slice)),
+                    taps: s.conv,
+                    scale: layer.k_conv.scale,
+                    clip: s.qk_clip,
+                    eps: s.eps,
+                });
+                let attention = device.scratch.run_rows(
+                    compute, &state.kv, &queries, &layer.bias, &layer.output, seq.position, kv_conv,
+                    matches!(readout, Readout::Verify(_)),
+                )?;
+                if kv_weights.is_some() {
+                    state.key.remember_bf16(seq.position, s.kv_width(), &k_batch);
+                    state.value.remember_bf16(seq.position, s.kv_width(), &v_batch);
+                }
+                attention
+            };
             let mut inputs = Vec::new();
             let mut mixed = Vec::new();
             let mut messages_batch = Vec::new();
             let limit = compute.gate_batch_limit(s.hidden);
             let mut gated_logits = None;
-            let kv_weights = layer.kv_taps.as_ref().filter(|_| count > 1);
-            let kv_history = kv_weights.map(|_| [
-                state.key.bf16_history(seq.position, s.conv),
-                state.value.bf16_history(seq.position, s.conv),
-            ]);
-            let mut queries = Vec::with_capacity(count);
-            for offset in 0..count {
-                let position = seq.position + offset;
-                let q_raw = &q_batch[offset * layer.query.rows..(offset + 1) * layer.query.rows];
-                let (q_raw, rest) = q_raw.split_at(s.q_width());
-                let (gate, rest) = rest.split_at(s.q_width());
-                let (rel_raw, sink) = rest.split_at(s.rel_width());
-                let log_scale = if layer.local {
-                    1.0
-                } else {
-                    1.0 + s.log_alpha * (((position + 1) as f32 / s.log_floor).max(1.0)).ln()
-                };
-                let q = clipped(q_raw, &layer.q_clip, s.dim, s.qk_clip, log_scale);
-                let rel = clipped(rel_raw, &layer.rel_clip, s.relative, s.rel_clip, log_scale);
-                let kv_range = offset * s.kv_width()..(offset + 1) * s.kv_width();
-                if kv_weights.is_some() {
-                    queries.push(AttentionRow { q, gate, sink, relative: rel,
-                        key: (&k_batch[kv_range.clone()]).into(), value: (&v_batch[kv_range]).into() });
-                    continue;
-                }
-                let key: Vec<_> = k_batch[kv_range.clone()].iter().copied().map(from_bf16).collect();
-                let value: Vec<_> = v_batch[kv_range].iter().copied().map(from_bf16).collect();
-                let taps = |i: usize| conv.as_ref().map(|w| {
-                    let width = s.kv_heads * s.conv;
-                    &w[i][offset * width..(offset + 1) * width]
-                });
-                let key = layer.k_conv.run(&mut state.key, &key, taps(0), position, s.dim);
-                let value = layer.v_conv.run(&mut state.value, &value, taps(1), position, s.dim);
-                let key: Vec<_> = key
-                    .chunks_exact(s.dim)
-                    .flat_map(|row| {
-                        let scale = clip_scale(row, s.qk_clip);
-                        row.iter().map(move |&v| to_bf16(v * scale))
-                    })
-                    .collect();
-                let value: Vec<_> = value
-                    .chunks_exact(s.dim)
-                    .flat_map(|row| {
-                        let scale = inv_rms(row, s.eps);
-                        row.iter().map(move |&v| to_bf16(v * scale))
-                    })
-                    .collect();
-                queries.push(AttentionRow { q, gate, sink, relative: rel, key: key.into(), value: value.into() });
-            }
-            let kv_conv = kv_weights.zip(kv_history.as_ref()).map(|(weights, history)| AttentionConv {
-                weights,
-                history: history.each_ref().map(Vec::as_slice),
-                dynamic: conv.as_ref().map(|c| c.each_ref().map(Vec::as_slice)),
-                taps: s.conv,
-                scale: layer.k_conv.scale,
-                clip: s.qk_clip,
-                eps: s.eps,
-            });
-            let attention = device.scratch.run_rows(
-                compute, &state.kv, &queries, &layer.bias, &layer.output, seq.position, kv_conv,
-                matches!(readout, Readout::Verify(_)),
-            )?;
-            if kv_weights.is_some() {
-                state.key.remember_bf16(seq.position, s.kv_width(), &k_batch);
-                state.value.remember_bf16(seq.position, s.kv_width(), &v_batch);
-            }
             for (offset, (row, attn)) in rows.iter_mut().zip(attention.chunks_exact(s.hidden)).enumerate() {
                 let position = seq.position + offset;
                 let ForwardRow { x, blocks, messages, .. } = row;
