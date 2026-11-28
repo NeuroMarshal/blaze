@@ -1,4 +1,4 @@
-//! Qwen3.5 / 3.6 / 3.8 model graphs with Gated DeltaNet, softmax attention and dense or MoE MLPs.
+//! Model graphs with Gated DeltaNet, softmax attention and dense or MoE MLPs.
 //! Projections with a shared input are stacked at load time.
 
 use crate::config::{QSA_TABLE_STRIDE, LayerKind, MlpConfig, ModelConfig, RopeScaling};
@@ -139,7 +139,7 @@ pub enum Mlp {
     Dense { gu: Linear, down: Linear },
 }
 
-/// Low-rank gated hyper-connection of one block (Qwen4-Exp GatedResidual): per-stream norm, mix down to one input,
+/// Low-rank gated hyper-connection of one block: per-stream norm, mix down to one input,
 /// gated injection of the block's output back into every stream.
 pub struct HcBlock {
     pub(crate) norm: DevBuf,
@@ -161,7 +161,7 @@ pub enum FinalMix {
     Hyper(HcBlock),
 }
 
-/// Per-layer n-gram embedding (Qwen4-Exp PLE) of one layer.
+/// Per-layer n-gram embedding (PLE).
 pub struct Ple {
     key: Linear,
     value: Linear,
@@ -369,7 +369,7 @@ pub struct Options {
     pub draft: Option<std::path::PathBuf>,
     /// CUDA graphs of the drafter's chain
     pub draft_graphs: bool,
-    /// YaRN context extension (Qwen's recipe) by this factor over max_position_embeddings, when the config has no
+    /// YaRN context extension by this factor over max_position_embeddings, when the config has no
     /// rope scaling of its own (the checkpoint stays as is)
     pub yarn_factor: Option<f64>,
     /// Draft trees: state levels of the GDN tree verify (the branching rows on one path it can hold; 0: no tree
@@ -380,8 +380,8 @@ pub struct Options {
     /// EAGLE-4: this rank's vocabulary shard of the drafter's LM head in VRAM (Some(true)), in the pinned host table
     /// (Some(false)), or in VRAM when it fits with room to spare (None)
     pub draft_head_vram: Option<bool>,
-    /// The checkpoint's own MTP head as the drafter (its `mtp.*` weights; Qwen3.5 NextN): the attention window of its KV
-    /// ring in positions (0: no MTP drafter). The target keeps the normed final hidden state of every row for it.
+    /// KV window in positions for the checkpoint's `mtp.*` drafter. Zero disables it.
+    /// The target keeps the normalized final hidden state of each row for the drafter.
     pub mtp_window: usize,
     /// MTP drafter: the draft head scores only the first this many token ids of the vocabulary (the frequent ones; 0: all
     /// of them, the target's own head). The drafts are only proposals, the verify decides, so the loss is acceptance on
@@ -946,8 +946,7 @@ pub struct Model {
     mrope_comp: DevBuf,
 }
 
-/// The stream of each of the `half` rotary frequencies: Qwen3-VL interleaves them (t h w t h w ... then t), earlier
-/// Qwen-VL models give each stream a contiguous section.
+/// Assign rotary frequencies by stream using interleaved t/h/w frequencies or one contiguous section per stream.
 fn mrope_components(rope: &crate::config::RopeConfig) -> Vec<u8> {
     let half = rope.rotary_dim / 2;
     let sec = &rope.mrope_section;
@@ -998,7 +997,7 @@ impl Model {
     /// they need over PCIe instead of keeping 1-2.5 GB in VRAM).
     pub fn load_embedding(dir: &Path) -> Result<HostMapped> {
         if crate::config::is_inkling_loop(&ModelConfig::read_json(dir)?) {
-            bail!("Inkling 2 Mini uses the looped execution path (blaze serve-inkling or blaze inkling-run)");
+            bail!("This checkpoint requires the looped executor. Use blaze serve --model <PATH>.");
         }
         let ckpt = Checkpoint::open(dir)?;
         let name = format!("{}embed_tokens.weight", ckpt.text_prefix());

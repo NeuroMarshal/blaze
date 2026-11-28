@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(kThreads) rmsnorm_ld_kernel(const uint16_t* __
   for (int i = threadIdx.x; i < dim; i += kThreads) o[i] = to_bf(bf(xr[i]) * inv * bf(w[i]));
 }
 
-// the same with the zero-centered weight (1 + w) of the Qwen3.5 norms
+// the same with a zero-centered weight (1 + w)
 __global__ void __launch_bounds__(kThreads) rmsnorm_ld_zc_kernel(const uint16_t* __restrict__ x, int64_t ldx,
                                                                  const uint16_t* __restrict__ w, float eps, int dim,
                                                                  uint16_t* __restrict__ out, int64_t ldo) {

@@ -14,7 +14,7 @@ Build each model from the runtime's existing operations. Checkpoint code maps me
 
 - A routed model can compute its own top-k IDs and coefficients. Pass those to HybridMoE through `expert_runtime`. HybridMoE already owns expert placement, CPU offload, and execution.
 - An attention layer describes heads, masks or windows, KV format, and any bias its math requires. FlashAttention is an implementation of the attention operation. A model that uses an existing operation should inherit its compatible implementations.
-- A recurrent model describes repeated visits and their dependencies. Inkling uses `layer_walk` to describe the visits. Weights can be shared across visits while KV and convolution history retain their own state.
+- A recurrent model uses `layer_walk` to describe repeated visits and their dependencies. Visits can share weights and retain separate KV and convolution history.
 - A model can connect DFlash2 by supplying the target embeddings, activation taps, and readout to `dflash::Target`. MTP and n-gram also supply drafts to a target-side verification and commit step. Keep draft acceptance and state rollback in the generation path.
 - Use the CUDA graph and GPU transfer primitives when a step repeats or crosses devices. Select the kernels and prepare graph inputs outside the hot loop where their shapes and lifetimes allow it.
 

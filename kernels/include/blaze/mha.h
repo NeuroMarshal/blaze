@@ -1,4 +1,4 @@
-// C API of dense attention straight from an NVFP4 KV pool (full-attention layers of Qwen3.5/3.6/3.8 dense models,
+// C API for dense attention reading from an NVFP4 KV pool (full-attention layers,
 // --kv-cache-dtype nvfp4_4over6): decode and speculative verify read the 4-bit codes directly, flash-decode style
 // (the context split over blocks, partial results merged by log-sum-exp); prefill dequantizes the prefix rows into a
 // 16-bit workspace for the extend kernel. Raw device pointers, caller's stream; no torch dependency.

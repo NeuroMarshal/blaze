@@ -68,8 +68,8 @@ pub struct ServiceArgs {
     /// JSON sampling defaults over generation_config (explicit CLI and request parameters take precedence)
     #[arg(long, alias = "preferred-sampling-params")]
     pub override_generation_config: Option<String>,
-    /// JSON sampling defaults of chat requests with thinking off, over the defaults above (Qwen's instruct mode:
-    /// {"temperature":0.7,"top_p":0.8,"presence_penalty":1.5}); request parameters take precedence
+    /// JSON sampling defaults for chat requests with thinking off, for example
+    /// {"temperature":0.7,"top_p":0.8,"presence_penalty":1.5}. Request parameters take precedence.
     #[arg(long)]
     pub instruct_sampling: Option<String>,
     /// Ordered sampling stages, as a comma-separated list or JSON array

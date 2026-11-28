@@ -404,7 +404,7 @@ void PleService::run() {
 
 }  // namespace blaze
 
-// C API (qwen4.h)
+// C API for the per-layer embedding service
 #include "blaze/qwen4.h"
 
 struct blz_ple {

@@ -95,7 +95,7 @@ struct EngineArgs {
     /// GPUs (tensor-parallel ranks)
     #[arg(long, aliases = ["tensor-parallel-size", "tp-size"], default_value_t = 1)]
     tp: usize,
-    /// YaRN context extension by this factor (Qwen: 2 for 524288 positions from 262144), the checkpoint unchanged
+    /// YaRN context multiplier, such as 2 to extend 262144 positions to 524288
     #[arg(long)]
     yarn_factor: Option<f64>,
     /// EAGLE-4 drafter checkpoint (speculative decoding with --spec-method eagle)
@@ -373,8 +373,8 @@ enum Command {
     },
     /// Describe a checkpoint: architecture, layers, weight formats per module.
     Inspect { model: PathBuf },
-    /// Run native Inkling 2 Mini text generation and report prefill and decode time.
-    InklingRun {
+    /// Run a looped checkpoint locally and report prefill and decode time.
+    RunLooped {
         #[arg(long)]
         model: PathBuf,
         #[arg(long)]
@@ -401,13 +401,13 @@ enum Command {
         /// Format for both local and global attention KV.
         #[arg(long, value_enum, default_value = "bf16")]
         kv_cache_dtype: blaze::inkling::KvDtype,
-        /// Inkling prefill attention: scalar or faster tensor (FP16 probabilities, FP32 accumulation).
+        /// Looped prefill uses scalar attention or tensor cores with FP16 probabilities and FP32 accumulation.
         #[arg(long, value_enum, default_value = "scalar")]
         prefill_attention: blaze::inkling::PrefillAttention,
         /// Number of native DSpark draft tokens per block (0 disables drafting).
         #[arg(long, default_value_t = 0)]
         dspark_tokens: usize,
-        /// DFlash2 checkpoint for the Inkling target.
+        /// DFlash2 draft checkpoint.
         #[arg(long)]
         draft: Option<PathBuf>,
         /// Number of vocabulary rows scored by the draft head. Zero uses the full vocabulary.
@@ -421,57 +421,6 @@ enum Command {
         temperature: f32,
         #[arg(long)]
         seed: Option<u64>,
-    },
-    /// Serve Inkling 2 Mini with a native looped backend.
-    #[command(args_override_self = true, hide = true)]
-    ServeInkling {
-        #[arg(long)]
-        model: PathBuf,
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-        #[arg(long, default_value_t = 8000)]
-        port: u16,
-        #[arg(long, default_value = "inkling-2-mini")]
-        served_model_name: String,
-        #[arg(long, alias = "max-model-len", default_value_t = 32768)]
-        context: usize,
-        #[arg(long, default_value_t = 8192)]
-        max_tokens: usize,
-        #[arg(long, default_value_t = 0)]
-        device: i32,
-        #[arg(long, default_value_t = 1)]
-        gpus: usize,
-        #[arg(long, default_value_t = 0)]
-        expert_cache_mib: usize,
-        /// Keep cold experts in RAM and compute them on CPU. Zero selects every available CPU.
-        #[arg(long)]
-        expert_threads: Option<usize>,
-        #[arg(long)]
-        host_kv: bool,
-        /// Format for both local and global attention KV.
-        #[arg(long, value_enum, default_value = "bf16")]
-        kv_cache_dtype: blaze::inkling::KvDtype,
-        /// Inkling prefill attention: scalar or faster tensor (FP16 probabilities, FP32 accumulation).
-        #[arg(long, value_enum, default_value = "scalar")]
-        prefill_attention: blaze::inkling::PrefillAttention,
-        /// Number of native DSpark draft tokens per block (0 disables drafting).
-        #[arg(long, default_value_t = 0)]
-        dspark_tokens: usize,
-        /// DFlash2 checkpoint for the Inkling target.
-        #[arg(long)]
-        draft: Option<PathBuf>,
-        /// Number of vocabulary rows scored by the draft head. Zero uses the full vocabulary.
-        #[arg(long, default_value_t = 0)]
-        dspark_head_vocab: usize,
-        #[arg(long, default_value_t = 32)]
-        prefill_chunk: usize,
-        /// Maximum tokens per image. Zero leaves the visual encoder unloaded.
-        #[arg(long, default_value_t = 0)]
-        max_image_tokens: usize,
-        #[arg(long, default_value_t = 16)]
-        max_queued_requests: usize,
-        #[arg(long)]
-        allowed_media_domain: Vec<String>,
     },
     /// Teacher-forced scoring of a text file: per position the log-probability of the next token and the argmax,
     /// as JSON lines (for comparisons against a reference engine).
@@ -762,26 +711,7 @@ fn main() -> Result<()> {
             blaze::engine::remote::serve(&listen, &engine.model, opts, !engine.no_graphs)
         }
         Command::Inspect { model } => blaze::inspect::run(&model),
-        Command::ServeInkling { model, host, port, served_model_name, context, max_tokens, device, gpus,
-                                expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, max_image_tokens, max_queued_requests, allowed_media_domain } => {
-            let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-            runtime.block_on(blaze::server::serve_inkling(blaze::server::InklingConfig {
-                path: model, queue: max_queued_requests,
-                options: blaze::inkling::Options { device, gpus, context, expert_cache_mib, expert_threads, host_kv, kv_dtype: kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, max_image_tokens },
-                service: blaze::server::ServeConfig {
-                    host, port, served_name: served_model_name, default_max_tokens: max_tokens,
-                    defaults: Default::default(), instruct_defaults: None, api_keys: Vec::new(),
-                    max_concurrent_requests: max_queued_requests.max(1), request_timeout: std::time::Duration::ZERO,
-                    shutdown_timeout: std::time::Duration::from_secs(10), body_limit: 32 << 20,
-                    allowed_origins: Vec::new(), effective, tool_parser: None, reasoning_parser: None,
-                    thinking_budget: None, grammar_whitespace: 0,
-                },
-                media: blaze::server::MmConfig::new(
-                    None, Default::default(), 4, 0, std::time::Duration::from_secs(5), 16 << 20, allowed_media_domain,
-                ),
-            }))
-        }
-        Command::InklingRun { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, temperature, seed } => {
+        Command::RunLooped { model, prompt, raw, image, reasoning_effort, context, max_tokens, device, gpus, expert_cache_mib, expert_threads, host_kv, kv_cache_dtype, prefill_attention, draft, dspark_tokens, dspark_head_vocab, prefill_chunk, temperature, seed } => {
             anyhow::ensure!(temperature.is_finite() && temperature >= 0.0, "--temperature must be finite and nonnegative");
             let text = blaze::text::Text::load(&model)?;
             let images = image.map(std::fs::read).transpose()?.into_iter().collect::<Vec<_>>();

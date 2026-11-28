@@ -1,6 +1,6 @@
 // blz_skinny_gemm(_ex) and the BF16 tensor-core GEMV (blz_bf16_gemv_mma_cfg): agreement with an FP64 reference (one
-// rounding of the FP32 sum to 16 bits), and timing of the shapes they serve (Qwen3.8-27B GDN in_proj_ba per TP rank:
-// 48 x 5120; the EAGLE-4 low-rank down: 128 x 5120).
+// rounding of the FP32 sum to 16 bits). Time a GDN in_proj_ba shard (48 x 5120)
+// and an EAGLE-4 low-rank down projection (128 x 5120).
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>

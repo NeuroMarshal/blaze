@@ -1,4 +1,4 @@
-// Hyper-connection low-rank input mix for decode / verify batches (Qwen4-Exp attn/mlp hyper connections).
+// Low-rank hyper-connection input mix for decode and verification batches.
 //
 //   t[m]      = bf16(silu(fp32(x[m] . w_down^T) / hc))                      [rows][lowrank]
 //   u[m]      = fp32(t[m] . w_up^T)                                           [rows][hc * hs]

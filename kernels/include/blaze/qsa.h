@@ -1,4 +1,4 @@
-// C API of the NVFP4 KV readers for Qwen Sparse Attention (QSA). They mirror SGLang's Triton gathers
+// NVFP4 KV readers for compressed sparse attention. They mirror SGLang's Triton gathers
 // (_compact_kv and _pack_qsa_prefill_kv in layers/attention/qsa/sparse_attn.py) for an NVFP4 pool and
 // dequantize on the way into the 16-bit scratch the attention kernels read.
 #pragma once

@@ -23,7 +23,7 @@ cudaError_t blz_cand_argmax(const float* logits, const int32_t* ids, int rows, i
 /// \brief a[i] = b[i] = (int64) src[i] for i < n (a greedy pick as the next draft input and as the call's record).
 cudaError_t blz_widen_i32(const int32_t* src, int64_t* a, int64_t* b, int n, cudaStream_t stream);
 
-/// \brief blz_rmsnorm_ld with the zero-centered weight: out = x / rms * (1 + w) (the Qwen3.5 / MTP norms).
+/// \brief blz_rmsnorm_ld with a zero-centered weight, out = x / rms * (1 + w).
 cudaError_t blz_rmsnorm_ld_zc(const uint16_t* x, int64_t ldx, const uint16_t* w, float eps, int rows, int dim,
                               uint16_t* out, int64_t ldo, cudaStream_t stream);
 

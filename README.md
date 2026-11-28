@@ -3,7 +3,6 @@
 Developed with extensive AI assistance. The code and its tests are the reference.
 
 Blaze is an inference runtime I built for my own workloads and hardware, using Rust and C++/CUDA.
-It currently focuses on quantized Qwen models.
 Reads local safetensors checkpoints with BF16, FP8, MXFP8 and NVFP4 weights.
 Includes tensor/pipeline parallelism, prefix caching, speculative decoding and an HTTP API.
 

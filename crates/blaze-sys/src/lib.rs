@@ -546,7 +546,7 @@ unsafe extern "C" {
                                   w: *const f32, out: *mut bf16, s: cudaStream_t) -> cudaError_t;
 }
 
-// Qwen4-Exp (qwen4.h, hc_mix.h)
+// Hyper-connections and per-layer n-gram embeddings
 #[repr(C)]
 pub struct blz_ple {
     _private: [u8; 0],

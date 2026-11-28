@@ -143,7 +143,7 @@ static void test_attn_prep() {
 }
 
 // M-RoPE: with the three position streams equal the kernel is the text kernel bit for bit; with different streams every
-// frequency rotates by its own stream (interleaved t h w t h w ... as Qwen3-VL: sections [11, 11, 10] of 32).
+// frequency rotates by its own stream (interleaved t h w t h w ... with sections [11, 11, 10] of 32).
 static void test_attn_prep_mrope() {
   const int T = 5, H = 4, KVH = 2, D = 256, RD = 64;
   auto qg = rand_bf(T * H * 2 * D, 2.0f), k = rand_bf(T * KVH * D, 2.0f), qn = rand_bf(D, 0.1f), kn = rand_bf(D, 0.1f);

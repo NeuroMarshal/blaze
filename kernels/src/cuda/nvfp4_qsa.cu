@@ -1,4 +1,4 @@
-// NVFP4 KV readers for Qwen Sparse Attention: gather + dequantize selected rows into 16-bit scratch.
+// Gather and dequantize selected NVFP4 KV rows into 16-bit scratch.
 //
 // Thread mapping: one thread owns 8 consecutive values of one (row, head): it loads 4 bytes of codes and
 // one block scale, and stores one 16-byte vector. A warp covers 256 values, i.e. one head of dim 256.

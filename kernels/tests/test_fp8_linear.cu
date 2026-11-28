@@ -1,5 +1,5 @@
 // blz_fp8_gemv_mma / blz_fp8_weight_dequant: agreement with an FP64 reference (per-channel and 128-block scales), and
-// the cold-weight bandwidth of the GEMV on Qwen3.8-Flash-Next shapes (GDN in_proj 16384 x 2560, out_proj 2560 x 6144).
+// the cold-weight bandwidth of the GEMV (GDN in_proj 16384 x 2560, out_proj 2560 x 6144).
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>

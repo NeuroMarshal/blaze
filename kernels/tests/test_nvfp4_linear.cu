@@ -1,5 +1,5 @@
 // blz_nvfp4_gemv / blz_nvfp4_weight_dequant: agreement with an FP64 reference of the checkpoint formula, and the effective
-// weight bandwidth of the GEMV on the Qwen3.8-27B shapes per TP rank (gate|up 17408 x 5120, down 5120 x 8704).
+// weight bandwidth of the GEMV per TP rank (gate|up 17408 x 5120, down 5120 x 8704).
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -71,7 +71,7 @@ float fb(uint16_t v) { return __bfloat162float(__ushort_as_bfloat16(v)); }
 
 // Worst |y - ref| / max |ref| of `rows` rows through the GEMV (rows <= 8) or dequant + cuBLAS.
 // f16: the FP16-accumulate route (blz_nvfp4_f16_rows + blz_nvfp4_gemv_mma_f16_cfg); outliers: a few input channels
-// a thousand times larger (Qwen's massive activations reach the down projections).
+// 1000 times larger to exercise outliers in down-projection inputs.
 double run(const Weights& W, int rows, int64_t ldx, std::mt19937& rng, blz_gemm* gemm, bool mma = false, int split = 0,
            int tiles = 0, bool f16 = false, bool outliers = false) {
   std::normal_distribution<float> d(0.0f, 1.0f);

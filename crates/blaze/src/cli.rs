@@ -124,11 +124,8 @@ fn resolve(command: clap::Command, mut args: Vec<OsString>) -> Result<(Vec<OsStr
         return Ok((args, Value::Object(Map::new())));
     }
     let subcommand = args.get(1).and_then(|arg| arg.to_str()).unwrap_or_default();
-    if !matches!(subcommand, "serve" | "serve-inkling") {
+    if subcommand != "serve" {
         bail!("--config and --preset are supported for serving");
-    }
-    if preset.is_some() && subcommand != "serve" {
-        bail!("--preset is supported by serve");
     }
     let mut value = match &path {
         Some(path) => serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("config {}", path.display()))?)?,

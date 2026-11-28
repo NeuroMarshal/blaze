@@ -85,8 +85,7 @@ struct AppState {
     vocab: usize,
     /// structured outputs (None: the tokenizer could not be read for grammars)
     grammars: Option<Grammars>,
-    /// the chat template knows no "developer" role (Qwen3.5/3.6 raise on it): such messages render as "system", the
-    /// role OpenAI's developer messages take the place of
+    /// Render developer messages as system messages when the template lacks a developer role.
     developer_as_system: bool,
     /// `created` of /v1/models: when the server started
     started: u64,
@@ -628,8 +627,8 @@ impl Spec {
     }
 }
 
-/// The request's thinking budget: vLLM's thinking_token_budget, SGLang-style thinking_budget, or the server default;
-/// the forced ending follows Qwen's recipe for budgeted thinking.
+/// Use the request's thinking_token_budget or thinking_budget, then the server default.
+/// The forced ending closes the reasoning block and asks the model to answer.
 fn think_budget(st: &AppState, body: &Value, starts_inside: bool) -> Option<ThinkBudget> {
     let budget = ["thinking_token_budget", "thinking_budget"]
         .iter()

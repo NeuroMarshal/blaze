@@ -14,7 +14,7 @@ pub struct Grammars {
 }
 
 /// The token environment of the grammars: toktrie_hf_tokenizers' bytes of every token, except that an added token
-/// the tokenizer does not call special (Qwen's `<tool_call>`, `</think>`) is its text. toktrie_hf_tokenizers takes
+/// the tokenizer does not mark as special, such as `<tool_call>` or `</think>`, is its text. toktrie_hf_tokenizers takes
 /// every `<...>` added token for a special one (bytes behind the 0xFF marker) while its tokenize_bytes, the Hugging Face
 /// encoder, turns the text `<tool_call>` into that token: llguidance then forced the token for the text and rejected
 /// it when it was sampled ("token doesn't satisfy the grammar"), and the forced tool call ran without its grammar.
